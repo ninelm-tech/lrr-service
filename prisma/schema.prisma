@@ -1,0 +1,163 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============== ENUMS ==============
+
+enum UserRole {
+  CUSTOMER
+  OPERATOR
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum OperatorMemberRole {
+  OWNER
+  MANAGER
+  DISPATCHER
+  DRIVER
+  STAFF
+}
+
+enum OperatorType {
+  TOW_TRUCK
+  MECHANIC
+  FUEL_DELIVERY
+  TYRE_REPAIR
+  BATTERY_JUMPSTART
+}
+
+enum OperatorStatus {
+  PENDING
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+enum RescueRequestStatus {
+  WAITING_FOR_LOCATION
+  WAITING_FOR_ISSUE_TYPE
+  WAITING_FOR_DEPOSIT
+  DISPATCHING
+  OPERATOR_ASSIGNED
+  IN_PROGRESS
+  ARRIVED
+  COMPLETED
+  CANCELLED
+  STALLED
+}
+
+enum IssueType {
+  BREAKDOWN
+  ACCIDENT
+  FLAT_TYRE
+  FUEL
+}
+
+// ============== MODELS ==============
+
+model User {
+  id           String    @id @default(cuid())
+  email        String?   @unique
+  phoneNumber  String?   @unique
+  passwordHash String?
+  name         String?
+  role         UserRole
+
+  operatorMemberships OperatorMember[]
+  rescueRequests      RescueRequest[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([role])
+  @@index([phoneNumber])
+}
+
+model Operator {
+  id            String         @id @default(cuid())
+
+  type          OperatorType   @default(TOW_TRUCK)
+
+  businessName  String
+  contactName   String
+  phoneNumber   String         @unique
+  email         String?
+
+  address       String
+  latitude      Decimal
+  longitude     Decimal
+
+  serviceRadius Int            @default(10)
+  status        OperatorStatus @default(PENDING)
+  isAvailable   Boolean        @default(true)
+
+  verifiedAt    DateTime?
+  notes         String?
+
+  members       OperatorMember[]
+  rescueRequests RescueRequest[]
+
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@index([status])
+  @@index([type])
+  @@index([latitude, longitude])
+}
+
+model OperatorMember {
+  id         String              @id @default(cuid())
+
+  userId     String
+  user       User                @relation(fields: [userId], references: [id])
+
+  operatorId String
+  operator   Operator            @relation(fields: [operatorId], references: [id])
+
+  role       OperatorMemberRole  @default(STAFF)
+
+  createdAt  DateTime            @default(now())
+  updatedAt  DateTime            @updatedAt
+
+  @@unique([userId, operatorId])
+  @@index([operatorId])
+  @@index([userId])
+  @@index([role])
+}
+
+model RescueRequest {
+  id                 String              @id @default(cuid())
+  
+  customerId         String
+  customer           User                @relation(fields: [customerId], references: [id])
+
+  status             RescueRequestStatus @default(WAITING_FOR_LOCATION)
+
+  latitude           Decimal?
+  longitude          Decimal?
+
+  issueType          IssueType?
+
+  depositPaid        Boolean             @default(false)
+  depositAmount      Int?
+  depositReference   String?
+  balancePaid        Boolean             @default(false)
+  balanceAmount      Int?
+  balanceReference   String?
+
+  assignedOperatorId String?
+  assignedOperator   Operator?           @relation(fields: [assignedOperatorId], references: [id])
+
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  @@index([customerId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([depositReference])
+}
