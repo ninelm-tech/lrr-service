@@ -137,6 +137,79 @@ export class AuthService {
   }
 
   /**
+   * Register a new customer (self-service via web or WhatsApp subscription flow).
+   * Phone number is mandatory — it must match the WhatsApp number they SOS from.
+   */
+  async registerCustomer(dto: {
+    phoneNumber: string;
+    email?: string;
+    password?: string;
+    name?: string;
+  }): Promise<AuthResponse> {
+    // Check phone uniqueness
+    const existingPhone = await this.prisma.user.findUnique({
+      where: { phoneNumber: dto.phoneNumber },
+    });
+    if (existingPhone) {
+      // If already exists as a CUSTOMER (created automatically by WhatsApp bot),
+      // just attach email/password and return a token.
+      if (existingPhone.role === UserRole.CUSTOMER) {
+        const updates: any = {};
+        if (dto.name)     updates.name = dto.name;
+        if (dto.email)    updates.email = dto.email;
+        if (dto.password) updates.passwordHash = await this.hashPassword(dto.password);
+
+        const updated = await this.prisma.user.update({
+          where: { id: existingPhone.id },
+          data:  updates,
+        });
+
+        const accessToken = this.generateToken({
+          id:    updated.id,
+          email: updated.email ?? dto.phoneNumber,
+          role:  updated.role,
+        });
+
+        return {
+          accessToken,
+          user: { id: updated.id, email: updated.email!, name: updated.name, role: updated.role },
+        };
+      }
+
+      throw new ConflictException('Phone number already registered to a different account type.');
+    }
+
+    // Check email uniqueness if provided
+    if (dto.email) {
+      const existingEmail = await this.prisma.user.findUnique({ where: { email: dto.email } });
+      if (existingEmail) throw new ConflictException('Email already registered.');
+    }
+
+    const passwordHash = dto.password ? await this.hashPassword(dto.password) : null;
+
+    const user = await this.prisma.user.create({
+      data: {
+        phoneNumber:  dto.phoneNumber,
+        email:        dto.email ?? null,
+        passwordHash: passwordHash ?? undefined,
+        name:         dto.name ?? null,
+        role:         UserRole.CUSTOMER,
+      },
+    });
+
+    const accessToken = this.generateToken({
+      id:    user.id,
+      email: user.email ?? dto.phoneNumber,
+      role:  user.role,
+    });
+
+    return {
+      accessToken,
+      user: { id: user.id, email: user.email!, name: user.name, role: user.role },
+    };
+  }
+
+  /**
    * Register a new operator
    */
   async registerOperator(dto: {

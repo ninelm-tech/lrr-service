@@ -90,4 +90,140 @@ export class PaystackService {
   generateReference(prefix: string = 'LRR'): string {
     return `${prefix}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
   }
+
+  // ── Paystack Customers ───────────────────────────────────────────────────
+
+  /**
+   * Create or fetch a Paystack customer by email.
+   * Returns the customer_code used for subscriptions.
+   */
+  async createOrFetchCustomer(params: {
+    email: string;
+    first_name?: string;
+    last_name?: string;
+    phone?: string;
+  }): Promise<{ customer_code: string; id: number }> {
+    // Try fetching first
+    const fetchRes = await fetch(`${this.baseUrl}/customer/${params.email}`, {
+      headers: { Authorization: `Bearer ${this.secretKey}` },
+    });
+    const fetchData = await fetchRes.json() as any;
+
+    if (fetchData.status && fetchData.data?.customer_code) {
+      return { customer_code: fetchData.data.customer_code, id: fetchData.data.id };
+    }
+
+    // Create new customer
+    const createRes = await fetch(`${this.baseUrl}/customer`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.secretKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(params),
+    });
+    const createData = await createRes.json() as any;
+    console.log('Paystack create customer:', createData);
+    return { customer_code: createData.data.customer_code, id: createData.data.id };
+  }
+
+  // ── Paystack Plans ───────────────────────────────────────────────────────
+
+  /**
+   * Create a Paystack plan (recurring billing).
+   * Returns the plan_code.
+   */
+  async createPlan(params: {
+    name: string;
+    amount: number;       // in kobo
+    interval: 'monthly' | 'annually';
+    description?: string;
+  }): Promise<{ plan_code: string; id: number }> {
+    const res = await fetch(`${this.baseUrl}/plan`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.secretKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(params),
+    });
+    const data = await res.json() as any;
+    console.log('Paystack create plan:', data);
+    return { plan_code: data.data.plan_code, id: data.data.id };
+  }
+
+  /**
+   * List plans — used to find existing plans by name at startup.
+   */
+  async listPlans(): Promise<Array<{ id: number; plan_code: string; name: string; amount: number; interval: string }>> {
+    const res = await fetch(`${this.baseUrl}/plan?perPage=50`, {
+      headers: { Authorization: `Bearer ${this.secretKey}` },
+    });
+    const data = await res.json() as any;
+    return data.data ?? [];
+  }
+
+  // ── Paystack Subscriptions ───────────────────────────────────────────────
+
+  /**
+   * Initialize a subscription via checkout page (customer pays first charge + subscribes).
+   * Returns the authorization_url to send to the customer.
+   */
+  async initializeSubscriptionCheckout(params: {
+    email: string;
+    amount: number;
+    plan: string;            // plan_code
+    reference: string;
+    callback_url?: string;   // where Paystack redirects after payment
+    metadata?: Record<string, any>;
+  }): Promise<PaystackInitializeResponse> {
+    const res = await fetch(`${this.baseUrl}/transaction/initialize`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.secretKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        email:        params.email,
+        amount:       params.amount,
+        plan:         params.plan,
+        reference:    params.reference,
+        callback_url: params.callback_url,
+        metadata:     params.metadata,
+      }),
+    });
+    const data = await res.json() as any;
+    console.log('Paystack subscription checkout init:', data);
+    return data as PaystackInitializeResponse;
+  }
+
+  /**
+   * Cancel a Paystack subscription.
+   */
+  async cancelSubscription(params: {
+    code: string;            // subscription_code
+    token: string;           // email_token from Paystack subscription object
+  }): Promise<{ status: boolean; message: string }> {
+    const res = await fetch(`${this.baseUrl}/subscription/disable`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.secretKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(params),
+    });
+    const data = await res.json() as any;
+    console.log('Paystack cancel subscription:', data);
+    return data;
+  }
+
+  /**
+   * Fetch a Paystack subscription by code.
+   */
+  async fetchSubscription(subscriptionCode: string): Promise<any> {
+    const res = await fetch(`${this.baseUrl}/subscription/${subscriptionCode}`, {
+      headers: { Authorization: `Bearer ${this.secretKey}` },
+    });
+    return (await res.json() as any).data;
+  }
 }

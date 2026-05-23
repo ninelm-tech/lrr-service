@@ -2,6 +2,7 @@ export enum WhatsAppFlowState {
   IDLE = 'IDLE',
   WAITING_FOR_LOCATION = 'WAITING_FOR_LOCATION',
   WAITING_FOR_ISSUE_TYPE = 'WAITING_FOR_ISSUE_TYPE',
+  WAITING_FOR_DEPOSIT = 'WAITING_FOR_DEPOSIT',
   REQUEST_CONFIRMED = 'REQUEST_CONFIRMED',
 }
 
@@ -13,5 +14,10 @@ export interface WhatsAppSession {
   latitude?: number;
   longitude?: number;
   issueType?: IssueType;
+  rescueRequestId?: string;
+  depositReference?: string;
+  // Dispatch tracking
+  dispatchRound?: number;
+  offeredOperatorIds?: string[];
   updatedAt: Date;
 }

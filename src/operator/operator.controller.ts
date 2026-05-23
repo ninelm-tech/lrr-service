@@ -5,6 +5,7 @@ import {
   Param,
   Patch,
   Post,
+  Query,
 } from '@nestjs/common';
 import { OperatorService } from './operator.service';
 import { OperatorStatus, OperatorType } from '@prisma/client';
@@ -53,12 +54,31 @@ export class OperatorController {
   }
 
   /**
+   * Get performance stats for ALL operators — admin leaderboard.
+   * Must be declared BEFORE `:id` routes to avoid param shadowing.
+   */
+  @Get('all-stats')
+  async getAllStats(@Query('days') days?: string) {
+    const stats = await this.operatorService.getAllOperatorStats(days ? parseInt(days, 10) : 30);
+    return { data: stats };
+  }
+
+  /**
    * Get an operator by ID
    */
   @Get(':id')
   async findById(@Param('id') id: string) {
     const operator = await this.operatorService.findById(id);
     return { data: operator };
+  }
+
+  /**
+   * Get performance stats for a single operator
+   */
+  @Get(':id/stats')
+  async getStats(@Param('id') id: string, @Query('days') days?: string) {
+    const stats = await this.operatorService.getOperatorStats(id, days ? parseInt(days, 10) : 30);
+    return { data: stats };
   }
 
   /**

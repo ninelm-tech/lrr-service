@@ -1,15 +1,24 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { TowOperatorController } from './tow-operator.controller';
+import { OperatorController } from './operator.controller';
 
-describe('TowOperatorController', () => {
-  let controller: TowOperatorController;
+describe('OperatorController', () => {
+  let controller: OperatorController;
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
-      controllers: [TowOperatorController],
-    }).compile();
+      controllers: [OperatorController],
+      providers: [
+        {
+          provide: 'OperatorService',
+          useValue: {},
+        },
+      ],
+    })
+      .overrideProvider('OperatorService')
+      .useValue({})
+      .compile();
 
-    controller = module.get<TowOperatorController>(TowOperatorController);
+    controller = module.get<OperatorController>(OperatorController);
   });
 
   it('should be defined', () => {

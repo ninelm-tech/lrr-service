@@ -15,6 +15,18 @@ export class RegisterDto {
   name?: string;
 }
 
+/**
+ * Customer self-registration.
+ * Phone number is the primary identifier (matches WhatsApp SOS phone).
+ * Email + password are optional — used only if they want dashboard login.
+ */
+export class RegisterCustomerDto {
+  phoneNumber: string;
+  email?: string;
+  password?: string;
+  name?: string;
+}
+
 @Controller('auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
@@ -40,7 +52,17 @@ export class AuthController {
   }
 
   /**
-   * Register a new operator (for testing/admin)
+   * Register a new customer (self-service).
+   * Phone number is required — it must match the WhatsApp number they'll SOS from.
+   * Returns a JWT so they can log in immediately.
+   */
+  @Post('register/customer')
+  async registerCustomer(@Body() dto: RegisterCustomerDto) {
+    return this.authService.registerCustomer(dto);
+  }
+
+  /**
+   * Register a new operator
    */
   @Post('register/operator')
   async registerOperator(@Body() dto: RegisterOperatorDto) {

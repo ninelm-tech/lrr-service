@@ -4,12 +4,9 @@ import { OperatorStatus, OperatorType, UserRole, OperatorMemberRole } from '@pri
 import * as bcrypt from 'bcrypt';
 
 interface CreateOperatorDto {
-  // User fields
   email: string;
   password: string;
   name?: string;
-
-  // Operator fields
   type?: OperatorType;
   businessName: string;
   contactName: string;
@@ -20,52 +17,82 @@ interface CreateOperatorDto {
   serviceRadius?: number;
 }
 
+// ── Scoring weights ────────────────────────────────────────────────────────────
+// Distance is the dominant factor but reliability and speed matter.
+// New operators (no history) receive neutral scores on the last two factors
+// so they aren't unfairly penalised before they've had a chance to prove themselves.
+const WEIGHT_DISTANCE        = 0.50;
+const WEIGHT_ACCEPTANCE_RATE = 0.30;
+const WEIGHT_RESPONSE_SPEED  = 0.20;
+
+// Look-back window for computing operator stats
+const STATS_LOOKBACK_DAYS = 30;
+
+export interface ScoredOperator {
+  id: string;
+  businessName: string;
+  phoneNumber: string;
+  latitude: number;
+  longitude: number;
+  serviceRadius: number;
+  distance: number;          // km from the rescue location
+  score: number;             // composite 0–1, higher = better
+  stats: OperatorStats;
+}
+
+export interface OperatorStats {
+  totalOffered:      number;
+  totalAccepted:     number;
+  totalDeclined:     number;
+  totalTimedOut:     number;
+  acceptanceRate:    number;   // 0–1
+  avgResponseSec:    number;   // seconds; null-safe (0 for new operators)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+
 @Injectable()
 export class OperatorService {
   constructor(private readonly prisma: PrismaService) {}
 
-  /**
-   * Register a new operator (creates User + Operator)
-   */
+  // ══════════════════════════════════════════════════════
+  //  REGISTRATION
+  // ══════════════════════════════════════════════════════
+
   async create(data: CreateOperatorDto) {
-    // Hash password
     const passwordHash = await bcrypt.hash(data.password, 10);
 
-    // Create user and operator in a transaction
     return this.prisma.$transaction(async (tx) => {
-      // Create user
       const user = await tx.user.create({
         data: {
-          email: data.email,
+          email:        data.email,
           passwordHash,
-          name: data.name,
-          phoneNumber: data.phoneNumber,
-          role: UserRole.OPERATOR,
+          name:         data.name,
+          phoneNumber:  data.phoneNumber,
+          role:         UserRole.OPERATOR,
         },
       });
 
-      // Create operator
       const operator = await tx.operator.create({
         data: {
-          type: data.type ?? OperatorType.TOW_TRUCK,
-          businessName: data.businessName,
-          contactName: data.contactName,
-          phoneNumber: data.phoneNumber,
-          email: data.email,
-          address: data.address,
-          latitude: data.latitude,
-          longitude: data.longitude,
+          type:          data.type ?? OperatorType.TOW_TRUCK,
+          businessName:  data.businessName,
+          contactName:   data.contactName,
+          phoneNumber:   data.phoneNumber,
+          email:         data.email,
+          address:       data.address,
+          latitude:      data.latitude,
+          longitude:     data.longitude,
           serviceRadius: data.serviceRadius ?? 10,
-          status: OperatorStatus.PENDING,
+          status:        OperatorStatus.PENDING,
         },
       });
 
-      // Create OperatorMember (OWNER)
       const operatorMember = await tx.operatorMember.create({
         data: {
-          userId: user.id,
+          userId:     user.id,
           operatorId: operator.id,
-          role: OperatorMemberRole.OWNER,
+          role:       OperatorMemberRole.OWNER,
         },
       });
 
@@ -73,55 +100,206 @@ export class OperatorService {
     });
   }
 
+  // ══════════════════════════════════════════════════════
+  //  DISPATCH — find and rank candidates
+  // ══════════════════════════════════════════════════════
+
   /**
-   * Find the nearest available operator to a given location
+   * Find all available operators within range, ranked by composite score.
+   * Used by the dispatch loop to build each broadcast batch.
+   *
+   * Scoring = distance (50%) + acceptance rate (30%) + response speed (20%)
+   * Operators with no history receive neutral scores on the last two factors.
+   *
+   * @param excludeIds  Operator IDs already offered this job (skip them)
+   * @param extraRadiusKm  Radius expansion applied in retry rounds
    */
-  async findNearestAvailable(
+  async findAndRankCandidates(
     latitude: number,
     longitude: number,
+    excludeIds: string[] = [],
+    extraRadiusKm: number = 0,
     type?: OperatorType,
-  ) {
-    // Get all active and available operators
+  ): Promise<ScoredOperator[]> {
     const operators = await this.prisma.operator.findMany({
       where: {
-        status: OperatorStatus.ACTIVE,
+        status:      OperatorStatus.ACTIVE,
         isAvailable: true,
+        ...(excludeIds.length > 0 && { id: { notIn: excludeIds } }),
         ...(type && { type }),
-      },
-      include: {
-        members: { include: { user: true } },
       },
     });
 
-    if (operators.length === 0) {
-      return null;
-    }
+    if (operators.length === 0) return [];
 
-    // Calculate distance for each operator and find the nearest
-    let nearestOperator = null;
-    let shortestDistance = Infinity;
-
-    for (const operator of operators) {
+    // Filter to within effective radius and compute distances
+    const inRange: Array<{ op: typeof operators[0]; distance: number }> = [];
+    for (const op of operators) {
       const distance = this.calculateDistance(
-        latitude,
-        longitude,
-        Number(operator.latitude),
-        Number(operator.longitude),
+        latitude, longitude,
+        Number(op.latitude), Number(op.longitude),
       );
-
-      // Check if within service radius
-      if (distance <= operator.serviceRadius && distance < shortestDistance) {
-        shortestDistance = distance;
-        nearestOperator = { ...operator, distance };
+      const effectiveRadius = op.serviceRadius + extraRadiusKm;
+      if (distance <= effectiveRadius) {
+        inRange.push({ op, distance });
       }
     }
 
-    return nearestOperator;
+    if (inRange.length === 0) return [];
+
+    // Fetch dispatch history for all candidates in one query
+    const since = new Date();
+    since.setDate(since.getDate() - STATS_LOOKBACK_DAYS);
+
+    const operatorIds = inRange.map((r) => r.op.id);
+    const offers = await this.prisma.dispatchOffer.findMany({
+      where: {
+        operatorId: { in: operatorIds },
+        offeredAt:  { gte: since },
+      },
+      select: {
+        operatorId:  true,
+        status:      true,
+        offeredAt:   true,
+        respondedAt: true,
+      },
+    });
+
+    // Group offers by operator
+    const offersByOperator = new Map<string, typeof offers>();
+    for (const offer of offers) {
+      if (!offersByOperator.has(offer.operatorId)) {
+        offersByOperator.set(offer.operatorId, []);
+      }
+      offersByOperator.get(offer.operatorId)!.push(offer);
+    }
+
+    // Compute the max distance in range (used to normalise distance score)
+    const maxDistance = Math.max(...inRange.map((r) => r.distance), 1);
+
+    // Score each operator
+    const scored: ScoredOperator[] = inRange.map(({ op, distance }) => {
+      const stats = this.computeStats(offersByOperator.get(op.id) ?? []);
+
+      // Distance score: closer = 1.0, furthest in range = 0.0
+      const distanceScore = 1 - distance / maxDistance;
+
+      // Acceptance rate score: direct 0–1
+      const acceptanceScore = stats.acceptanceRate;
+
+      // Response speed score: faster = 1.0. Cap at 5 min (300s) = 0.0.
+      // New operators (avgResponseSec === 0) get a neutral 0.5.
+      const MAX_RESPONSE_SEC = 300;
+      const speedScore = stats.totalAccepted === 0
+        ? 0.5                                                    // neutral for new operators
+        : Math.max(0, 1 - stats.avgResponseSec / MAX_RESPONSE_SEC);
+
+      const score =
+        distanceScore   * WEIGHT_DISTANCE +
+        acceptanceScore * WEIGHT_ACCEPTANCE_RATE +
+        speedScore      * WEIGHT_RESPONSE_SPEED;
+
+      return {
+        id:            op.id,
+        businessName:  op.businessName,
+        phoneNumber:   op.phoneNumber,
+        latitude:      Number(op.latitude),
+        longitude:     Number(op.longitude),
+        serviceRadius: op.serviceRadius,
+        distance,
+        score,
+        stats,
+      };
+    });
+
+    // Sort highest score first
+    return scored.sort((a, b) => b.score - a.score);
   }
 
   /**
-   * Get all operators
+   * @deprecated Use findAndRankCandidates for dispatch.
+   * Kept for backwards compatibility with any existing callers.
    */
+  async findNearestAvailableExcluding(
+    latitude: number,
+    longitude: number,
+    excludeIds: string[] = [],
+    extraRadiusKm: number = 0,
+    type?: OperatorType,
+  ) {
+    const ranked = await this.findAndRankCandidates(latitude, longitude, excludeIds, extraRadiusKm, type);
+    return ranked[0] ?? null;
+  }
+
+  async findNearestAvailable(latitude: number, longitude: number, type?: OperatorType) {
+    return this.findNearestAvailableExcluding(latitude, longitude, [], 0, type);
+  }
+
+  // ══════════════════════════════════════════════════════
+  //  OPERATOR STATS (admin dashboard)
+  // ══════════════════════════════════════════════════════
+
+  /**
+   * Compute performance stats for a single operator.
+   * Admin dashboard can call this per-operator, or aggregate across all.
+   */
+  async getOperatorStats(operatorId: string, days = 30): Promise<OperatorStats> {
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+
+    const offers = await this.prisma.dispatchOffer.findMany({
+      where: { operatorId, offeredAt: { gte: since } },
+      select: { status: true, offeredAt: true, respondedAt: true },
+    });
+
+    return this.computeStats(offers);
+  }
+
+  /**
+   * Get stats for all operators — used for admin leaderboard / performance page.
+   */
+  async getAllOperatorStats(days = 30): Promise<Array<{
+    operatorId: string;
+    businessName: string;
+    phoneNumber: string;
+    status: string;
+    stats: OperatorStats;
+  }>> {
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+
+    const [operators, allOffers] = await Promise.all([
+      this.prisma.operator.findMany({
+        select: { id: true, businessName: true, phoneNumber: true, status: true },
+        orderBy: { createdAt: 'desc' },
+      }),
+      this.prisma.dispatchOffer.findMany({
+        where: { offeredAt: { gte: since } },
+        select: { operatorId: true, status: true, offeredAt: true, respondedAt: true },
+      }),
+    ]);
+
+    const offersByOperator = new Map<string, typeof allOffers>();
+    for (const offer of allOffers) {
+      if (!offersByOperator.has(offer.operatorId)) {
+        offersByOperator.set(offer.operatorId, []);
+      }
+      offersByOperator.get(offer.operatorId)!.push(offer);
+    }
+
+    return operators.map((op) => ({
+      operatorId:   op.id,
+      businessName: op.businessName,
+      phoneNumber:  op.phoneNumber,
+      status:       op.status,
+      stats:        this.computeStats(offersByOperator.get(op.id) ?? []),
+    }));
+  }
+
+  // ══════════════════════════════════════════════════════
+  //  CRUD
+  // ══════════════════════════════════════════════════════
+
   async findAll() {
     return this.prisma.operator.findMany({
       include: { members: { include: { user: true } } },
@@ -129,9 +307,6 @@ export class OperatorService {
     });
   }
 
-  /**
-   * Get an operator by ID
-   */
   async findById(id: string) {
     return this.prisma.operator.findUnique({
       where: { id },
@@ -139,11 +314,7 @@ export class OperatorService {
     });
   }
 
-  /**
-   * Get an operator by user ID
-   */
   async findByUserId(userId: string) {
-    // Find the first operator where the user is a member
     const membership = await this.prisma.operatorMember.findFirst({
       where: { userId },
       include: { operator: { include: { members: { include: { user: true } } } } },
@@ -151,9 +322,6 @@ export class OperatorService {
     return membership?.operator || null;
   }
 
-  /**
-   * Update operator status (for admin approval)
-   */
   async updateStatus(id: string, status: OperatorStatus) {
     return this.prisma.operator.update({
       where: { id },
@@ -164,9 +332,6 @@ export class OperatorService {
     });
   }
 
-  /**
-   * Toggle operator availability
-   */
   async setAvailability(id: string, isAvailable: boolean) {
     return this.prisma.operator.update({
       where: { id },
@@ -174,27 +339,50 @@ export class OperatorService {
     });
   }
 
-  /**
-   * Calculate distance between two points using Haversine formula
-   * Returns distance in kilometers
-   */
-  private calculateDistance(
-    lat1: number,
-    lon1: number,
-    lat2: number,
-    lon2: number,
-  ): number {
-    const R = 6371; // Earth's radius in km
+  // ══════════════════════════════════════════════════════
+  //  PRIVATE HELPERS
+  // ══════════════════════════════════════════════════════
+
+  private computeStats(
+    offers: Array<{ status: string; offeredAt: Date; respondedAt: Date | null }>,
+  ): OperatorStats {
+    const totalOffered  = offers.length;
+    const totalAccepted = offers.filter((o) => o.status === 'ACCEPTED').length;
+    const totalDeclined = offers.filter((o) => o.status === 'DECLINED').length;
+    const totalTimedOut = offers.filter((o) => o.status === 'TIMED_OUT').length;
+
+    const acceptanceRate = totalOffered > 0 ? totalAccepted / totalOffered : 0;
+
+    // Average response time only across responded offers (ACCEPTED or DECLINED)
+    const respondedOffers = offers.filter(
+      (o) => (o.status === 'ACCEPTED' || o.status === 'DECLINED') && o.respondedAt,
+    );
+    const avgResponseSec =
+      respondedOffers.length > 0
+        ? respondedOffers.reduce((sum, o) => {
+            const ms = o.respondedAt!.getTime() - o.offeredAt.getTime();
+            return sum + ms / 1000;
+          }, 0) / respondedOffers.length
+        : 0;
+
+    return {
+      totalOffered,
+      totalAccepted,
+      totalDeclined,
+      totalTimedOut,
+      acceptanceRate,
+      avgResponseSec,
+    };
+  }
+
+  private calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    const R = 6371;
     const dLat = this.toRad(lat2 - lat1);
     const dLon = this.toRad(lon2 - lon1);
     const a =
-      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-      Math.cos(this.toRad(lat1)) *
-        Math.cos(this.toRad(lat2)) *
-        Math.sin(dLon / 2) *
-        Math.sin(dLon / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c;
+      Math.sin(dLat / 2) ** 2 +
+      Math.cos(this.toRad(lat1)) * Math.cos(this.toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   }
 
   private toRad(deg: number): number {

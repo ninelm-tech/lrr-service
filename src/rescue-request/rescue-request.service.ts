@@ -1,4 +1,5 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
+import * as Sentry from '@sentry/node';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import {
   IssueType,
@@ -17,7 +18,21 @@ import {
   PaginationMetaDto,
 } from './dto/rescue-request-response.dto';
 
-const DEPOSIT_AMOUNT_KOBO = 500000; // ₦5,000 deposit
+const DEPOSIT_AMOUNT_KOBO = 500000;   // ₦5,000
+const BALANCE_AMOUNT_KOBO = 4500000;  // ₦45,000
+const FULL_AMOUNT_KOBO    = 5000000;  // ₦50,000 (subscriber tow exhausted)
+
+// ── Dispatch config ────────────────────────────────────────────────────────────
+const BATCH_SIZE = 3;                  // operators offered per round simultaneously
+const CUSTOMER_BUDGET_MINUTES = 10;   // max total customer wait before radius expands
+const MIN_WINDOW_SECONDS = 90;        // floor: operators always get at least 90s
+const MAX_WINDOW_SECONDS = 180;       // ceiling: never more than 3 min per batch
+const DISPATCH_RETRY_MINUTES = 5;     // wait between radius-expansion retries
+const MAX_FAILED_ROUNDS_BEFORE_ALERT = 2;   // alert admin after this many failed rounds
+const MAX_ROUNDS_BEFORE_AUTO_CANCEL  = 4;   // ~20 min total wait — auto-cancel after this
+const RADIUS_EXPANSION_KM = 2;
+
+// ──────────────────────────────────────────────────────────────────────────────
 
 @Injectable()
 export class RescueRequestService {
@@ -29,93 +44,1215 @@ export class RescueRequestService {
     private readonly operatorService: OperatorService,
   ) {}
 
-  // Unified API for rescue requests by user role
+  // ═══════════════════════════════════════════════════════
+  //  WHATSAPP FLOW — incoming message handler
+  // ═══════════════════════════════════════════════════════
+
+  async handleIncomingWhatsAppMessage(body: Record<string, any>) {
+    const phoneNumber: string = body.From;
+    const message = String(body.Body || '').trim().toLowerCase();
+    const latitude  = body.Latitude  ? Number(body.Latitude)  : undefined;
+    const longitude = body.Longitude ? Number(body.Longitude) : undefined;
+
+    console.log('Incoming WhatsApp message:', { phoneNumber, message, latitude, longitude });
+
+    const session = await this.sessionStore.getOrCreate(phoneNumber);
+
+    // ── Route operator messages first ──────────────────────────────────────
+    // Operators share the same WhatsApp channel; identify them by phone number.
+    const operatorRecord = await this.prisma.operator.findUnique({
+      where: { phoneNumber: phoneNumber.replace('whatsapp:', '') },
+    });
+    if (operatorRecord) {
+      return this.handleOperatorMessage(phoneNumber, message, session, operatorRecord);
+    }
+
+    // ── CONFIRM / DISPUTE job completion (customer side) ──────────────────
+    if (session.state === WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM) {
+      if (message === 'confirm') {
+        if (session.rescueRequestId) {
+          await this.markJobCompleted(session.rescueRequestId);
+          await this.sessionStore.update(phoneNumber, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
+        }
+        return this.xmlOk();
+      }
+      if (message === 'dispute') {
+        // Notify admin and hold the request — do not auto-complete
+        await this.alertAdminNoOperator(session.rescueRequestId ?? '', 0, 0, -1); // reuse alert channel
+        await this.twilioService.sendWhatsAppMessage(
+          phoneNumber,
+          `⚠️ Your dispute has been logged. Our team will contact you within 30 minutes.\n\nDo NOT release the vehicle until you hear from us.`,
+        );
+        return this.xmlOk();
+      }
+      // Any other message — remind them what to do
+      return this.reply(
+        `Your operator says the job is done. Reply *CONFIRM* to release the vehicle and receive your balance payment link, or *DISPUTE* if there's a problem.`,
+      );
+    }
+
+    // ── SOS / new request ──────────────────────────────────────────────────
+    if (this.isSosMessage(message)) {
+      // Duplicate SOS detection — check for existing open request
+      const customer = await this.prisma.user.findUnique({ where: { phoneNumber } });
+      if (customer) {
+        const openRequest = await this.prisma.rescueRequest.findFirst({
+          where: {
+            customerId: customer.id,
+            status: {
+              notIn: [
+                RescueRequestStatus.COMPLETED,
+                RescueRequestStatus.CANCELLED,
+              ] as RescueRequestStatus[],
+            },
+          },
+        });
+        if (openRequest) {
+          return this.reply(
+            `⚠️ You already have an active rescue request (${this.formatStatus(openRequest.status)}).\n\nWe're on it! Reply CANCEL to cancel the current request.`,
+          );
+        }
+      }
+
+      await this.sessionStore.update(phoneNumber, {
+        state: WhatsAppFlowState.WAITING_FOR_LOCATION,
+        latitude: undefined,
+        longitude: undefined,
+        issueType: undefined,
+        rescueRequestId: undefined,
+        depositReference: undefined,
+        dispatchRound: 0,
+        offeredOperatorIds: [],
+      });
+
+      return this.reply(
+        `🚨 LRR Rescue here. Please share your current location pin so we can find the nearest tow operator.`,
+      );
+    }
+
+    // ── CANCEL active request ──────────────────────────────────────────────
+    if (message === 'cancel') {
+      // Primary path: rescueRequestId stored in session
+      let requestIdToCancel = session.rescueRequestId;
+
+      // Fallback: session may have lost state (server restart, previous session cleared
+      // before request was created, etc.) — look up the open request in the DB directly
+      if (!requestIdToCancel) {
+        const customer = await this.prisma.user.findUnique({ where: { phoneNumber } });
+        if (customer) {
+          const openRequest = await this.prisma.rescueRequest.findFirst({
+            where: {
+              customerId: customer.id,
+              status: {
+                notIn: [RescueRequestStatus.COMPLETED, RescueRequestStatus.CANCELLED] as RescueRequestStatus[],
+              },
+            },
+            orderBy: { createdAt: 'desc' },
+          });
+          if (openRequest) requestIdToCancel = openRequest.id;
+        }
+      }
+
+      if (requestIdToCancel) {
+        const existing = await this.prisma.rescueRequest.findUnique({
+          where: { id: requestIdToCancel },
+          include: { assignedOperator: true },
+        });
+
+        await this.prisma.rescueRequest.update({
+          where: { id: requestIdToCancel },
+          data: { status: RescueRequestStatus.CANCELLED },
+        });
+        await this.sessionStore.clear(phoneNumber);
+
+        // If an operator was tentatively holding this job (awaiting customer payment),
+        // release them and let them know
+        if (
+          existing?.status === RescueRequestStatus.WAITING_FOR_DEPOSIT &&
+          existing.assignedOperator
+        ) {
+          await this.twilioService.sendWhatsAppMessage(
+            `whatsapp:${existing.assignedOperator.phoneNumber}`,
+            `❌ The customer cancelled before confirming payment. You have been released. Watch out for new offers!`,
+          );
+        }
+
+        return this.reply(`❌ Your rescue request has been cancelled. You were not charged.\n\nSend SOS or HELP if you need assistance again.`);
+      }
+
+      // Nothing to cancel
+      return this.reply(`You don't have an active rescue request to cancel.\n\nSend SOS or HELP if you need assistance.`);
+    }
+
+    // ── Step 1: Waiting for location ───────────────────────────────────────
+    if (session.state === WhatsAppFlowState.WAITING_FOR_LOCATION) {
+      if (!latitude || !longitude) {
+        return this.reply(
+          `📍 Please share your location using WhatsApp's location pin — not a typed address.`,
+        );
+      }
+      await this.sessionStore.update(phoneNumber, {
+        latitude,
+        longitude,
+        state: WhatsAppFlowState.WAITING_FOR_ISSUE_TYPE,
+      });
+      return this.reply(
+        `📍 Location received!\n\nWhat issue are you having?\n\n1️⃣ Breakdown\n2️⃣ Accident\n3️⃣ Flat tyre\n4️⃣ Fuel`,
+      );
+    }
+
+    // ── Step 2: Waiting for issue type ─────────────────────────────────────
+    if (session.state === WhatsAppFlowState.WAITING_FOR_ISSUE_TYPE) {
+      const issueType = this.mapIssueType(message);
+      if (!issueType) {
+        return this.reply(`Please reply with a number 1-4 to select the issue type.`);
+      }
+      return this.handleIssueTypeSelected(phoneNumber, session, issueType);
+    }
+
+    // ── Step 3: Operator found — waiting for customer to pay ──────────────
+    if (session.state === WhatsAppFlowState.OPERATOR_FOUND_WAITING_PAYMENT) {
+      return this.reply(
+        `🚗 An operator is standing by for you! Please pay using the link we sent you to confirm.\n\nYou have 5 minutes or the slot will be released.\n\nReply CANCEL to cancel (you will not be charged).`,
+      );
+    }
+
+    // ── Step 4: Request confirmed ──────────────────────────────────────────
+    if (session.state === WhatsAppFlowState.REQUEST_CONFIRMED) {
+      return this.reply(
+        `✅ Your rescue request is confirmed and a tow operator is on the way.\n\nSend SOS or HELP to start a new request.`,
+      );
+    }
+
+    return this.reply(
+      `👋 Welcome to Lagos Roadside Rescue.\n\nSend HELP or SOS if you need roadside assistance.`,
+    );
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  //  Operator message router
+  // ──────────────────────────────────────────────────────────────────────────
+  private async handleOperatorMessage(
+    phoneNumber: string,
+    message: string,
+    session: Awaited<ReturnType<WhatsAppSessionStore['getOrCreate']>>,
+    operator: { id: string; businessName: string; phoneNumber: string },
+  ) {
+    // ── Dispatch accept / decline ──────────────────────────────────────────
+    if (message === 'yes' || message === 'accept') {
+      return this.handleOperatorResponse(phoneNumber, true);
+    }
+    if (message === 'no' || message === 'decline') {
+      return this.handleOperatorResponse(phoneNumber, false);
+    }
+
+    // ── ARRIVED at customer location ───────────────────────────────────────
+    if (message === 'arrived' || message === 'on site' || message === 'onsite') {
+      if (session.state !== WhatsAppFlowState.OPERATOR_ON_JOB || !session.rescueRequestId) {
+        return this.reply(`You don't have an active job. Wait for a dispatch offer.`);
+      }
+      return this.handleOperatorArrived(phoneNumber, session.rescueRequestId, operator);
+    }
+
+    // ── Job DONE — prompt customer to confirm ──────────────────────────────
+    if (message === 'done' || message === 'complete' || message === 'finished') {
+      if (session.state !== WhatsAppFlowState.OPERATOR_AT_LOCATION || !session.rescueRequestId) {
+        return this.reply(`Please send ARRIVED first when you reach the customer location.`);
+      }
+      return this.handleOperatorJobDone(phoneNumber, session.rescueRequestId, operator);
+    }
+
+    // ── Contextual help ───────────────────────────────────────────────────
+    if (session.state === WhatsAppFlowState.OPERATOR_ON_JOB) {
+      return this.reply(
+        `📍 Send *ARRIVED* when you reach the customer location so we can notify them.`,
+      );
+    }
+    if (session.state === WhatsAppFlowState.OPERATOR_AT_LOCATION) {
+      return this.reply(
+        `✅ Send *DONE* when the job is complete. The customer will confirm and you'll both be notified.`,
+      );
+    }
+
+    return this.xmlOk();
+  }
+
+  private async handleOperatorArrived(
+    operatorPhone: string,
+    rescueRequestId: string,
+    operator: { id: string; businessName: string },
+  ) {
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      include: { customer: true },
+    });
+    if (!rescueRequest || rescueRequest.status === RescueRequestStatus.CANCELLED || rescueRequest.status === RescueRequestStatus.COMPLETED) {
+      await this.sessionStore.clear(operatorPhone);
+      return this.reply(`This job has already ended. Watch out for new dispatch offers.`);
+    }
+
+    // Update request status to ARRIVED
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequestId },
+      data: { status: RescueRequestStatus.ARRIVED },
+    });
+
+    // Operator session → AT_LOCATION
+    await this.sessionStore.update(operatorPhone, {
+      state: WhatsAppFlowState.OPERATOR_AT_LOCATION,
+    });
+
+    // Notify customer
+    const customerPhone = rescueRequest.customer.phoneNumber;
+    if (customerPhone) {
+      await this.twilioService.sendWhatsAppMessage(
+        customerPhone,
+        `🚗 Your tow operator has arrived!\n\nBusiness: *${operator.businessName}*\n\nThey're at your location. Please show them your vehicle.`,
+      );
+    }
+
+    return this.reply(`✅ Arrival confirmed! The customer has been notified.\n\nSend *DONE* when the job is complete.`);
+  }
+
+  private async handleOperatorJobDone(
+    operatorPhone: string,
+    rescueRequestId: string,
+    operator: { id: string; businessName: string },
+  ) {
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      include: { customer: true },
+    });
+    if (!rescueRequest || rescueRequest.status === RescueRequestStatus.CANCELLED || rescueRequest.status === RescueRequestStatus.COMPLETED) {
+      await this.sessionStore.clear(operatorPhone);
+      return this.reply(`This job has already ended.`);
+    }
+
+    const customerPhone = rescueRequest.customer.phoneNumber;
+
+    // Put customer session in AWAITING_COMPLETION_CONFIRM
+    if (customerPhone) {
+      await this.sessionStore.update(customerPhone, {
+        state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
+        rescueRequestId,
+      });
+
+      await this.twilioService.sendWhatsAppMessage(
+        customerPhone,
+        `🔧 ${operator.businessName} says the job is done!\n\nReply *CONFIRM* to release your vehicle and receive the balance payment link.\n\nIf there's a problem, reply *DISPUTE* and our team will investigate.`,
+      );
+    }
+
+    // Auto-complete after 30 minutes if customer doesn't respond
+    setTimeout(async () => {
+      const fresh = await this.prisma.rescueRequest.findUnique({
+        where: { id: rescueRequestId },
+        select: { status: true },
+      });
+      if (fresh && fresh.status !== RescueRequestStatus.COMPLETED && fresh.status !== RescueRequestStatus.CANCELLED) {
+        console.log(`⏱ Auto-completing request ${rescueRequestId} — customer did not confirm in 30 min`);
+        await this.markJobCompleted(rescueRequestId);
+        if (customerPhone) {
+          await this.sessionStore.update(customerPhone, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
+        }
+      }
+    }, 30 * 60 * 1000);
+
+    await this.sessionStore.update(operatorPhone, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
+
+    return this.reply(
+      `✅ Job marked as done! Waiting for customer confirmation.\n\nIf they confirm, you'll receive a notification. Thank you 🙏`,
+    );
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  //  Issue type selected → subscriber check → deposit or direct dispatch
+  // ──────────────────────────────────────────────────────────────────────────
+  private async handleIssueTypeSelected(
+    phoneNumber: string,
+    session: Awaited<ReturnType<WhatsAppSessionStore['getOrCreate']>>,
+    issueType: IssueType,
+  ) {
+    const customer = await this.findOrCreateCustomer(phoneNumber);
+    const subscription = await this.getActiveSubscription(customer.id);
+
+    if (subscription) {
+      const towsLeft = subscription.towsIncludedPerMonth - subscription.towsUsedThisMonth;
+
+      if (towsLeft > 0) {
+        // Subscriber with remaining allowance — skip deposit
+        const rescueRequest = await this.prisma.rescueRequest.create({
+          data: {
+            customerId:  customer.id,
+            status:      RescueRequestStatus.DISPATCHING,
+            latitude:    session.latitude,
+            longitude:   session.longitude,
+            issueType,
+            depositPaid: true,
+          },
+        });
+
+        await this.prisma.subscription.update({
+          where: { id: subscription.id },
+          data: { towsUsedThisMonth: { increment: 1 } },
+        });
+
+        await this.sessionStore.update(phoneNumber, {
+          issueType,
+          rescueRequestId:    rescueRequest.id,
+          state:              WhatsAppFlowState.REQUEST_CONFIRMED,
+          dispatchRound:      0,
+          offeredOperatorIds: [],
+        });
+
+        const greet = customer.name ? `Hi ${customer.name}! ` : '';
+        await this.twilioService.sendWhatsAppMessage(
+          phoneNumber,
+          `${greet}✅ Subscriber recognised!\n\nIssue: ${this.formatIssueType(issueType)}\nTows remaining this month: ${towsLeft - 1}\n\nFinding nearest operator...`,
+        );
+
+        void this.startDispatch(rescueRequest.id, phoneNumber);
+        return this.xmlOk();
+      }
+
+      // Subscriber tows exhausted — fall through to dispatch-first flow with full amount
+    }
+
+    // ── Dispatch-first: find an operator BEFORE charging the customer ─────────
+    // depositAmount is stored on the request; we only generate the payment link
+    // once an operator actually accepts. No charge if nobody is found.
+    const isExhaustedSubscriber = !!subscription;
+    const depositAmount = isExhaustedSubscriber ? FULL_AMOUNT_KOBO : DEPOSIT_AMOUNT_KOBO;
+
+    const rescueRequest = await this.prisma.rescueRequest.create({
+      data: {
+        customerId:    customer.id,
+        status:        RescueRequestStatus.DISPATCHING,
+        latitude:      session.latitude,
+        longitude:     session.longitude,
+        issueType,
+        depositAmount, // stored so we know what to charge when operator accepts
+      },
+    });
+
+    await this.sessionStore.update(phoneNumber, {
+      issueType,
+      rescueRequestId:    rescueRequest.id,
+      state:              WhatsAppFlowState.REQUEST_CONFIRMED,
+      dispatchRound:      0,
+      offeredOperatorIds: [],
+    });
+
+    const greet     = customer.name ? `Hi ${customer.name.split(' ')[0]}! ` : '';
+    const costNote  = isExhaustedSubscriber
+      ? `ℹ️ Monthly tow allowance used up. A one-time fee of ₦50,000 will apply.\n`
+      : ``;
+    const costBreak = depositAmount === FULL_AMOUNT_KOBO
+      ? `💰 Fee if assigned: *₦50,000* (paid in full at confirmation)`
+      : `💰 Total if assigned: *₦50,000* (₦5,000 now · ₦45,000 on completion)`;
+
+    await this.twilioService.sendWhatsAppMessage(
+      phoneNumber,
+      `${greet}🔍 ${costNote}Searching for the nearest tow operator...\n\nIssue: ${this.formatIssueType(issueType)}\n${costBreak}\n\n⏳ You will *only be charged once an operator is confirmed*. Reply CANCEL at any time.`,
+    );
+
+    void this.startDispatch(rescueRequest.id, phoneNumber);
+    return this.xmlOk();
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  //  Create rescue request + Paystack link
+  // ──────────────────────────────────────────────────────────────────────────
+  private async initiateDeposit(
+    customer: any,
+    session: any,
+    issueType: IssueType,
+    phoneNumber: string,
+    prefixNote: string | null,
+    amountKobo: number,
+  ) {
+    const rescueRequest = await this.prisma.rescueRequest.create({
+      data: {
+        customerId:    customer.id,
+        status:        RescueRequestStatus.WAITING_FOR_DEPOSIT,
+        latitude:      session.latitude,
+        longitude:     session.longitude,
+        issueType,
+        depositAmount: amountKobo,
+      },
+    });
+
+    const reference = this.paystackService.generateReference('DEP');
+    const email = customer.email || `${phoneNumber.replace(/\D/g, '')}@lrr.ng`;
+
+    const paymentResponse = await this.paystackService.initializePayment({
+      email,
+      amount: amountKobo,
+      reference,
+      metadata: {
+        rescueRequestId: rescueRequest.id,
+        customerId:      customer.id,
+        phoneNumber,
+        type: 'deposit',
+      },
+    });
+
+    if (!paymentResponse.status) {
+      console.error('Failed to initialize Paystack payment:', paymentResponse);
+      return this.reply(`Sorry, we couldn't create a payment link. Please try again.`);
+    }
+
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequest.id },
+      data:  { depositReference: reference },
+    });
+
+    await this.sessionStore.update(phoneNumber, {
+      issueType,
+      rescueRequestId:  rescueRequest.id,
+      depositReference: reference,
+      state:            WhatsAppFlowState.WAITING_FOR_DEPOSIT,
+    });
+
+    const isStandardDeposit = amountKobo === DEPOSIT_AMOUNT_KOBO;
+    const note = prefixNote ? `\n\n${prefixNote}` : '';
+
+    const costBreakdown = isStandardDeposit
+      ? `💰 *Total cost: ₦50,000*\n   • ₦5,000 deposit now (holds your slot)\n   • ₦45,000 balance on job completion — car released after payment\n`
+      : `💰 *One-time fee: ₦50,000* (paid in full now)\n`;
+
+    return this.reply(
+      `Issue: ${this.formatIssueType(issueType)}${note}\n\n${costBreakdown}\nPay ${isStandardDeposit ? '₦5,000 deposit' : '₦50,000'} to confirm your rescue:\n\n${paymentResponse.data.authorization_url}\n\n⏱ Slot held for 5 minutes.`,
+    );
+  }
+
+  // ══════════════════════════════════════════════════════
+  //  DEPOSIT CONFIRMED (webhook)
+  // ══════════════════════════════════════════════════════
+
+  async handleDepositPaymentConfirmed(reference: string) {
+    console.log('🔍 Deposit confirmed, reference:', reference);
+
+    const rescueRequest = await this.prisma.rescueRequest.findFirst({
+      where:   { depositReference: reference },
+      include: { customer: true, assignedOperator: true },
+    });
+    if (!rescueRequest) {
+      console.error('❌ No rescue request for deposit reference:', reference);
+      Sentry.captureMessage(`Deposit webhook: no request found for reference ${reference}`, 'error');
+      return;
+    }
+
+    const customerPhone = rescueRequest.customer.phoneNumber;
+
+    // Mark deposit paid and fully confirm the operator assignment
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequest.id },
+      data:  { depositPaid: true, status: RescueRequestStatus.OPERATOR_ASSIGNED },
+    });
+
+    const operator = rescueRequest.assignedOperator;
+
+    if (customerPhone) {
+      // Customer: confirmed with operator details
+      await this.sessionStore.update(customerPhone, {
+        state: WhatsAppFlowState.REQUEST_CONFIRMED,
+      });
+      await this.twilioService.sendWhatsAppMessage(
+        customerPhone,
+        operator
+          ? `✅ *Payment confirmed — operator is on the way!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nIssue: ${this.formatIssueType(rescueRequest.issueType as IssueType)}\n\nYou'll be notified when they arrive.`
+          : `✅ Deposit confirmed! Finding the nearest tow operator...`,
+      );
+    }
+
+    if (operator) {
+      // Operator: job is now live — send customer location + details
+      await this.sessionStore.update(`whatsapp:${operator.phoneNumber}`, {
+        state:           WhatsAppFlowState.OPERATOR_ON_JOB,
+        rescueRequestId: rescueRequest.id,
+      });
+      const lat = rescueRequest.latitude;
+      const lon = rescueRequest.longitude;
+      await this.twilioService.sendWhatsAppMessage(
+        `whatsapp:${operator.phoneNumber}`,
+        `💰 *Payment confirmed — job is live!*\n\nCustomer: ${customerPhone?.replace('whatsapp:', '')}\nIssue: ${this.formatIssueType(rescueRequest.issueType as IssueType)}\nLocation: https://maps.google.com/?q=${lat},${lon}\n\nHead over now and send *ARRIVED* when you reach them.`,
+      );
+    } else {
+      // Edge case: no operator was pre-assigned (e.g. admin manually sent a payment link)
+      void this.startDispatch(rescueRequest.id, customerPhone!);
+    }
+  }
+
+  // ══════════════════════════════════════════════════════
+  //  BALANCE CONFIRMED (webhook)
+  // ══════════════════════════════════════════════════════
+
+  async handleBalancePaymentConfirmed(reference: string) {
+    console.log('💰 Balance confirmed, reference:', reference);
+
+    const rescueRequest = await this.prisma.rescueRequest.findFirst({
+      where: { balanceReference: reference },
+      include: { customer: true, assignedOperator: true },
+    });
+    if (!rescueRequest) {
+      console.error('❌ No rescue request for balance reference:', reference);
+      Sentry.captureMessage(`Balance webhook: no request found for reference ${reference}`, 'error');
+      return;
+    }
+
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequest.id },
+      data:  { balancePaid: true, status: RescueRequestStatus.COMPLETED },
+    });
+
+    // Notify customer — payment confirmed
+    const customerPhone = rescueRequest.customer.phoneNumber;
+    if (customerPhone) {
+      await this.twilioService.sendWhatsAppMessage(
+        customerPhone,
+        `✅ Payment of ₦45,000 confirmed! Thank you for using Lagos Roadside Rescue 🙏\n\nHow was your experience? Reply 1–5 to rate your operator.`,
+      );
+      // Clear customer session
+      await this.sessionStore.update(`whatsapp:${customerPhone}`, {
+        state: WhatsAppFlowState.IDLE,
+        rescueRequestId: undefined,
+      });
+    }
+
+    // Notify operator — release the vehicle
+    const operator = rescueRequest.assignedOperator;
+    if (operator?.phoneNumber) {
+      await this.twilioService.sendWhatsAppMessage(
+        `whatsapp:${operator.phoneNumber}`,
+        `💵 *Payment received!*\n\nThe customer has paid the ₦45,000 balance in full.\n\n✅ You may now *release the vehicle*. Job complete — well done!\n\nYour payment will be remitted within 24 hours.`,
+      );
+      // Clear operator session
+      await this.sessionStore.update(`whatsapp:${operator.phoneNumber}`, {
+        state: WhatsAppFlowState.IDLE,
+        rescueRequestId: undefined,
+      });
+    }
+
+    console.log(`✅ Job ${rescueRequest.id} completed — operator and customer notified`);
+  }
+
+  // ══════════════════════════════════════════════════════
+  //  DISPATCH — parallel batch offer, dynamic window, retry + radius expansion
+  // ══════════════════════════════════════════════════════
+
+  async startDispatch(
+    rescueRequestId: string,
+    customerPhone: string,
+    extraRadiusKm: number = 0,
+  ) {
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+    });
+    if (!rescueRequest) return;
+    if (
+      rescueRequest.status === RescueRequestStatus.CANCELLED ||
+      rescueRequest.status === RescueRequestStatus.COMPLETED ||
+      rescueRequest.status === RescueRequestStatus.OPERATOR_ASSIGNED ||
+      rescueRequest.status === RescueRequestStatus.WAITING_FOR_DEPOSIT  // payment window active
+    ) return;
+
+    const session = await this.sessionStore.getOrCreate(customerPhone);
+    const alreadyOffered: string[] = session.offeredOperatorIds ?? [];
+    const round = session.dispatchRound ?? 0;
+
+    const lat = Number(rescueRequest.latitude);
+    const lon = Number(rescueRequest.longitude);
+
+    // Get all ranked candidates (excluding already-offered operators)
+    const candidates = await this.operatorService.findAndRankCandidates(
+      lat, lon, alreadyOffered, extraRadiusKm,
+    );
+
+    if (candidates.length === 0) {
+      // No operators available — expand radius and retry, up to the auto-cancel limit
+      const newRound = round + 1;
+      // Reset offeredOperatorIds so timed-out operators can be re-offered
+      // after the retry delay — they may have missed the first notification
+      await this.sessionStore.update(customerPhone, {
+        dispatchRound: newRound,
+        offeredOperatorIds: [],
+      });
+
+      if (newRound >= MAX_ROUNDS_BEFORE_AUTO_CANCEL) {
+        // Tried long enough — auto-cancel the request and notify everyone
+        await this.prisma.rescueRequest.update({
+          where: { id: rescueRequestId },
+          data: { status: RescueRequestStatus.CANCELLED },
+        });
+        await this.sessionStore.clear(customerPhone);
+
+        await this.twilioService.sendWhatsAppMessage(
+          customerPhone,
+          `😔 We're sorry — no tow operator was available near you after an extended search.\n\nYour request has been automatically cancelled and *you were not charged*.\n\nPlease try again shortly or call your breakdown cover provider.`,
+        );
+
+        await this.alertAdminNoOperator(rescueRequestId, lat, lon, newRound);
+        console.warn(`🚨 Auto-cancelled request ${rescueRequestId} after ${newRound} rounds with no operator found.`);
+        Sentry.withScope((scope) => {
+          scope.setLevel('warning');
+          scope.setContext('dispatch', { rescueRequestId, lat, lon, rounds: newRound });
+          Sentry.captureMessage(`Auto-cancelled: no operator after ${newRound} rounds`);
+        });
+        return;
+      }
+
+      if (newRound > MAX_FAILED_ROUNDS_BEFORE_ALERT) {
+        await this.alertAdminNoOperator(rescueRequestId, lat, lon, newRound);
+      }
+
+      await this.twilioService.sendWhatsAppMessage(
+        customerPhone,
+        `⏳ Still searching for a tow operator nearby (attempt ${newRound}/${MAX_ROUNDS_BEFORE_AUTO_CANCEL - 1}). Expanding the search area. Thank you for your patience.`,
+      );
+
+      const expandedRadius = extraRadiusKm + RADIUS_EXPANSION_KM;
+      setTimeout(
+        () => void this.startDispatch(rescueRequestId, customerPhone, expandedRadius),
+        DISPATCH_RETRY_MINUTES * 60 * 1000,
+      );
+      return;
+    }
+
+    // Take the next batch of top-ranked candidates
+    const batch = candidates.slice(0, BATCH_SIZE);
+    const batchOperatorIds = batch.map((op) => op.id);
+
+    // Dynamic window: spread customer budget evenly across expected batches
+    const totalBatches = Math.ceil(candidates.length / BATCH_SIZE);
+    const windowSeconds = Math.min(
+      MAX_WINDOW_SECONDS,
+      Math.max(MIN_WINDOW_SECONDS, Math.floor((CUSTOMER_BUDGET_MINUTES * 60) / totalBatches)),
+    );
+
+    const expiresAt = new Date(Date.now() + windowSeconds * 1000);
+
+    // Create all offers in one batch insert
+    await this.prisma.dispatchOffer.createMany({
+      data: batch.map((op) => ({
+        rescueRequestId,
+        operatorId: op.id,
+        expiresAt,
+      })),
+    });
+
+    // Track offered operators in session
+    await this.sessionStore.update(customerPhone, {
+      offeredOperatorIds: [...alreadyOffered, ...batchOperatorIds],
+      dispatchRound: round,
+    });
+
+    const issueLabel = rescueRequest.issueType
+      ? this.formatIssueType(rescueRequest.issueType as IssueType)
+      : 'Unknown';
+
+    // Notify all batch operators simultaneously
+    await Promise.all(
+      batch.map((op) =>
+        this.twilioService.sendWhatsAppMessage(
+          `whatsapp:${op.phoneNumber}`,
+          `🚨 *NEW RESCUE JOB*\n\nIssue: ${issueLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: https://maps.google.com/?q=${lat},${lon}\n\nReply *YES* to accept or *NO* to decline.\nYou have ${windowSeconds} seconds.`,
+        ),
+      ),
+    );
+
+    // Single timeout covers the entire batch
+    setTimeout(
+      () => void this.handleBatchTimeout(rescueRequestId, batchOperatorIds, customerPhone, extraRadiusKm),
+      windowSeconds * 1000,
+    );
+  }
+
+  private async handleBatchTimeout(
+    rescueRequestId: string,
+    batchOperatorIds: string[],
+    customerPhone: string,
+    extraRadiusKm: number,
+  ) {
+    // Race condition guard — skip if someone already accepted
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      select: { status: true },
+    });
+    if (
+      !rescueRequest ||
+      rescueRequest.status === RescueRequestStatus.OPERATOR_ASSIGNED ||
+      rescueRequest.status === RescueRequestStatus.WAITING_FOR_DEPOSIT ||
+      rescueRequest.status === RescueRequestStatus.COMPLETED ||
+      rescueRequest.status === RescueRequestStatus.CANCELLED
+    ) return;
+
+    // Mark all still-pending offers in this batch as timed out
+    await this.prisma.dispatchOffer.updateMany({
+      where: {
+        rescueRequestId,
+        operatorId: { in: batchOperatorIds },
+        status: 'PENDING',
+      },
+      data: { status: 'TIMED_OUT', respondedAt: new Date() },
+    });
+
+    // Move to next batch (same radius — untried operators may still be available)
+    void this.startDispatch(rescueRequestId, customerPhone, extraRadiusKm);
+  }
+
+  private async handleOperatorResponse(operatorPhone: string, accepted: boolean) {
+    const operator = await this.prisma.operator.findUnique({
+      where: { phoneNumber: operatorPhone.replace('whatsapp:', '') },
+    });
+    if (!operator) return this.xmlOk();
+
+    const offer = await this.prisma.dispatchOffer.findFirst({
+      where: { operatorId: operator.id, status: 'PENDING' },
+      include: { rescueRequest: { include: { customer: true } } },
+      orderBy: { offeredAt: 'desc' },
+    });
+    if (!offer) return this.xmlOk();
+
+    const rescueRequest = offer.rescueRequest;
+    const customerPhone = rescueRequest.customer.phoneNumber;
+
+    if (accepted) {
+      // ── Subscriber with tows — no deposit needed, confirm immediately ──────
+      if (rescueRequest.depositPaid) {
+        // Race guard: only proceed if still dispatching
+        if (rescueRequest.status === RescueRequestStatus.OPERATOR_ASSIGNED) {
+          await this.prisma.dispatchOffer.update({ where: { id: offer.id }, data: { status: 'DECLINED', respondedAt: new Date() } });
+          return this.reply(`Sorry, this job was just taken. Watch for the next one!`);
+        }
+        await this.prisma.dispatchOffer.update({ where: { id: offer.id }, data: { status: 'ACCEPTED', respondedAt: new Date() } });
+        await this.prisma.dispatchOffer.updateMany({ where: { rescueRequestId: rescueRequest.id, status: 'PENDING', id: { not: offer.id } }, data: { status: 'DECLINED', respondedAt: new Date() } });
+        await this.prisma.rescueRequest.update({ where: { id: rescueRequest.id }, data: { assignedOperatorId: operator.id, status: RescueRequestStatus.OPERATOR_ASSIGNED } });
+        await this.sessionStore.update(`whatsapp:${operator.phoneNumber}`, { state: WhatsAppFlowState.OPERATOR_ON_JOB, rescueRequestId: rescueRequest.id });
+        if (customerPhone) {
+          await this.twilioService.sendWhatsAppMessage(customerPhone,
+            `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nThey're on their way! You'll be notified when they arrive.`);
+        }
+        return this.reply(`✅ Job accepted! Head to the customer location.\n📍 Customer: ${customerPhone?.replace('whatsapp:', '')}\n\nSend *ARRIVED* when you reach them.`);
+      }
+
+      // ── Non-subscriber / exhausted subscriber — find operator first, THEN charge ──
+      // Atomic update: only succeeds if still DISPATCHING (race condition guard)
+      const claimed = await this.prisma.rescueRequest.updateMany({
+        where: { id: rescueRequest.id, status: RescueRequestStatus.DISPATCHING },
+        data:  { assignedOperatorId: operator.id, status: RescueRequestStatus.WAITING_FOR_DEPOSIT },
+      });
+      if (claimed.count === 0) {
+        // Another operator got there first
+        await this.prisma.dispatchOffer.update({ where: { id: offer.id }, data: { status: 'DECLINED', respondedAt: new Date() } });
+        return this.reply(`Sorry, this job was just taken. Watch for the next one!`);
+      }
+
+      await this.prisma.dispatchOffer.update({ where: { id: offer.id }, data: { status: 'ACCEPTED', respondedAt: new Date() } });
+      await this.prisma.dispatchOffer.updateMany({ where: { rescueRequestId: rescueRequest.id, status: 'PENDING', id: { not: offer.id } }, data: { status: 'DECLINED', respondedAt: new Date() } });
+
+      // Update customer session — they need to pay within 5 minutes
+      if (customerPhone) {
+        await this.sessionStore.update(customerPhone, { state: WhatsAppFlowState.OPERATOR_FOUND_WAITING_PAYMENT });
+        await this.sendDepositRequestToCustomer(rescueRequest, customerPhone, operator);
+      }
+
+      // 5-minute payment timeout — release operator if customer doesn't pay
+      const DEPOSIT_WINDOW_MS = 5 * 60 * 1000;
+      setTimeout(async () => {
+        const fresh = await this.prisma.rescueRequest.findUnique({
+          where:  { id: rescueRequest.id },
+          select: { status: true },
+        });
+        if (fresh?.status === RescueRequestStatus.WAITING_FOR_DEPOSIT) {
+          // Customer didn't pay — release operator and try next
+          await this.prisma.rescueRequest.update({
+            where: { id: rescueRequest.id },
+            data:  { assignedOperatorId: null, status: RescueRequestStatus.DISPATCHING },
+          });
+          if (customerPhone) {
+            const session = await this.sessionStore.getOrCreate(customerPhone);
+            await this.sessionStore.update(customerPhone, {
+              state: WhatsAppFlowState.REQUEST_CONFIRMED,
+              offeredOperatorIds: [...(session.offeredOperatorIds ?? []), operator.id],
+            });
+            await this.twilioService.sendWhatsAppMessage(
+              customerPhone,
+              `⏰ Payment window expired. Looking for the next available operator...`,
+            );
+            void this.startDispatch(rescueRequest.id, customerPhone);
+          }
+          await this.twilioService.sendWhatsAppMessage(
+            `whatsapp:${operator.phoneNumber}`,
+            `⏰ The customer did not pay within 5 minutes. You have been released. Watch for new offers!`,
+          );
+        }
+      }, DEPOSIT_WINDOW_MS);
+
+      return this.reply(
+        `✅ Job accepted! Stand by — the customer has 5 minutes to confirm payment.\n\nYou'll receive their location and full details once they pay.`,
+      );
+    } else {
+      // Decline — mark this offer; the batch timeout will handle retrying if needed
+      await this.prisma.dispatchOffer.update({
+        where: { id: offer.id },
+        data: { status: 'DECLINED', respondedAt: new Date() },
+      });
+      return this.reply(`Understood. We'll offer this job to another operator.`);
+    }
+  }
+
+  // ══════════════════════════════════════════════════════
+  //  MARK JOB COMPLETED → trigger balance payment
+  // ══════════════════════════════════════════════════════
+
+  async markJobCompleted(rescueRequestId: string) {
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      include: { customer: true },
+    });
+    if (!rescueRequest) throw new Error('Rescue request not found');
+
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequestId },
+      data:  { status: RescueRequestStatus.COMPLETED },
+    });
+
+    const subscription = await this.getActiveSubscription(rescueRequest.customerId);
+    if (!subscription && !rescueRequest.balancePaid) {
+      await this.sendBalancePaymentLink(rescueRequest);
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  //  Send deposit payment link to customer once operator has been confirmed
+  // ──────────────────────────────────────────────────────────────────────────
+  private async sendDepositRequestToCustomer(
+    rescueRequest: any,
+    customerPhone: string,
+    operator: { id: string; businessName: string; phoneNumber: string },
+  ) {
+    const amountKobo = rescueRequest.depositAmount ?? DEPOSIT_AMOUNT_KOBO;
+    const isFullPayment = amountKobo === FULL_AMOUNT_KOBO;
+
+    const reference = this.paystackService.generateReference('DEP');
+    const email     = rescueRequest.customer?.email
+      ?? `${customerPhone.replace(/\D/g, '')}@lrr.ng`;
+
+    const paymentResponse = await this.paystackService.initializePayment({
+      email,
+      amount:   amountKobo,
+      reference,
+      metadata: {
+        rescueRequestId: rescueRequest.id,
+        customerId:      rescueRequest.customerId,
+        phoneNumber:     customerPhone,
+        type:            'deposit',
+      },
+    });
+
+    if (!paymentResponse.status) {
+      console.error('Failed to create deposit payment link:', paymentResponse);
+      await this.twilioService.sendWhatsAppMessage(
+        customerPhone,
+        `⚠️ Operator found but we couldn't generate a payment link. Our team has been alerted. Reply CANCEL to cancel.`,
+      );
+      return;
+    }
+
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequest.id },
+      data:  { depositReference: reference },
+    });
+
+    const costLine = isFullPayment
+      ? `💰 Amount: *₦50,000* (one-time full payment)`
+      : `💰 Deposit: *₦5,000* now · ₦45,000 balance on completion`;
+
+    await this.twilioService.sendWhatsAppMessage(
+      customerPhone,
+      `🚗 *Operator found!*\n\nBusiness: ${operator.businessName}\n${costLine}\n\n⏳ You have *5 minutes* to confirm:\n\n${paymentResponse.data.authorization_url}\n\nThe operator is standing by. Reply CANCEL to cancel (no charge).`,
+    );
+  }
+
+  private async sendBalancePaymentLink(rescueRequest: any) {
+    const customerPhone = rescueRequest.customer.phoneNumber;
+    if (!customerPhone) return;
+
+    const reference = this.paystackService.generateReference('BAL');
+    const email = rescueRequest.customer.email || `${customerPhone.replace(/\D/g, '')}@lrr.ng`;
+
+    const paymentResponse = await this.paystackService.initializePayment({
+      email,
+      amount: BALANCE_AMOUNT_KOBO,
+      reference,
+      metadata: {
+        rescueRequestId: rescueRequest.id,
+        customerId:      rescueRequest.customerId,
+        phoneNumber:     customerPhone,
+        type: 'balance',
+      },
+    });
+
+    if (!paymentResponse.status) {
+      console.error('Failed to create balance payment link:', paymentResponse);
+      return;
+    }
+
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequest.id },
+      data:  { balanceAmount: BALANCE_AMOUNT_KOBO, balanceReference: reference },
+    });
+
+    await this.twilioService.sendWhatsAppMessage(
+      customerPhone,
+      `✅ Your tow is complete!\n\nPlease pay the ₦45,000 balance:\n\n${paymentResponse.data.authorization_url}\n\nThank you for using Lagos Roadside Rescue 🚗`,
+    );
+  }
+
+  // ══════════════════════════════════════════════════════
+  //  ADMIN API (fully implemented)
+  // ══════════════════════════════════════════════════════
+
+  async adminList(query: any) {
+    const {
+      status, issueType, operatorId, depositPaid, balancePaid,
+      from, to, search, page = 1, limit = 20,
+    } = query;
+
+    const where: any = {};
+    if (status)     where.status    = status;
+    if (issueType)  where.issueType = issueType;
+    if (operatorId) where.assignedOperatorId = operatorId;
+    if (depositPaid !== undefined) where.depositPaid = depositPaid === 'true' || depositPaid === true;
+    if (balancePaid !== undefined) where.balancePaid = balancePaid === 'true' || balancePaid === true;
+    if (from && to) where.createdAt = { gte: new Date(from), lte: new Date(to) };
+    if (search) {
+      where.OR = [
+        { customer: { phoneNumber: { contains: search, mode: 'insensitive' } } },
+        { customer: { name:        { contains: search, mode: 'insensitive' } } },
+      ];
+    }
+    return this.buildListResponse(where, Number(page), Number(limit));
+  }
+
+  async adminDetail(id: string) {
+    const raw = await this.prisma.rescueRequest.findUnique({
+      where: { id },
+      include: {
+        customer:        { select: { id: true, phoneNumber: true, email: true, name: true } },
+        assignedOperator: { select: { id: true, businessName: true, phoneNumber: true, email: true } },
+        dispatchOffers:  {
+          include: { operator: { select: { id: true, businessName: true } } },
+          orderBy: { offeredAt: 'asc' },
+        },
+      },
+    });
+    if (!raw) throw new UnauthorizedException('Rescue request not found');
+    return { data: { ...this.mapToDetailDto(raw), dispatchOffers: raw.dispatchOffers } };
+  }
+
+  async assignOperator(id: string, dto: { operatorId: string }) {
+    const updated = await this.prisma.rescueRequest.update({
+      where: { id },
+      data:  { assignedOperatorId: dto.operatorId, status: RescueRequestStatus.OPERATOR_ASSIGNED },
+      include: { customer: true, assignedOperator: true },
+    });
+
+    if (updated.customer.phoneNumber) {
+      await this.twilioService.sendWhatsAppMessage(
+        updated.customer.phoneNumber,
+        `🚗 An operator has been assigned to your request.\n\nBusiness: ${updated.assignedOperator?.businessName}\nPhone: ${updated.assignedOperator?.phoneNumber}`,
+      );
+    }
+    return { data: this.mapToDetailDto(updated) };
+  }
+
+  async updateStatus(id: string, dto: { status: string }) {
+    const status = dto.status as RescueRequestStatus;
+    const updated = await this.prisma.rescueRequest.update({
+      where: { id },
+      data:  { status },
+      include: { customer: true },
+    });
+
+    if (status === RescueRequestStatus.COMPLETED) {
+      await this.markJobCompleted(id);
+    }
+    return { data: this.mapToDetailDto(updated) };
+  }
+
+  async cancel(id: string, dto: { reason?: string }) {
+    const updated = await this.prisma.rescueRequest.update({
+      where: { id },
+      data:  { status: RescueRequestStatus.CANCELLED },
+      include: { customer: true },
+    });
+
+    if (updated.customer.phoneNumber) {
+      await this.twilioService.sendWhatsAppMessage(
+        updated.customer.phoneNumber,
+        `❌ Your rescue request has been cancelled${dto.reason ? `: ${dto.reason}` : '.'}\n\nSend SOS or HELP if you need assistance again.`,
+      );
+    }
+    return { data: this.mapToDetailDto(updated) };
+  }
+
+  // ══════════════════════════════════════════════════════
+  //  OPERATOR API
+  // ══════════════════════════════════════════════════════
+
+  async operatorList(userId: string, query: any) {
+    const memberships = await this.prisma.operatorMember.findMany({
+      where: { userId },
+      select: { operatorId: true },
+    });
+    if (memberships.length === 0) return { data: [], meta: { page: 1, limit: 20, total: 0 } };
+
+    const operatorIds = memberships.map((m) => m.operatorId);
+    const where: any = { assignedOperatorId: { in: operatorIds } };
+    const { status, page = 1, limit = 20 } = query;
+    if (status) where.status = status;
+
+    return this.buildListResponse(where, Number(page), Number(limit));
+  }
+
+  async operatorDetail(userId: string, id: string) {
+    const memberships = await this.prisma.operatorMember.findMany({
+      where: { userId },
+      select: { operatorId: true },
+    });
+    const operatorIds = memberships.map((m) => m.operatorId);
+
+    const raw = await this.prisma.rescueRequest.findUnique({
+      where: { id },
+      include: {
+        customer:        { select: { id: true, phoneNumber: true, email: true, name: true } },
+        assignedOperator: { select: { id: true, businessName: true, phoneNumber: true, email: true } },
+      },
+    });
+
+    if (!raw || !operatorIds.includes(raw.assignedOperatorId!)) {
+      throw new UnauthorizedException('Rescue request not found or access denied');
+    }
+    return { data: this.mapToDetailDto(raw) };
+  }
+
+  // ══════════════════════════════════════════════════════
+  //  UNIFIED LIST / DETAIL (role-aware)
+  // ══════════════════════════════════════════════════════
+
   async listForUser(user: any, query: any) {
     const { role } = user;
     const { status, issueType, operatorId, depositPaid, balancePaid, from, to, search, page = 1, limit = 20 } = query;
 
-    // Build dynamic where clause
     const whereClause: any = {};
-
-    // Apply filters
-    if (status) {
-      whereClause.status = status;
-    }
-    if (issueType) {
-      whereClause.issueType = issueType;
-    }
-    if (depositPaid !== undefined) {
-      whereClause.depositPaid = depositPaid === 'true' || depositPaid === true;
-    }
-    if (balancePaid !== undefined) {
-      whereClause.balancePaid = balancePaid === 'true' || balancePaid === true;
-    }
-    if (from && to) {
-      whereClause.createdAt = {
-        gte: new Date(from),
-        lte: new Date(to),
-      };
-    } else if (from) {
-      whereClause.createdAt = { gte: new Date(from) };
-    } else if (to) {
-      whereClause.createdAt = { lte: new Date(to) };
-    }
+    if (status)     whereClause.status    = status;
+    if (issueType)  whereClause.issueType = issueType;
+    if (depositPaid !== undefined) whereClause.depositPaid = depositPaid === 'true' || depositPaid === true;
+    if (balancePaid !== undefined) whereClause.balancePaid = balancePaid === 'true' || balancePaid === true;
+    if (from && to) whereClause.createdAt = { gte: new Date(from), lte: new Date(to) };
+    else if (from)  whereClause.createdAt = { gte: new Date(from) };
+    else if (to)    whereClause.createdAt = { lte: new Date(to) };
     if (search) {
       whereClause.OR = [
         { customer: { phoneNumber: { contains: search, mode: 'insensitive' } } },
-        { customer: { name: { contains: search, mode: 'insensitive' } } },
+        { customer: { name:        { contains: search, mode: 'insensitive' } } },
         { assignedOperator: { businessName: { contains: search, mode: 'insensitive' } } },
       ];
     }
 
-    // SUPER_ADMIN and ADMIN: return all rescue requests with filters
     if (role === 'SUPER_ADMIN' || role === 'ADMIN') {
-      if (operatorId) {
-        whereClause.assignedOperatorId = operatorId;
-      }
-      return this.buildListResponse(
-        whereClause,
-        parseInt(page) || 1,
-        parseInt(limit) || 20,
-      );
+      if (operatorId) whereClause.assignedOperatorId = operatorId;
+      return this.buildListResponse(whereClause, parseInt(page), parseInt(limit));
     }
 
-    // OPERATOR: return only requests assigned to their operator(s)
     if (role === 'OPERATOR') {
-      const operatorMemberships = await this.prisma.operatorMember.findMany({
+      const memberships = await this.prisma.operatorMember.findMany({
         where: { userId: user.userId },
         select: { operatorId: true },
       });
-
-      const operatorIds = operatorMemberships.map((m) => m.operatorId);
-
-      if (operatorIds.length === 0) {
-        return { data: [], meta: { page: 1, limit, total: 0 } };
-      }
-
+      const operatorIds = memberships.map((m) => m.operatorId);
+      if (operatorIds.length === 0) return { data: [], meta: { page: 1, limit, total: 0 } };
       whereClause.assignedOperatorId = { in: operatorIds };
-
-      return this.buildListResponse(
-        whereClause,
-        parseInt(page) || 1,
-        parseInt(limit) || 20,
-      );
+      return this.buildListResponse(whereClause, parseInt(page), parseInt(limit));
     }
 
-    // CUSTOMER: reject for now (can be implemented later to return own requests)
     throw new UnauthorizedException('Customers do not have access to rescue request list');
+  }
+
+  async detailForUser(user: any, id: string): Promise<RescueRequestDetailResponseDto> {
+    const { role, userId } = user;
+
+    const raw = await this.prisma.rescueRequest.findUnique({
+      where: { id },
+      include: {
+        customer:        { select: { id: true, phoneNumber: true, email: true, name: true } },
+        assignedOperator: { select: { id: true, businessName: true, phoneNumber: true, email: true } },
+      },
+    });
+    if (!raw) throw new UnauthorizedException('Rescue request not found');
+
+    if (role === 'SUPER_ADMIN' || role === 'ADMIN') return { data: this.mapToDetailDto(raw) };
+
+    if (role === 'OPERATOR') {
+      const memberships = await this.prisma.operatorMember.findMany({
+        where: { userId },
+        select: { operatorId: true },
+      });
+      const operatorIds = memberships.map((m) => m.operatorId);
+      if (!operatorIds.includes(raw.assignedOperatorId!)) {
+        throw new UnauthorizedException('You do not have access to this rescue request');
+      }
+      return { data: this.mapToDetailDto(raw) };
+    }
+
+    throw new UnauthorizedException('Customers do not have access to rescue request details');
+  }
+
+  // ══════════════════════════════════════════════════════
+  //  PRIVATE HELPERS
+  // ══════════════════════════════════════════════════════
+
+  private async findOrCreateCustomer(phoneNumber: string) {
+    return this.prisma.user.upsert({
+      where:  { phoneNumber },
+      update: {},
+      create: { phoneNumber, role: UserRole.CUSTOMER },
+    });
+  }
+
+  private async getActiveSubscription(userId: string) {
+    return this.prisma.subscription.findFirst({
+      where: {
+        userId,
+        status: 'ACTIVE',
+        currentPeriodEnd: { gte: new Date() },
+      },
+    });
+  }
+
+  private async alertAdminNoOperator(
+    rescueRequestId: string,
+    lat: number,
+    lon: number,
+    round: number,
+  ) {
+    console.warn(
+      `🚨 ADMIN ALERT: No operator after ${round} rounds for request ${rescueRequestId} @ ${lat},${lon}`,
+    );
+    // Hook to admin notification service when available
   }
 
   private async buildListResponse(where: any, page: number, limit: number): Promise<RescueRequestListResponseDto> {
     const skip = (page - 1) * limit;
-
     const [rawData, total] = await Promise.all([
       this.prisma.rescueRequest.findMany({
         where,
         skip,
         take: limit,
         include: {
-          customer: { select: { id: true, phoneNumber: true } },
+          customer:        { select: { id: true, phoneNumber: true } },
           assignedOperator: { select: { id: true, businessName: true } },
         },
         orderBy: { createdAt: 'desc' },
@@ -124,17 +1261,14 @@ export class RescueRequestService {
     ]);
 
     const data: RescueRequestListItemDto[] = rawData.map((item) => ({
-      id: item.id,
-      status: item.status,
-      issueType: item.issueType || undefined,
-      latitude: item.latitude ? Number(item.latitude) : undefined,
+      id:        item.id,
+      status:    item.status,
+      issueType: item.issueType ?? undefined,
+      latitude:  item.latitude  ? Number(item.latitude)  : undefined,
       longitude: item.longitude ? Number(item.longitude) : undefined,
       depositPaid: item.depositPaid,
       balancePaid: item.balancePaid,
-      customer: {
-        id: item.customer.id,
-        phoneNumber: item.customer.phoneNumber!,
-      },
+      customer: { id: item.customer.id, phoneNumber: item.customer.phoneNumber! },
       assignedOperator: item.assignedOperator
         ? { id: item.assignedOperator.id, businessName: item.assignedOperator.businessName }
         : undefined,
@@ -143,402 +1277,67 @@ export class RescueRequestService {
     }));
 
     const meta: PaginationMetaDto = { page, limit, total };
-
     return { data, meta };
   }
 
-  async detailForUser(user: any, id: string): Promise<RescueRequestDetailResponseDto> {
-    const { role, userId } = user;
-
-    // Fetch the rescue request
-    const rawRescueRequest = await this.prisma.rescueRequest.findUnique({
-      where: { id },
-      include: {
-        customer: { select: { id: true, phoneNumber: true, email: true, name: true } },
-        assignedOperator: { select: { id: true, businessName: true, phoneNumber: true, email: true } },
-      },
-    });
-
-    if (!rawRescueRequest) {
-      throw new UnauthorizedException('Rescue request not found');
-    }
-
-    // SUPER_ADMIN and ADMIN: return full detail
-    if (role === 'SUPER_ADMIN' || role === 'ADMIN') {
-      return { data: this.mapToDetailDto(rawRescueRequest) };
-    }
-
-    // OPERATOR: return only if assigned to their operator(s)
-    if (role === 'OPERATOR') {
-      const operatorMemberships = await this.prisma.operatorMember.findMany({
-        where: { userId },
-        select: { operatorId: true },
-      });
-
-      const operatorIds = operatorMemberships.map((m) => m.operatorId);
-
-      if (!operatorIds.includes(rawRescueRequest.assignedOperatorId!)) {
-        throw new UnauthorizedException('You do not have access to this rescue request');
-      }
-
-      return { data: this.mapToDetailDto(rawRescueRequest) };
-    }
-
-    // CUSTOMER: reject for now (can be implemented later to return own requests)
-    throw new UnauthorizedException('Customers do not have access to rescue request details');
-  }
-
-  private mapToDetailDto(rawRescueRequest: any): RescueRequestDetailDto {
+  private mapToDetailDto(raw: any): RescueRequestDetailDto {
     return {
-      id: rawRescueRequest.id,
-      status: rawRescueRequest.status,
-      issueType: rawRescueRequest.issueType || undefined,
-      latitude: rawRescueRequest.latitude ? Number(rawRescueRequest.latitude) : undefined,
-      longitude: rawRescueRequest.longitude ? Number(rawRescueRequest.longitude) : undefined,
-      depositPaid: rawRescueRequest.depositPaid,
-      depositAmount: rawRescueRequest.depositAmount,
-      depositReference: rawRescueRequest.depositReference,
-      balancePaid: rawRescueRequest.balancePaid,
-      balanceAmount: rawRescueRequest.balanceAmount,
-      balanceReference: rawRescueRequest.balanceReference,
+      id:               raw.id,
+      status:           raw.status,
+      issueType:        raw.issueType  ?? undefined,
+      latitude:         raw.latitude   ? Number(raw.latitude)  : undefined,
+      longitude:        raw.longitude  ? Number(raw.longitude) : undefined,
+      depositPaid:      raw.depositPaid,
+      depositAmount:    raw.depositAmount,
+      depositReference: raw.depositReference,
+      balancePaid:      raw.balancePaid,
+      balanceAmount:    raw.balanceAmount,
+      balanceReference: raw.balanceReference,
       customer: {
-        id: rawRescueRequest.customer.id,
-        phoneNumber: rawRescueRequest.customer.phoneNumber,
-        email: rawRescueRequest.customer.email,
-        name: rawRescueRequest.customer.name,
+        id:          raw.customer.id,
+        phoneNumber: raw.customer.phoneNumber,
+        email:       raw.customer.email,
+        name:        raw.customer.name,
       },
-      assignedOperator: rawRescueRequest.assignedOperator
+      assignedOperator: raw.assignedOperator
         ? {
-            id: rawRescueRequest.assignedOperator.id,
-            businessName: rawRescueRequest.assignedOperator.businessName,
-            phoneNumber: rawRescueRequest.assignedOperator.phoneNumber,
-            email: rawRescueRequest.assignedOperator.email,
+            id:           raw.assignedOperator.id,
+            businessName: raw.assignedOperator.businessName,
+            phoneNumber:  raw.assignedOperator.phoneNumber,
+            email:        raw.assignedOperator.email,
           }
         : undefined,
-      createdAt: rawRescueRequest.createdAt,
-      updatedAt: rawRescueRequest.updatedAt,
+      createdAt: raw.createdAt,
+      updatedAt: raw.updatedAt,
     };
   }
 
-  // ...existing methods...
-
-  // ================= ADMIN API =================
-  async adminList(query: any) {
-    // TODO: Implement filtering, pagination, and search
-    return { data: [], meta: { page: 1, limit: 20, total: 0 } };
-  }
-
-  async adminDetail(id: string) {
-    // TODO: Implement detail fetch
-    return {};
-  }
-
-  async assignOperator(id: string, dto: { operatorId: string }) {
-    // TODO: Implement operator assignment
-    return {};
-  }
-
-  async updateStatus(id: string, dto: { status: string }) {
-    // TODO: Implement status update
-    return {};
-  }
-
-  async cancel(id: string, dto: { reason: string }) {
-    // TODO: Implement cancel logic
-    return {};
-  }
-
-  // ================= OPERATOR API =================
-  async operatorList(query: any) {
-    // TODO: Implement operator filtering
-    return { data: [], meta: { page: 1, limit: 20, total: 0 } };
-  }
-
-  async operatorDetail(id: string) {
-    // TODO: Implement operator detail fetch
-    return {};
-  }
-
-
-  /**
-   * Find or create a customer user by phone number
-   */
-  private async findOrCreateCustomer(phoneNumber: string) {
-    let customer = await this.prisma.user.findUnique({
-      where: { phoneNumber },
-    });
-
-    if (!customer) {
-      customer = await this.prisma.user.create({
-        data: {
-          phoneNumber,
-          role: UserRole.CUSTOMER,
-        },
-      });
-      console.log('New customer created:', customer.id);
-    }
-
-    return customer;
-  }
-
-  async handleIncomingWhatsAppMessage(body: Record<string, any>) {
-    const phoneNumber = body.From;
-    const message = String(body.Body || '').trim().toLowerCase();
-    const latitude = body.Latitude ? Number(body.Latitude) : undefined;
-    const longitude = body.Longitude ? Number(body.Longitude) : undefined;
-
-    console.log('Incoming WhatsApp message:', {
-      phoneNumber,
-      message,
-      latitude,
-      longitude,
-    });
-
-    const session = this.sessionStore.getOrCreate(phoneNumber);
-
-    // Handle SOS/HELP to start a new request
-    if (this.isSosMessage(message)) {
-      this.sessionStore.update(phoneNumber, {
-        state: WhatsAppFlowState.WAITING_FOR_LOCATION,
-      });
-      return this.reply(
-        `LRR Rescue here. Please share your current location pin so we can find the nearest tow operator.`,
-      );
-    }
-
-    // Step 1: Waiting for location
-    if (session.state === WhatsAppFlowState.WAITING_FOR_LOCATION) {
-      if (!latitude || !longitude) {
-        return this.reply(
-          `Please share your location using WhatsApp location pin, not typed address.`,
-        );
-      }
-      this.sessionStore.update(phoneNumber, {
-        latitude,
-        longitude,
-        state: WhatsAppFlowState.WAITING_FOR_ISSUE_TYPE,
-      });
-      return this.reply(
-        `Location received. What issue are you having?\n\n1. Breakdown\n2. Accident\n3. Flat tyre\n4. Fuel`,
-      );
-    }
-
-    // Step 2: Waiting for issue type
-    if (session.state === WhatsAppFlowState.WAITING_FOR_ISSUE_TYPE) {
-      const issueType = this.mapIssueType(message);
-      if (!issueType) {
-        return this.reply(
-          `Please reply with a number (1-4) to select the issue type.`,
-        );
-      }
-
-      // Find or create customer
-      const customer = await this.findOrCreateCustomer(phoneNumber);
-
-      // Create rescue request in DB with WAITING_FOR_DEPOSIT status
-      const rescueRequest = await this.prisma.rescueRequest.create({
-        data: {
-          customerId: customer.id,
-          status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
-          latitude: session.latitude,
-          longitude: session.longitude,
-          issueType,
-          depositAmount: DEPOSIT_AMOUNT_KOBO,
-        },
-      });
-
-      console.log('RescueRequest created:', rescueRequest);
-
-      // Generate Paystack payment link
-      const reference = this.paystackService.generateReference('DEP');
-      const email = customer.email || `${phoneNumber.replace(/[^0-9]/g, '')}@lrr.ng`;
-
-      const paymentResponse = await this.paystackService.initializePayment({
-        email,
-        amount: DEPOSIT_AMOUNT_KOBO,
-        reference,
-        metadata: {
-          rescueRequestId: rescueRequest.id,
-          customerId: customer.id,
-          phoneNumber,
-          type: 'deposit',
-        },
-      });
-
-      if (!paymentResponse.status) {
-        console.error('Failed to initialize payment:', paymentResponse);
-        return this.reply(
-          `Sorry, we couldn't create a payment link. Please try again later.`,
-        );
-      }
-
-      // Update rescue request with payment reference
-      await this.prisma.rescueRequest.update({
-        where: { id: rescueRequest.id },
-        data: { depositReference: reference },
-      });
-
-      // Update session
-      this.sessionStore.update(phoneNumber, {
-        issueType,
-        rescueRequestId: rescueRequest.id,
-        depositReference: reference,
-        state: WhatsAppFlowState.WAITING_FOR_DEPOSIT,
-      });
-
-      const paymentUrl = paymentResponse.data.authorization_url;
-
-      return this.reply(
-        `Issue: ${this.formatIssueType(issueType)}\n\nTo confirm your request, please pay a ₦5,000 deposit.\n\nPay here: ${paymentUrl}\n\nOnce payment is confirmed, we will dispatch a tow operator to your location.`,
-      );
-    }
-
-    // Step 3: Waiting for deposit confirmation
-    if (session.state === WhatsAppFlowState.WAITING_FOR_DEPOSIT) {
-      return this.reply(
-        `We're still waiting for your deposit payment.\n\nOnce payment is confirmed, we will dispatch a tow operator to your location.\n\nIf you've already paid, please wait a moment for confirmation.`,
-      );
-    }
-
-    // Step 4: Request confirmed
-    if (session.state === WhatsAppFlowState.REQUEST_CONFIRMED) {
-      return this.reply(
-        `Your rescue request is confirmed and a tow operator is being dispatched.\n\nSend HELP or SOS to start a new request.`,
-      );
-    }
-
-    return this.reply(
-      `Welcome to Lagos Roadside Rescue.\n\nSend HELP or SOS if you need roadside assistance.`,
-    );
-  }
-
-  /**
-   * Handle deposit payment confirmation (called from webhook)
-   */
-  async handleDepositPaymentConfirmed(reference: string) {
-    const rescueRequest = await this.prisma.rescueRequest.findFirst({
-      where: { depositReference: reference },
-      include: { customer: true },
-    });
-
-    if (!rescueRequest) {
-      console.error('No rescue request found for reference:', reference);
-      return;
-    }
-
-    const customerPhoneNumber = rescueRequest.customer.phoneNumber;
-
-    // Update rescue request to DISPATCHING
-    await this.prisma.rescueRequest.update({
-      where: { id: rescueRequest.id },
-      data: {
-        depositPaid: true,
-        status: RescueRequestStatus.DISPATCHING,
-      },
-    });
-
-    // Update session state
-    if (customerPhoneNumber) {
-      this.sessionStore.update(customerPhoneNumber, {
-        state: WhatsAppFlowState.REQUEST_CONFIRMED,
-      });
-    }
-
-    console.log('Deposit confirmed for rescue request:', rescueRequest.id);
-
-    const issueType = rescueRequest.issueType
-      ? this.formatIssueType(rescueRequest.issueType)
-      : 'Unknown';
-
-    // Send payment confirmation to customer
-    if (customerPhoneNumber) {
-      await this.twilioService.sendWhatsAppMessage(
-        customerPhoneNumber,
-        `✅ Payment received!\n\nYour ₦5,000 deposit has been confirmed.\n\nIssue: ${issueType}\n\nWe are now finding the nearest tow operator...`,
-      );
-    }
-
-    // Find nearest available operator
-    const latitude = Number(rescueRequest.latitude);
-    const longitude = Number(rescueRequest.longitude);
-    const nearestOperator = await this.operatorService.findNearestAvailable(latitude, longitude);
-
-    if (!nearestOperator) {
-      console.log('No available operators found for rescue request:', rescueRequest.id);
-      
-      // Update request to indicate waiting for operator
-      await this.prisma.rescueRequest.update({
-        where: { id: rescueRequest.id },
-        data: { status: RescueRequestStatus.DISPATCHING }, // Keep in DISPATCHING while searching
-      });
-
-      if (customerPhoneNumber) {
-        await this.twilioService.sendWhatsAppMessage(
-          customerPhoneNumber,
-          `⏳ We're searching for available tow operators in your area...\n\nThis may take a few moments. We'll notify you as soon as one is assigned.\n\nThank you for your patience.`,
-        );
-      }
-      
-      // TODO: Implement queue system or scheduled retry for operator assignment
-      console.warn(`Request ${rescueRequest.id} queued for operator assignment`);
-      return;
-    }
-
-    // Assign operator to rescue request
-    await this.prisma.rescueRequest.update({
-      where: { id: rescueRequest.id },
-      data: {
-        assignedOperatorId: nearestOperator.id,
-        status: RescueRequestStatus.OPERATOR_ASSIGNED,
-      },
-    });
-
-    console.log(`Operator ${nearestOperator.businessName} assigned to rescue request ${rescueRequest.id}`);
-
-    // Notify operator via WhatsApp
-    await this.twilioService.sendWhatsAppMessage(
-      `whatsapp:${nearestOperator.phoneNumber}`,
-      `🚨 NEW RESCUE REQUEST\n\nIssue: ${issueType}\nDistance: ${nearestOperator.distance.toFixed(1)} km\n\nCustomer is waiting for your assistance.\n\nPlease respond ASAP.`,
-    );
-
-    // Notify customer that operator is assigned
-    if (customerPhoneNumber) {
-      await this.twilioService.sendWhatsAppMessage(
-        customerPhoneNumber,
-        `🚗 Tow operator assigned!\n\nBusiness: ${nearestOperator.businessName}\nDistance: ${nearestOperator.distance.toFixed(1)} km away\n\nThey have been notified and will contact you shortly.`,
-      );
-    }
-  }
-
   private isSosMessage(message: string): boolean {
-    return ['help', 'sos', 'stuck', 'rescue'].some((word) =>
-      message.includes(word),
-    );
+    return ['help', 'sos', 'stuck', 'rescue', 'emergency'].some((w) => message.includes(w));
   }
 
   private mapIssueType(message: string): IssueType | undefined {
-    switch (message) {
-      case '1':
-        return 'BREAKDOWN';
-      case '2':
-        return 'ACCIDENT';
-      case '3':
-        return 'FLAT_TYRE';
-      case '4':
-        return 'FUEL';
-      default:
-        return undefined;
-    }
+    const map: Record<string, IssueType> = {
+      '1': 'BREAKDOWN', '2': 'ACCIDENT', '3': 'FLAT_TYRE', '4': 'FUEL',
+      'breakdown': 'BREAKDOWN', 'accident': 'ACCIDENT',
+      'flat': 'FLAT_TYRE', 'tyre': 'FLAT_TYRE', 'fuel': 'FUEL',
+    };
+    return map[message];
   }
 
   private formatIssueType(issueType: IssueType): string {
-    return issueType
-      .replace('_', ' ')
-      .toLowerCase()
-      .replace(/\b\w/g, (char) => char.toUpperCase());
+    return issueType.replace('_', ' ').toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
   }
 
-  private reply(message: string) {
+  private formatStatus(status: RescueRequestStatus): string {
+    return status.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+
+  private reply(message: string): string {
     return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n<Message>${message}</Message>\n</Response>`;
+  }
+
+  private xmlOk(): string {
+    return `<?xml version="1.0" encoding="UTF-8"?>\n<Response></Response>`;
   }
 }
