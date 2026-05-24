@@ -30,10 +30,12 @@ COPY package.json yarn.lock ./
 RUN yarn install --frozen-lockfile --production && yarn cache clean
 
 # Copy built output and Prisma artifacts
-COPY --from=builder /app/dist            ./dist
+COPY --from=builder /app/dist                  ./dist
 COPY --from=builder /app/node_modules/.prisma  ./node_modules/.prisma
 COPY --from=builder /app/node_modules/@prisma  ./node_modules/@prisma
-COPY --from=builder /app/prisma          ./prisma
+COPY --from=builder /app/prisma                ./prisma
+# Prisma 7 reads datasource URL from prisma.config.ts (not schema.prisma)
+COPY --from=builder /app/prisma.config.ts      ./prisma.config.ts
 
 EXPOSE 3000
 
