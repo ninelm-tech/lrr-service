@@ -1,14 +1,19 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
+  NotFoundException,
   Param,
   Patch,
   Post,
   Query,
+  Req,
+  UseGuards,
 } from '@nestjs/common';
 import { OperatorService } from './operator.service';
-import { OperatorStatus, OperatorType } from '@prisma/client';
+import { OperatorMemberRole, OperatorStatus, OperatorType } from '@prisma/client';
+import { AuthGuard } from '../auth/auth.guard';
 
 class CreateOperatorDto {
   email: string;
@@ -64,6 +69,18 @@ export class OperatorController {
   }
 
   /**
+   * Get the operator record for the currently authenticated user.
+   * Used by the operator dashboard to load their own operator profile.
+   */
+  @UseGuards(AuthGuard)
+  @Get('me')
+  async getMyOperator(@Req() req: any) {
+    const operator = await this.operatorService.findByUserId(req.user.id);
+    if (!operator) throw new NotFoundException('No operator account found for this user');
+    return { data: operator };
+  }
+
+  /**
    * Get an operator by ID
    */
   @Get(':id')
@@ -109,5 +126,39 @@ export class OperatorController {
       message: `Operator availability set to ${isAvailable}`,
       data: operator,
     };
+  }
+
+  // ═══════════════════════════════════════
+  //  Member management
+  // ═══════════════════════════════════════
+
+  @UseGuards(AuthGuard)
+  @Get(':id/members')
+  async listMembers(@Param('id') id: string) {
+    const members = await this.operatorService.listMembers(id);
+    return { data: members };
+  }
+
+  @UseGuards(AuthGuard)
+  @Post(':id/members')
+  async addMember(
+    @Param('id') id: string,
+    @Body() body: { userId: string; role?: OperatorMemberRole },
+  ) {
+    const member = await this.operatorService.addMember(id, {
+      userId: body.userId,
+      role:   body.role ?? OperatorMemberRole.STAFF,
+    });
+    return { message: 'Member added', data: member };
+  }
+
+  @UseGuards(AuthGuard)
+  @Delete(':id/members/:memberId')
+  async removeMember(
+    @Param('id') id: string,
+    @Param('memberId') memberId: string,
+  ) {
+    await this.operatorService.removeMember(id, memberId);
+    return { message: 'Member removed' };
   }
 }

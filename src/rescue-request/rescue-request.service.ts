@@ -1,5 +1,6 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import * as Sentry from '@sentry/node';
+import { toWhatsAppAddress } from '../common/phone.util';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import {
   IssueType,
@@ -27,9 +28,9 @@ const BATCH_SIZE = 3;                  // operators offered per round simultaneo
 const CUSTOMER_BUDGET_MINUTES = 10;   // max total customer wait before radius expands
 const MIN_WINDOW_SECONDS = 90;        // floor: operators always get at least 90s
 const MAX_WINDOW_SECONDS = 180;       // ceiling: never more than 3 min per batch
-const DISPATCH_RETRY_MINUTES = 5;     // wait between radius-expansion retries
-const MAX_FAILED_ROUNDS_BEFORE_ALERT = 2;   // alert admin after this many failed rounds
-const MAX_ROUNDS_BEFORE_AUTO_CANCEL  = 4;   // ~20 min total wait — auto-cancel after this
+const DISPATCH_RETRY_MINUTES         = Number(process.env.DISPATCH_RETRY_MINUTES  ?? 5);   // set to 1 in dev
+const MAX_FAILED_ROUNDS_BEFORE_ALERT = Number(process.env.DISPATCH_MAX_ALERT_ROUND ?? 2);
+const MAX_ROUNDS_BEFORE_AUTO_CANCEL  = Number(process.env.DISPATCH_MAX_ROUNDS     ?? 4);   // ~RETRY*MAX min total
 const RADIUS_EXPANSION_KM = 2;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -49,22 +50,27 @@ export class RescueRequestService {
   // ═══════════════════════════════════════════════════════
 
   async handleIncomingWhatsAppMessage(body: Record<string, any>) {
-    const phoneNumber: string = body.From;
+    // Twilio always delivers E.164 with country code — just strip the whatsapp: prefix
+    const phoneNumber: string = String(body.From || '').replace(/^whatsapp:/i, '');
     const message = String(body.Body || '').trim().toLowerCase();
     const latitude  = body.Latitude  ? Number(body.Latitude)  : undefined;
     const longitude = body.Longitude ? Number(body.Longitude) : undefined;
 
     console.log('Incoming WhatsApp message:', { phoneNumber, message, latitude, longitude });
 
-    const session = await this.sessionStore.getOrCreate(phoneNumber);
+    // Always resolve (or create) a User for this phone number.
+    // Operators and customers both have a User record — this is our session key.
+    const user = await this.findOrCreateCustomer(phoneNumber);
+    const userId = user.id;
+
+    const session = await this.sessionStore.getOrCreate(userId);
 
     // ── Route operator messages first ──────────────────────────────────────
-    // Operators share the same WhatsApp channel; identify them by phone number.
     const operatorRecord = await this.prisma.operator.findUnique({
-      where: { phoneNumber: phoneNumber.replace('whatsapp:', '') },
+      where: { phoneNumber },
     });
     if (operatorRecord) {
-      return this.handleOperatorMessage(phoneNumber, message, session, operatorRecord);
+      return this.handleOperatorMessage(phoneNumber, userId, message, session, operatorRecord);
     }
 
     // ── CONFIRM / DISPUTE job completion (customer side) ──────────────────
@@ -72,7 +78,7 @@ export class RescueRequestService {
       if (message === 'confirm') {
         if (session.rescueRequestId) {
           await this.markJobCompleted(session.rescueRequestId);
-          await this.sessionStore.update(phoneNumber, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
+          await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
         }
         return this.xmlOk();
       }
@@ -94,11 +100,10 @@ export class RescueRequestService {
     // ── SOS / new request ──────────────────────────────────────────────────
     if (this.isSosMessage(message)) {
       // Duplicate SOS detection — check for existing open request
-      const customer = await this.prisma.user.findUnique({ where: { phoneNumber } });
-      if (customer) {
+      {
         const openRequest = await this.prisma.rescueRequest.findFirst({
           where: {
-            customerId: customer.id,
+            customerId: userId,
             status: {
               notIn: [
                 RescueRequestStatus.COMPLETED,
@@ -114,7 +119,7 @@ export class RescueRequestService {
         }
       }
 
-      await this.sessionStore.update(phoneNumber, {
+      await this.sessionStore.update(userId, {
         state: WhatsAppFlowState.WAITING_FOR_LOCATION,
         latitude: undefined,
         longitude: undefined,
@@ -138,19 +143,16 @@ export class RescueRequestService {
       // Fallback: session may have lost state (server restart, previous session cleared
       // before request was created, etc.) — look up the open request in the DB directly
       if (!requestIdToCancel) {
-        const customer = await this.prisma.user.findUnique({ where: { phoneNumber } });
-        if (customer) {
-          const openRequest = await this.prisma.rescueRequest.findFirst({
-            where: {
-              customerId: customer.id,
-              status: {
-                notIn: [RescueRequestStatus.COMPLETED, RescueRequestStatus.CANCELLED] as RescueRequestStatus[],
-              },
+        const openRequest = await this.prisma.rescueRequest.findFirst({
+          where: {
+            customerId: userId,
+            status: {
+              notIn: [RescueRequestStatus.COMPLETED, RescueRequestStatus.CANCELLED] as RescueRequestStatus[],
             },
-            orderBy: { createdAt: 'desc' },
-          });
-          if (openRequest) requestIdToCancel = openRequest.id;
-        }
+          },
+          orderBy: { createdAt: 'desc' },
+        });
+        if (openRequest) requestIdToCancel = openRequest.id;
       }
 
       if (requestIdToCancel) {
@@ -163,7 +165,7 @@ export class RescueRequestService {
           where: { id: requestIdToCancel },
           data: { status: RescueRequestStatus.CANCELLED },
         });
-        await this.sessionStore.clear(phoneNumber);
+        await this.sessionStore.clear(userId);
 
         // If an operator was tentatively holding this job (awaiting customer payment),
         // release them and let them know
@@ -172,7 +174,7 @@ export class RescueRequestService {
           existing.assignedOperator
         ) {
           await this.twilioService.sendWhatsAppMessage(
-            `whatsapp:${existing.assignedOperator.phoneNumber}`,
+            toWhatsAppAddress(existing.assignedOperator.phoneNumber),
             `❌ The customer cancelled before confirming payment. You have been released. Watch out for new offers!`,
           );
         }
@@ -191,7 +193,7 @@ export class RescueRequestService {
           `📍 Please share your location using WhatsApp's location pin — not a typed address.`,
         );
       }
-      await this.sessionStore.update(phoneNumber, {
+      await this.sessionStore.update(userId, {
         latitude,
         longitude,
         state: WhatsAppFlowState.WAITING_FOR_ISSUE_TYPE,
@@ -207,7 +209,7 @@ export class RescueRequestService {
       if (!issueType) {
         return this.reply(`Please reply with a number 1-4 to select the issue type.`);
       }
-      return this.handleIssueTypeSelected(phoneNumber, session, issueType);
+      return this.handleIssueTypeSelected(phoneNumber, userId, session, issueType);
     }
 
     // ── Step 3: Operator found — waiting for customer to pay ──────────────
@@ -217,10 +219,10 @@ export class RescueRequestService {
       );
     }
 
-    // ── Step 4: Request confirmed ──────────────────────────────────────────
+    // ── Step 4: Request active — searching for operator ───────────────────
     if (session.state === WhatsAppFlowState.REQUEST_CONFIRMED) {
       return this.reply(
-        `✅ Your rescue request is confirmed and a tow operator is on the way.\n\nSend SOS or HELP to start a new request.`,
+        `🔍 We've received your request and are searching for the nearest operator.\n\nYou will be notified once one is confirmed. Reply CANCEL to cancel (no charge).`,
       );
     }
 
@@ -234,16 +236,17 @@ export class RescueRequestService {
   // ──────────────────────────────────────────────────────────────────────────
   private async handleOperatorMessage(
     phoneNumber: string,
+    userId: string,
     message: string,
     session: Awaited<ReturnType<WhatsAppSessionStore['getOrCreate']>>,
     operator: { id: string; businessName: string; phoneNumber: string },
   ) {
     // ── Dispatch accept / decline ──────────────────────────────────────────
     if (message === 'yes' || message === 'accept') {
-      return this.handleOperatorResponse(phoneNumber, true);
+      return this.handleOperatorResponse(phoneNumber, userId, true);
     }
     if (message === 'no' || message === 'decline') {
-      return this.handleOperatorResponse(phoneNumber, false);
+      return this.handleOperatorResponse(phoneNumber, userId, false);
     }
 
     // ── ARRIVED at customer location ───────────────────────────────────────
@@ -251,7 +254,7 @@ export class RescueRequestService {
       if (session.state !== WhatsAppFlowState.OPERATOR_ON_JOB || !session.rescueRequestId) {
         return this.reply(`You don't have an active job. Wait for a dispatch offer.`);
       }
-      return this.handleOperatorArrived(phoneNumber, session.rescueRequestId, operator);
+      return this.handleOperatorArrived(phoneNumber, userId, session.rescueRequestId, operator);
     }
 
     // ── Job DONE — prompt customer to confirm ──────────────────────────────
@@ -259,7 +262,7 @@ export class RescueRequestService {
       if (session.state !== WhatsAppFlowState.OPERATOR_AT_LOCATION || !session.rescueRequestId) {
         return this.reply(`Please send ARRIVED first when you reach the customer location.`);
       }
-      return this.handleOperatorJobDone(phoneNumber, session.rescueRequestId, operator);
+      return this.handleOperatorJobDone(phoneNumber, userId, session.rescueRequestId, operator);
     }
 
     // ── Contextual help ───────────────────────────────────────────────────
@@ -279,6 +282,7 @@ export class RescueRequestService {
 
   private async handleOperatorArrived(
     operatorPhone: string,
+    operatorUserId: string,
     rescueRequestId: string,
     operator: { id: string; businessName: string },
   ) {
@@ -287,7 +291,7 @@ export class RescueRequestService {
       include: { customer: true },
     });
     if (!rescueRequest || rescueRequest.status === RescueRequestStatus.CANCELLED || rescueRequest.status === RescueRequestStatus.COMPLETED) {
-      await this.sessionStore.clear(operatorPhone);
+      await this.sessionStore.clear(operatorUserId);
       return this.reply(`This job has already ended. Watch out for new dispatch offers.`);
     }
 
@@ -298,7 +302,7 @@ export class RescueRequestService {
     });
 
     // Operator session → AT_LOCATION
-    await this.sessionStore.update(operatorPhone, {
+    await this.sessionStore.update(operatorUserId, {
       state: WhatsAppFlowState.OPERATOR_AT_LOCATION,
     });
 
@@ -316,6 +320,7 @@ export class RescueRequestService {
 
   private async handleOperatorJobDone(
     operatorPhone: string,
+    operatorUserId: string,
     rescueRequestId: string,
     operator: { id: string; businessName: string },
   ) {
@@ -324,19 +329,21 @@ export class RescueRequestService {
       include: { customer: true },
     });
     if (!rescueRequest || rescueRequest.status === RescueRequestStatus.CANCELLED || rescueRequest.status === RescueRequestStatus.COMPLETED) {
-      await this.sessionStore.clear(operatorPhone);
+      await this.sessionStore.clear(operatorUserId);
       return this.reply(`This job has already ended.`);
     }
 
     const customerPhone = rescueRequest.customer.phoneNumber;
+    const customerId    = rescueRequest.customerId;
 
     // Put customer session in AWAITING_COMPLETION_CONFIRM
-    if (customerPhone) {
-      await this.sessionStore.update(customerPhone, {
+    if (customerId) {
+      await this.sessionStore.update(customerId, {
         state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
         rescueRequestId,
       });
-
+    }
+    if (customerPhone) {
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
         `🔧 ${operator.businessName} says the job is done!\n\nReply *CONFIRM* to release your vehicle and receive the balance payment link.\n\nIf there's a problem, reply *DISPUTE* and our team will investigate.`,
@@ -352,13 +359,11 @@ export class RescueRequestService {
       if (fresh && fresh.status !== RescueRequestStatus.COMPLETED && fresh.status !== RescueRequestStatus.CANCELLED) {
         console.log(`⏱ Auto-completing request ${rescueRequestId} — customer did not confirm in 30 min`);
         await this.markJobCompleted(rescueRequestId);
-        if (customerPhone) {
-          await this.sessionStore.update(customerPhone, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
-        }
+        await this.sessionStore.update(customerId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
       }
     }, 30 * 60 * 1000);
 
-    await this.sessionStore.update(operatorPhone, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
+    await this.sessionStore.update(operatorUserId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
 
     return this.reply(
       `✅ Job marked as done! Waiting for customer confirmation.\n\nIf they confirm, you'll receive a notification. Thank you 🙏`,
@@ -370,6 +375,7 @@ export class RescueRequestService {
   // ──────────────────────────────────────────────────────────────────────────
   private async handleIssueTypeSelected(
     phoneNumber: string,
+    userId: string,
     session: Awaited<ReturnType<WhatsAppSessionStore['getOrCreate']>>,
     issueType: IssueType,
   ) {
@@ -397,7 +403,7 @@ export class RescueRequestService {
           data: { towsUsedThisMonth: { increment: 1 } },
         });
 
-        await this.sessionStore.update(phoneNumber, {
+        await this.sessionStore.update(customer.id, {
           issueType,
           rescueRequestId:    rescueRequest.id,
           state:              WhatsAppFlowState.REQUEST_CONFIRMED,
@@ -411,7 +417,7 @@ export class RescueRequestService {
           `${greet}✅ Subscriber recognised!\n\nIssue: ${this.formatIssueType(issueType)}\nTows remaining this month: ${towsLeft - 1}\n\nFinding nearest operator...`,
         );
 
-        void this.startDispatch(rescueRequest.id, phoneNumber);
+        void this.startDispatch(rescueRequest.id, customer.id);
         return this.xmlOk();
       }
 
@@ -435,7 +441,7 @@ export class RescueRequestService {
       },
     });
 
-    await this.sessionStore.update(phoneNumber, {
+    await this.sessionStore.update(customer.id, {
       issueType,
       rescueRequestId:    rescueRequest.id,
       state:              WhatsAppFlowState.REQUEST_CONFIRMED,
@@ -456,7 +462,7 @@ export class RescueRequestService {
       `${greet}🔍 ${costNote}Searching for the nearest tow operator...\n\nIssue: ${this.formatIssueType(issueType)}\n${costBreak}\n\n⏳ You will *only be charged once an operator is confirmed*. Reply CANCEL at any time.`,
     );
 
-    void this.startDispatch(rescueRequest.id, phoneNumber);
+    void this.startDispatch(rescueRequest.id, customer.id);
     return this.xmlOk();
   }
 
@@ -507,7 +513,7 @@ export class RescueRequestService {
       data:  { depositReference: reference },
     });
 
-    await this.sessionStore.update(phoneNumber, {
+    await this.sessionStore.update(customer.id, {
       issueType,
       rescueRequestId:  rescueRequest.id,
       depositReference: reference,
@@ -543,6 +549,7 @@ export class RescueRequestService {
       return;
     }
 
+    const customerId    = rescueRequest.customerId;
     const customerPhone = rescueRequest.customer.phoneNumber;
 
     // Mark deposit paid and fully confirm the operator assignment
@@ -553,11 +560,11 @@ export class RescueRequestService {
 
     const operator = rescueRequest.assignedOperator;
 
+    // Customer: confirmed with operator details
+    await this.sessionStore.update(customerId, {
+      state: WhatsAppFlowState.REQUEST_CONFIRMED,
+    });
     if (customerPhone) {
-      // Customer: confirmed with operator details
-      await this.sessionStore.update(customerPhone, {
-        state: WhatsAppFlowState.REQUEST_CONFIRMED,
-      });
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
         operator
@@ -568,19 +575,20 @@ export class RescueRequestService {
 
     if (operator) {
       // Operator: job is now live — send customer location + details
-      await this.sessionStore.update(`whatsapp:${operator.phoneNumber}`, {
+      const opUser = await this.findOrCreateCustomer(operator.phoneNumber);
+      await this.sessionStore.update(opUser.id, {
         state:           WhatsAppFlowState.OPERATOR_ON_JOB,
         rescueRequestId: rescueRequest.id,
       });
       const lat = rescueRequest.latitude;
       const lon = rescueRequest.longitude;
       await this.twilioService.sendWhatsAppMessage(
-        `whatsapp:${operator.phoneNumber}`,
-        `💰 *Payment confirmed — job is live!*\n\nCustomer: ${customerPhone?.replace('whatsapp:', '')}\nIssue: ${this.formatIssueType(rescueRequest.issueType as IssueType)}\nLocation: https://maps.google.com/?q=${lat},${lon}\n\nHead over now and send *ARRIVED* when you reach them.`,
+        toWhatsAppAddress(operator.phoneNumber),
+        `💰 *Payment confirmed — job is live!*\n\nCustomer: ${customerPhone}\nIssue: ${this.formatIssueType(rescueRequest.issueType as IssueType)}\nLocation: https://maps.google.com/?q=${lat},${lon}\n\nHead over now and send *ARRIVED* when you reach them.`,
       );
     } else {
       // Edge case: no operator was pre-assigned (e.g. admin manually sent a payment link)
-      void this.startDispatch(rescueRequest.id, customerPhone!);
+      void this.startDispatch(rescueRequest.id, customerId);
     }
   }
 
@@ -607,28 +615,30 @@ export class RescueRequestService {
     });
 
     // Notify customer — payment confirmed
+    const customerId    = rescueRequest.customerId;
     const customerPhone = rescueRequest.customer.phoneNumber;
     if (customerPhone) {
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
         `✅ Payment of ₦45,000 confirmed! Thank you for using Lagos Roadside Rescue 🙏\n\nHow was your experience? Reply 1–5 to rate your operator.`,
       );
-      // Clear customer session
-      await this.sessionStore.update(`whatsapp:${customerPhone}`, {
-        state: WhatsAppFlowState.IDLE,
-        rescueRequestId: undefined,
-      });
     }
+    // Clear customer session
+    await this.sessionStore.update(customerId, {
+      state: WhatsAppFlowState.IDLE,
+      rescueRequestId: undefined,
+    });
 
     // Notify operator — release the vehicle
     const operator = rescueRequest.assignedOperator;
     if (operator?.phoneNumber) {
       await this.twilioService.sendWhatsAppMessage(
-        `whatsapp:${operator.phoneNumber}`,
+        toWhatsAppAddress(operator.phoneNumber),
         `💵 *Payment received!*\n\nThe customer has paid the ₦45,000 balance in full.\n\n✅ You may now *release the vehicle*. Job complete — well done!\n\nYour payment will be remitted within 24 hours.`,
       );
       // Clear operator session
-      await this.sessionStore.update(`whatsapp:${operator.phoneNumber}`, {
+      const opUser = await this.findOrCreateCustomer(operator.phoneNumber);
+      await this.sessionStore.update(opUser.id, {
         state: WhatsAppFlowState.IDLE,
         rescueRequestId: undefined,
       });
@@ -643,7 +653,7 @@ export class RescueRequestService {
 
   async startDispatch(
     rescueRequestId: string,
-    customerPhone: string,
+    customerId: string,
     extraRadiusKm: number = 0,
   ) {
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
@@ -657,7 +667,14 @@ export class RescueRequestService {
       rescueRequest.status === RescueRequestStatus.WAITING_FOR_DEPOSIT  // payment window active
     ) return;
 
-    const session = await this.sessionStore.getOrCreate(customerPhone);
+    // Resolve the customer's phone number for Twilio messages
+    const customerRecord = await this.prisma.user.findUnique({
+      where: { id: customerId },
+      select: { phoneNumber: true },
+    });
+    const customerPhone = customerRecord?.phoneNumber ?? null;
+
+    const session = await this.sessionStore.getOrCreate(customerId);
     const alreadyOffered: string[] = session.offeredOperatorIds ?? [];
     const round = session.dispatchRound ?? 0;
 
@@ -670,11 +687,46 @@ export class RescueRequestService {
     );
 
     if (candidates.length === 0) {
-      // No operators available — expand radius and retry, up to the auto-cancel limit
+      // Fast-fail: check if there are ANY active operators near this location
+      // (ignoring isAvailable — counts busy ones too).
+      // If zero, it's a geography/coverage gap — retrying with an expanded
+      // radius won't help, so cancel immediately rather than making the
+      // customer wait 15-20 minutes for the same result.
+      //
+      // ~1.5° ≈ 150 km bounding box — larger than any realistic service radius,
+      // so this covers the maximum possible expansion area upfront.
+      const COVERAGE_DELTA_DEG = 1.5;
+      const nearbyOperatorCount = await this.prisma.operator.count({
+        where: {
+          status: 'ACTIVE',           // isAvailable intentionally omitted
+          latitude:  { gte: lat - COVERAGE_DELTA_DEG, lte: lat + COVERAGE_DELTA_DEG },
+          longitude: { gte: lon - COVERAGE_DELTA_DEG, lte: lon + COVERAGE_DELTA_DEG },
+        },
+      });
+
+      if (nearbyOperatorCount === 0) {
+        // No operator infrastructure in this area at all — cancel immediately
+        await this.prisma.rescueRequest.update({
+          where: { id: rescueRequestId },
+          data:  { status: RescueRequestStatus.CANCELLED },
+        });
+        await this.sessionStore.clear(customerId);
+        if (customerPhone) {
+          await this.twilioService.sendWhatsAppMessage(
+            customerPhone,
+            `😔 Sorry, there are no tow operators available in your area at the moment.\n\nYour request has been cancelled and *you have not been charged*.\n\nPlease try again later or call your breakdown provider.`,
+          );
+        }
+        await this.alertAdminNoOperator(rescueRequestId, lat, lon, 0);
+        return;
+      }
+
+      // Operators exist in the area but are currently busy or offline —
+      // proceed with the normal retry + radius-expansion cycle.
       const newRound = round + 1;
       // Reset offeredOperatorIds so timed-out operators can be re-offered
       // after the retry delay — they may have missed the first notification
-      await this.sessionStore.update(customerPhone, {
+      await this.sessionStore.update(customerId, {
         dispatchRound: newRound,
         offeredOperatorIds: [],
       });
@@ -685,12 +737,14 @@ export class RescueRequestService {
           where: { id: rescueRequestId },
           data: { status: RescueRequestStatus.CANCELLED },
         });
-        await this.sessionStore.clear(customerPhone);
+        await this.sessionStore.clear(customerId);
 
-        await this.twilioService.sendWhatsAppMessage(
-          customerPhone,
-          `😔 We're sorry — no tow operator was available near you after an extended search.\n\nYour request has been automatically cancelled and *you were not charged*.\n\nPlease try again shortly or call your breakdown cover provider.`,
-        );
+        if (customerPhone) {
+          await this.twilioService.sendWhatsAppMessage(
+            customerPhone,
+            `😔 We're sorry — no tow operator was available near you after an extended search.\n\nYour request has been automatically cancelled and *you were not charged*.\n\nPlease try again shortly or call your breakdown cover provider.`,
+          );
+        }
 
         await this.alertAdminNoOperator(rescueRequestId, lat, lon, newRound);
         console.warn(`🚨 Auto-cancelled request ${rescueRequestId} after ${newRound} rounds with no operator found.`);
@@ -706,14 +760,16 @@ export class RescueRequestService {
         await this.alertAdminNoOperator(rescueRequestId, lat, lon, newRound);
       }
 
-      await this.twilioService.sendWhatsAppMessage(
-        customerPhone,
-        `⏳ Still searching for a tow operator nearby (attempt ${newRound}/${MAX_ROUNDS_BEFORE_AUTO_CANCEL - 1}). Expanding the search area. Thank you for your patience.`,
-      );
+      if (customerPhone) {
+        await this.twilioService.sendWhatsAppMessage(
+          customerPhone,
+          `⏳ Still searching for a tow operator nearby (attempt ${newRound}/${MAX_ROUNDS_BEFORE_AUTO_CANCEL - 1}). Expanding the search area. Thank you for your patience.`,
+        );
+      }
 
       const expandedRadius = extraRadiusKm + RADIUS_EXPANSION_KM;
       setTimeout(
-        () => void this.startDispatch(rescueRequestId, customerPhone, expandedRadius),
+        () => void this.startDispatch(rescueRequestId, customerId, expandedRadius),
         DISPATCH_RETRY_MINUTES * 60 * 1000,
       );
       return;
@@ -742,7 +798,7 @@ export class RescueRequestService {
     });
 
     // Track offered operators in session
-    await this.sessionStore.update(customerPhone, {
+    await this.sessionStore.update(customerId, {
       offeredOperatorIds: [...alreadyOffered, ...batchOperatorIds],
       dispatchRound: round,
     });
@@ -755,7 +811,7 @@ export class RescueRequestService {
     await Promise.all(
       batch.map((op) =>
         this.twilioService.sendWhatsAppMessage(
-          `whatsapp:${op.phoneNumber}`,
+          toWhatsAppAddress(op.phoneNumber),
           `🚨 *NEW RESCUE JOB*\n\nIssue: ${issueLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: https://maps.google.com/?q=${lat},${lon}\n\nReply *YES* to accept or *NO* to decline.\nYou have ${windowSeconds} seconds.`,
         ),
       ),
@@ -763,7 +819,7 @@ export class RescueRequestService {
 
     // Single timeout covers the entire batch
     setTimeout(
-      () => void this.handleBatchTimeout(rescueRequestId, batchOperatorIds, customerPhone, extraRadiusKm),
+      () => void this.handleBatchTimeout(rescueRequestId, batchOperatorIds, customerId, extraRadiusKm),
       windowSeconds * 1000,
     );
   }
@@ -771,7 +827,7 @@ export class RescueRequestService {
   private async handleBatchTimeout(
     rescueRequestId: string,
     batchOperatorIds: string[],
-    customerPhone: string,
+    customerId: string,
     extraRadiusKm: number,
   ) {
     // Race condition guard — skip if someone already accepted
@@ -798,12 +854,13 @@ export class RescueRequestService {
     });
 
     // Move to next batch (same radius — untried operators may still be available)
-    void this.startDispatch(rescueRequestId, customerPhone, extraRadiusKm);
+    void this.startDispatch(rescueRequestId, customerId, extraRadiusKm);
   }
 
-  private async handleOperatorResponse(operatorPhone: string, accepted: boolean) {
+  private async handleOperatorResponse(operatorPhone: string, operatorUserId: string, accepted: boolean) {
+    // operatorPhone already arrived as +234... from Twilio — use as-is
     const operator = await this.prisma.operator.findUnique({
-      where: { phoneNumber: operatorPhone.replace('whatsapp:', '') },
+      where: { phoneNumber: operatorPhone },
     });
     if (!operator) return this.xmlOk();
 
@@ -815,6 +872,7 @@ export class RescueRequestService {
     if (!offer) return this.xmlOk();
 
     const rescueRequest = offer.rescueRequest;
+    const customerId    = rescueRequest.customerId;
     const customerPhone = rescueRequest.customer.phoneNumber;
 
     if (accepted) {
@@ -828,12 +886,12 @@ export class RescueRequestService {
         await this.prisma.dispatchOffer.update({ where: { id: offer.id }, data: { status: 'ACCEPTED', respondedAt: new Date() } });
         await this.prisma.dispatchOffer.updateMany({ where: { rescueRequestId: rescueRequest.id, status: 'PENDING', id: { not: offer.id } }, data: { status: 'DECLINED', respondedAt: new Date() } });
         await this.prisma.rescueRequest.update({ where: { id: rescueRequest.id }, data: { assignedOperatorId: operator.id, status: RescueRequestStatus.OPERATOR_ASSIGNED } });
-        await this.sessionStore.update(`whatsapp:${operator.phoneNumber}`, { state: WhatsAppFlowState.OPERATOR_ON_JOB, rescueRequestId: rescueRequest.id });
+        await this.sessionStore.update(operatorUserId, { state: WhatsAppFlowState.OPERATOR_ON_JOB, rescueRequestId: rescueRequest.id });
         if (customerPhone) {
           await this.twilioService.sendWhatsAppMessage(customerPhone,
             `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nThey're on their way! You'll be notified when they arrive.`);
         }
-        return this.reply(`✅ Job accepted! Head to the customer location.\n📍 Customer: ${customerPhone?.replace('whatsapp:', '')}\n\nSend *ARRIVED* when you reach them.`);
+        return this.reply(`✅ Job accepted! Head to the customer location.\n📍 Customer: ${customerPhone}\n\nSend *ARRIVED* when you reach them.`);
       }
 
       // ── Non-subscriber / exhausted subscriber — find operator first, THEN charge ──
@@ -852,8 +910,8 @@ export class RescueRequestService {
       await this.prisma.dispatchOffer.updateMany({ where: { rescueRequestId: rescueRequest.id, status: 'PENDING', id: { not: offer.id } }, data: { status: 'DECLINED', respondedAt: new Date() } });
 
       // Update customer session — they need to pay within 5 minutes
+      await this.sessionStore.update(customerId, { state: WhatsAppFlowState.OPERATOR_FOUND_WAITING_PAYMENT });
       if (customerPhone) {
-        await this.sessionStore.update(customerPhone, { state: WhatsAppFlowState.OPERATOR_FOUND_WAITING_PAYMENT });
         await this.sendDepositRequestToCustomer(rescueRequest, customerPhone, operator);
       }
 
@@ -870,20 +928,20 @@ export class RescueRequestService {
             where: { id: rescueRequest.id },
             data:  { assignedOperatorId: null, status: RescueRequestStatus.DISPATCHING },
           });
+          const session = await this.sessionStore.getOrCreate(customerId);
+          await this.sessionStore.update(customerId, {
+            state: WhatsAppFlowState.REQUEST_CONFIRMED,
+            offeredOperatorIds: [...(session.offeredOperatorIds ?? []), operator.id],
+          });
           if (customerPhone) {
-            const session = await this.sessionStore.getOrCreate(customerPhone);
-            await this.sessionStore.update(customerPhone, {
-              state: WhatsAppFlowState.REQUEST_CONFIRMED,
-              offeredOperatorIds: [...(session.offeredOperatorIds ?? []), operator.id],
-            });
             await this.twilioService.sendWhatsAppMessage(
               customerPhone,
               `⏰ Payment window expired. Looking for the next available operator...`,
             );
-            void this.startDispatch(rescueRequest.id, customerPhone);
           }
+          void this.startDispatch(rescueRequest.id, customerId);
           await this.twilioService.sendWhatsAppMessage(
-            `whatsapp:${operator.phoneNumber}`,
+            toWhatsAppAddress(operator.phoneNumber),
             `⏰ The customer did not pay within 5 minutes. You have been released. Watch for new offers!`,
           );
         }
@@ -1178,7 +1236,13 @@ export class RescueRequestService {
       return this.buildListResponse(whereClause, parseInt(page), parseInt(limit));
     }
 
-    throw new UnauthorizedException('Customers do not have access to rescue request list');
+    // CUSTOMER — only see their own requests
+    if (role === 'CUSTOMER') {
+      whereClause.customerId = user.userId;
+      return this.buildListResponse(whereClause, parseInt(page), parseInt(limit));
+    }
+
+    throw new UnauthorizedException('Access denied');
   }
 
   async detailForUser(user: any, id: string): Promise<RescueRequestDetailResponseDto> {

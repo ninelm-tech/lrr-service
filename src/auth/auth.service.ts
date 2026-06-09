@@ -3,6 +3,7 @@ import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../prisma/prisma.service';
 import { UserRole } from '@prisma/client';
+import { normalizePhone } from '../common/phone.util';
 
 export interface JwtPayload {
   sub: string;
@@ -146,9 +147,12 @@ export class AuthService {
     password?: string;
     name?: string;
   }): Promise<AuthResponse> {
+    // Normalise to E.164 — covers "080..." entered on the web form
+    const phoneNumber = normalizePhone(dto.phoneNumber);
+
     // Check phone uniqueness
     const existingPhone = await this.prisma.user.findUnique({
-      where: { phoneNumber: dto.phoneNumber },
+      where: { phoneNumber },
     });
     if (existingPhone) {
       // If already exists as a CUSTOMER (created automatically by WhatsApp bot),
@@ -166,7 +170,7 @@ export class AuthService {
 
         const accessToken = this.generateToken({
           id:    updated.id,
-          email: updated.email ?? dto.phoneNumber,
+          email: updated.email ?? phoneNumber,
           role:  updated.role,
         });
 
@@ -189,7 +193,7 @@ export class AuthService {
 
     const user = await this.prisma.user.create({
       data: {
-        phoneNumber:  dto.phoneNumber,
+        phoneNumber,         // normalised +234... form
         email:        dto.email ?? null,
         passwordHash: passwordHash ?? undefined,
         name:         dto.name ?? null,
@@ -199,7 +203,7 @@ export class AuthService {
 
     const accessToken = this.generateToken({
       id:    user.id,
-      email: user.email ?? dto.phoneNumber,
+      email: user.email ?? phoneNumber,
       role:  user.role,
     });
 
@@ -223,6 +227,9 @@ export class AuthService {
     type: string;
     password: string;
   }) {
+    // Normalise phone to E.164 at the registration boundary
+    const phoneNumber = normalizePhone(dto.phoneNumber);
+
     // Check if user already exists
     const existingUser = await this.prisma.user.findUnique({ where: { email: dto.email } });
     if (existingUser) {
@@ -234,7 +241,7 @@ export class AuthService {
       where: {
         OR: [
           { businessName: dto.businessName },
-          { phoneNumber: dto.phoneNumber },
+          { phoneNumber },
         ],
       },
     });
@@ -247,7 +254,7 @@ export class AuthService {
     // Create user
     const user = await this.prisma.user.create({
       data: {
-        phoneNumber: dto.phoneNumber,
+        phoneNumber,
         email: dto.email,
         passwordHash,
         name: dto.contactName,
@@ -260,7 +267,7 @@ export class AuthService {
       data: {
         businessName: dto.businessName,
         contactName: dto.contactName,
-        phoneNumber: dto.phoneNumber,
+        phoneNumber,
         email: dto.email,
         address: dto.address,
         latitude: Number(dto.latitude),
@@ -305,6 +312,46 @@ export class AuthService {
     return this.prisma.user.findUnique({
       where: { email },
     });
+  }
+
+  /**
+   * List users — admin use only.
+   */
+  async listUsers(opts: {
+    role?: string;
+    search?: string;
+    page: number;
+    limit: number;
+  }) {
+    const skip = (opts.page - 1) * opts.limit;
+    const where: any = {};
+    if (opts.role) where.role = opts.role;
+    if (opts.search) {
+      where.OR = [
+        { name:        { contains: opts.search, mode: 'insensitive' } },
+        { email:       { contains: opts.search, mode: 'insensitive' } },
+        { phoneNumber: { contains: opts.search } },
+      ];
+    }
+
+    const [data, total] = await this.prisma.$transaction([
+      this.prisma.user.findMany({
+        where,
+        skip,
+        take: opts.limit,
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true, email: true, phoneNumber: true, name: true,
+          role: true, createdAt: true, updatedAt: true,
+        },
+      }),
+      this.prisma.user.count({ where }),
+    ]);
+
+    return {
+      data,
+      meta: { page: opts.page, limit: opts.limit, total, pages: Math.ceil(total / opts.limit) },
+    };
   }
 
   /**

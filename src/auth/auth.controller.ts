@@ -1,6 +1,7 @@
-import { Body, Controller, Get, Post, UseGuards, Request, Query } from '@nestjs/common';
+import { Body, Controller, Get, Post, UseGuards, Request, Query, BadRequestException } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
+import { AuthGuard } from '../auth/auth.guard';
 import * as bcrypt from 'bcrypt';
 import { RegisterOperatorDto } from './dto/register-operator.dto';
 
@@ -76,6 +77,25 @@ export class AuthController {
   @Get('me')
   async getProfile(@Request() req: any) {
     return this.authService.getUserById(req.user.id);
+  }
+
+  /**
+   * List all users — Super Admin only.
+   * Supports ?role=CUSTOMER|OPERATOR|ADMIN|SUPER_ADMIN&search=&page=&limit=
+   */
+  @UseGuards(AuthGuard)
+  @Get('users')
+  async listUsers(
+    @Request() req: any,
+    @Query('role') role?: string,
+    @Query('search') search?: string,
+    @Query('page') page = '1',
+    @Query('limit') limit = '25',
+  ) {
+    if (req.user.role !== 'SUPER_ADMIN' && req.user.role !== 'ADMIN') {
+      throw new BadRequestException('Forbidden');
+    }
+    return this.authService.listUsers({ role, search, page: +page, limit: +limit });
   }
 
   @Get('hash-password')

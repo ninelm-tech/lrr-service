@@ -89,6 +89,7 @@ model User {
   operatorMemberships OperatorMember[]
   rescueRequests      RescueRequest[]
   subscriptions       Subscription[]
+  whatsAppSession     WhatsAppSession?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -206,19 +207,25 @@ model DispatchOffer {
 }
 
 // WhatsApp conversation sessions (DB-backed, survives restarts)
+// One session per User — userId is the primary lookup key.
+// Twilio gives us a phone number on every inbound message; we always
+// resolve it to a User (creating one if needed) before touching this table.
 model WhatsAppSession {
-  id              String   @id @default(cuid())
-  phoneNumber     String   @unique
+  id      String @id @default(cuid())
+
+  // Every session belongs to exactly one User (created on first SOS if unregistered).
+  userId  String @unique
+  user    User   @relation(fields: [userId], references: [id])
 
   // Flow state (matches WhatsAppFlowState enum)
-  state           String   @default("IDLE")
+  state   String @default("IDLE")
 
   // Location captured during flow
-  latitude        Decimal?
-  longitude       Decimal?
+  latitude    Decimal?
+  longitude   Decimal?
 
   // Issue selected
-  issueType       String?
+  issueType   String?
 
   // Linked rescue request once created
   rescueRequestId String?
@@ -226,14 +233,12 @@ model WhatsAppSession {
   // Payment reference (deposit)
   depositReference String?
 
-  // Dispatch tracking: current round and operators already offered
-  dispatchRound   Int      @default(0)
-  offeredOperatorIds String @default("[]") // JSON array of operator IDs already offered in this cycle
+  // Dispatch tracking
+  dispatchRound      Int    @default(0)
+  offeredOperatorIds String @default("[]") // JSON array of operator IDs already tried
 
-  updatedAt       DateTime @updatedAt
-  createdAt       DateTime @default(now())
-
-  @@index([phoneNumber])
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
 }
 
 // Customer subscriptions (Individual or Commercial/Fleet)

@@ -25,7 +25,8 @@ export enum WhatsAppFlowState {
 export type IssueType = 'BREAKDOWN' | 'ACCIDENT' | 'FLAT_TYRE' | 'FUEL';
 
 export interface WhatsAppSession {
-  phoneNumber: string;
+  /** Always set — every session is owned by a User. */
+  userId: string;
   state: WhatsAppFlowState;
   latitude?: number;
   longitude?: number;

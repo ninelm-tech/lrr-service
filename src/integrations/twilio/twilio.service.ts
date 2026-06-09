@@ -20,9 +20,11 @@ export class TwilioService {
    */
   async sendWhatsAppMessage(to: string, message: string): Promise<void> {
     try {
+      // Accept either "+234..." or "whatsapp:+234..." — normalise here
+      const formattedTo = to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
       const result = await this.client.messages.create({
         from: `whatsapp:${this.whatsappFrom}`,
-        to: to, // Should already be in format 'whatsapp:+234...'
+        to:   formattedTo,
         body: message,
       });
       console.log('WhatsApp message sent:', result.sid);

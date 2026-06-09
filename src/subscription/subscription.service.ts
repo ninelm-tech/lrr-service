@@ -139,11 +139,14 @@ export class SubscriptionService implements OnModuleInit {
 
     const reference = this.paystackService.generateReference('SUB');
 
+    const frontendUrl = this.configService.get<string>('FRONTEND_URL') ?? 'http://localhost:3001';
+
     const checkoutRes = await this.paystackService.initializeSubscriptionCheckout({
       email,
       amount:    planDef.amount,
       plan:      planCode,
       reference,
+      callback_url: `${frontendUrl}/payment/callback`,
       metadata: {
         userId,
         planKey,

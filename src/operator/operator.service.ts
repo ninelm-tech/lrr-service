@@ -340,6 +340,41 @@ export class OperatorService {
   }
 
   // ══════════════════════════════════════════════════════
+  //  MEMBER MANAGEMENT
+  // ══════════════════════════════════════════════════════
+
+  async listMembers(operatorId: string) {
+    return this.prisma.operatorMember.findMany({
+      where: { operatorId },
+      include: { user: { select: { id: true, name: true, email: true, phoneNumber: true, role: true, createdAt: true } } },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  async addMember(operatorId: string, data: { userId: string; role: OperatorMemberRole }) {
+    // Validate user exists
+    const user = await this.prisma.user.findUnique({ where: { id: data.userId } });
+    if (!user) throw new Error('User not found');
+    // Check not already a member
+    const existing = await this.prisma.operatorMember.findUnique({
+      where: { userId_operatorId: { userId: data.userId, operatorId } },
+    });
+    if (existing) throw new Error('User is already a member');
+
+    return this.prisma.operatorMember.create({
+      data: { userId: data.userId, operatorId, role: data.role },
+      include: { user: { select: { id: true, name: true, email: true, phoneNumber: true } } },
+    });
+  }
+
+  async removeMember(operatorId: string, memberId: string) {
+    const member = await this.prisma.operatorMember.findUnique({ where: { id: memberId } });
+    if (!member || member.operatorId !== operatorId) throw new Error('Member not found');
+    if (member.role === OperatorMemberRole.OWNER) throw new Error('Cannot remove the owner');
+    return this.prisma.operatorMember.delete({ where: { id: memberId } });
+  }
+
+  // ══════════════════════════════════════════════════════
   //  PRIVATE HELPERS
   // ══════════════════════════════════════════════════════
 
