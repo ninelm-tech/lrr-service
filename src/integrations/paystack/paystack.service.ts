@@ -153,6 +153,29 @@ export class PaystackService {
   }
 
   /**
+   * Update an existing Paystack plan (e.g. price change).
+   * Note: only affects NEW subscriptions — existing subscribers keep their old amount.
+   */
+  async updatePlan(planCode: string, params: {
+    name?: string;
+    amount?: number;      // in kobo
+    interval?: 'monthly' | 'annually';
+    description?: string;
+  }): Promise<boolean> {
+    const res = await fetch(`${this.baseUrl}/plan/${planCode}`, {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${this.secretKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(params),
+    });
+    const data = await res.json() as any;
+    console.log('Paystack update plan:', planCode, data?.status, data?.message);
+    return Boolean(data?.status);
+  }
+
+  /**
    * List plans — used to find existing plans by name at startup.
    */
   async listPlans(): Promise<Array<{ id: number; plan_code: string; name: string; amount: number; interval: string }>> {

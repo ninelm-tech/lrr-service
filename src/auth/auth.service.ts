@@ -1,4 +1,4 @@
-import { Injectable, UnauthorizedException, ConflictException } from '@nestjs/common';
+import { Injectable, UnauthorizedException, ConflictException, BadRequestException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../prisma/prisma.service';
@@ -286,6 +286,78 @@ export class AuthService {
     });
 
     return { user, operator, operatorMember };
+  }
+
+  /**
+   * Update the authenticated user's own profile.
+   * Email and phone are checked for uniqueness; phone is normalised to E.164
+   * (it is the WhatsApp identity, so it must stay canonical).
+   */
+  async updateProfile(userId: string, dto: { name?: string; email?: string; phoneNumber?: string }) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new UnauthorizedException('User not found');
+
+    const data: { name?: string | null; email?: string; phoneNumber?: string } = {};
+
+    if (dto.name !== undefined) {
+      data.name = dto.name.trim() || null;
+    }
+
+    if (dto.email !== undefined && dto.email.trim()) {
+      const email = dto.email.trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        throw new BadRequestException('Invalid email address');
+      }
+      if (email !== user.email) {
+        const existing = await this.prisma.user.findUnique({ where: { email } });
+        if (existing && existing.id !== userId) throw new ConflictException('Email already in use');
+        data.email = email;
+      }
+    }
+
+    if (dto.phoneNumber !== undefined && dto.phoneNumber.trim()) {
+      const phoneNumber = normalizePhone(dto.phoneNumber);
+      if (phoneNumber !== user.phoneNumber) {
+        const existing = await this.prisma.user.findUnique({ where: { phoneNumber } });
+        if (existing && existing.id !== userId) throw new ConflictException('Phone number already in use');
+        data.phoneNumber = phoneNumber;
+      }
+    }
+
+    if (Object.keys(data).length === 0) return this.getUserById(userId);
+
+    return this.prisma.user.update({
+      where: { id: userId },
+      data,
+      select: { id: true, email: true, phoneNumber: true, name: true, role: true, createdAt: true },
+    });
+  }
+
+  /**
+   * Change (or set) the authenticated user's password.
+   * Requires the current password when one exists. Customers created by the
+   * WhatsApp bot have no password yet — they may set one directly.
+   */
+  async changePassword(userId: string, dto: { currentPassword?: string; newPassword: string }) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new UnauthorizedException('User not found');
+
+    if (!dto.newPassword || dto.newPassword.length < 6) {
+      throw new BadRequestException('New password must be at least 6 characters');
+    }
+
+    if (user.passwordHash) {
+      if (!dto.currentPassword) throw new BadRequestException('Current password is required');
+      const ok = await this.verifyPassword(dto.currentPassword, user.passwordHash);
+      if (!ok) throw new UnauthorizedException('Current password is incorrect');
+    }
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { passwordHash: await this.hashPassword(dto.newPassword) },
+    });
+
+    return { message: 'Password updated successfully' };
   }
 
   /**

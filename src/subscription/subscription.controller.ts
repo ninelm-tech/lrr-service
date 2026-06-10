@@ -11,6 +11,9 @@ import {
 } from '@nestjs/common';
 import { SubscriptionService } from './subscription.service';
 import { AuthGuard } from '../auth/auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
+import { UserRole } from '@prisma/client';
 import type { Request } from 'express';
 
 class InitiateSubscriptionDto {
@@ -30,6 +33,20 @@ export class SubscriptionController {
   @Get('plans')
   getPlans() {
     return { data: this.subscriptionService.getAvailablePlans() };
+  }
+
+  /**
+   * GET /subscriptions/verify/:reference
+   * Called by the payment-callback page after Paystack redirects back.
+   * Verifies the transaction with Paystack and activates the subscription.
+   * Idempotent — safe to call repeatedly while polling.
+   */
+  @Get('verify/:reference')
+  async verifyPayment(@Req() req: Request, @Param('reference') reference: string) {
+    return this.subscriptionService.verifyAndActivate(
+      (req.user as any).userId,
+      reference,
+    );
   }
 
   /**
@@ -64,17 +81,14 @@ export class SubscriptionController {
 
   /**
    * DELETE /subscriptions/:id
-   * Cancel an active subscription.
+   * Cancel a subscription — admin/support only.
+   * Customers cannot self-cancel (non-refundable annual plan; support handles it).
    */
   @Delete(':id')
-  async cancelSubscription(
-    @Req() req: Request,
-    @Param('id') id: string,
-  ) {
-    return this.subscriptionService.cancelSubscription(
-      (req.user as any).userId,
-      id,
-    );
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async cancelSubscription(@Param('id') id: string) {
+    return this.subscriptionService.cancelSubscription(id);
   }
 
   /**

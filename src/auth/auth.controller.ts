@@ -1,9 +1,19 @@
-import { Body, Controller, Get, Post, UseGuards, Request, Query, BadRequestException } from '@nestjs/common';
+import { Body, Controller, Get, Patch, Post, UseGuards, Request, Query, BadRequestException } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { AuthGuard } from '../auth/auth.guard';
-import * as bcrypt from 'bcrypt';
 import { RegisterOperatorDto } from './dto/register-operator.dto';
+
+export class UpdateProfileDto {
+  name?: string;
+  email?: string;
+  phoneNumber?: string;
+}
+
+export class ChangePasswordDto {
+  currentPassword?: string;
+  newPassword: string;
+}
 
 export class LoginDto {
   email: string;
@@ -80,6 +90,25 @@ export class AuthController {
   }
 
   /**
+   * Update the current user's profile (name, email, phone).
+   */
+  @UseGuards(JwtAuthGuard)
+  @Patch('me')
+  async updateProfile(@Request() req: any, @Body() dto: UpdateProfileDto) {
+    const user = await this.authService.updateProfile(req.user.id, dto);
+    return { message: 'Profile updated', data: user };
+  }
+
+  /**
+   * Change (or set) the current user's password.
+   */
+  @UseGuards(JwtAuthGuard)
+  @Post('change-password')
+  async changePassword(@Request() req: any, @Body() dto: ChangePasswordDto) {
+    return this.authService.changePassword(req.user.id, dto);
+  }
+
+  /**
    * List all users — Super Admin only.
    * Supports ?role=CUSTOMER|OPERATOR|ADMIN|SUPER_ADMIN&search=&page=&limit=
    */
@@ -96,12 +125,5 @@ export class AuthController {
       throw new BadRequestException('Forbidden');
     }
     return this.authService.listUsers({ role, search, page: +page, limit: +limit });
-  }
-
-  @Get('hash-password')
-  async hashPassword(@Query('password') password: string) {
-    if (!password) return { error: 'Password is required' };
-    const hash = await bcrypt.hash(password, 10);
-    return { hash };
   }
 }

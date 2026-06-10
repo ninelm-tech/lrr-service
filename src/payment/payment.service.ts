@@ -50,8 +50,9 @@ export class PaymentService {
           await this.rescueRequestService.handleBalancePaymentConfirmed(reference);
 
         } else if (metadata?.type === 'subscription_init') {
-          // First charge of a subscription — handled by invoice.payment_success below
-          console.log('subscription_init charge.success — deferring to invoice.payment_success');
+          // First charge of a plan subscription — Paystack fires charge.success here,
+          // NOT invoice.payment_success (that's mainly renewals). Activate now.
+          await this.subscriptionService.handleSubscriptionInitCharge(data);
 
         } else {
           console.warn('⚠️ Unknown charge metadata type:', metadata?.type);
@@ -81,8 +82,8 @@ export class PaymentService {
 
       // ── Subscription created on Paystack side ────────────────────────────
       case 'subscription.create': {
-        // invoice.payment_success fires alongside this — no duplicate action needed
-        console.log('ℹ️ subscription.create received — handled by invoice.payment_success');
+        // Store the subscription_code so we can cancel/manage it later.
+        await this.subscriptionService.handleSubscriptionCreate(data);
         break;
       }
 

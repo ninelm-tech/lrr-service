@@ -12,8 +12,11 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { OperatorService } from './operator.service';
-import { OperatorMemberRole, OperatorStatus, OperatorType } from '@prisma/client';
+import type { UpdateOperatorProfileDto } from './operator.service';
+import { OperatorMemberRole, OperatorStatus, OperatorType, UserRole } from '@prisma/client';
 import { AuthGuard } from '../auth/auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
 
 class CreateOperatorDto {
   email: string;
@@ -52,6 +55,7 @@ export class OperatorController {
   /**
    * Get all operators
    */
+  @UseGuards(AuthGuard)
   @Get()
   async findAll() {
     const operators = await this.operatorService.findAll();
@@ -62,6 +66,7 @@ export class OperatorController {
    * Get performance stats for ALL operators — admin leaderboard.
    * Must be declared BEFORE `:id` routes to avoid param shadowing.
    */
+  @UseGuards(AuthGuard)
   @Get('all-stats')
   async getAllStats(@Query('days') days?: string) {
     const stats = await this.operatorService.getAllOperatorStats(days ? parseInt(days, 10) : 30);
@@ -75,7 +80,7 @@ export class OperatorController {
   @UseGuards(AuthGuard)
   @Get('me')
   async getMyOperator(@Req() req: any) {
-    const operator = await this.operatorService.findByUserId(req.user.id);
+    const operator = await this.operatorService.findByUserId(req.user.userId);
     if (!operator) throw new NotFoundException('No operator account found for this user');
     return { data: operator };
   }
@@ -83,6 +88,7 @@ export class OperatorController {
   /**
    * Get an operator by ID
    */
+  @UseGuards(AuthGuard)
   @Get(':id')
   async findById(@Param('id') id: string) {
     const operator = await this.operatorService.findById(id);
@@ -92,6 +98,7 @@ export class OperatorController {
   /**
    * Get performance stats for a single operator
    */
+  @UseGuards(AuthGuard)
   @Get(':id/stats')
   async getStats(@Param('id') id: string, @Query('days') days?: string) {
     const stats = await this.operatorService.getOperatorStats(id, days ? parseInt(days, 10) : 30);
@@ -99,8 +106,26 @@ export class OperatorController {
   }
 
   /**
-   * Update operator status (admin)
+   * Update operator business profile.
+   * Allowed: admins, or OWNER/MANAGER members of this operator.
    */
+  @UseGuards(AuthGuard)
+  @Patch(':id')
+  async updateProfile(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() dto: UpdateOperatorProfileDto,
+  ) {
+    await this.operatorService.assertCanManageOperator(req.user, id);
+    const operator = await this.operatorService.updateProfile(id, dto);
+    return { message: 'Operator profile updated', data: operator };
+  }
+
+  /**
+   * Update operator status (verification) — admin only.
+   */
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
   @Patch(':id/status')
   async updateStatus(
     @Param('id') id: string,
@@ -114,14 +139,17 @@ export class OperatorController {
   }
 
   /**
-   * Toggle operator availability
+   * Toggle operator availability — any member of this operator, or admin.
    */
+  @UseGuards(AuthGuard)
   @Patch(':id/availability')
   async setAvailability(
+    @Req() req: any,
     @Param('id') id: string,
     @Body('isAvailable') isAvailable: boolean,
   ) {
-    const operator = await this.operatorService.setAvailability(id, isAvailable);
+    await this.operatorService.assertIsMemberOrAdmin(req.user, id);
+    const operator = await this.operatorService.setAvailability(id, Boolean(isAvailable));
     return {
       message: `Operator availability set to ${isAvailable}`,
       data: operator,
@@ -134,7 +162,8 @@ export class OperatorController {
 
   @UseGuards(AuthGuard)
   @Get(':id/members')
-  async listMembers(@Param('id') id: string) {
+  async listMembers(@Req() req: any, @Param('id') id: string) {
+    await this.operatorService.assertIsMemberOrAdmin(req.user, id);
     const members = await this.operatorService.listMembers(id);
     return { data: members };
   }
@@ -142,9 +171,11 @@ export class OperatorController {
   @UseGuards(AuthGuard)
   @Post(':id/members')
   async addMember(
+    @Req() req: any,
     @Param('id') id: string,
     @Body() body: { userId: string; role?: OperatorMemberRole },
   ) {
+    await this.operatorService.assertCanManageOperator(req.user, id);
     const member = await this.operatorService.addMember(id, {
       userId: body.userId,
       role:   body.role ?? OperatorMemberRole.STAFF,
@@ -155,9 +186,11 @@ export class OperatorController {
   @UseGuards(AuthGuard)
   @Delete(':id/members/:memberId')
   async removeMember(
+    @Req() req: any,
     @Param('id') id: string,
     @Param('memberId') memberId: string,
   ) {
+    await this.operatorService.assertCanManageOperator(req.user, id);
     await this.operatorService.removeMember(id, memberId);
     return { message: 'Member removed' };
   }

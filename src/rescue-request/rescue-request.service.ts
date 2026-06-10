@@ -1,4 +1,4 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import * as Sentry from '@sentry/node';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
@@ -871,6 +871,88 @@ export class RescueRequestService {
     });
     if (!offer) return this.xmlOk();
 
+    const result = await this.processOfferResponse(offer, operator, operatorUserId, accepted);
+    return this.reply(result.message);
+  }
+
+  // ══════════════════════════════════════════════════════
+  //  OFFER RESPONSE — channel-agnostic core
+  //  Used by both the WhatsApp handler above and the dashboard API.
+  // ══════════════════════════════════════════════════════
+
+  /** List PENDING dispatch offers for all operators this user belongs to. */
+  async listMyPendingOffers(userId: string) {
+    const memberships = await this.prisma.operatorMember.findMany({
+      where: { userId },
+      select: { operatorId: true },
+    });
+    if (memberships.length === 0) return { data: [] };
+
+    const offers = await this.prisma.dispatchOffer.findMany({
+      where: {
+        operatorId: { in: memberships.map((m) => m.operatorId) },
+        status: 'PENDING',
+        expiresAt: { gte: new Date() },
+      },
+      include: {
+        rescueRequest: {
+          select: { id: true, issueType: true, latitude: true, longitude: true, status: true, createdAt: true },
+        },
+      },
+      orderBy: { offeredAt: 'desc' },
+    });
+
+    // Note: customer contact details are deliberately NOT exposed before acceptance.
+    return {
+      data: offers.map((o) => ({
+        id:        o.id,
+        offeredAt: o.offeredAt,
+        expiresAt: o.expiresAt,
+        request: {
+          id:        o.rescueRequest.id,
+          issueType: o.rescueRequest.issueType,
+          latitude:  o.rescueRequest.latitude,
+          longitude: o.rescueRequest.longitude,
+          createdAt: o.rescueRequest.createdAt,
+        },
+      })),
+    };
+  }
+
+  /** Accept or decline a dispatch offer from the dashboard. */
+  async respondToOffer(userId: string, offerId: string, accepted: boolean) {
+    const memberships = await this.prisma.operatorMember.findMany({
+      where: { userId },
+      select: { operatorId: true },
+    });
+    const operatorIds = memberships.map((m) => m.operatorId);
+
+    const offer = await this.prisma.dispatchOffer.findUnique({
+      where: { id: offerId },
+      include: { rescueRequest: { include: { customer: true } }, operator: true },
+    });
+
+    if (!offer || !operatorIds.includes(offer.operatorId)) {
+      throw new NotFoundException('Offer not found');
+    }
+    if (offer.status !== 'PENDING') {
+      throw new BadRequestException('This offer is no longer available.');
+    }
+
+    const result = await this.processOfferResponse(offer, offer.operator, userId, accepted);
+    return { data: result };
+  }
+
+  /**
+   * Core accept/decline logic — identical behavior regardless of channel
+   * (WhatsApp reply vs dashboard API). Returns a human-readable outcome.
+   */
+  private async processOfferResponse(
+    offer: { id: string; rescueRequest: any },
+    operator: { id: string; businessName: string; phoneNumber: string },
+    operatorUserId: string,
+    accepted: boolean,
+  ): Promise<{ accepted: boolean; message: string }> {
     const rescueRequest = offer.rescueRequest;
     const customerId    = rescueRequest.customerId;
     const customerPhone = rescueRequest.customer.phoneNumber;
@@ -881,7 +963,7 @@ export class RescueRequestService {
         // Race guard: only proceed if still dispatching
         if (rescueRequest.status === RescueRequestStatus.OPERATOR_ASSIGNED) {
           await this.prisma.dispatchOffer.update({ where: { id: offer.id }, data: { status: 'DECLINED', respondedAt: new Date() } });
-          return this.reply(`Sorry, this job was just taken. Watch for the next one!`);
+          return { accepted: false, message: `Sorry, this job was just taken. Watch for the next one!` };
         }
         await this.prisma.dispatchOffer.update({ where: { id: offer.id }, data: { status: 'ACCEPTED', respondedAt: new Date() } });
         await this.prisma.dispatchOffer.updateMany({ where: { rescueRequestId: rescueRequest.id, status: 'PENDING', id: { not: offer.id } }, data: { status: 'DECLINED', respondedAt: new Date() } });
@@ -891,7 +973,7 @@ export class RescueRequestService {
           await this.twilioService.sendWhatsAppMessage(customerPhone,
             `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nThey're on their way! You'll be notified when they arrive.`);
         }
-        return this.reply(`✅ Job accepted! Head to the customer location.\n📍 Customer: ${customerPhone}\n\nSend *ARRIVED* when you reach them.`);
+        return { accepted: true, message: `✅ Job accepted! Head to the customer location.\n📍 Customer: ${customerPhone}\n\nSend *ARRIVED* on WhatsApp when you reach them.` };
       }
 
       // ── Non-subscriber / exhausted subscriber — find operator first, THEN charge ──
@@ -903,7 +985,7 @@ export class RescueRequestService {
       if (claimed.count === 0) {
         // Another operator got there first
         await this.prisma.dispatchOffer.update({ where: { id: offer.id }, data: { status: 'DECLINED', respondedAt: new Date() } });
-        return this.reply(`Sorry, this job was just taken. Watch for the next one!`);
+        return { accepted: false, message: `Sorry, this job was just taken. Watch for the next one!` };
       }
 
       await this.prisma.dispatchOffer.update({ where: { id: offer.id }, data: { status: 'ACCEPTED', respondedAt: new Date() } });
@@ -947,16 +1029,17 @@ export class RescueRequestService {
         }
       }, DEPOSIT_WINDOW_MS);
 
-      return this.reply(
-        `✅ Job accepted! Stand by — the customer has 5 minutes to confirm payment.\n\nYou'll receive their location and full details once they pay.`,
-      );
+      return {
+        accepted: true,
+        message: `✅ Job accepted! Stand by — the customer has 5 minutes to confirm payment.\n\nYou'll receive their location and full details once they pay.`,
+      };
     } else {
       // Decline — mark this offer; the batch timeout will handle retrying if needed
       await this.prisma.dispatchOffer.update({
         where: { id: offer.id },
         data: { status: 'DECLINED', respondedAt: new Date() },
       });
-      return this.reply(`Understood. We'll offer this job to another operator.`);
+      return { accepted: false, message: `Understood. We'll offer this job to another operator.` };
     }
   }
 
@@ -1111,6 +1194,17 @@ export class RescueRequestService {
   }
 
   async assignOperator(id: string, dto: { operatorId: string }) {
+    if (!dto.operatorId) throw new BadRequestException('operatorId is required');
+
+    const operator = await this.prisma.operator.findUnique({ where: { id: dto.operatorId } });
+    if (!operator) throw new NotFoundException('Operator not found');
+
+    const request = await this.prisma.rescueRequest.findUnique({ where: { id } });
+    if (!request) throw new NotFoundException('Rescue request not found');
+    if (([RescueRequestStatus.COMPLETED, RescueRequestStatus.CANCELLED] as RescueRequestStatus[]).includes(request.status)) {
+      throw new BadRequestException(`Cannot assign an operator to a ${request.status} request`);
+    }
+
     const updated = await this.prisma.rescueRequest.update({
       where: { id },
       data:  { assignedOperatorId: dto.operatorId, status: RescueRequestStatus.OPERATOR_ASSIGNED },
@@ -1128,6 +1222,9 @@ export class RescueRequestService {
 
   async updateStatus(id: string, dto: { status: string }) {
     const status = dto.status as RescueRequestStatus;
+    if (!Object.values(RescueRequestStatus).includes(status)) {
+      throw new BadRequestException(`Invalid status: ${dto.status}`);
+    }
     const updated = await this.prisma.rescueRequest.update({
       where: { id },
       data:  { status },

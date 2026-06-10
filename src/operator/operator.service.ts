@@ -1,7 +1,20 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { OperatorStatus, OperatorType, UserRole, OperatorMemberRole } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
+import { normalizePhone } from '../common/phone.util';
+
+export interface UpdateOperatorProfileDto {
+  businessName?: string;
+  contactName?: string;
+  email?: string;
+  phoneNumber?: string;
+  address?: string;
+  latitude?: number;
+  longitude?: number;
+  type?: OperatorType;
+  serviceRadius?: number;
+}
 
 interface CreateOperatorDto {
   email: string;
@@ -320,6 +333,95 @@ export class OperatorService {
       include: { operator: { include: { members: { include: { user: true } } } } },
     });
     return membership?.operator || null;
+  }
+
+  /**
+   * Authorization helper: can this user manage the given operator?
+   * Admins always can; otherwise the user must be an OWNER or MANAGER member.
+   */
+  async assertCanManageOperator(user: { userId: string; role: string }, operatorId: string): Promise<void> {
+    if (user.role === UserRole.ADMIN || user.role === UserRole.SUPER_ADMIN) return;
+
+    const membership = await this.prisma.operatorMember.findUnique({
+      where: { userId_operatorId: { userId: user.userId, operatorId } },
+    });
+    const allowed: OperatorMemberRole[] = [OperatorMemberRole.OWNER, OperatorMemberRole.MANAGER];
+    if (!membership || !allowed.includes(membership.role)) {
+      throw new ForbiddenException('You do not have permission to manage this operator');
+    }
+  }
+
+  /** Like assertCanManageOperator but any membership counts (e.g. availability toggle). */
+  async assertIsMemberOrAdmin(user: { userId: string; role: string }, operatorId: string): Promise<void> {
+    if (user.role === UserRole.ADMIN || user.role === UserRole.SUPER_ADMIN) return;
+
+    const membership = await this.prisma.operatorMember.findUnique({
+      where: { userId_operatorId: { userId: user.userId, operatorId } },
+    });
+    if (!membership) {
+      throw new ForbiddenException('You are not a member of this operator');
+    }
+  }
+
+  /**
+   * Update an operator's business profile.
+   * Status, availability and verification are deliberately NOT updatable here —
+   * they have their own (admin-guarded) endpoints.
+   */
+  async updateProfile(id: string, dto: UpdateOperatorProfileDto) {
+    const operator = await this.prisma.operator.findUnique({ where: { id } });
+    if (!operator) throw new NotFoundException('Operator not found');
+
+    const data: Record<string, any> = {};
+
+    if (dto.businessName !== undefined) {
+      const name = dto.businessName.trim();
+      if (!name) throw new BadRequestException('Business name cannot be empty');
+      data.businessName = name;
+    }
+    if (dto.contactName !== undefined && dto.contactName.trim()) data.contactName = dto.contactName.trim();
+    if (dto.email !== undefined) data.email = dto.email.trim().toLowerCase() || null;
+    if (dto.address !== undefined && dto.address.trim()) data.address = dto.address.trim();
+
+    if (dto.phoneNumber !== undefined && dto.phoneNumber.trim()) {
+      const phoneNumber = normalizePhone(dto.phoneNumber);
+      if (phoneNumber !== operator.phoneNumber) {
+        const existing = await this.prisma.operator.findUnique({ where: { phoneNumber } });
+        if (existing && existing.id !== id) throw new ConflictException('Phone number already in use by another operator');
+        data.phoneNumber = phoneNumber;
+      }
+    }
+
+    if (dto.latitude !== undefined && dto.longitude !== undefined) {
+      const lat = Number(dto.latitude);
+      const lng = Number(dto.longitude);
+      if (Number.isNaN(lat) || Number.isNaN(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+        throw new BadRequestException('Invalid coordinates');
+      }
+      data.latitude = lat;
+      data.longitude = lng;
+    }
+
+    if (dto.type !== undefined) {
+      if (!Object.values(OperatorType).includes(dto.type)) {
+        throw new BadRequestException(`Invalid operator type: ${dto.type}`);
+      }
+      data.type = dto.type;
+    }
+
+    if (dto.serviceRadius !== undefined) {
+      const radius = Number(dto.serviceRadius);
+      if (Number.isNaN(radius) || radius < 1 || radius > 100) {
+        throw new BadRequestException('Service radius must be between 1 and 100 km');
+      }
+      data.serviceRadius = radius;
+    }
+
+    return this.prisma.operator.update({
+      where: { id },
+      data,
+      include: { members: { include: { user: true } } },
+    });
   }
 
   async updateStatus(id: string, status: OperatorStatus) {

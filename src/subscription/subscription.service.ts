@@ -14,7 +14,7 @@ import { SubscriptionPlan, SubscriptionStatus } from '@prisma/client';
 // These Paystack plan codes are created on first boot and stored in config.
 // They map to the prices in the MVP brief:
 //   Individual monthly:  ₦3,000
-//   Individual annual:   ₦30,000
+//   Individual annual:   ₦50,000
 //   Commercial monthly:  ₦3,000 per vehicle (same plan code — vehicle ref stored on Subscription)
 
 const PLAN_DEFINITIONS = [
@@ -29,7 +29,7 @@ const PLAN_DEFINITIONS = [
   {
     key: 'INDIVIDUAL_ANNUAL',
     name: 'LRR Individual – Annual',
-    amount: 3000000,         // ₦30,000 in kobo
+    amount: 5000000,         // ₦50,000 in kobo
     interval: 'annually' as const,
     plan: SubscriptionPlan.INDIVIDUAL,
     tows: 2,
@@ -45,6 +45,14 @@ const PLAN_DEFINITIONS = [
 ] as const;
 
 type PlanKey = typeof PLAN_DEFINITIONS[number]['key'];
+
+/**
+ * Plans customers can actually buy right now.
+ * MVP launches with the annual plan only — monthly and fleet plans stay
+ * defined (and synced to Paystack) but are hidden from the plan picker and
+ * rejected at checkout until they're launched.
+ */
+const LAUNCHED_PLAN_KEYS: PlanKey[] = ['INDIVIDUAL_ANNUAL'];
 
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -65,14 +73,38 @@ export class SubscriptionService implements OnModuleInit {
    * This is idempotent — safe to run on every deploy.
    */
   async onModuleInit() {
+    await this.syncPlans();
+  }
+
+  /**
+   * Sync Paystack plan codes into the in-memory cache.
+   * Idempotent and safe to retry — also called lazily from initiateSubscription
+   * if the boot-time sync failed (e.g. transient network error on deploy).
+   */
+  private async syncPlans(): Promise<void> {
+    if (!this.configService.get<string>('PAYSTACK_SECRET_KEY')) {
+      console.error(
+        '❌ PAYSTACK_SECRET_KEY is not set — Paystack plans cannot be synced and subscription checkout will fail until it is configured.',
+      );
+      return;
+    }
     try {
       const existing = await this.paystackService.listPlans();
-      const existingByName = new Map(existing.map((p) => [p.name, p.plan_code]));
+      const existingByName = new Map(existing.map((p) => [p.name, p]));
 
       for (const def of PLAN_DEFINITIONS) {
-        if (existingByName.has(def.name)) {
-          this.planCodes[def.key] = existingByName.get(def.name)!;
-          console.log(`✅ Paystack plan cached: ${def.key} → ${this.planCodes[def.key]}`);
+        const found = existingByName.get(def.name);
+        if (found) {
+          this.planCodes[def.key] = found.plan_code;
+          console.log(`✅ Paystack plan cached: ${def.key} → ${found.plan_code}`);
+          // Reconcile price drift: code is the source of truth for plan amounts.
+          // (Only affects new subscriptions — existing subscribers keep their amount.)
+          if (found.amount !== def.amount) {
+            console.warn(
+              `⚠️  Paystack plan ${def.key} amount mismatch (Paystack: ${found.amount}, code: ${def.amount}) — updating Paystack…`,
+            );
+            await this.paystackService.updatePlan(found.plan_code, { amount: def.amount });
+          }
         } else {
           const created = await this.paystackService.createPlan({
             name:        def.name,
@@ -85,8 +117,8 @@ export class SubscriptionService implements OnModuleInit {
         }
       }
     } catch (err) {
-      // Don't crash the app on startup — just warn. Subscriptions won't work until resolved.
-      console.error('⚠️  Failed to sync Paystack plans on startup:', err);
+      // Don't crash the app — just warn. Subscriptions won't work until resolved.
+      console.error('⚠️  Failed to sync Paystack plans:', err);
     }
   }
 
@@ -108,9 +140,17 @@ export class SubscriptionService implements OnModuleInit {
 
     const planDef = PLAN_DEFINITIONS.find((p) => p.key === planKey);
     if (!planDef) throw new BadRequestException(`Invalid plan: ${planKey}`);
+    if (!LAUNCHED_PLAN_KEYS.includes(planKey)) {
+      throw new BadRequestException('This plan is not available yet.');
+    }
 
-    const planCode = this.planCodes[planKey];
-    if (!planCode) throw new BadRequestException('Payment plans not yet synced. Please try again shortly.');
+    let planCode = this.planCodes[planKey];
+    if (!planCode) {
+      // Boot-time sync may have failed — retry once before giving up.
+      await this.syncPlans();
+      planCode = this.planCodes[planKey];
+    }
+    if (!planCode) throw new BadRequestException('Payment plans are currently unavailable. Please try again shortly.');
 
     // Check for existing active subscription
     const existing = await this.prisma.subscription.findFirst({
@@ -181,8 +221,145 @@ export class SubscriptionService implements OnModuleInit {
   }
 
   // ══════════════════════════════════════════════════════
+  //  VERIFY & ACTIVATE (callback-driven — does not depend on webhooks)
+  // ══════════════════════════════════════════════════════
+
+  /**
+   * Called by the frontend payment-callback page after Paystack redirects back.
+   * Verifies the transaction directly with Paystack and activates the
+   * subscription immediately. Idempotent — safe if the webhook already ran.
+   */
+  async verifyAndActivate(userId: string, reference: string) {
+    const verifyRes = await this.paystackService.verifyPayment(reference);
+    const tx = verifyRes?.data;
+
+    if (!verifyRes?.status || tx?.status !== 'success') {
+      // Not an error — payment may still be processing on Paystack's side.
+      return { active: false, message: tx?.status === 'abandoned' ? 'Payment was not completed.' : 'Payment not confirmed yet.' };
+    }
+
+    const meta = tx.metadata ?? {};
+    if (meta.type !== 'subscription_init' || meta.userId !== userId) {
+      throw new BadRequestException('This reference is not a subscription payment for your account.');
+    }
+
+    const sub = await this.activateInitialSubscription({
+      userId,
+      planKey:              meta.planKey,
+      paystackCustomerCode: meta.paystackCustomerCode,
+    });
+
+    if (!sub) {
+      throw new NotFoundException('No pending subscription found for this payment. Please contact support.');
+    }
+
+    return { active: true, subscription: sub };
+  }
+
+  /**
+   * Idempotent activation of the placeholder record created in initiateSubscription.
+   * Used by verifyAndActivate (callback) and handleSubscriptionInitCharge (webhook) —
+   * whichever runs first wins, the second is a no-op.
+   */
+  private async activateInitialSubscription(params: {
+    userId?: string;
+    planKey?: string;
+    paystackCustomerCode?: string;
+  }) {
+    const { userId, planKey, paystackCustomerCode } = params;
+    if (!userId && !paystackCustomerCode) return null;
+
+    const sub = await this.prisma.subscription.findFirst({
+      where: {
+        ...(userId ? { userId } : {}),
+        ...(paystackCustomerCode ? { paystackCustomerCode } : {}),
+      },
+      include: { user: true },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!sub) {
+      console.warn('⚠️  activateInitialSubscription: no subscription record found', params);
+      return null;
+    }
+
+    // Already active for a current period → nothing to do (idempotency).
+    if (sub.status === SubscriptionStatus.ACTIVE && sub.currentPeriodEnd > new Date()) {
+      return sub;
+    }
+
+    const def = PLAN_DEFINITIONS.find((p) => p.key === planKey);
+    const periodStart = new Date();
+    const periodEnd =
+      def?.interval === 'annually' ? this.addOneYear(periodStart) : this.addOneMonth(periodStart);
+
+    const updated = await this.prisma.subscription.update({
+      where: { id: sub.id },
+      data: {
+        status:             SubscriptionStatus.ACTIVE,
+        towsUsedThisMonth:  0,
+        currentPeriodStart: periodStart,
+        currentPeriodEnd:   periodEnd,
+      },
+    });
+
+    console.log(`✅ Subscription activated for user ${sub.userId} (${planKey ?? 'unknown plan'})`);
+
+    // Best-effort WhatsApp confirmation — never block activation on this.
+    const phone = sub.user.phoneNumber;
+    if (phone) {
+      try {
+        const tows = sub.towsIncludedPerMonth;
+        await this.twilioService.sendWhatsAppMessage(
+          phone,
+          `🎉 Your LRR subscription is now active!\n\nYou have ${tows} free tow${tows > 1 ? 's' : ''} this month.\n\nSend SOS or HELP anytime you need roadside assistance — no deposit required.`,
+        );
+      } catch (err) {
+        console.error('Failed to send subscription WhatsApp confirmation:', err);
+      }
+    }
+
+    return updated;
+  }
+
+  // ══════════════════════════════════════════════════════
   //  WEBHOOK HANDLERS
   // ══════════════════════════════════════════════════════
+
+  /**
+   * Called on `charge.success` with metadata.type === 'subscription_init' —
+   * the event Paystack actually fires for the FIRST charge of a plan.
+   * (invoice.payment_success mainly covers renewals.)
+   */
+  async handleSubscriptionInitCharge(data: any) {
+    const meta = data?.metadata ?? {};
+    await this.activateInitialSubscription({
+      userId:               meta.userId,
+      planKey:              meta.planKey,
+      paystackCustomerCode: meta.paystackCustomerCode,
+    });
+  }
+
+  /**
+   * Called on `subscription.create` — stores the Paystack subscription_code
+   * so cancellation and renewals can be managed later.
+   */
+  async handleSubscriptionCreate(data: any) {
+    const customerCode = data?.customer?.customer_code;
+    const subscriptionCode = data?.subscription_code;
+    if (!customerCode || !subscriptionCode) return;
+
+    const sub = await this.prisma.subscription.findFirst({
+      where: { paystackCustomerCode: customerCode },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (sub && sub.paystackSubscriptionCode !== subscriptionCode) {
+      await this.prisma.subscription.update({
+        where: { id: sub.id },
+        data: { paystackSubscriptionCode: subscriptionCode },
+      });
+      console.log(`✅ Stored Paystack subscription code for user ${sub.userId}`);
+    }
+  }
 
   /**
    * Called by PaymentService when Paystack fires `invoice.payment_success`.
@@ -273,12 +450,18 @@ export class SubscriptionService implements OnModuleInit {
   //  CANCEL
   // ══════════════════════════════════════════════════════
 
-  async cancelSubscription(userId: string, subscriptionId: string) {
+  /**
+   * Cancel a subscription — ADMIN/SUPPORT ONLY.
+   * Self-service cancellation was removed by product decision (2026-06-09):
+   * the annual plan is non-refundable, so cancellations are handled by
+   * support to avoid messy refund disputes. Stops Paystack auto-renewal.
+   */
+  async cancelSubscription(subscriptionId: string) {
     const sub = await this.prisma.subscription.findUnique({
       where: { id: subscriptionId },
     });
 
-    if (!sub || sub.userId !== userId) {
+    if (!sub) {
       throw new NotFoundException('Subscription not found');
     }
 
@@ -352,7 +535,7 @@ export class SubscriptionService implements OnModuleInit {
   // ══════════════════════════════════════════════════════
 
   getAvailablePlans() {
-    return PLAN_DEFINITIONS.map((def) => ({
+    return PLAN_DEFINITIONS.filter((def) => LAUNCHED_PLAN_KEYS.includes(def.key)).map((def) => ({
       key:              def.key,
       name:             def.name,
       plan:             def.plan,
@@ -368,6 +551,12 @@ export class SubscriptionService implements OnModuleInit {
   private addOneMonth(date: Date): Date {
     const d = new Date(date);
     d.setMonth(d.getMonth() + 1);
+    return d;
+  }
+
+  private addOneYear(date: Date): Date {
+    const d = new Date(date);
+    d.setFullYear(d.getFullYear() + 1);
     return d;
   }
 }
