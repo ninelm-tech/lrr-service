@@ -12,25 +12,12 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { OperatorService } from './operator.service';
-import type { UpdateOperatorProfileDto } from './operator.service';
+import { CreateOperatorDto } from './dto/create-operator.dto';
+import { UpdateOperatorProfileDto } from './dto/update-operator-profile.dto';
 import { OperatorMemberRole, OperatorStatus, OperatorType, UserRole } from '@prisma/client';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
-
-class CreateOperatorDto {
-  email: string;
-  password: string;
-  name?: string;
-  type?: OperatorType;
-  businessName: string;
-  contactName: string;
-  phoneNumber: string;
-  address: string;
-  latitude: number;
-  longitude: number;
-  serviceRadius?: number;
-}
 
 @Controller('operators')
 export class OperatorController {

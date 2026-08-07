@@ -3,32 +3,8 @@ import { PrismaService } from '../prisma/prisma.service';
 import { OperatorStatus, OperatorType, UserRole, OperatorMemberRole, TruckClass } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { normalizePhone } from '../common/phone.util';
-
-export interface UpdateOperatorProfileDto {
-  businessName?: string;
-  contactName?: string;
-  email?: string;
-  phoneNumber?: string;
-  address?: string;
-  latitude?: number;
-  longitude?: number;
-  type?: OperatorType;
-  serviceRadius?: number;
-}
-
-interface CreateOperatorDto {
-  email: string;
-  password: string;
-  name?: string;
-  type?: OperatorType;
-  businessName: string;
-  contactName: string;
-  phoneNumber: string;
-  address: string;
-  latitude: number;
-  longitude: number;
-  serviceRadius?: number;
-}
+import { CreateOperatorDto } from './dto/create-operator.dto';
+import { UpdateOperatorProfileDto } from './dto/update-operator-profile.dto';
 
 // ── Scoring weights ────────────────────────────────────────────────────────────
 // Distance is the dominant factor but reliability and speed matter.
@@ -89,6 +65,7 @@ export class OperatorService {
       const operator = await tx.operator.create({
         data: {
           type:          data.type ?? OperatorType.TOW_TRUCK,
+          truckClasses:  data.truckClasses,
           businessName:  data.businessName,
           contactName:   data.contactName,
           phoneNumber:   data.phoneNumber,
@@ -411,6 +388,14 @@ export class OperatorService {
         throw new BadRequestException(`Invalid operator type: ${dto.type}`);
       }
       data.type = dto.type;
+    }
+
+    if (dto.truckClasses !== undefined) {
+      const invalid = dto.truckClasses.filter((tc) => !Object.values(TruckClass).includes(tc));
+      if (invalid.length > 0) {
+        throw new BadRequestException(`Invalid truck class(es): ${invalid.join(', ')}`);
+      }
+      data.truckClasses = dto.truckClasses;
     }
 
     if (dto.serviceRadius !== undefined) {
