@@ -7,7 +7,12 @@ import {
   WhatsAppFlowState,
 } from './state/whatsapp-session.types';
 import { PrismaService } from '../prisma/prisma.service';
-import { RescueRequestStatus, UserRole } from '@prisma/client';
+import { RescueRequestStatus, UserRole, VehicleType } from '@prisma/client';
+import {
+  getEligibleTruckClasses,
+  mapVehicleTypeReply,
+  formatVehicleType,
+} from './domain/vehicle-truck-mapping';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { OperatorService } from '../operator/operator.service';
@@ -196,20 +201,37 @@ export class RescueRequestService {
       await this.sessionStore.update(userId, {
         latitude,
         longitude,
-        state: WhatsAppFlowState.WAITING_FOR_ISSUE_TYPE,
+        state: WhatsAppFlowState.WAITING_FOR_VEHICLE_TYPE,
       });
       return this.reply(
-        `📍 Location received!\n\nWhat issue are you having?\n\n1️⃣ Breakdown\n2️⃣ Accident\n3️⃣ Flat tyre\n4️⃣ Fuel`,
+        `📍 Location received!\n\nWhat type of vehicle is it?\n\n1️⃣ Sedan\n2️⃣ SUV\n3️⃣ Armored/Luxury\n4️⃣ Heavy Trailer`,
       );
     }
 
-    // ── Step 2: Waiting for issue type ─────────────────────────────────────
-    if (session.state === WhatsAppFlowState.WAITING_FOR_ISSUE_TYPE) {
-      const issueType = this.mapIssueType(message);
-      if (!issueType) {
-        return this.reply(`Please reply with a number 1-4 to select the issue type.`);
+    // ── Step 2: Waiting for vehicle type ───────────────────────────────────
+    if (session.state === WhatsAppFlowState.WAITING_FOR_VEHICLE_TYPE) {
+      const vehicleType = mapVehicleTypeReply(message);
+      if (!vehicleType) {
+        return this.reply(`Please reply with a number 1-4 to select the vehicle type.`);
       }
-      return this.handleIssueTypeSelected(phoneNumber, userId, session, issueType);
+      await this.sessionStore.update(userId, {
+        vehicleType,
+        state: WhatsAppFlowState.WAITING_FOR_DESTINATION,
+      });
+      return this.reply(
+        `🚗 ${formatVehicleType(vehicleType)} noted!\n\nWhere would you like the car towed to? (e.g. a workshop name or address)`,
+      );
+    }
+
+    // ── Step 3: Waiting for destination ────────────────────────────────────
+    if (session.state === WhatsAppFlowState.WAITING_FOR_DESTINATION) {
+      const destination = message.trim();
+      if (!destination) {
+        return this.reply(`Please type where you'd like the car towed to.`);
+      }
+      return this.handleDestinationProvided(
+        phoneNumber, userId, session, session.vehicleType as VehicleType, destination,
+      );
     }
 
     // ── Step 3: Operator found — waiting for customer to pay ──────────────
@@ -373,11 +395,12 @@ export class RescueRequestService {
   // ──────────────────────────────────────────────────────────────────────────
   //  Issue type selected → subscriber check → deposit or direct dispatch
   // ──────────────────────────────────────────────────────────────────────────
-  private async handleIssueTypeSelected(
+  private async handleDestinationProvided(
     phoneNumber: string,
     userId: string,
     session: Awaited<ReturnType<WhatsAppSessionStore['getOrCreate']>>,
-    issueType: IssueType,
+    vehicleType: VehicleType,
+    destination: string,
   ) {
     const customer = await this.findOrCreateCustomer(phoneNumber);
     const subscription = await this.getActiveSubscription(customer.id);
@@ -393,7 +416,8 @@ export class RescueRequestService {
             status:      RescueRequestStatus.DISPATCHING,
             latitude:    session.latitude,
             longitude:   session.longitude,
-            issueType,
+            vehicleType,
+            destination,
             depositPaid: true,
           },
         });
@@ -404,7 +428,8 @@ export class RescueRequestService {
         });
 
         await this.sessionStore.update(customer.id, {
-          issueType,
+          vehicleType,
+          destination,
           rescueRequestId:    rescueRequest.id,
           state:              WhatsAppFlowState.REQUEST_CONFIRMED,
           dispatchRound:      0,
@@ -414,7 +439,7 @@ export class RescueRequestService {
         const greet = customer.name ? `Hi ${customer.name}! ` : '';
         await this.twilioService.sendWhatsAppMessage(
           phoneNumber,
-          `${greet}✅ Subscriber recognised!\n\nIssue: ${this.formatIssueType(issueType)}\nTows remaining this month: ${towsLeft - 1}\n\nFinding nearest operator...`,
+          `${greet}✅ Subscriber recognised!\n\nVehicle: ${formatVehicleType(vehicleType)}\nDestination: ${destination}\nTows remaining this month: ${towsLeft - 1}\n\nFinding nearest operator...`,
         );
 
         void this.startDispatch(rescueRequest.id, customer.id);
@@ -425,8 +450,6 @@ export class RescueRequestService {
     }
 
     // ── Dispatch-first: find an operator BEFORE charging the customer ─────────
-    // depositAmount is stored on the request; we only generate the payment link
-    // once an operator actually accepts. No charge if nobody is found.
     const isExhaustedSubscriber = !!subscription;
     const depositAmount = isExhaustedSubscriber ? FULL_AMOUNT_KOBO : DEPOSIT_AMOUNT_KOBO;
 
@@ -436,13 +459,15 @@ export class RescueRequestService {
         status:        RescueRequestStatus.DISPATCHING,
         latitude:      session.latitude,
         longitude:     session.longitude,
-        issueType,
-        depositAmount, // stored so we know what to charge when operator accepts
+        vehicleType,
+        destination,
+        depositAmount,
       },
     });
 
     await this.sessionStore.update(customer.id, {
-      issueType,
+      vehicleType,
+      destination,
       rescueRequestId:    rescueRequest.id,
       state:              WhatsAppFlowState.REQUEST_CONFIRMED,
       dispatchRound:      0,
@@ -459,7 +484,7 @@ export class RescueRequestService {
 
     await this.twilioService.sendWhatsAppMessage(
       phoneNumber,
-      `${greet}🔍 ${costNote}Searching for the nearest tow operator...\n\nIssue: ${this.formatIssueType(issueType)}\n${costBreak}\n\n⏳ You will *only be charged once an operator is confirmed*. Reply CANCEL at any time.`,
+      `${greet}🔍 ${costNote}Searching for the nearest tow operator...\n\nVehicle: ${formatVehicleType(vehicleType)}\nDestination: ${destination}\n${costBreak}\n\n⏳ You will *only be charged once an operator is confirmed*. Reply CANCEL at any time.`,
     );
 
     void this.startDispatch(rescueRequest.id, customer.id);
@@ -568,7 +593,7 @@ export class RescueRequestService {
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
         operator
-          ? `✅ *Payment confirmed — operator is on the way!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nIssue: ${this.formatIssueType(rescueRequest.issueType as IssueType)}\n\nYou'll be notified when they arrive.`
+          ? `✅ *Payment confirmed — operator is on the way!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType as VehicleType) : 'Unknown'}\n\nYou'll be notified when they arrive.`
           : `✅ Deposit confirmed! Finding the nearest tow operator...`,
       );
     }
@@ -584,7 +609,7 @@ export class RescueRequestService {
       const lon = rescueRequest.longitude;
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(operator.phoneNumber),
-        `💰 *Payment confirmed — job is live!*\n\nCustomer: ${customerPhone}\nIssue: ${this.formatIssueType(rescueRequest.issueType as IssueType)}\nLocation: https://maps.google.com/?q=${lat},${lon}\n\nHead over now and send *ARRIVED* when you reach them.`,
+        `💰 *Payment confirmed — job is live!*\n\nCustomer: ${customerPhone}\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType as VehicleType) : 'Unknown'}\nLocation: https://maps.google.com/?q=${lat},${lon}\n\nHead over now and send *ARRIVED* when you reach them.`,
       );
     } else {
       // Edge case: no operator was pre-assigned (e.g. admin manually sent a payment link)
@@ -681,9 +706,13 @@ export class RescueRequestService {
     const lat = Number(rescueRequest.latitude);
     const lon = Number(rescueRequest.longitude);
 
+    const eligibleTruckClasses = rescueRequest.vehicleType
+      ? getEligibleTruckClasses(rescueRequest.vehicleType as VehicleType)
+      : undefined;
+
     // Get all ranked candidates (excluding already-offered operators)
     const candidates = await this.operatorService.findAndRankCandidates(
-      lat, lon, alreadyOffered, extraRadiusKm,
+      lat, lon, alreadyOffered, extraRadiusKm, undefined, eligibleTruckClasses,
     );
 
     if (candidates.length === 0) {
@@ -803,16 +832,17 @@ export class RescueRequestService {
       dispatchRound: round,
     });
 
-    const issueLabel = rescueRequest.issueType
-      ? this.formatIssueType(rescueRequest.issueType as IssueType)
+    const vehicleLabel = rescueRequest.vehicleType
+      ? formatVehicleType(rescueRequest.vehicleType as VehicleType)
       : 'Unknown';
+    const destinationLabel = rescueRequest.destination ?? 'Not specified';
 
     // Notify all batch operators simultaneously
     await Promise.all(
       batch.map((op) =>
         this.twilioService.sendWhatsAppMessage(
           toWhatsAppAddress(op.phoneNumber),
-          `🚨 *NEW RESCUE JOB*\n\nIssue: ${issueLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: https://maps.google.com/?q=${lat},${lon}\n\nReply *YES* to accept or *NO* to decline.\nYou have ${windowSeconds} seconds.`,
+          `🚨 *NEW RESCUE JOB*\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: https://maps.google.com/?q=${lat},${lon}\n\nReply *YES* to accept or *NO* to decline.\nYou have ${windowSeconds} seconds.`,
         ),
       ),
     );
