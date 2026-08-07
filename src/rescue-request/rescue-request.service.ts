@@ -57,7 +57,8 @@ export class RescueRequestService {
   async handleIncomingWhatsAppMessage(body: Record<string, any>) {
     // Twilio always delivers E.164 with country code — just strip the whatsapp: prefix
     const phoneNumber: string = String(body.From || '').replace(/^whatsapp:/i, '');
-    const message = String(body.Body || '').trim().toLowerCase();
+    const rawMessage = String(body.Body || '').trim();
+    const message = rawMessage.toLowerCase();
     const latitude  = body.Latitude  ? Number(body.Latitude)  : undefined;
     const longitude = body.Longitude ? Number(body.Longitude) : undefined;
 
@@ -225,7 +226,7 @@ export class RescueRequestService {
 
     // ── Step 3: Waiting for destination ────────────────────────────────────
     if (session.state === WhatsAppFlowState.WAITING_FOR_DESTINATION) {
-      const destination = message.trim();
+      const destination = rawMessage;
       if (!destination) {
         return this.reply(`Please type where you'd like the car towed to.`);
       }

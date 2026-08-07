@@ -49,6 +49,14 @@ export class OperatorService {
   // ══════════════════════════════════════════════════════
 
   async create(data: CreateOperatorDto) {
+    if (!Array.isArray(data.truckClasses) || data.truckClasses.length === 0) {
+      throw new BadRequestException('truckClasses is required and must be a non-empty array');
+    }
+    const invalidTruckClasses = data.truckClasses.filter((tc) => !Object.values(TruckClass).includes(tc));
+    if (invalidTruckClasses.length > 0) {
+      throw new BadRequestException(`Invalid truck class(es): ${invalidTruckClasses.join(', ')}`);
+    }
+
     const passwordHash = await bcrypt.hash(data.password, 10);
 
     return this.prisma.$transaction(async (tx) => {
