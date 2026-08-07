@@ -1,5 +1,8 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { OperatorController } from './operator.controller';
+import { OperatorService } from './operator.service';
+import { AuthGuard } from '../auth/auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
 
 describe('OperatorController', () => {
   let controller: OperatorController;
@@ -9,13 +12,15 @@ describe('OperatorController', () => {
       controllers: [OperatorController],
       providers: [
         {
-          provide: 'OperatorService',
+          provide: OperatorService,
           useValue: {},
         },
       ],
     })
-      .overrideProvider('OperatorService')
-      .useValue({})
+      .overrideGuard(AuthGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(RolesGuard)
+      .useValue({ canActivate: () => true })
       .compile();
 
     controller = module.get<OperatorController>(OperatorController);
