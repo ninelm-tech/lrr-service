@@ -1,6 +1,6 @@
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { OperatorStatus, OperatorType, UserRole, OperatorMemberRole } from '@prisma/client';
+import { OperatorStatus, OperatorType, UserRole, OperatorMemberRole, TruckClass } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { normalizePhone } from '../common/phone.util';
 
@@ -133,6 +133,7 @@ export class OperatorService {
     excludeIds: string[] = [],
     extraRadiusKm: number = 0,
     type?: OperatorType,
+    truckClasses?: TruckClass[],
   ): Promise<ScoredOperator[]> {
     const operators = await this.prisma.operator.findMany({
       where: {
@@ -140,6 +141,9 @@ export class OperatorService {
         isAvailable: true,
         ...(excludeIds.length > 0 && { id: { notIn: excludeIds } }),
         ...(type && { type }),
+        ...(truckClasses && truckClasses.length > 0 && {
+          truckClasses: { hasSome: truckClasses },
+        }),
       },
     });
 
