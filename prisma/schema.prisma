@@ -76,6 +76,20 @@ enum IssueType {
   FUEL
 }
 
+enum TruckClass {
+  LIGHT_DUTY
+  TEN_TYRE
+  LOW_BED
+  HIAB
+}
+
+enum VehicleType {
+  SEDAN
+  SUV
+  ARMORED_LUXURY
+  HEAVY_TRAILER
+}
+
 // ============== MODELS ==============
 
 model User {
@@ -102,6 +116,7 @@ model Operator {
   id            String         @id @default(cuid())
 
   type          OperatorType   @default(TOW_TRUCK)
+  truckClasses  TruckClass[]   @default([])
 
   businessName  String
   contactName   String
@@ -163,6 +178,8 @@ model RescueRequest {
   longitude          Decimal?
 
   issueType          IssueType?
+  vehicleType        VehicleType?
+  destination        String?
 
   depositPaid        Boolean             @default(false)
   depositAmount      Int?
@@ -226,6 +243,8 @@ model WhatsAppSession {
 
   // Issue selected
   issueType   String?
+  vehicleType String?
+  destination String?
 
   // Linked rescue request once created
   rescueRequestId String?
