@@ -40,6 +40,8 @@ export class WhatsAppSessionStore {
     if (updates.latitude !== undefined)         data.latitude = updates.latitude;
     if (updates.longitude !== undefined)        data.longitude = updates.longitude;
     if (updates.issueType !== undefined)        data.issueType = updates.issueType;
+    if (updates.vehicleType !== undefined)      data.vehicleType = updates.vehicleType;
+    if (updates.destination !== undefined)      data.destination = updates.destination;
     if (updates.rescueRequestId !== undefined)  data.rescueRequestId = updates.rescueRequestId;
     if (updates.depositReference !== undefined) data.depositReference = updates.depositReference;
     if (updates.dispatchRound !== undefined)    data.dispatchRound = updates.dispatchRound;
@@ -66,6 +68,8 @@ export class WhatsAppSessionStore {
       latitude: row.latitude != null ? Number(row.latitude) : undefined,
       longitude: row.longitude != null ? Number(row.longitude) : undefined,
       issueType: row.issueType ?? undefined,
+      vehicleType: row.vehicleType ?? undefined,
+      destination: row.destination ?? undefined,
       rescueRequestId: row.rescueRequestId ?? undefined,
       depositReference: row.depositReference ?? undefined,
       dispatchRound: row.dispatchRound ?? 0,

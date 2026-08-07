@@ -1,6 +1,8 @@
 export enum WhatsAppFlowState {
   IDLE = 'IDLE',
   WAITING_FOR_LOCATION = 'WAITING_FOR_LOCATION',
+  WAITING_FOR_VEHICLE_TYPE = 'WAITING_FOR_VEHICLE_TYPE',
+  WAITING_FOR_DESTINATION = 'WAITING_FOR_DESTINATION',
   WAITING_FOR_ISSUE_TYPE = 'WAITING_FOR_ISSUE_TYPE',
   WAITING_FOR_DEPOSIT = 'WAITING_FOR_DEPOSIT',
   REQUEST_CONFIRMED = 'REQUEST_CONFIRMED',
@@ -31,6 +33,8 @@ export interface WhatsAppSession {
   latitude?: number;
   longitude?: number;
   issueType?: IssueType;
+  vehicleType?: string;
+  destination?: string;
   rescueRequestId?: string;
   depositReference?: string;
   // Dispatch tracking — used during operator offer loop
