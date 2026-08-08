@@ -11,6 +11,7 @@ import { OperatorModule } from './operator/operator.module';
 import { AuthModule } from './auth/auth.module';
 import { WebhooksModule } from './webhooks/webhooks.module';
 import { SubscriptionModule } from './subscription/subscription.module';
+import { MediaModule } from './media/media.module';
 import { SentryInterceptor } from './common/sentry.interceptor';
 
 @Module({
@@ -26,6 +27,7 @@ import { SentryInterceptor } from './common/sentry.interceptor';
     OperatorModule,
     WebhooksModule,
     SubscriptionModule,
+    MediaModule,
   ],
   controllers: [AppController],
   providers: [
