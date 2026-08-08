@@ -939,9 +939,15 @@ export class RescueRequestService {
       : 'Unknown';
     const destinationLabel = rescueRequest.destination ?? 'Not specified';
 
-    const mediaItems = await this.prisma.requestMedia.findMany({
-      where: { rescueRequestId },
-    });
+    const mediaItems = await this.prisma.requestMedia
+      .findMany({
+        where: { rescueRequestId },
+      })
+      .catch((error) => {
+        console.error('Failed to fetch media for dispatch offer:', error);
+        Sentry.captureException(error);
+        return [];
+      });
     const mediaSection = this.buildMediaLinksSection(mediaItems);
 
     // Notify all batch operators simultaneously
