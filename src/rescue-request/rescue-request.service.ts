@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import * as Sentry from '@sentry/node';
+import * as crypto from 'crypto';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import {
@@ -7,12 +8,17 @@ import {
   WhatsAppFlowState,
 } from './state/whatsapp-session.types';
 import { PrismaService } from '../prisma/prisma.service';
-import { RescueRequestStatus, UserRole, VehicleType } from '@prisma/client';
+import { RescueRequestStatus, UserRole, VehicleType, MediaType } from '@prisma/client';
 import {
   getEligibleTruckClasses,
   mapVehicleTypeReply,
   formatVehicleType,
 } from './domain/vehicle-truck-mapping';
+import {
+  classifyMediaType,
+  getExtensionFromContentType,
+} from './domain/media-classification';
+import { S3Service } from '../integrations/s3/s3.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { OperatorService } from '../operator/operator.service';
@@ -37,6 +43,7 @@ const DISPATCH_RETRY_MINUTES         = Number(process.env.DISPATCH_RETRY_MINUTES
 const MAX_FAILED_ROUNDS_BEFORE_ALERT = Number(process.env.DISPATCH_MAX_ALERT_ROUND ?? 2);
 const MAX_ROUNDS_BEFORE_AUTO_CANCEL  = Number(process.env.DISPATCH_MAX_ROUNDS     ?? 4);   // ~RETRY*MAX min total
 const RADIUS_EXPANSION_KM = 2;
+const MAX_MEDIA_ITEMS = 5;
 
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -48,6 +55,7 @@ export class RescueRequestService {
     private readonly paystackService: PaystackService,
     private readonly twilioService: TwilioService,
     private readonly operatorService: OperatorService,
+    private readonly s3Service: S3Service,
   ) {}
 
   // ═══════════════════════════════════════════════════════
@@ -230,8 +238,88 @@ export class RescueRequestService {
       if (!destination) {
         return this.reply(`Please type where you'd like the car towed to.`);
       }
-      return this.handleDestinationProvided(
-        phoneNumber, userId, session, session.vehicleType as VehicleType, destination,
+
+      const customer = await this.findOrCreateCustomer(phoneNumber);
+      const rescueRequest = await this.prisma.rescueRequest.create({
+        data: {
+          customerId:  customer.id,
+          status:      RescueRequestStatus.WAITING_FOR_MEDIA,
+          latitude:    session.latitude,
+          longitude:   session.longitude,
+          vehicleType: session.vehicleType as VehicleType,
+          destination,
+        },
+      });
+
+      await this.sessionStore.update(userId, {
+        destination,
+        rescueRequestId: rescueRequest.id,
+        state: WhatsAppFlowState.WAITING_FOR_MEDIA,
+      });
+      return this.reply(
+        `📍 Got it!\n\nPlease send at least one *photo or video* of the vehicle/breakdown (voice notes welcome too, but a photo or video is required).`,
+      );
+    }
+
+    // ── Step 3b: Waiting for media ─────────────────────────────────────────
+    if (session.state === WhatsAppFlowState.WAITING_FOR_MEDIA) {
+      const rescueRequestId = session.rescueRequestId as string;
+
+      if (message === '2') {
+        const visualCount = await this.prisma.requestMedia.count({
+          where: { rescueRequestId, mediaType: { in: [MediaType.IMAGE, MediaType.VIDEO] } },
+        });
+        if (visualCount === 0) {
+          return this.reply(
+            `Please send at least one photo or video before continuing — a voice note alone isn't enough for the operator to assess the vehicle.`,
+          );
+        }
+        return this.handleMediaFinished(phoneNumber, userId, session, rescueRequestId);
+      }
+
+      if (message === '1') {
+        return this.reply(`Go ahead — send your photo(s), video(s), or voice note(s).`);
+      }
+
+      const numMedia = Number(body.NumMedia ?? 0);
+      if (numMedia === 0) {
+        return this.reply(
+          `Please send at least one photo or video (voice notes welcome too).\n\n1️⃣ Add more\n2️⃣ Continue to dispatch`,
+        );
+      }
+
+      const existingCount = await this.prisma.requestMedia.count({ where: { rescueRequestId } });
+      let savedCount = existingCount;
+      let failedCount = 0;
+      let capReached = false;
+
+      for (let i = 0; i < numMedia; i++) {
+        if (savedCount >= MAX_MEDIA_ITEMS) {
+          capReached = true;
+          break;
+        }
+
+        const mediaUrl: string | undefined = body[`MediaUrl${i}`];
+        const contentType: string | undefined = body[`MediaContentType${i}`];
+        if (!mediaUrl || !contentType) continue;
+
+        const saved = await this.captureMediaAttachment(rescueRequestId, mediaUrl, contentType);
+        if (saved) {
+          savedCount++;
+        } else {
+          failedCount++;
+        }
+      }
+
+      const capNote = capReached
+        ? `\n\n⚠️ You've reached the ${MAX_MEDIA_ITEMS}-item limit — further attachments won't be saved.`
+        : '';
+      const failNote = failedCount > 0
+        ? `\n\n⚠️ ${failedCount} item(s) failed to upload — please resend if important.`
+        : '';
+
+      return this.reply(
+        `📸 Received (${savedCount}/${MAX_MEDIA_ITEMS} items saved).${capNote}${failNote}\n\n1️⃣ Add more\n2️⃣ Continue to dispatch`,
       );
     }
 
@@ -252,6 +340,38 @@ export class RescueRequestService {
     return this.reply(
       `👋 Welcome to Lagos Roadside Rescue.\n\nSend HELP or SOS if you need roadside assistance.`,
     );
+  }
+
+  /**
+   * Downloads one Twilio media attachment, uploads it to S3, and creates the
+   * RequestMedia row. Returns false (rather than throwing) on any failure —
+   * a single bad attachment must not break the rest of the batch or the flow.
+   */
+  private async captureMediaAttachment(
+    rescueRequestId: string,
+    mediaUrl: string,
+    contentType: string,
+  ): Promise<boolean> {
+    const mediaType = classifyMediaType(contentType);
+    if (!mediaType) return false;
+
+    try {
+      const buffer = await this.twilioService.downloadMedia(mediaUrl);
+      const extension = getExtensionFromContentType(contentType);
+      const s3Key = `rescue-requests/${rescueRequestId}/${crypto.randomUUID()}.${extension}`;
+
+      await this.s3Service.uploadMedia(buffer, contentType, s3Key);
+
+      await this.prisma.requestMedia.create({
+        data: { rescueRequestId, mediaType, s3Key, contentType },
+      });
+
+      return true;
+    } catch (error) {
+      console.error('Failed to capture media attachment:', error);
+      Sentry.captureException(error);
+      return false;
+    }
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -394,33 +514,27 @@ export class RescueRequestService {
   }
 
   // ──────────────────────────────────────────────────────────────────────────
-  //  Issue type selected → subscriber check → deposit or direct dispatch
+  //  Media capture finished → subscriber check → deposit or direct dispatch
   // ──────────────────────────────────────────────────────────────────────────
-  private async handleDestinationProvided(
+  private async handleMediaFinished(
     phoneNumber: string,
     userId: string,
     session: Awaited<ReturnType<WhatsAppSessionStore['getOrCreate']>>,
-    vehicleType: VehicleType,
-    destination: string,
+    rescueRequestId: string,
   ) {
     const customer = await this.findOrCreateCustomer(phoneNumber);
     const subscription = await this.getActiveSubscription(customer.id);
+    const vehicleType = session.vehicleType as VehicleType;
+    const destination = session.destination as string;
 
     if (subscription) {
       const towsLeft = subscription.towsIncludedPerMonth - subscription.towsUsedThisMonth;
 
       if (towsLeft > 0) {
         // Subscriber with remaining allowance — skip deposit
-        const rescueRequest = await this.prisma.rescueRequest.create({
-          data: {
-            customerId:  customer.id,
-            status:      RescueRequestStatus.DISPATCHING,
-            latitude:    session.latitude,
-            longitude:   session.longitude,
-            vehicleType,
-            destination,
-            depositPaid: true,
-          },
+        await this.prisma.rescueRequest.update({
+          where: { id: rescueRequestId },
+          data: { status: RescueRequestStatus.DISPATCHING, depositPaid: true },
         });
 
         await this.prisma.subscription.update({
@@ -428,10 +542,7 @@ export class RescueRequestService {
           data: { towsUsedThisMonth: { increment: 1 } },
         });
 
-        await this.sessionStore.update(customer.id, {
-          vehicleType,
-          destination,
-          rescueRequestId:    rescueRequest.id,
+        await this.sessionStore.update(userId, {
           state:              WhatsAppFlowState.REQUEST_CONFIRMED,
           dispatchRound:      0,
           offeredOperatorIds: [],
@@ -443,7 +554,7 @@ export class RescueRequestService {
           `${greet}✅ Subscriber recognised!\n\nVehicle: ${formatVehicleType(vehicleType)}\nDestination: ${destination}\nTows remaining this month: ${towsLeft - 1}\n\nFinding nearest operator...`,
         );
 
-        void this.startDispatch(rescueRequest.id, customer.id);
+        void this.startDispatch(rescueRequestId, customer.id);
         return this.xmlOk();
       }
 
@@ -454,22 +565,12 @@ export class RescueRequestService {
     const isExhaustedSubscriber = !!subscription;
     const depositAmount = isExhaustedSubscriber ? FULL_AMOUNT_KOBO : DEPOSIT_AMOUNT_KOBO;
 
-    const rescueRequest = await this.prisma.rescueRequest.create({
-      data: {
-        customerId:    customer.id,
-        status:        RescueRequestStatus.DISPATCHING,
-        latitude:      session.latitude,
-        longitude:     session.longitude,
-        vehicleType,
-        destination,
-        depositAmount,
-      },
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequestId },
+      data: { status: RescueRequestStatus.DISPATCHING, depositAmount },
     });
 
-    await this.sessionStore.update(customer.id, {
-      vehicleType,
-      destination,
-      rescueRequestId:    rescueRequest.id,
+    await this.sessionStore.update(userId, {
       state:              WhatsAppFlowState.REQUEST_CONFIRMED,
       dispatchRound:      0,
       offeredOperatorIds: [],
@@ -488,7 +589,7 @@ export class RescueRequestService {
       `${greet}🔍 ${costNote}Searching for the nearest tow operator...\n\nVehicle: ${formatVehicleType(vehicleType)}\nDestination: ${destination}\n${costBreak}\n\n⏳ You will *only be charged once an operator is confirmed*. Reply CANCEL at any time.`,
     );
 
-    void this.startDispatch(rescueRequest.id, customer.id);
+    void this.startDispatch(rescueRequestId, customer.id);
     return this.xmlOk();
   }
 

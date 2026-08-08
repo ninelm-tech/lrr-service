@@ -6,6 +6,7 @@ import { PrismaModule } from '../prisma/prisma.module';
 import { RescueRequestController } from './rescue-request.controller';
 import { PaystackModule } from '../integrations/paystack/paystack.module';
 import { TwilioModule } from '../integrations/twilio/twilio.module';
+import { S3Module } from '../integrations/s3/s3.module';
 import { OperatorModule } from '../operator/operator.module';
 import { AuthGuard } from '../auth/auth.guard';
 
@@ -14,6 +15,7 @@ import { AuthGuard } from '../auth/auth.guard';
     PrismaModule,
     PaystackModule,
     TwilioModule,
+    S3Module,
     OperatorModule,
     JwtModule.register({
       secret: process.env.JWT_SECRET || 'your-secret-key',
