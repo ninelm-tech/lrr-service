@@ -6,13 +6,15 @@ import { Twilio } from 'twilio';
 export class TwilioService {
   private readonly client: Twilio;
   private readonly whatsappFrom: string;
+  private readonly accountSid: string;
+  private readonly authToken: string;
 
   constructor(private readonly configService: ConfigService) {
-    const accountSid = this.configService.get<string>('TWILIO_ACCOUNT_SID') || '';
-    const authToken = this.configService.get<string>('TWILIO_AUTH_TOKEN') || '';
+    this.accountSid = this.configService.get<string>('TWILIO_ACCOUNT_SID') || '';
+    this.authToken = this.configService.get<string>('TWILIO_AUTH_TOKEN') || '';
     this.whatsappFrom = this.configService.get<string>('TWILIO_WHATSAPP_FROM') || '';
 
-    this.client = new Twilio(accountSid, authToken);
+    this.client = new Twilio(this.accountSid, this.authToken);
   }
 
   /**
@@ -32,5 +34,23 @@ export class TwilioService {
       console.error('Failed to send WhatsApp message:', error);
       throw error;
     }
+  }
+
+  /**
+   * Download media (photo/video/audio) from a Twilio-hosted MediaUrl.
+   * Twilio media URLs require HTTP Basic Auth with the account SID/auth token.
+   */
+  async downloadMedia(url: string): Promise<Buffer> {
+    const credentials = Buffer.from(`${this.accountSid}:${this.authToken}`).toString('base64');
+    const response = await fetch(url, {
+      headers: { Authorization: `Basic ${credentials}` },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to download Twilio media: ${response.status}`);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    return Buffer.from(arrayBuffer);
   }
 }
