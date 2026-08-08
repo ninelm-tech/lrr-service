@@ -939,12 +939,17 @@ export class RescueRequestService {
       : 'Unknown';
     const destinationLabel = rescueRequest.destination ?? 'Not specified';
 
+    const mediaItems = await this.prisma.requestMedia.findMany({
+      where: { rescueRequestId },
+    });
+    const mediaSection = this.buildMediaLinksSection(mediaItems);
+
     // Notify all batch operators simultaneously
     await Promise.all(
       batch.map((op) =>
         this.twilioService.sendWhatsAppMessage(
           toWhatsAppAddress(op.phoneNumber),
-          `🚨 *NEW RESCUE JOB*\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: https://maps.google.com/?q=${lat},${lon}\n\nReply *YES* to accept or *NO* to decline.\nYou have ${windowSeconds} seconds.`,
+          `🚨 *NEW RESCUE JOB*\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: https://maps.google.com/?q=${lat},${lon}${mediaSection}\n\nReply *YES* to accept or *NO* to decline.\nYou have ${windowSeconds} seconds.`,
         ),
       ),
     );
@@ -1624,6 +1629,24 @@ export class RescueRequestService {
 
   private formatStatus(status: RescueRequestStatus): string {
     return status.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+
+  /**
+   * Builds the "Photos/Video/Audio" section appended to the operator offer
+   * message. Best-effort: if API_BASE_URL isn't configured, the section is
+   * simply omitted — this must never block the dispatch offer itself.
+   */
+  private buildMediaLinksSection(mediaItems: Array<{ id: string }>): string {
+    if (mediaItems.length === 0) return '';
+
+    const apiBaseUrl = process.env.API_BASE_URL;
+    if (!apiBaseUrl) return '';
+
+    const links = mediaItems
+      .map((item) => `${apiBaseUrl}/api/v1/media/${item.id}`)
+      .join('\n');
+
+    return `\n\n📎 Photos/Video/Audio:\n${links}`;
   }
 
   private reply(message: string): string {
