@@ -126,7 +126,14 @@ export class RescueRequestService {
             },
           },
         });
-        if (openRequest) {
+        if (openRequest && openRequest.status === RescueRequestStatus.WAITING_FOR_MEDIA) {
+          // Stale request abandoned before any media was sent — nothing else expires it,
+          // so auto-cancel it and let the new SOS proceed normally.
+          await this.prisma.rescueRequest.update({
+            where: { id: openRequest.id },
+            data: { status: RescueRequestStatus.CANCELLED },
+          });
+        } else if (openRequest) {
           return this.reply(
             `⚠️ You already have an active rescue request (${this.formatStatus(openRequest.status)}).\n\nWe're on it! Reply CANCEL to cancel the current request.`,
           );
@@ -263,7 +270,11 @@ export class RescueRequestService {
 
     // ── Step 3b: Waiting for media ─────────────────────────────────────────
     if (session.state === WhatsAppFlowState.WAITING_FOR_MEDIA) {
-      const rescueRequestId = session.rescueRequestId as string;
+      const rescueRequestId = session.rescueRequestId;
+      if (!rescueRequestId) {
+        await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE });
+        return this.reply(`Sorry, we lost track of your request. Please send SOS to start again.`);
+      }
 
       if (message === '2') {
         const visualCount = await this.prisma.requestMedia.count({
@@ -522,10 +533,17 @@ export class RescueRequestService {
     session: Awaited<ReturnType<WhatsAppSessionStore['getOrCreate']>>,
     rescueRequestId: string,
   ) {
-    const customer = await this.findOrCreateCustomer(phoneNumber);
+    const [customer, rescueRequestRow] = await Promise.all([
+      this.prisma.user.findUnique({ where: { id: userId } }),
+      this.prisma.rescueRequest.findUnique({ where: { id: rescueRequestId } }),
+    ]);
+    if (!customer || !rescueRequestRow) {
+      await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE });
+      return this.reply(`Sorry, we lost track of your request. Please send SOS to start again.`);
+    }
     const subscription = await this.getActiveSubscription(customer.id);
-    const vehicleType = session.vehicleType as VehicleType;
-    const destination = session.destination as string;
+    const vehicleType = rescueRequestRow.vehicleType as VehicleType;
+    const destination = rescueRequestRow.destination as string;
 
     if (subscription) {
       const towsLeft = subscription.towsIncludedPerMonth - subscription.towsUsedThisMonth;
