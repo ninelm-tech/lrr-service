@@ -736,6 +736,19 @@ export class RescueRequestService {
       data:  { depositPaid: true, status: RescueRequestStatus.OPERATOR_ASSIGNED },
     });
 
+    // The offer is only actually awarded now that payment is confirmed —
+    // selection alone (Task 8) only reached SELECTED_PENDING_PAYMENT.
+    if (rescueRequest.assignedOperatorId) {
+      await this.prisma.dispatchOffer.updateMany({
+        where: {
+          rescueRequestId: rescueRequest.id,
+          operatorId: rescueRequest.assignedOperatorId,
+          status: 'SELECTED_PENDING_PAYMENT',
+        },
+        data: { status: 'ACCEPTED' },
+      });
+    }
+
     const operator = rescueRequest.assignedOperator;
 
     // Customer: confirmed with operator details
@@ -796,9 +809,10 @@ export class RescueRequestService {
     const customerId    = rescueRequest.customerId;
     const customerPhone = rescueRequest.customer.phoneNumber;
     if (customerPhone) {
+      const balanceNaira = ((rescueRequest.balanceAmount ?? 0) / 100).toLocaleString();
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
-        `✅ Payment of ₦45,000 confirmed! Thank you for using Lagos Roadside Rescue 🙏\n\nHow was your experience? Reply 1–5 to rate your operator.`,
+        `✅ Payment of ₦${balanceNaira} confirmed! Thank you for using Lagos Roadside Rescue 🙏`,
       );
     }
     // Clear customer session
@@ -1584,12 +1598,19 @@ export class RescueRequestService {
     const customerPhone = rescueRequest.customer.phoneNumber;
     if (!customerPhone) return;
 
+    const balanceAmount = rescueRequest.balanceAmount;
+    if (!balanceAmount) {
+      console.error('No balanceAmount persisted for rescue request:', rescueRequest.id);
+      Sentry.captureMessage(`sendBalancePaymentLink: missing balanceAmount for ${rescueRequest.id}`, 'error');
+      return;
+    }
+
     const reference = this.paystackService.generateReference('BAL');
     const email = rescueRequest.customer.email || `${customerPhone.replace(/\D/g, '')}@lrr.ng`;
 
     const paymentResponse = await this.paystackService.initializePayment({
       email,
-      amount: BALANCE_AMOUNT_KOBO,
+      amount: balanceAmount,
       reference,
       metadata: {
         rescueRequestId: rescueRequest.id,
@@ -1606,12 +1627,13 @@ export class RescueRequestService {
 
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequest.id },
-      data:  { balanceAmount: BALANCE_AMOUNT_KOBO, balanceReference: reference },
+      data:  { balanceReference: reference },
     });
 
+    const balanceNaira = (balanceAmount / 100).toLocaleString();
     await this.twilioService.sendWhatsAppMessage(
       customerPhone,
-      `✅ Your tow is complete!\n\nPlease pay the ₦45,000 balance:\n\n${paymentResponse.data.authorization_url}\n\nThank you for using Lagos Roadside Rescue 🚗`,
+      `✅ Your tow is complete!\n\nPlease pay the ₦${balanceNaira} balance:\n\n${paymentResponse.data.authorization_url}\n\nThank you for using Lagos Roadside Rescue 🚗`,
     );
   }
 
