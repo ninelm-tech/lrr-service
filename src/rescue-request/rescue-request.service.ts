@@ -83,6 +83,7 @@ export class RescueRequestService {
     const operatorRecord = await this.prisma.operator.findUnique({
       where: { phoneNumber },
     });
+    
     if (operatorRecord) {
       return this.handleOperatorMessage(phoneNumber, userId, message, session, operatorRecord);
     }
@@ -541,51 +542,12 @@ export class RescueRequestService {
       await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE });
       return this.reply(`Sorry, we lost track of your request. Please send SOS to start again.`);
     }
-    const subscription = await this.getActiveSubscription(customer.id);
     const vehicleType = rescueRequestRow.vehicleType as VehicleType;
     const destination = rescueRequestRow.destination as string;
 
-    if (subscription) {
-      const towsLeft = subscription.towsIncludedPerMonth - subscription.towsUsedThisMonth;
-
-      if (towsLeft > 0) {
-        // Subscriber with remaining allowance — skip deposit
-        await this.prisma.rescueRequest.update({
-          where: { id: rescueRequestId },
-          data: { status: RescueRequestStatus.DISPATCHING, depositPaid: true },
-        });
-
-        await this.prisma.subscription.update({
-          where: { id: subscription.id },
-          data: { towsUsedThisMonth: { increment: 1 } },
-        });
-
-        await this.sessionStore.update(userId, {
-          state:              WhatsAppFlowState.REQUEST_CONFIRMED,
-          dispatchRound:      0,
-          offeredOperatorIds: [],
-        });
-
-        const greet = customer.name ? `Hi ${customer.name}! ` : '';
-        await this.twilioService.sendWhatsAppMessage(
-          phoneNumber,
-          `${greet}✅ Subscriber recognised!\n\nVehicle: ${formatVehicleType(vehicleType)}\nDestination: ${destination}\nTows remaining this month: ${towsLeft - 1}\n\nFinding nearest operator...`,
-        );
-
-        void this.startDispatch(rescueRequestId, customer.id);
-        return this.xmlOk();
-      }
-
-      // Subscriber tows exhausted — fall through to dispatch-first flow with full amount
-    }
-
-    // ── Dispatch-first: find an operator BEFORE charging the customer ─────────
-    const isExhaustedSubscriber = !!subscription;
-    const depositAmount = isExhaustedSubscriber ? FULL_AMOUNT_KOBO : DEPOSIT_AMOUNT_KOBO;
-
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequestId },
-      data: { status: RescueRequestStatus.DISPATCHING, depositAmount },
+      data: { status: RescueRequestStatus.DISPATCHING },
     });
 
     await this.sessionStore.update(userId, {
@@ -594,17 +556,10 @@ export class RescueRequestService {
       offeredOperatorIds: [],
     });
 
-    const greet     = customer.name ? `Hi ${customer.name.split(' ')[0]}! ` : '';
-    const costNote  = isExhaustedSubscriber
-      ? `ℹ️ Monthly tow allowance used up. A one-time fee of ₦50,000 will apply.\n`
-      : ``;
-    const costBreak = depositAmount === FULL_AMOUNT_KOBO
-      ? `💰 Fee if assigned: *₦50,000* (paid in full at confirmation)`
-      : `💰 Total if assigned: *₦50,000* (₦5,000 now · ₦45,000 on completion)`;
-
+    const greet = customer.name ? `Hi ${customer.name.split(' ')[0]}! ` : '';
     await this.twilioService.sendWhatsAppMessage(
       phoneNumber,
-      `${greet}🔍 ${costNote}Searching for the nearest tow operator...\n\nVehicle: ${formatVehicleType(vehicleType)}\nDestination: ${destination}\n${costBreak}\n\n⏳ You will *only be charged once an operator is confirmed*. Reply CANCEL at any time.`,
+      `${greet}🔍 Searching for nearby tow operators...\n\nVehicle: ${formatVehicleType(vehicleType)}\nDestination: ${destination}\n\nOperators will submit their price and ETA — you'll get a shortlist to choose from shortly. Reply CANCEL at any time.`,
     );
 
     void this.startDispatch(rescueRequestId, customer.id);
