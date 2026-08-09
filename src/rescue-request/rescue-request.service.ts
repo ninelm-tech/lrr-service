@@ -14,6 +14,7 @@ import {
   mapVehicleTypeReply,
   formatVehicleType,
 } from './domain/vehicle-truck-mapping';
+import { estimateEtaMinutes } from './domain/quote-ranking';
 import {
   classifyMediaType,
   getExtensionFromContentType,
@@ -396,12 +397,12 @@ export class RescueRequestService {
     session: Awaited<ReturnType<WhatsAppSessionStore['getOrCreate']>>,
     operator: { id: string; businessName: string; phoneNumber: string },
   ) {
-    // ── Dispatch accept / decline ──────────────────────────────────────────
-    if (message === 'yes' || message === 'accept') {
-      return this.handleOperatorResponse(phoneNumber, userId, true);
-    }
+    // ── Dispatch quote / decline ─────────────────────────────────────────
     if (message === 'no' || message === 'decline') {
-      return this.handleOperatorResponse(phoneNumber, userId, false);
+      return this.handleOperatorQuoteOrDecline(phoneNumber, userId, undefined);
+    }
+    if (/^\d+$/.test(message)) {
+      return this.handleOperatorQuoteOrDecline(phoneNumber, userId, Number(message) * 100);
     }
 
     // ── ARRIVED at customer location ───────────────────────────────────────
@@ -433,6 +434,62 @@ export class RescueRequestService {
     }
 
     return this.xmlOk();
+  }
+
+  /**
+   * Channel-agnostic core: an operator submitted a price (quote) or declined
+   * a specific PENDING offer. `quotedPriceKobo` is undefined for a decline.
+   * Used by both the WhatsApp reply handler below and the dashboard quote
+   * endpoint (Task 12) — the only thing that differs between channels is how
+   * the caller resolves `offer` in the first place.
+   */
+  private async processQuoteOrDecline(
+    offer: { id: string; rescueRequestId: string; expiresAt: Date },
+    quotedPriceKobo: number | undefined,
+  ): Promise<{ quoted: boolean; message: string }> {
+    if (quotedPriceKobo === undefined) {
+      await this.prisma.dispatchOffer.update({
+        where: { id: offer.id },
+        data: { status: 'DECLINED', respondedAt: new Date() },
+      });
+      await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.expiresAt);
+      return { quoted: false, message: `Understood. We'll offer this job to another operator.` };
+    }
+
+    await this.prisma.dispatchOffer.update({
+      where: { id: offer.id },
+      data: { status: 'QUOTED', quotedPrice: quotedPriceKobo, respondedAt: new Date() },
+    });
+    await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.expiresAt);
+
+    return {
+      quoted: true,
+      message: `✅ Quote of ₦${(quotedPriceKobo / 100).toLocaleString()} submitted! We'll notify you if you're selected.`,
+    };
+  }
+
+  /**
+   * Operator replied to a dispatch offer with either a price (quote) or NO
+   * (decline) over WhatsApp. `quotedPriceKobo` is undefined for a decline.
+   */
+  private async handleOperatorQuoteOrDecline(
+    operatorPhone: string,
+    operatorUserId: string,
+    quotedPriceKobo: number | undefined,
+  ) {
+    const operator = await this.prisma.operator.findUnique({
+      where: { phoneNumber: operatorPhone },
+    });
+    if (!operator) return this.xmlOk();
+
+    const offer = await this.prisma.dispatchOffer.findFirst({
+      where: { operatorId: operator.id, status: 'PENDING' },
+      orderBy: { offeredAt: 'desc' },
+    });
+    if (!offer) return this.xmlOk();
+
+    const result = await this.processQuoteOrDecline(offer, quotedPriceKobo);
+    return this.reply(result.message);
   }
 
   private async handleOperatorArrived(
@@ -928,7 +985,7 @@ export class RescueRequestService {
       batch.map((op) =>
         this.twilioService.sendWhatsAppMessage(
           toWhatsAppAddress(op.phoneNumber),
-          `🚨 *NEW RESCUE JOB*\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: https://maps.google.com/?q=${lat},${lon}${mediaSection}\n\nReply *YES* to accept or *NO* to decline.\nYou have ${windowSeconds} seconds.`,
+          `🚨 *NEW RESCUE JOB*\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: https://maps.google.com/?q=${lat},${lon}${mediaSection}\n\n💰 Reply with your price to bid, e.g. "25000".\nEst. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.\nReply *NO* to decline.\nYou have ${windowSeconds} seconds.`,
         ),
       ),
     );
@@ -971,24 +1028,6 @@ export class RescueRequestService {
 
     // Move to next batch (same radius — untried operators may still be available)
     void this.startDispatch(rescueRequestId, customerId, extraRadiusKm);
-  }
-
-  private async handleOperatorResponse(operatorPhone: string, operatorUserId: string, accepted: boolean) {
-    // operatorPhone already arrived as +234... from Twilio — use as-is
-    const operator = await this.prisma.operator.findUnique({
-      where: { phoneNumber: operatorPhone },
-    });
-    if (!operator) return this.xmlOk();
-
-    const offer = await this.prisma.dispatchOffer.findFirst({
-      where: { operatorId: operator.id, status: 'PENDING' },
-      include: { rescueRequest: { include: { customer: true } } },
-      orderBy: { offeredAt: 'desc' },
-    });
-    if (!offer) return this.xmlOk();
-
-    const result = await this.processOfferResponse(offer, operator, operatorUserId, accepted);
-    return this.reply(result.message);
   }
 
   // ══════════════════════════════════════════════════════
