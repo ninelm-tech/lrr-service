@@ -21,8 +21,11 @@ enum SubscriptionStatus {
 
 enum DispatchOfferStatus {
   PENDING
+  QUOTED
+  SELECTED_PENDING_PAYMENT
   ACCEPTED
   DECLINED
+  NOT_SELECTED
   TIMED_OUT
 }
 
@@ -190,6 +193,7 @@ model RescueRequest {
 
   depositPaid        Boolean             @default(false)
   depositAmount      Int?
+  serviceFeeAmount    Int?
   depositReference   String?
   balancePaid        Boolean             @default(false)
   balanceAmount      Int?
@@ -209,6 +213,16 @@ model RescueRequest {
   @@index([createdAt])
   @@index([depositReference])
   @@index([balanceReference])
+}
+
+// Singleton row — platform-wide pricing configuration, admin-editable.
+// Read fresh at quote-selection time; never cached, never re-read after a
+// job's amounts are persisted onto its RescueRequest.
+model PlatformConfig {
+  id                String   @id @default(cuid())
+  serviceFeePercent Decimal  @default(10.0)
+  depositPercent    Decimal  @default(10.0)
+  updatedAt         DateTime @updatedAt
 }
 
 // Photos/video/audio submitted by the motorist for a request, forwarded
@@ -239,6 +253,7 @@ model DispatchOffer {
   operator         Operator            @relation(fields: [operatorId], references: [id])
 
   status           DispatchOfferStatus @default(PENDING)
+  quotedPrice      Int?
   offeredAt        DateTime            @default(now())
   respondedAt      DateTime?
   expiresAt        DateTime
