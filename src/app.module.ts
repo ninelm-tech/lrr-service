@@ -12,6 +12,7 @@ import { AuthModule } from './auth/auth.module';
 import { WebhooksModule } from './webhooks/webhooks.module';
 import { SubscriptionModule } from './subscription/subscription.module';
 import { MediaModule } from './media/media.module';
+import { PlatformConfigModule } from './platform-config/platform-config.module';
 import { SentryInterceptor } from './common/sentry.interceptor';
 
 @Module({
@@ -28,6 +29,7 @@ import { SentryInterceptor } from './common/sentry.interceptor';
     WebhooksModule,
     SubscriptionModule,
     MediaModule,
+    PlatformConfigModule,
   ],
   controllers: [AppController],
   providers: [
