@@ -8,6 +8,7 @@ import { PaystackModule } from '../integrations/paystack/paystack.module';
 import { TwilioModule } from '../integrations/twilio/twilio.module';
 import { S3Module } from '../integrations/s3/s3.module';
 import { OperatorModule } from '../operator/operator.module';
+import { PlatformConfigModule } from '../platform-config/platform-config.module';
 import { AuthGuard } from '../auth/auth.guard';
 
 @Module({
@@ -17,6 +18,7 @@ import { AuthGuard } from '../auth/auth.guard';
     TwilioModule,
     S3Module,
     OperatorModule,
+    PlatformConfigModule,
     JwtModule.register({
       secret: process.env.JWT_SECRET || 'your-secret-key',
       signOptions: { expiresIn: '24h' },

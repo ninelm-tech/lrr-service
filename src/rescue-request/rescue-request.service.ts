@@ -14,7 +14,7 @@ import {
   mapVehicleTypeReply,
   formatVehicleType,
 } from './domain/vehicle-truck-mapping';
-import { estimateEtaMinutes } from './domain/quote-ranking';
+import { estimateEtaMinutes, rankQuotes } from './domain/quote-ranking';
 import {
   classifyMediaType,
   getExtensionFromContentType,
@@ -23,6 +23,7 @@ import { S3Service } from '../integrations/s3/s3.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { OperatorService } from '../operator/operator.service';
+import { PlatformConfigService } from '../platform-config/platform-config.service';
 import {
   RescueRequestListResponseDto,
   RescueRequestListItemDto,
@@ -57,6 +58,7 @@ export class RescueRequestService {
     private readonly twilioService: TwilioService,
     private readonly operatorService: OperatorService,
     private readonly s3Service: S3Service,
+    private readonly platformConfigService: PlatformConfigService,
   ) {}
 
   /**
@@ -1083,6 +1085,94 @@ export class RescueRequestService {
     // radius expansion to find candidates — expansion only happens when
     // zero candidates exist at all, a separate path in startDispatch.
     void this.resolveBatch(rescueRequestId, batchOperatorIds, rescueRequest.customerId, 0);
+  }
+
+  private readonly QUOTE_SELECTION_WINDOW_MS = 5 * 60 * 1000;
+
+  private async sendQuoteShortlist(rescueRequestId: string, customerId: string) {
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      include: { customer: true },
+    });
+    if (!rescueRequest) return;
+
+    const quotedOffers = await this.prisma.dispatchOffer.findMany({
+      where: { rescueRequestId, status: 'QUOTED' },
+      include: { operator: true },
+    });
+    if (quotedOffers.length === 0) return;
+
+    const lat = Number(rescueRequest.latitude);
+    const lon = Number(rescueRequest.longitude);
+
+    const forRanking = quotedOffers.map((offer) => {
+      const distance = this.operatorService['calculateDistance'](
+        lat, lon, Number(offer.operator.latitude), Number(offer.operator.longitude),
+      );
+      return {
+        offerId: offer.id,
+        operatorId: offer.operatorId,
+        businessName: offer.operator.businessName,
+        quotedPrice: offer.quotedPrice!,
+        etaMinutes: estimateEtaMinutes(distance),
+      };
+    });
+
+    const ranked = rankQuotes(forRanking); // ranks by raw quotedPrice — markup is a uniform % and never changes order
+
+    const config = await this.platformConfigService.getConfig();
+    const lines = ranked.map((q, i) => {
+      const numberEmoji = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'][i] ?? `${i + 1}.`;
+      // Motorist-facing amount is ALWAYS quotedPrice + service fee — never the raw quote.
+      // This must exactly match what handleQuoteSelected (Task 8) later charges, so the
+      // motorist never sees one number here and a different one at payment.
+      const displayTotal = q.quotedPrice + Math.round((q.quotedPrice * config.serviceFeePercent) / 100);
+      const priceNaira = (displayTotal / 100).toLocaleString();
+      return `${numberEmoji} ₦${priceNaira} · ETA ${q.etaMinutes} min · ${q.businessName}`;
+    });
+
+    const customerPhone = rescueRequest.customer.phoneNumber;
+    if (customerPhone) {
+      await this.twilioService.sendWhatsAppMessage(
+        customerPhone,
+        `🚗 *Operator quotes received!*\n\n${lines.join('\n')}\n\nReply with the number of your choice.`,
+      );
+    }
+
+    await this.sessionStore.update(customerId, {
+      state: WhatsAppFlowState.WAITING_FOR_QUOTE_SELECTION,
+    });
+
+    setTimeout(async () => {
+      const fresh = await this.sessionStore.getOrCreate(customerId);
+      if (fresh.state !== WhatsAppFlowState.WAITING_FOR_QUOTE_SELECTION) return; // already selected
+
+      // Timed out — release every quoting operator and let the motorist retry.
+      await this.prisma.dispatchOffer.updateMany({
+        where: { rescueRequestId, status: 'QUOTED' },
+        data: { status: 'TIMED_OUT', respondedAt: new Date() },
+      });
+      await this.prisma.rescueRequest.update({
+        where: { id: rescueRequestId },
+        data: { status: RescueRequestStatus.CANCELLED },
+      });
+      await this.sessionStore.clear(customerId);
+
+      if (customerPhone) {
+        await this.twilioService.sendWhatsAppMessage(
+          customerPhone,
+          `⏰ You didn't choose a quote in time. Your request has been cancelled — send SOS to start again.`,
+        );
+      }
+      await Promise.all(
+        quotedOffers.map((offer) =>
+          this.twilioService.sendWhatsAppMessage(
+            toWhatsAppAddress(offer.operator.phoneNumber),
+            `⏰ The customer didn't respond in time. You've been released. Watch for new offers!`,
+          ),
+        ),
+      );
+    }, this.QUOTE_SELECTION_WINDOW_MS);
   }
 
   // ══════════════════════════════════════════════════════

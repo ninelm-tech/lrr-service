@@ -6,6 +6,7 @@ import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { OperatorService } from '../operator/operator.service';
 import { S3Service } from '../integrations/s3/s3.service';
+import { PlatformConfigService } from '../platform-config/platform-config.service';
 
 describe('RescueRequestService', () => {
   let service: RescueRequestService;
@@ -21,6 +22,7 @@ describe('RescueRequestService', () => {
         { provide: TwilioService, useValue: {} },
         { provide: OperatorService, useValue: {} },
         { provide: S3Service, useValue: {} },
+        { provide: PlatformConfigService, useValue: {} },
       ],
     }).compile();
 
