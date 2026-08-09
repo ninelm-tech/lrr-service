@@ -33,8 +33,6 @@ import {
 } from './dto/rescue-request-response.dto';
 
 const DEPOSIT_AMOUNT_KOBO = 500000;   // ₦5,000
-const BALANCE_AMOUNT_KOBO = 4500000;  // ₦45,000
-const FULL_AMOUNT_KOBO    = 5000000;  // ₦50,000 (subscriber tow exhausted)
 
 // ── Dispatch config ────────────────────────────────────────────────────────────
 const BATCH_SIZE = 3;                  // operators offered per round simultaneously
@@ -1374,11 +1372,17 @@ export class RescueRequestService {
       },
       include: {
         rescueRequest: {
-          select: { id: true, issueType: true, latitude: true, longitude: true, status: true, createdAt: true },
+          select: {
+            id: true, latitude: true, longitude: true, createdAt: true,
+            vehicleType: true, destination: true,
+            media: { select: { id: true } },
+          },
         },
       },
       orderBy: { offeredAt: 'desc' },
     });
+
+    const apiBaseUrl = process.env.API_BASE_URL;
 
     // Note: customer contact details are deliberately NOT exposed before acceptance.
     return {
@@ -1387,18 +1391,22 @@ export class RescueRequestService {
         offeredAt: o.offeredAt,
         expiresAt: o.expiresAt,
         request: {
-          id:        o.rescueRequest.id,
-          issueType: o.rescueRequest.issueType,
-          latitude:  o.rescueRequest.latitude,
-          longitude: o.rescueRequest.longitude,
-          createdAt: o.rescueRequest.createdAt,
+          id:          o.rescueRequest.id,
+          vehicleType: o.rescueRequest.vehicleType,
+          destination: o.rescueRequest.destination,
+          latitude:    o.rescueRequest.latitude,
+          longitude:   o.rescueRequest.longitude,
+          createdAt:   o.rescueRequest.createdAt,
+          mediaLinks: apiBaseUrl
+            ? o.rescueRequest.media.map((m) => `${apiBaseUrl}/api/v1/media/${m.id}`)
+            : [],
         },
       })),
     };
   }
 
-  /** Accept or decline a dispatch offer from the dashboard. */
-  async respondToOffer(userId: string, offerId: string, accepted: boolean) {
+  /** Submit a price quote (or decline) for a pending offer from the dashboard. */
+  async respondToOffer(userId: string, offerId: string, priceKobo?: number) {
     const memberships = await this.prisma.operatorMember.findMany({
       where: { userId },
       select: { operatorId: true },
@@ -1407,7 +1415,6 @@ export class RescueRequestService {
 
     const offer = await this.prisma.dispatchOffer.findUnique({
       where: { id: offerId },
-      include: { rescueRequest: { include: { customer: true } }, operator: true },
     });
 
     if (!offer || !operatorIds.includes(offer.operatorId)) {
@@ -1417,108 +1424,8 @@ export class RescueRequestService {
       throw new BadRequestException('This offer is no longer available.');
     }
 
-    const result = await this.processOfferResponse(offer, offer.operator, userId, accepted);
+    const result = await this.processQuoteOrDecline(offer, priceKobo);
     return { data: result };
-  }
-
-  /**
-   * Core accept/decline logic — identical behavior regardless of channel
-   * (WhatsApp reply vs dashboard API). Returns a human-readable outcome.
-   */
-  private async processOfferResponse(
-    offer: { id: string; rescueRequest: any },
-    operator: { id: string; businessName: string; phoneNumber: string },
-    operatorUserId: string,
-    accepted: boolean,
-  ): Promise<{ accepted: boolean; message: string }> {
-    const rescueRequest = offer.rescueRequest;
-    const customerId    = rescueRequest.customerId;
-    const customerPhone = rescueRequest.customer.phoneNumber;
-
-    if (accepted) {
-      // ── Subscriber with tows — no deposit needed, confirm immediately ──────
-      if (rescueRequest.depositPaid) {
-        // Race guard: only proceed if still dispatching
-        if (rescueRequest.status === RescueRequestStatus.OPERATOR_ASSIGNED) {
-          await this.prisma.dispatchOffer.update({ where: { id: offer.id }, data: { status: 'DECLINED', respondedAt: new Date() } });
-          return { accepted: false, message: `Sorry, this job was just taken. Watch for the next one!` };
-        }
-        await this.prisma.dispatchOffer.update({ where: { id: offer.id }, data: { status: 'ACCEPTED', respondedAt: new Date() } });
-        await this.prisma.dispatchOffer.updateMany({ where: { rescueRequestId: rescueRequest.id, status: 'PENDING', id: { not: offer.id } }, data: { status: 'DECLINED', respondedAt: new Date() } });
-        await this.prisma.rescueRequest.update({ where: { id: rescueRequest.id }, data: { assignedOperatorId: operator.id, status: RescueRequestStatus.OPERATOR_ASSIGNED } });
-        await this.sessionStore.update(operatorUserId, { state: WhatsAppFlowState.OPERATOR_ON_JOB, rescueRequestId: rescueRequest.id });
-        if (customerPhone) {
-          await this.twilioService.sendWhatsAppMessage(customerPhone,
-            `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nThey're on their way! You'll be notified when they arrive.`);
-        }
-        return { accepted: true, message: `✅ Job accepted! Head to the customer location.\n📍 Customer: ${customerPhone}\n\nSend *ARRIVED* on WhatsApp when you reach them.` };
-      }
-
-      // ── Non-subscriber / exhausted subscriber — find operator first, THEN charge ──
-      // Atomic update: only succeeds if still DISPATCHING (race condition guard)
-      const claimed = await this.prisma.rescueRequest.updateMany({
-        where: { id: rescueRequest.id, status: RescueRequestStatus.DISPATCHING },
-        data:  { assignedOperatorId: operator.id, status: RescueRequestStatus.WAITING_FOR_DEPOSIT },
-      });
-      if (claimed.count === 0) {
-        // Another operator got there first
-        await this.prisma.dispatchOffer.update({ where: { id: offer.id }, data: { status: 'DECLINED', respondedAt: new Date() } });
-        return { accepted: false, message: `Sorry, this job was just taken. Watch for the next one!` };
-      }
-
-      await this.prisma.dispatchOffer.update({ where: { id: offer.id }, data: { status: 'ACCEPTED', respondedAt: new Date() } });
-      await this.prisma.dispatchOffer.updateMany({ where: { rescueRequestId: rescueRequest.id, status: 'PENDING', id: { not: offer.id } }, data: { status: 'DECLINED', respondedAt: new Date() } });
-
-      // Update customer session — they need to pay within 5 minutes
-      await this.sessionStore.update(customerId, { state: WhatsAppFlowState.OPERATOR_FOUND_WAITING_PAYMENT });
-      if (customerPhone) {
-        await this.sendDepositRequestToCustomer(rescueRequest, customerPhone, operator);
-      }
-
-      // 5-minute payment timeout — release operator if customer doesn't pay
-      const DEPOSIT_WINDOW_MS = 5 * 60 * 1000;
-      setTimeout(async () => {
-        const fresh = await this.prisma.rescueRequest.findUnique({
-          where:  { id: rescueRequest.id },
-          select: { status: true },
-        });
-        if (fresh?.status === RescueRequestStatus.WAITING_FOR_DEPOSIT) {
-          // Customer didn't pay — release operator and try next
-          await this.prisma.rescueRequest.update({
-            where: { id: rescueRequest.id },
-            data:  { assignedOperatorId: null, status: RescueRequestStatus.DISPATCHING },
-          });
-          const session = await this.sessionStore.getOrCreate(customerId);
-          await this.sessionStore.update(customerId, {
-            state: WhatsAppFlowState.REQUEST_CONFIRMED,
-            offeredOperatorIds: [...(session.offeredOperatorIds ?? []), operator.id],
-          });
-          if (customerPhone) {
-            await this.twilioService.sendWhatsAppMessage(
-              customerPhone,
-              `⏰ Payment window expired. Looking for the next available operator...`,
-            );
-          }
-          void this.startDispatch(rescueRequest.id, customerId);
-          await this.twilioService.sendWhatsAppMessage(
-            toWhatsAppAddress(operator.phoneNumber),
-            `⏰ The customer did not pay within 5 minutes. You have been released. Watch for new offers!`,
-          );
-        }
-      }, DEPOSIT_WINDOW_MS);
-
-      return {
-        accepted: true,
-        message: `✅ Job accepted! Stand by — the customer has 5 minutes to confirm payment.\n\nYou'll receive their location and full details once they pay.`,
-      };
-    } else {
-      // Decline — mark this offer; the batch timeout will handle retrying if needed
-      await this.prisma.dispatchOffer.update({
-        where: { id: offer.id },
-        data: { status: 'DECLINED', respondedAt: new Date() },
-      });
-      return { accepted: false, message: `Understood. We'll offer this job to another operator.` };
-    }
   }
 
   // ══════════════════════════════════════════════════════
@@ -1541,57 +1448,6 @@ export class RescueRequestService {
     if (!subscription && !rescueRequest.balancePaid) {
       await this.sendBalancePaymentLink(rescueRequest);
     }
-  }
-
-  // ──────────────────────────────────────────────────────────────────────────
-  //  Send deposit payment link to customer once operator has been confirmed
-  // ──────────────────────────────────────────────────────────────────────────
-  private async sendDepositRequestToCustomer(
-    rescueRequest: any,
-    customerPhone: string,
-    operator: { id: string; businessName: string; phoneNumber: string },
-  ) {
-    const amountKobo = rescueRequest.depositAmount ?? DEPOSIT_AMOUNT_KOBO;
-    const isFullPayment = amountKobo === FULL_AMOUNT_KOBO;
-
-    const reference = this.paystackService.generateReference('DEP');
-    const email     = rescueRequest.customer?.email
-      ?? `${customerPhone.replace(/\D/g, '')}@lrr.ng`;
-
-    const paymentResponse = await this.paystackService.initializePayment({
-      email,
-      amount:   amountKobo,
-      reference,
-      metadata: {
-        rescueRequestId: rescueRequest.id,
-        customerId:      rescueRequest.customerId,
-        phoneNumber:     customerPhone,
-        type:            'deposit',
-      },
-    });
-
-    if (!paymentResponse.status) {
-      console.error('Failed to create deposit payment link:', paymentResponse);
-      await this.twilioService.sendWhatsAppMessage(
-        customerPhone,
-        `⚠️ Operator found but we couldn't generate a payment link. Our team has been alerted. Reply CANCEL to cancel.`,
-      );
-      return;
-    }
-
-    await this.prisma.rescueRequest.update({
-      where: { id: rescueRequest.id },
-      data:  { depositReference: reference },
-    });
-
-    const costLine = isFullPayment
-      ? `💰 Amount: *₦50,000* (one-time full payment)`
-      : `💰 Deposit: *₦5,000* now · ₦45,000 balance on completion`;
-
-    await this.twilioService.sendWhatsAppMessage(
-      customerPhone,
-      `🚗 *Operator found!*\n\nBusiness: ${operator.businessName}\n${costLine}\n\n⏳ You have *5 minutes* to confirm:\n\n${paymentResponse.data.authorization_url}\n\nThe operator is standing by. Reply CANCEL to cancel (no charge).`,
-    );
   }
 
   private async sendBalancePaymentLink(rescueRequest: any) {

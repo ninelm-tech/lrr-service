@@ -30,19 +30,20 @@ export class RescueRequestController {
     return this.rescueRequestService.listMyPendingOffers((req.user as any).userId);
   }
 
-  /** Accept or decline a pending offer from the dashboard. */
+  /** Submit a quote or decline a pending offer from the dashboard. */
   @Post('offers/:offerId/respond')
   @UseGuards(RolesGuard)
   @Roles(UserRole.OPERATOR)
   async respondToOffer(
     @Req() req: Request,
     @Param('offerId') offerId: string,
-    @Body() body: { accept: boolean },
+    @Body() body: { priceNaira?: number },
   ) {
+    const priceKobo = body.priceNaira !== undefined ? Math.round(body.priceNaira * 100) : undefined;
     return this.rescueRequestService.respondToOffer(
       (req.user as any).userId,
       offerId,
-      Boolean(body.accept),
+      priceKobo,
     );
   }
 
