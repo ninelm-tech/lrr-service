@@ -59,6 +59,16 @@ export class RescueRequestService {
     private readonly s3Service: S3Service,
   ) {}
 
+  /**
+   * In-memory map from rescueRequestId to the pending batch-window timer.
+   * Doubles as a simple single-process mutex: whichever code path (the
+   * timer firing, or an operator's response completing the batch early)
+   * finds and deletes the entry first is the one that resolves the batch;
+   * the other finds it already gone and returns immediately. Fine for a
+   * single-instance pilot deployment — not a distributed lock.
+   */
+  private readonly batchTimers = new Map<string, NodeJS.Timeout>();
+
   // ═══════════════════════════════════════════════════════
   //  WHATSAPP FLOW — incoming message handler
   // ═══════════════════════════════════════════════════════
@@ -990,20 +1000,28 @@ export class RescueRequestService {
       ),
     );
 
-    // Single timeout covers the entire batch
-    setTimeout(
-      () => void this.handleBatchTimeout(rescueRequestId, batchOperatorIds, customerId, extraRadiusKm),
+    // Single timeout covers the entire batch — stored so an early-resolved
+    // batch (Step below) can prevent this from firing a second time.
+    const timer = setTimeout(
+      () => void this.resolveBatch(rescueRequestId, batchOperatorIds, customerId, extraRadiusKm),
       windowSeconds * 1000,
     );
+    this.batchTimers.set(rescueRequestId, timer);
   }
 
-  private async handleBatchTimeout(
+  private async resolveBatch(
     rescueRequestId: string,
     batchOperatorIds: string[],
     customerId: string,
     extraRadiusKm: number,
   ) {
-    // Race condition guard — skip if someone already accepted
+    // Mutex: only the caller that finds (and removes) the timer entry proceeds.
+    const timer = this.batchTimers.get(rescueRequestId);
+    if (!timer) return; // already resolved by the other path
+    clearTimeout(timer);
+    this.batchTimers.delete(rescueRequestId);
+
+    // Race condition guard — skip if the request moved on for any other reason
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
       where: { id: rescueRequestId },
       select: { status: true },
@@ -1026,8 +1044,45 @@ export class RescueRequestService {
       data: { status: 'TIMED_OUT', respondedAt: new Date() },
     });
 
-    // Move to next batch (same radius — untried operators may still be available)
+    const quotedOffers = await this.prisma.dispatchOffer.findMany({
+      where: { rescueRequestId, status: 'QUOTED' },
+    });
+
+    if (quotedOffers.length > 0) {
+      await this.sendQuoteShortlist(rescueRequestId, customerId);
+      return;
+    }
+
+    // No quotes at all this round — move to next batch (same radius; untried
+    // operators may still be available), exactly as before.
     void this.startDispatch(rescueRequestId, customerId, extraRadiusKm);
+  }
+
+  /**
+   * Called after each operator quote/decline. If every operator in the
+   * current batch has now responded, resolves the batch immediately instead
+   * of waiting out the rest of the window.
+   */
+  private async maybeResolveBatchEarly(rescueRequestId: string, batchExpiresAt: Date) {
+    const batchOffers = await this.prisma.dispatchOffer.findMany({
+      where: { rescueRequestId, expiresAt: batchExpiresAt },
+      select: { operatorId: true, status: true },
+    });
+    const stillPending = batchOffers.some((o) => o.status === 'PENDING');
+    if (stillPending) return;
+
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      select: { customerId: true },
+    });
+    if (!rescueRequest) return;
+
+    const batchOperatorIds = batchOffers.map((o) => o.operatorId);
+    // extraRadiusKm isn't tracked per-batch outside the session; 0 is correct
+    // here because an early-resolved batch (all responded) never needed a
+    // radius expansion to find candidates — expansion only happens when
+    // zero candidates exist at all, a separate path in startDispatch.
+    void this.resolveBatch(rescueRequestId, batchOperatorIds, rescueRequest.customerId, 0);
   }
 
   // ══════════════════════════════════════════════════════
