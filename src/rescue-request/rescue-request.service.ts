@@ -348,6 +348,15 @@ export class RescueRequestService {
       );
     }
 
+    // ── Step 3c: Waiting for quote selection ───────────────────────────────
+    if (session.state === WhatsAppFlowState.WAITING_FOR_QUOTE_SELECTION) {
+      const choice = Number(message);
+      if (!Number.isInteger(choice) || choice < 1) {
+        return this.reply(`Please reply with the number of the quote you'd like to choose.`);
+      }
+      return this.handleQuoteSelected(phoneNumber, userId, choice);
+    }
+
     // ── Step 3: Operator found — waiting for customer to pay ──────────────
     if (session.state === WhatsAppFlowState.OPERATOR_FOUND_WAITING_PAYMENT) {
       return this.reply(
@@ -1173,6 +1182,161 @@ export class RescueRequestService {
         ),
       );
     }, this.QUOTE_SELECTION_WINDOW_MS);
+  }
+
+  private async handleQuoteSelected(phoneNumber: string, userId: string, choice: number) {
+    const session = await this.sessionStore.getOrCreate(userId);
+    const rescueRequestId = session.rescueRequestId;
+    if (!rescueRequestId) {
+      await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE });
+      return this.reply(`Sorry, we lost track of your request. Please send SOS to start again.`);
+    }
+
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      include: { customer: true },
+    });
+    if (!rescueRequest) {
+      return this.reply(`Sorry, we lost track of your request. Please send SOS to start again.`);
+    }
+
+    const quotedOffers = await this.prisma.dispatchOffer.findMany({
+      where: { rescueRequestId, status: 'QUOTED' },
+      include: { operator: true },
+    });
+    if (quotedOffers.length === 0) {
+      return this.reply(`Sorry, those quotes are no longer available.`);
+    }
+
+    const lat = Number(rescueRequest.latitude);
+    const lon = Number(rescueRequest.longitude);
+    const forRanking = quotedOffers.map((offer) => ({
+      offerId: offer.id,
+      operatorId: offer.operatorId,
+      businessName: offer.operator.businessName,
+      quotedPrice: offer.quotedPrice!,
+      etaMinutes: estimateEtaMinutes(
+        this.operatorService['calculateDistance'](lat, lon, Number(offer.operator.latitude), Number(offer.operator.longitude)),
+      ),
+    }));
+    const ranked = rankQuotes(forRanking);
+
+    const selected = ranked[choice - 1];
+    if (!selected) {
+      return this.reply(`That's not one of the options. Please reply with a valid number from the list.`);
+    }
+
+    // Atomic claim — only proceeds if the request is still DISPATCHING.
+    const claimed = await this.prisma.rescueRequest.updateMany({
+      where: { id: rescueRequestId, status: RescueRequestStatus.DISPATCHING },
+      data: { status: RescueRequestStatus.WAITING_FOR_DEPOSIT },
+    });
+    if (claimed.count === 0) {
+      return this.reply(`Sorry, this request has already moved on.`);
+    }
+
+    const config = await this.platformConfigService.getConfig();
+    const serviceFeeAmount = Math.round((selected.quotedPrice * config.serviceFeePercent) / 100);
+    const total = selected.quotedPrice + serviceFeeAmount;
+    const depositAmount = Math.round((total * config.depositPercent) / 100);
+    const balanceAmount = total - depositAmount;
+
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequestId },
+      data: { serviceFeeAmount, depositAmount, balanceAmount, assignedOperatorId: selected.operatorId },
+    });
+
+    const selectedOffer = quotedOffers.find((o) => o.id === selected.offerId)!;
+    await this.prisma.dispatchOffer.update({
+      where: { id: selectedOffer.id },
+      data: { status: 'SELECTED_PENDING_PAYMENT', respondedAt: new Date() },
+    });
+    await this.prisma.dispatchOffer.updateMany({
+      where: { rescueRequestId, status: 'QUOTED', id: { not: selectedOffer.id } },
+      data: { status: 'NOT_SELECTED', respondedAt: new Date() },
+    });
+
+    // Notify the operators who weren't picked.
+    await Promise.all(
+      quotedOffers
+        .filter((o) => o.id !== selectedOffer.id)
+        .map((o) =>
+          this.twilioService.sendWhatsAppMessage(
+            toWhatsAppAddress(o.operator.phoneNumber),
+            `Sorry, the customer chose another quote — thanks for bidding!`,
+          ),
+        ),
+    );
+
+    await this.sessionStore.update(userId, { state: WhatsAppFlowState.OPERATOR_FOUND_WAITING_PAYMENT });
+
+    const operator = selectedOffer.operator;
+    const reference = this.paystackService.generateReference('DEP');
+    const email = rescueRequest.customer.email ?? `${phoneNumber.replace(/\D/g, '')}@lrr.ng`;
+
+    const paymentResponse = await this.paystackService.initializePayment({
+      email,
+      amount: depositAmount,
+      reference,
+      metadata: {
+        rescueRequestId,
+        customerId: rescueRequest.customerId,
+        phoneNumber,
+        type: 'deposit',
+      },
+    });
+
+    if (!paymentResponse.status) {
+      console.error('Failed to create deposit payment link:', paymentResponse);
+      return this.reply(`⚠️ We couldn't generate a payment link. Our team has been alerted. Reply CANCEL to cancel.`);
+    }
+
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequestId },
+      data: { depositReference: reference },
+    });
+
+    const depositNaira = (depositAmount / 100).toLocaleString();
+    const balanceNaira = (balanceAmount / 100).toLocaleString();
+
+    void this.twilioService.sendWhatsAppMessage(
+      phoneNumber,
+      `🚗 *Operator selected!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⏳ You have *5 minutes* to confirm:\n\n${paymentResponse.data.authorization_url}\n\nThe operator is standing by. Reply CANCEL to cancel (no charge).`,
+    );
+
+    const DEPOSIT_WINDOW_MS = 5 * 60 * 1000;
+    setTimeout(async () => {
+      const fresh = await this.prisma.rescueRequest.findUnique({
+        where: { id: rescueRequestId },
+        select: { status: true },
+      });
+      if (fresh?.status !== RescueRequestStatus.WAITING_FOR_DEPOSIT) return;
+
+      await this.prisma.dispatchOffer.update({
+        where: { id: selectedOffer.id },
+        data: { status: 'TIMED_OUT', respondedAt: new Date() },
+      });
+      await this.prisma.rescueRequest.update({
+        where: { id: rescueRequestId },
+        data: { assignedOperatorId: null, status: RescueRequestStatus.DISPATCHING },
+      });
+      const freshSession = await this.sessionStore.getOrCreate(rescueRequest.customerId);
+      await this.sessionStore.update(rescueRequest.customerId, {
+        state: WhatsAppFlowState.REQUEST_CONFIRMED,
+        offeredOperatorIds: [...(freshSession.offeredOperatorIds ?? []), operator.id],
+      });
+      await this.twilioService.sendWhatsAppMessage(
+        phoneNumber,
+        `⏰ Payment window expired. Looking for the next available operator...`,
+      );
+      void this.startDispatch(rescueRequestId, rescueRequest.customerId);
+      await this.twilioService.sendWhatsAppMessage(
+        toWhatsAppAddress(operator.phoneNumber),
+        `⏰ The customer did not pay within 5 minutes. You have been released. Watch for new offers!`,
+      );
+    }, DEPOSIT_WINDOW_MS);
+
+    return this.xmlOk();
   }
 
   // ══════════════════════════════════════════════════════
