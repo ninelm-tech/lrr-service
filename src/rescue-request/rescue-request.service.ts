@@ -29,6 +29,7 @@ import {
   RescueRequestListItemDto,
   RescueRequestDetailResponseDto,
   RescueRequestDetailDto,
+  DispatchOfferAdminDto,
   PaginationMetaDto,
 } from './dto/rescue-request-response.dto';
 
@@ -850,8 +851,8 @@ export class RescueRequestService {
     // Notify customer — payment confirmed
     const customerId    = rescueRequest.customerId;
     const customerPhone = rescueRequest.customer.phoneNumber;
+    const balanceNaira  = ((rescueRequest.balanceAmount ?? 0) / 100).toLocaleString();
     if (customerPhone) {
-      const balanceNaira = ((rescueRequest.balanceAmount ?? 0) / 100).toLocaleString();
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
         `✅ Payment of ₦${balanceNaira} confirmed! Thank you for using Lagos Roadside Rescue 🙏`,
@@ -868,7 +869,7 @@ export class RescueRequestService {
     if (operator?.phoneNumber) {
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(operator.phoneNumber),
-        `💵 *Payment received!*\n\nThe customer has paid the ₦45,000 balance in full.\n\n✅ You may now *release the vehicle*. Job complete — well done!\n\nYour payment will be remitted within 24 hours.`,
+        `💵 *Payment received!*\n\nThe customer has paid the ₦${balanceNaira} balance in full.\n\n✅ You may now *release the vehicle*. Job complete — well done!\n\nYour payment will be remitted within 24 hours.`,
       );
       // Clear operator session
       const opUser = await this.findOrCreateCustomer(operator.phoneNumber);
@@ -1570,22 +1571,6 @@ export class RescueRequestService {
     return this.buildListResponse(where, Number(page), Number(limit));
   }
 
-  async adminDetail(id: string) {
-    const raw = await this.prisma.rescueRequest.findUnique({
-      where: { id },
-      include: {
-        customer:        { select: { id: true, phoneNumber: true, email: true, name: true } },
-        assignedOperator: { select: { id: true, businessName: true, phoneNumber: true, email: true } },
-        dispatchOffers:  {
-          include: { operator: { select: { id: true, businessName: true } } },
-          orderBy: { offeredAt: 'asc' },
-        },
-      },
-    });
-    if (!raw) throw new UnauthorizedException('Rescue request not found');
-    return { data: { ...this.mapToDetailDto(raw), dispatchOffers: raw.dispatchOffers } };
-  }
-
   async assignOperator(id: string, dto: { operatorId: string }) {
     if (!dto.operatorId) throw new BadRequestException('operatorId is required');
 
@@ -1743,11 +1728,30 @@ export class RescueRequestService {
       include: {
         customer:        { select: { id: true, phoneNumber: true, email: true, name: true } },
         assignedOperator: { select: { id: true, businessName: true, phoneNumber: true, email: true } },
+        media:            { select: { id: true } },
+        dispatchOffers:   {
+          include: { operator: { select: { id: true, businessName: true } } },
+          orderBy: { offeredAt: 'asc' },
+        },
       },
     });
     if (!raw) throw new UnauthorizedException('Rescue request not found');
 
-    if (role === 'SUPER_ADMIN' || role === 'ADMIN') return { data: this.mapToDetailDto(raw) };
+    if (role === 'SUPER_ADMIN' || role === 'ADMIN') {
+      const config = await this.platformConfigService.getConfig();
+      const offers: DispatchOfferAdminDto[] = raw.dispatchOffers.map((o: any) => ({
+        operatorId:          o.operatorId,
+        businessName:        o.operator.businessName,
+        status:              o.status,
+        quotedPrice:         o.quotedPrice ?? undefined,
+        motoristFacingTotal: o.quotedPrice
+          ? o.quotedPrice + Math.round((o.quotedPrice * config.serviceFeePercent) / 100)
+          : undefined,
+        offeredAt:   o.offeredAt,
+        respondedAt: o.respondedAt ?? undefined,
+      }));
+      return { data: this.mapToDetailDto(raw, offers) };
+    }
 
     if (role === 'OPERATOR') {
       const memberships = await this.prisma.operatorMember.findMany({
@@ -1834,11 +1838,19 @@ export class RescueRequestService {
     return { data, meta };
   }
 
-  private mapToDetailDto(raw: any): RescueRequestDetailDto {
+  private mapToDetailDto(raw: any, offers?: DispatchOfferAdminDto[]): RescueRequestDetailDto {
+    const apiBaseUrl = process.env.API_BASE_URL;
+    const mediaLinks: string[] = raw.media && apiBaseUrl
+      ? raw.media.map((m: { id: string }) => `${apiBaseUrl}/api/v1/media/${m.id}`)
+      : [];
+
     return {
       id:               raw.id,
       status:           raw.status,
-      issueType:        raw.issueType  ?? undefined,
+      issueType:        raw.issueType    ?? undefined,
+      vehicleType:      raw.vehicleType  ?? undefined,
+      destination:      raw.destination  ?? undefined,
+      mediaLinks,
       latitude:         raw.latitude   ? Number(raw.latitude)  : undefined,
       longitude:        raw.longitude  ? Number(raw.longitude) : undefined,
       depositPaid:      raw.depositPaid,
@@ -1863,6 +1875,7 @@ export class RescueRequestService {
         : undefined,
       createdAt: raw.createdAt,
       updatedAt: raw.updatedAt,
+      offers,
     };
   }
 

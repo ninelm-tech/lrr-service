@@ -1,4 +1,4 @@
-import { RescueRequestStatus, IssueType } from '@prisma/client';
+import { RescueRequestStatus, IssueType, VehicleType, DispatchOfferStatus } from '@prisma/client';
 
 export class CustomerSummaryDto {
   id: string;
@@ -38,10 +38,23 @@ export class RescueRequestListItemDto {
   updatedAt: Date;
 }
 
+export class DispatchOfferAdminDto {
+  operatorId: string;
+  businessName: string;
+  status: DispatchOfferStatus;
+  quotedPrice?: number;
+  motoristFacingTotal?: number;
+  offeredAt: Date;
+  respondedAt?: Date;
+}
+
 export class RescueRequestDetailDto {
   id: string;
   status: RescueRequestStatus;
   issueType?: IssueType;
+  vehicleType?: VehicleType;
+  destination?: string;
+  mediaLinks: string[];
   latitude?: number;
   longitude?: number;
   depositPaid: boolean;
@@ -54,6 +67,7 @@ export class RescueRequestDetailDto {
   assignedOperator?: OperatorDetailDto;
   createdAt: Date;
   updatedAt: Date;
+  offers?: DispatchOfferAdminDto[];
 }
 
 export class PaginationMetaDto {
