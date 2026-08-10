@@ -69,6 +69,19 @@ export class RescueRequestService {
    */
   private readonly batchTimers = new Map<string, NodeJS.Timeout>();
 
+  /**
+   * In-memory map from rescueRequestId to a short grace-period timer, started
+   * the moment the FIRST quote in a batch arrives. If the rest of the batch
+   * stays silent, we don't make the motorist wait out the full window for a
+   * shortlist that already has a usable quote — resolveBatch fires early with
+   * whatever's in by then (any still-PENDING offers are marked TIMED_OUT, same
+   * as a normal window expiry). Guarded by the same batchTimers mutex inside
+   * resolveBatch, so this is safe to fire even if the batch already resolved
+   * some other way by the time it goes off.
+   */
+  private readonly graceTimers = new Map<string, NodeJS.Timeout>();
+  private readonly QUOTE_GRACE_MS = 25 * 1000;
+
   // ═══════════════════════════════════════════════════════
   //  WHATSAPP FLOW — incoming message handler
   // ═══════════════════════════════════════════════════════
@@ -480,11 +493,42 @@ export class RescueRequestService {
       data: { status: 'QUOTED', quotedPrice: quotedPriceKobo, respondedAt: new Date() },
     });
     await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.expiresAt);
+    this.scheduleGraceResolve(offer.rescueRequestId, offer.expiresAt);
 
     return {
       quoted: true,
       message: `✅ Quote of ₦${(quotedPriceKobo / 100).toLocaleString()} submitted! We'll notify you if you're selected.`,
     };
+  }
+
+  /**
+   * Starts (once per batch) the QUOTE_GRACE_MS countdown after a batch's
+   * first quote arrives. If nothing else has resolved the batch by then,
+   * forces resolution with whatever quotes exist rather than making the
+   * motorist wait out the rest of the full window for silent operators.
+   */
+  private scheduleGraceResolve(rescueRequestId: string, batchExpiresAt: Date) {
+    if (this.graceTimers.has(rescueRequestId)) return; // already scheduled for this batch
+
+    const timer = setTimeout(async () => {
+      this.graceTimers.delete(rescueRequestId);
+      const batchOffers = await this.prisma.dispatchOffer.findMany({
+        where: { rescueRequestId, expiresAt: batchExpiresAt },
+        select: { operatorId: true },
+      });
+      const rescueRequest = await this.prisma.rescueRequest.findUnique({
+        where: { id: rescueRequestId },
+        select: { customerId: true },
+      });
+      if (!rescueRequest) return;
+
+      // extraRadiusKm is 0 here for the same reason maybeResolveBatchEarly uses
+      // 0 — a grace-forced resolve already has at least one quote, so it never
+      // needs a radius expansion to find candidates.
+      void this.resolveBatch(rescueRequestId, batchOffers.map((o) => o.operatorId), rescueRequest.customerId, 0);
+    }, this.QUOTE_GRACE_MS);
+
+    this.graceTimers.set(rescueRequestId, timer);
   }
 
   /**
@@ -1043,6 +1087,13 @@ export class RescueRequestService {
     if (!timer) return; // already resolved by the other path
     clearTimeout(timer);
     this.batchTimers.delete(rescueRequestId);
+
+    // This batch is resolving now — no need for a pending grace timer to fire later.
+    const graceTimer = this.graceTimers.get(rescueRequestId);
+    if (graceTimer) {
+      clearTimeout(graceTimer);
+      this.graceTimers.delete(rescueRequestId);
+    }
 
     // Race condition guard — skip if the request moved on for any other reason
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
