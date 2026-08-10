@@ -151,5 +151,28 @@ describe('RescueRequestService', () => {
 
       expect(result.data.offers).toBeUndefined();
     });
+
+    it('returns data for a CUSTOMER who owns the request', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        ...baseRaw,
+        customerId: 'cust-1',
+      });
+
+      const result = await detailService.detailForUser({ role: 'CUSTOMER', userId: 'cust-1' }, 'req-1');
+
+      expect(result.data.vehicleType).toBe('SEDAN');
+      expect(result.data.offers).toBeUndefined();
+    });
+
+    it('rejects a CUSTOMER who does not own the request', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        ...baseRaw,
+        customerId: 'cust-1',
+      });
+
+      await expect(
+        detailService.detailForUser({ role: 'CUSTOMER', userId: 'someone-else' }, 'req-1'),
+      ).rejects.toThrow('You do not have access to this rescue request');
+    });
   });
 });

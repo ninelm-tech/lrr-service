@@ -1765,7 +1765,14 @@ export class RescueRequestService {
       return { data: this.mapToDetailDto(raw) };
     }
 
-    throw new UnauthorizedException('Customers do not have access to rescue request details');
+    if (role === 'CUSTOMER') {
+      if (raw.customerId !== userId) {
+        throw new UnauthorizedException('You do not have access to this rescue request');
+      }
+      return { data: this.mapToDetailDto(raw) };
+    }
+
+    throw new UnauthorizedException('Access denied');
   }
 
   // ══════════════════════════════════════════════════════
