@@ -430,6 +430,20 @@ git add src/rating src/app.module.ts
 git commit -m "feat(rating): add RatingService and public two-way rating endpoints"
 ```
 
+**Implementation note:** `dto/rating-response.dto.ts` (Step 3) was renamed
+to `dto/rating.dto.ts` and extended with a proper class-validator-decorated
+`SubmitRatingCommentDto` for the `PATCH` body, replacing the plan's
+originally-inline `@Body() body: { comment: string }` — the codebase's
+CLAUDE.md explicitly requires request DTOs to be decorated classes, never
+inline types. Note this repo has no global `ValidationPipe` wired up
+anywhere yet (confirmed by checking `main.ts` and the existing
+`platform-config` controller), so the decorators don't actually enforce
+anything today — the controller's manual `if (!body.comment...)` check is
+what actually validates, kept deliberately alongside the decorators for
+when that gap gets addressed. `npx prisma generate` was also needed after
+Task 1's migration — `migrate dev` alone left the TS client stale in this
+session.
+
 ---
 
 ### Task 3: WhatsApp flow — prompt, collect, and link (both directions)

@@ -13,6 +13,7 @@ import { WebhooksModule } from './webhooks/webhooks.module';
 import { SubscriptionModule } from './subscription/subscription.module';
 import { MediaModule } from './media/media.module';
 import { PlatformConfigModule } from './platform-config/platform-config.module';
+import { RatingModule } from './rating/rating.module';
 import { SentryInterceptor } from './common/sentry.interceptor';
 
 @Module({
@@ -30,6 +31,7 @@ import { SentryInterceptor } from './common/sentry.interceptor';
     SubscriptionModule,
     MediaModule,
     PlatformConfigModule,
+    RatingModule,
   ],
   controllers: [AppController],
   providers: [
