@@ -145,10 +145,17 @@ model Operator {
   verifiedAt    DateTime?
   notes         String?
 
+  bankCode              String?
+  bankName              String?
+  accountNumber         String?
+  accountName           String?
+  paystackRecipientCode String?
+
   members        OperatorMember[]
   rescueRequests RescueRequest[]
   dispatchOffers DispatchOffer[]
   ratings        Rating[]
+  payouts        Payout[]
 
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
@@ -210,6 +217,7 @@ model RescueRequest {
   dispatchOffers     DispatchOffer[]
   media              RequestMedia[]
   ratings            Rating[]
+  payout             Payout?
 
   @@index([customerId])
   @@index([status])
@@ -367,4 +375,43 @@ model Subscription {
   @@index([userId])
   @@index([status])
   @@index([currentPeriodEnd])
+}
+
+enum PayoutStatus {
+  PENDING     // created; either not yet attempted, or blocked from attempting (see blockReason)
+  PROCESSING  // transfer initiated, awaiting webhook confirmation
+  SUCCESS
+  FAILED      // an actual transfer attempt was made and did not succeed
+}
+
+enum PayoutBlockReason {
+  NO_BANK_DETAILS
+  INSUFFICIENT_BALANCE
+}
+
+// One payout per completed job — created and processed synchronously
+// inside handleBalancePaymentConfirmed. PENDING with a non-null blockReason
+// means the payout was never attempted (no bank details / insufficient
+// platform balance); FAILED means an attempt was made and did not succeed.
+// Both cases require an admin-triggered retry — never auto-retried.
+model Payout {
+  id                   String             @id @default(cuid())
+
+  rescueRequestId      String             @unique
+  rescueRequest        RescueRequest      @relation(fields: [rescueRequestId], references: [id])
+
+  operatorId           String
+  operator             Operator           @relation(fields: [operatorId], references: [id])
+
+  amount               Int
+  status               PayoutStatus       @default(PENDING)
+  blockReason          PayoutBlockReason?
+  paystackTransferCode String?
+  failureReason        String?
+
+  createdAt            DateTime           @default(now())
+  completedAt          DateTime?
+
+  @@index([operatorId])
+  @@index([status])
 }
