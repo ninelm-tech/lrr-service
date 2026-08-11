@@ -538,6 +538,7 @@ describe('RescueRequestService', () => {
       rescueRequest: { findUnique: jest.Mock };
       operator: { findUnique: jest.Mock };
       dispatchOffer: { create: jest.Mock; updateMany: jest.Mock };
+      requestMedia: { findMany: jest.Mock };
     };
     let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
     let twilioService: { sendWhatsAppMessage: jest.Mock };
@@ -547,9 +548,10 @@ describe('RescueRequestService', () => {
         rescueRequest: { findUnique: jest.fn() },
         operator: { findUnique: jest.fn() },
         dispatchOffer: { create: jest.fn(), updateMany: jest.fn() },
+        requestMedia: { findMany: jest.fn().mockResolvedValue([]) },
       };
       sessionStore = {
-        getOrCreate: jest.fn().mockResolvedValue({ offeredOperatorIds: ['op-already-tried'] }),
+        getOrCreate: jest.fn().mockResolvedValue({ offeredOperatorIds: ['op-already-tried'], dispatchRound: 1 }),
         update: jest.fn(),
       };
       twilioService = { sendWhatsAppMessage: jest.fn() };
@@ -619,6 +621,71 @@ describe('RescueRequestService', () => {
 
       // Clean up the real timer this test scheduled
       clearTimeout((manualService as any).batchTimers.get('req-1'));
+    });
+
+    it('supersedes a pre-existing batchTimers entry (e.g. an untracked-style automatic retry) instead of leaking it', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+        vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+      });
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1', status: 'ACTIVE', businessName: 'Swift Towing', phoneNumber: '+2349012345678',
+      });
+      prisma.dispatchOffer.updateMany.mockResolvedValue({ count: 0 });
+      prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
+
+      // Simulate a previously-scheduled round-continuation timer (e.g. the
+      // automatic DISPATCH_RETRY_MINUTES retry) sitting in batchTimers.
+      const priorTimer = setTimeout(() => {}, 100000);
+      (manualService as any).batchTimers.set('req-1', priorTimer);
+
+      await manualService.manualOfferToOperator('req-1', 'op-1');
+
+      // The prior timer must have been cleared/replaced, not overwritten
+      // silently while still pending — batchTimers now holds a fresh timer.
+      const newTimer = (manualService as any).batchTimers.get('req-1');
+      expect(newTimer).toBeDefined();
+      expect(newTimer).not.toBe(priorTimer);
+
+      clearTimeout(newTimer);
+      clearTimeout(priorTimer);
+    });
+
+    it('passes the current accumulated radius (not a hardcoded 0) to resolveBatch on timeout, and includes media links in the message', async () => {
+      jest.useFakeTimers();
+      const prevApiBaseUrl = process.env.API_BASE_URL;
+      process.env.API_BASE_URL = 'https://api.example.com';
+      try {
+        prisma.rescueRequest.findUnique.mockResolvedValue({
+          id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+          vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+        });
+        prisma.operator.findUnique.mockResolvedValue({
+          id: 'op-1', status: 'ACTIVE', businessName: 'Swift Towing', phoneNumber: '+2349012345678',
+        });
+        prisma.dispatchOffer.updateMany.mockResolvedValue({ count: 0 });
+        prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
+        prisma.requestMedia.findMany.mockResolvedValue([{ id: 'media-1' }]);
+        // session.dispatchRound is 1 → currentRadius should be 1 * RADIUS_EXPANSION_KM (2), not 0
+        sessionStore.getOrCreate.mockResolvedValue({ offeredOperatorIds: [], dispatchRound: 1 });
+
+        const resolveBatchSpy = jest.spyOn(manualService as any, 'resolveBatch').mockResolvedValue(undefined);
+
+        await manualService.manualOfferToOperator('req-1', 'op-1');
+
+        expect(prisma.requestMedia.findMany).toHaveBeenCalledWith({ where: { rescueRequestId: 'req-1' } });
+        expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.stringContaining('media-1'),
+        );
+
+        jest.advanceTimersByTime(5 * 60 * 1000);
+
+        expect(resolveBatchSpy).toHaveBeenCalledWith('req-1', ['op-1'], 'cust-1', 2);
+      } finally {
+        jest.useRealTimers();
+        process.env.API_BASE_URL = prevApiBaseUrl;
+      }
     });
   });
 });

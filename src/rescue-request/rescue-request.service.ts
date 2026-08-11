@@ -1062,10 +1062,11 @@ export class RescueRequestService {
       }
 
       const expandedRadius = extraRadiusKm + RADIUS_EXPANSION_KM;
-      setTimeout(
+      const retryTimer = setTimeout(
         () => void this.startDispatch(rescueRequestId, customerId, expandedRadius),
         DISPATCH_RETRY_MINUTES * 60 * 1000,
       );
+      this.batchTimers.set(rescueRequestId, retryTimer);
       return;
     }
 
@@ -1313,13 +1314,25 @@ export class RescueRequestService {
       : 'Unknown';
     const destinationLabel = rescueRequest.destination ?? 'Not specified';
 
+    const mediaItems = await this.prisma.requestMedia
+      .findMany({
+        where: { rescueRequestId },
+      })
+      .catch((error) => {
+        console.error('Failed to fetch media for dispatch offer:', error);
+        Sentry.captureException(error);
+        return [];
+      });
+    const mediaSection = this.buildMediaLinksSection(mediaItems);
+
     await this.twilioService.sendWhatsAppMessage(
       toWhatsAppAddress(operator.phoneNumber),
-      `🚨 *NEW RESCUE JOB*\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nLocation: https://maps.google.com/?q=${lat},${lon}\n\n💰 Reply with your price to bid, e.g. "25000".\nReply *NO* to decline.\nYou have 5 minutes.`,
+      `🚨 *NEW RESCUE JOB*\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nLocation: https://maps.google.com/?q=${lat},${lon}${mediaSection}\n\n💰 Reply with your price to bid, e.g. "25000".\nReply *NO* to decline.\nYou have 5 minutes.`,
     );
 
+    const currentRadius = (session.dispatchRound ?? 0) * RADIUS_EXPANSION_KM;
     const timer = setTimeout(
-      () => void this.resolveBatch(rescueRequestId, [operatorId], rescueRequest.customerId, 0),
+      () => void this.resolveBatch(rescueRequestId, [operatorId], rescueRequest.customerId, currentRadius),
       MANUAL_OFFER_WINDOW_MS,
     );
     this.batchTimers.set(rescueRequestId, timer);
