@@ -48,6 +48,16 @@ export class DispatchOfferAdminDto {
   respondedAt?: Date;
 }
 
+export class DispatchBoardRowDto {
+  id: string;
+  status: RescueRequestStatus;
+  vehicleType?: VehicleType;
+  destination?: string;
+  round: number;
+  createdAt: Date;
+  offers: DispatchOfferAdminDto[];
+}
+
 export class RescueRequestDetailDto {
   id: string;
   status: RescueRequestStatus;

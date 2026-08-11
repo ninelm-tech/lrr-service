@@ -32,6 +32,7 @@ import {
   RescueRequestDetailResponseDto,
   RescueRequestDetailDto,
   DispatchOfferAdminDto,
+  DispatchBoardRowDto,
   PaginationMetaDto,
 } from './dto/rescue-request-response.dto';
 
@@ -1879,6 +1880,53 @@ export class RescueRequestService {
     }
 
     throw new UnauthorizedException('Access denied');
+  }
+
+  async getDispatchBoard(): Promise<DispatchBoardRowDto[]> {
+    const sixtyMinAgo = new Date(Date.now() - 60 * 60 * 1000);
+
+    const requests = await this.prisma.rescueRequest.findMany({
+      where: {
+        OR: [
+          { status: RescueRequestStatus.DISPATCHING },
+          {
+            status: { in: [RescueRequestStatus.OPERATOR_ASSIGNED, RescueRequestStatus.CANCELLED] },
+            updatedAt: { gte: sixtyMinAgo },
+          },
+        ],
+      },
+      include: {
+        dispatchOffers: {
+          include: { operator: { select: { businessName: true } } },
+          orderBy: { offeredAt: 'asc' },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const customerIds = [...new Set(requests.map((r) => r.customerId))];
+    const sessions = await this.prisma.whatsAppSession.findMany({
+      where: { userId: { in: customerIds } },
+      select: { userId: true, dispatchRound: true },
+    });
+    const roundByCustomerId = new Map(sessions.map((s) => [s.userId, s.dispatchRound]));
+
+    return requests.map((r) => ({
+      id: r.id,
+      status: r.status,
+      vehicleType: r.vehicleType ?? undefined,
+      destination: r.destination ?? undefined,
+      round: roundByCustomerId.get(r.customerId) ?? 0,
+      createdAt: r.createdAt,
+      offers: r.dispatchOffers.map((o) => ({
+        operatorId: o.operatorId,
+        businessName: o.operator.businessName,
+        status: o.status,
+        quotedPrice: o.quotedPrice ?? undefined,
+        offeredAt: o.offeredAt,
+        respondedAt: o.respondedAt ?? undefined,
+      })),
+    }));
   }
 
   // ══════════════════════════════════════════════════════

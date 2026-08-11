@@ -358,4 +358,112 @@ describe('RescueRequestService', () => {
       expect(payoutServiceMock.createAndProcessPayout).toHaveBeenCalledWith('req-1', 'op-1', 225000);
     });
   });
+
+  describe('getDispatchBoard', () => {
+    let boardService: RescueRequestService;
+    let prisma: {
+      rescueRequest: { findMany: jest.Mock };
+      whatsAppSession: { findMany: jest.Mock };
+    };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: { findMany: jest.fn() },
+        whatsAppSession: { findMany: jest.fn() },
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestService,
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: S3Service, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PayoutService, useValue: {} },
+        ],
+      }).compile();
+
+      boardService = module.get<RescueRequestService>(RescueRequestService);
+    });
+
+    it('queries DISPATCHING requests plus resolved ones from the last 60 minutes, with offers and round number', async () => {
+      prisma.rescueRequest.findMany.mockResolvedValue([
+        {
+          id: 'req-1',
+          status: 'DISPATCHING',
+          vehicleType: 'SEDAN',
+          destination: 'Lekki',
+          createdAt: new Date('2026-08-12T10:00:00Z'),
+          customerId: 'cust-1',
+          dispatchOffers: [
+            {
+              operatorId: 'op-1',
+              status: 'PENDING',
+              quotedPrice: null,
+              offeredAt: new Date('2026-08-12T10:00:00Z'),
+              respondedAt: null,
+              operator: { businessName: 'Swift Towing' },
+            },
+          ],
+        },
+      ]);
+      prisma.whatsAppSession.findMany.mockResolvedValue([
+        { userId: 'cust-1', dispatchRound: 2 },
+      ]);
+
+      const result = await boardService.getDispatchBoard();
+
+      expect(prisma.rescueRequest.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            OR: [
+              { status: 'DISPATCHING' },
+              {
+                status: { in: ['OPERATOR_ASSIGNED', 'CANCELLED'] },
+                updatedAt: { gte: expect.any(Date) },
+              },
+            ],
+          },
+        }),
+      );
+      expect(result).toEqual([
+        {
+          id: 'req-1',
+          status: 'DISPATCHING',
+          vehicleType: 'SEDAN',
+          destination: 'Lekki',
+          round: 2,
+          createdAt: new Date('2026-08-12T10:00:00Z'),
+          offers: [
+            {
+              operatorId: 'op-1',
+              businessName: 'Swift Towing',
+              status: 'PENDING',
+              quotedPrice: undefined,
+              offeredAt: new Date('2026-08-12T10:00:00Z'),
+              respondedAt: undefined,
+            },
+          ],
+        },
+      ]);
+    });
+
+    it('defaults round to 0 when no session is found for the customer', async () => {
+      prisma.rescueRequest.findMany.mockResolvedValue([
+        {
+          id: 'req-1', status: 'DISPATCHING', vehicleType: null, destination: null,
+          createdAt: new Date(), customerId: 'cust-1', dispatchOffers: [],
+        },
+      ]);
+      prisma.whatsAppSession.findMany.mockResolvedValue([]);
+
+      const result = await boardService.getDispatchBoard();
+
+      expect(result[0].round).toBe(0);
+    });
+  });
 });

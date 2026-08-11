@@ -47,6 +47,15 @@ export class RescueRequestController {
     );
   }
 
+  /** Live + recent dispatch state across all requests, for the admin ops board. */
+  @Get('dispatch-board')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async dispatchBoard() {
+    const rows = await this.rescueRequestService.getDispatchBoard();
+    return { data: rows };
+  }
+
   @Get(':id')
   async detail(@Req() req: Request, @Param('id') id: string) {
     return this.rescueRequestService.detailForUser(req.user, id);
