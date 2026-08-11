@@ -466,4 +466,69 @@ describe('RescueRequestService', () => {
       expect(result[0].round).toBe(0);
     });
   });
+
+  describe('expandRadiusNow', () => {
+    let radiusService: RescueRequestService;
+    let prisma: {
+      rescueRequest: { findUnique: jest.Mock };
+      dispatchOffer: { updateMany: jest.Mock };
+    };
+    let sessionStore: { getOrCreate: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: { findUnique: jest.fn() },
+        dispatchOffer: { updateMany: jest.fn() },
+      };
+      sessionStore = { getOrCreate: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestService,
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: S3Service, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PayoutService, useValue: {} },
+        ],
+      }).compile();
+
+      radiusService = module.get<RescueRequestService>(RescueRequestService);
+    });
+
+    it('rejects a request that is not DISPATCHING', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({ id: 'req-1', status: 'OPERATOR_ASSIGNED' });
+
+      await expect(radiusService.expandRadiusNow('req-1')).rejects.toThrow('not currently DISPATCHING');
+    });
+
+    it('clears any active batch/grace timer, times out pending offers, and starts a new round with an expanded radius', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+      });
+      prisma.dispatchOffer.updateMany.mockResolvedValue({ count: 1 });
+      sessionStore.getOrCreate.mockResolvedValue({ dispatchRound: 1 });
+
+      const startDispatchSpy = jest.spyOn(radiusService as any, 'startDispatch').mockResolvedValue(undefined);
+      const existingTimer = setTimeout(() => {}, 100000);
+      (radiusService as any).batchTimers.set('req-1', existingTimer);
+
+      await radiusService.expandRadiusNow('req-1');
+
+      expect((radiusService as any).batchTimers.has('req-1')).toBe(false);
+      expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith({
+        where: { rescueRequestId: 'req-1', status: 'PENDING' },
+        data: { status: 'TIMED_OUT', respondedAt: expect.any(Date) },
+      });
+      // round 1 → current radius approximated as 1 * RADIUS_EXPANSION_KM (2) = 2,
+      // expanded by one more increment = 4
+      expect(startDispatchSpy).toHaveBeenCalledWith('req-1', 'cust-1', 4);
+
+      clearTimeout(existingTimer);
+    });
+  });
 });

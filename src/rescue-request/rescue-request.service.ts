@@ -1215,6 +1215,59 @@ export class RescueRequestService {
     void this.resolveBatch(rescueRequestId, batchOperatorIds, rescueRequest.customerId, 0);
   }
 
+  /**
+   * Tears down whatever automatic dispatch round is currently active for a
+   * request, so an admin-initiated round (expand-radius or a manual offer)
+   * can safely take over the round slot. Without this, a stale timer from
+   * the superseded round could later fire, grab the *new* round's
+   * batchTimers entry via the shared map key, and resolve using the *old*
+   * round's stale operator list — see Global Constraints for the full
+   * mechanism this guards against.
+   */
+  private async supersedeActiveRound(rescueRequestId: string): Promise<void> {
+    const batchTimer = this.batchTimers.get(rescueRequestId);
+    if (batchTimer) {
+      clearTimeout(batchTimer);
+      this.batchTimers.delete(rescueRequestId);
+    }
+
+    const graceTimer = this.graceTimers.get(rescueRequestId);
+    if (graceTimer) {
+      clearTimeout(graceTimer);
+      this.graceTimers.delete(rescueRequestId);
+    }
+
+    await this.prisma.dispatchOffer.updateMany({
+      where: { rescueRequestId, status: 'PENDING' },
+      data: { status: 'TIMED_OUT', respondedAt: new Date() },
+    });
+  }
+
+  /**
+   * Admin action: immediately start a new dispatch round with an expanded
+   * radius, instead of waiting for the automatic DISPATCH_RETRY_MINUTES
+   * timer. extraRadiusKm isn't persisted between rounds (see the comment
+   * on maybeResolveBatchEarly's callers), so the current radius is
+   * approximated from the session's dispatchRound — the same
+   * approximation the automatic retry path already effectively produces.
+   */
+  async expandRadiusNow(rescueRequestId: string): Promise<void> {
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+    });
+    if (!rescueRequest || rescueRequest.status !== RescueRequestStatus.DISPATCHING) {
+      throw new BadRequestException('Request is not currently DISPATCHING');
+    }
+
+    await this.supersedeActiveRound(rescueRequestId);
+
+    const session = await this.sessionStore.getOrCreate(rescueRequest.customerId);
+    const currentRadius = (session.dispatchRound ?? 0) * RADIUS_EXPANSION_KM;
+    const expandedRadius = currentRadius + RADIUS_EXPANSION_KM;
+
+    void this.startDispatch(rescueRequestId, rescueRequest.customerId, expandedRadius);
+  }
+
   private readonly QUOTE_SELECTION_WINDOW_MS = 5 * 60 * 1000;
 
   private async sendQuoteShortlist(rescueRequestId: string, customerId: string) {

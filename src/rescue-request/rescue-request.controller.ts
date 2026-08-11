@@ -56,6 +56,14 @@ export class RescueRequestController {
     return { data: rows };
   }
 
+  @Post(':id/expand-radius')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async expandRadius(@Param('id') id: string) {
+    await this.rescueRequestService.expandRadiusNow(id);
+    return { message: 'Radius expansion triggered' };
+  }
+
   @Get(':id')
   async detail(@Req() req: Request, @Param('id') id: string) {
     return this.rescueRequestService.detailForUser(req.user, id);
