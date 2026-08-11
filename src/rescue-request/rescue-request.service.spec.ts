@@ -8,6 +8,7 @@ import { OperatorService } from '../operator/operator.service';
 import { S3Service } from '../integrations/s3/s3.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { RatingService } from '../rating/rating.service';
+import { PayoutService } from '../payout/payout.service';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
 
 describe('RescueRequestService', () => {
@@ -26,6 +27,7 @@ describe('RescueRequestService', () => {
         { provide: S3Service, useValue: {} },
         { provide: PlatformConfigService, useValue: {} },
         { provide: RatingService, useValue: {} },
+        { provide: PayoutService, useValue: {} },
       ],
     }).compile();
 
@@ -87,6 +89,7 @@ describe('RescueRequestService', () => {
           { provide: S3Service, useValue: {} },
           { provide: PlatformConfigService, useValue: platformConfigService },
           { provide: RatingService, useValue: {} },
+          { provide: PayoutService, useValue: {} },
         ],
       }).compile();
 
@@ -202,6 +205,7 @@ describe('RescueRequestService', () => {
           { provide: S3Service, useValue: {} },
           { provide: PlatformConfigService, useValue: {} },
           { provide: RatingService, useValue: ratingServiceMock },
+          { provide: PayoutService, useValue: {} },
         ],
       }).compile();
 
@@ -267,6 +271,7 @@ describe('RescueRequestService', () => {
           { provide: S3Service, useValue: {} },
           { provide: PlatformConfigService, useValue: {} },
           { provide: RatingService, useValue: ratingServiceMock },
+          { provide: PayoutService, useValue: {} },
         ],
       }).compile();
 
@@ -290,6 +295,67 @@ describe('RescueRequestService', () => {
       expect(ratingServiceMock.create).toHaveBeenCalledWith({
         rescueRequestId: 'req-1', direction: 'OPERATOR_TO_MOTORIST', operatorId: 'op-1', customerId: 'cust-1', score: 4,
       });
+    });
+  });
+
+  describe('handleBalancePaymentConfirmed — payout trigger', () => {
+    let payoutTestService: RescueRequestService;
+    let prisma: {
+      rescueRequest: { findFirst: jest.Mock; update: jest.Mock };
+      user: { upsert: jest.Mock };
+    };
+    let payoutServiceMock: { createAndProcessPayout: jest.Mock };
+    let sessionStore: { update: jest.Mock; getOrCreate: jest.Mock };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: {
+          findFirst: jest.fn().mockResolvedValue({
+            id: 'req-1',
+            customerId: 'cust-1',
+            balanceAmount: 200000,
+            depositAmount: 50000,
+            serviceFeeAmount: 25000,
+            assignedOperatorId: 'op-1',
+            customer: { phoneNumber: '+2348012345678' },
+            assignedOperator: { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2349012345678' },
+          }),
+          update: jest.fn(),
+        },
+        user: { upsert: jest.fn().mockResolvedValue({ id: 'op-user-1' }) },
+      };
+      payoutServiceMock = { createAndProcessPayout: jest.fn() };
+      sessionStore = { update: jest.fn(), getOrCreate: jest.fn().mockResolvedValue({ state: 'IDLE' }) };
+      twilioService = { sendWhatsAppMessage: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestService,
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: OperatorService, useValue: {} },
+          { provide: S3Service, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PayoutService, useValue: payoutServiceMock },
+        ],
+      }).compile();
+
+      payoutTestService = module.get<RescueRequestService>(RescueRequestService);
+      jest.useFakeTimers();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('triggers a payout for depositAmount + balanceAmount - serviceFeeAmount', async () => {
+      await payoutTestService.handleBalancePaymentConfirmed('BAL_ref');
+
+      expect(payoutServiceMock.createAndProcessPayout).toHaveBeenCalledWith('req-1', 'op-1', 225000);
     });
   });
 });

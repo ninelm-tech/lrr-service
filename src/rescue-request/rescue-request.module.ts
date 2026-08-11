@@ -10,6 +10,7 @@ import { S3Module } from '../integrations/s3/s3.module';
 import { OperatorModule } from '../operator/operator.module';
 import { PlatformConfigModule } from '../platform-config/platform-config.module';
 import { RatingModule } from '../rating/rating.module';
+import { PayoutModule } from '../payout/payout.module';
 import { AuthGuard } from '../auth/auth.guard';
 
 @Module({
@@ -21,6 +22,7 @@ import { AuthGuard } from '../auth/auth.guard';
     OperatorModule,
     PlatformConfigModule,
     RatingModule,
+    PayoutModule,
     JwtModule.register({
       secret: process.env.JWT_SECRET || 'your-secret-key',
       signOptions: { expiresIn: '24h' },

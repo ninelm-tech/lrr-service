@@ -25,6 +25,7 @@ import { TwilioService } from '../integrations/twilio/twilio.service';
 import { OperatorService } from '../operator/operator.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { RatingService } from '../rating/rating.service';
+import { PayoutService } from '../payout/payout.service';
 import {
   RescueRequestListResponseDto,
   RescueRequestListItemDto,
@@ -60,6 +61,7 @@ export class RescueRequestService {
     private readonly s3Service: S3Service,
     private readonly platformConfigService: PlatformConfigService,
     private readonly ratingService: RatingService,
+    private readonly payoutService: PayoutService,
   ) {}
 
   /**
@@ -924,6 +926,11 @@ export class RescueRequestService {
         rescueRequestId: rescueRequest.id,
       });
       this.scheduleRatingTimeout(opUser.id, rescueRequest.id);
+    }
+
+    if (rescueRequest.assignedOperatorId) {
+      const payoutAmount = (rescueRequest.depositAmount ?? 0) + (rescueRequest.balanceAmount ?? 0) - (rescueRequest.serviceFeeAmount ?? 0);
+      await this.payoutService.createAndProcessPayout(rescueRequest.id, rescueRequest.assignedOperatorId, payoutAmount);
     }
 
     console.log(`✅ Job ${rescueRequest.id} completed — operator and customer notified`);
