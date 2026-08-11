@@ -85,11 +85,25 @@ break the `ADMIN`/`OPERATOR` branches above it.
 - Eligible rows get a click handler that fetches fresh detail (`fetchDetail`,
   the same hook method the admin modal now uses, already fixed to unwrap
   `.data` correctly) and opens a receipt modal.
-- Receipt modal content: service/vehicle type, destination, operator
-  business name, request date, deposit amount, balance amount, total
-  (deposit + balance), and a "Paid in full" confirmation line. Follows the
-  existing modal visual pattern (inline `style={{}}`, no CSS framework) —
-  same backdrop/card structure as the admin detail modal.
+- **The list table's "Service" column (currently `r.issueType`) is dropped
+  entirely** — UI-only change, no backend involved. The table becomes
+  Operator / Date / Status (+ the "Receipt →" hint on eligible rows). The
+  list endpoint already doesn't need to change for this — it's purely
+  removing a column from the render, not adding a replacement field.
+- **Visual design (approved via the visual-companion mockup session,
+  2026-08-10):** a classic paper-receipt style, not a plain data grid —
+  letterhead with the real LRR logo (`public/lrr-logo.png`), dashed
+  section dividers, monospace-flavored itemization, and a bold "TOTAL"
+  line with a rule above it. Layout, top to bottom:
+  1. Centered letterhead: LRR logo, "Receipt · #\<id-prefix\>" in muted
+     text, dashed border below.
+  2. Detail rows (label left, value right, muted label color): Service
+     (`vehicleType` — no `issueType` fallback, per the column removal
+     above), Destination, Operator, Date.
+  3. Dashed divider, then itemized Deposit / Balance rows, then a bold
+     TOTAL row (deposit + balance) with a solid rule above it.
+  4. A green "✓ PAID IN FULL" banner below the total.
+  5. Print / Close buttons.
 - A "Print" button calls `window.print()`. A `@media print` CSS rule
   (scoped via a wrapper class on the modal content) hides the portal
   chrome/nav and the modal's backdrop, so only the receipt card prints.
