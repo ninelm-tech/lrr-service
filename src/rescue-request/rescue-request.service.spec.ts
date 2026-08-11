@@ -531,4 +531,94 @@ describe('RescueRequestService', () => {
       clearTimeout(existingTimer);
     });
   });
+
+  describe('manualOfferToOperator', () => {
+    let manualService: RescueRequestService;
+    let prisma: {
+      rescueRequest: { findUnique: jest.Mock };
+      operator: { findUnique: jest.Mock };
+      dispatchOffer: { create: jest.Mock; updateMany: jest.Mock };
+    };
+    let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: { findUnique: jest.fn() },
+        operator: { findUnique: jest.fn() },
+        dispatchOffer: { create: jest.fn(), updateMany: jest.fn() },
+      };
+      sessionStore = {
+        getOrCreate: jest.fn().mockResolvedValue({ offeredOperatorIds: ['op-already-tried'] }),
+        update: jest.fn(),
+      };
+      twilioService = { sendWhatsAppMessage: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestService,
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: OperatorService, useValue: {} },
+          { provide: S3Service, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PayoutService, useValue: {} },
+        ],
+      }).compile();
+
+      manualService = module.get<RescueRequestService>(RescueRequestService);
+    });
+
+    it('rejects a request that is not DISPATCHING', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({ id: 'req-1', status: 'OPERATOR_ASSIGNED' });
+
+      await expect(manualService.manualOfferToOperator('req-1', 'op-1')).rejects.toThrow('not currently DISPATCHING');
+    });
+
+    it('rejects a missing or inactive operator', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+        vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+      });
+      prisma.operator.findUnique.mockResolvedValue({ id: 'op-1', status: 'INACTIVE' });
+
+      await expect(manualService.manualOfferToOperator('req-1', 'op-1')).rejects.toThrow('not an active operator');
+    });
+
+    it('creates a single-operator round: offer created, WhatsApp sent, session updated, timer scheduled', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+        vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+      });
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1', status: 'ACTIVE', businessName: 'Swift Towing', phoneNumber: '+2349012345678',
+      });
+      prisma.dispatchOffer.updateMany.mockResolvedValue({ count: 0 });
+      prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
+
+      await manualService.manualOfferToOperator('req-1', 'op-1');
+
+      expect(prisma.dispatchOffer.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          rescueRequestId: 'req-1',
+          operatorId: 'op-1',
+          expiresAt: expect.any(Date),
+        }),
+      });
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('2349012345678'),
+        expect.stringContaining('NEW RESCUE JOB'),
+      );
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
+        offeredOperatorIds: ['op-already-tried', 'op-1'],
+      });
+      expect((manualService as any).batchTimers.has('req-1')).toBe(true);
+
+      // Clean up the real timer this test scheduled
+      clearTimeout((manualService as any).batchTimers.get('req-1'));
+    });
+  });
 });

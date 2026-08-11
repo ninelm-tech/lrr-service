@@ -1268,6 +1268,63 @@ export class RescueRequestService {
     void this.startDispatch(rescueRequestId, rescueRequest.customerId, expandedRadius);
   }
 
+  /**
+   * Admin action: offer this job directly to one specific operator,
+   * bypassing findAndRankCandidates entirely. Implemented as an ordinary
+   * single-operator dispatch round — the offer's expiresAt drives the same
+   * processQuoteOrDecline/maybeResolveBatchEarly machinery every other
+   * round uses, so no bespoke quote-handling is needed here.
+   */
+  async manualOfferToOperator(rescueRequestId: string, operatorId: string): Promise<void> {
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+    });
+    if (!rescueRequest || rescueRequest.status !== RescueRequestStatus.DISPATCHING) {
+      throw new BadRequestException('Request is not currently DISPATCHING');
+    }
+
+    const operator = await this.prisma.operator.findUnique({ where: { id: operatorId } });
+    if (!operator || operator.status !== 'ACTIVE') {
+      throw new BadRequestException('Target is not an active operator');
+    }
+
+    await this.supersedeActiveRound(rescueRequestId);
+
+    const MANUAL_OFFER_WINDOW_MS = 5 * 60 * 1000;
+    const expiresAt = new Date(Date.now() + MANUAL_OFFER_WINDOW_MS);
+
+    await this.prisma.dispatchOffer.create({
+      data: { rescueRequestId, operatorId, expiresAt },
+    });
+
+    // Append, never replace — every other call site that touches
+    // offeredOperatorIds spreads the existing list first (see e.g.
+    // startDispatch's batch-tracking update); replacing it here would let
+    // operators from earlier rounds become eligible for re-offering again.
+    const session = await this.sessionStore.getOrCreate(rescueRequest.customerId);
+    await this.sessionStore.update(rescueRequest.customerId, {
+      offeredOperatorIds: [...(session.offeredOperatorIds ?? []), operatorId],
+    });
+
+    const lat = Number(rescueRequest.latitude);
+    const lon = Number(rescueRequest.longitude);
+    const vehicleLabel = rescueRequest.vehicleType
+      ? formatVehicleType(rescueRequest.vehicleType as VehicleType)
+      : 'Unknown';
+    const destinationLabel = rescueRequest.destination ?? 'Not specified';
+
+    await this.twilioService.sendWhatsAppMessage(
+      toWhatsAppAddress(operator.phoneNumber),
+      `🚨 *NEW RESCUE JOB*\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nLocation: https://maps.google.com/?q=${lat},${lon}\n\n💰 Reply with your price to bid, e.g. "25000".\nReply *NO* to decline.\nYou have 5 minutes.`,
+    );
+
+    const timer = setTimeout(
+      () => void this.resolveBatch(rescueRequestId, [operatorId], rescueRequest.customerId, 0),
+      MANUAL_OFFER_WINDOW_MS,
+    );
+    this.batchTimers.set(rescueRequestId, timer);
+  }
+
   private readonly QUOTE_SELECTION_WINDOW_MS = 5 * 60 * 1000;
 
   private async sendQuoteShortlist(rescueRequestId: string, customerId: string) {

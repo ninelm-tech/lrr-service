@@ -64,6 +64,14 @@ export class RescueRequestController {
     return { message: 'Radius expansion triggered' };
   }
 
+  @Post(':id/offer-to/:operatorId')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async offerToOperator(@Param('id') id: string, @Param('operatorId') operatorId: string) {
+    await this.rescueRequestService.manualOfferToOperator(id, operatorId);
+    return { message: 'Offer sent' };
+  }
+
   @Get(':id')
   async detail(@Req() req: Request, @Param('id') id: string) {
     return this.rescueRequestService.detailForUser(req.user, id);
