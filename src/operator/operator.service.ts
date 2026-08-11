@@ -38,6 +38,14 @@ export interface OperatorStats {
   avgResponseSec:    number;   // seconds; null-safe (0 for new operators)
 }
 
+// computeStats() (used by dispatch ranking, which deliberately excludes
+// ratings from the composite score) returns plain OperatorStats. The
+// admin-facing stats endpoints attach ratings on top of that.
+export interface OperatorStatsWithRating extends OperatorStats {
+  averageRating:     number | null; // ratings RECEIVED from motorists only; null when zero ratings
+  ratingCount:       number;
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 
 @Injectable()
@@ -245,16 +253,27 @@ export class OperatorService {
    * Compute performance stats for a single operator.
    * Admin dashboard can call this per-operator, or aggregate across all.
    */
-  async getOperatorStats(operatorId: string, days = 30): Promise<OperatorStats> {
+  async getOperatorStats(operatorId: string, days = 30): Promise<OperatorStatsWithRating> {
     const since = new Date();
     since.setDate(since.getDate() - days);
 
-    const offers = await this.prisma.dispatchOffer.findMany({
-      where: { operatorId, offeredAt: { gte: since } },
-      select: { status: true, offeredAt: true, respondedAt: true },
-    });
+    const [offers, ratingAgg] = await Promise.all([
+      this.prisma.dispatchOffer.findMany({
+        where: { operatorId, offeredAt: { gte: since } },
+        select: { status: true, offeredAt: true, respondedAt: true },
+      }),
+      this.prisma.rating.aggregate({
+        where: { operatorId, direction: 'MOTORIST_TO_OPERATOR' },
+        _avg: { score: true },
+        _count: { score: true },
+      }),
+    ]);
 
-    return this.computeStats(offers);
+    return {
+      ...this.computeStats(offers),
+      averageRating: ratingAgg._avg.score,
+      ratingCount: ratingAgg._count.score,
+    };
   }
 
   /**
@@ -265,12 +284,12 @@ export class OperatorService {
     businessName: string;
     phoneNumber: string;
     status: string;
-    stats: OperatorStats;
+    stats: OperatorStatsWithRating;
   }>> {
     const since = new Date();
     since.setDate(since.getDate() - days);
 
-    const [operators, allOffers] = await Promise.all([
+    const [operators, allOffers, ratingGroups] = await Promise.all([
       this.prisma.operator.findMany({
         select: { id: true, businessName: true, phoneNumber: true, status: true },
         orderBy: { createdAt: 'desc' },
@@ -278,6 +297,12 @@ export class OperatorService {
       this.prisma.dispatchOffer.findMany({
         where: { offeredAt: { gte: since } },
         select: { operatorId: true, status: true, offeredAt: true, respondedAt: true },
+      }),
+      this.prisma.rating.groupBy({
+        by: ['operatorId'],
+        where: { direction: 'MOTORIST_TO_OPERATOR' },
+        _avg: { score: true },
+        _count: { score: true },
       }),
     ]);
 
@@ -289,13 +314,25 @@ export class OperatorService {
       offersByOperator.get(offer.operatorId)!.push(offer);
     }
 
-    return operators.map((op) => ({
-      operatorId:   op.id,
-      businessName: op.businessName,
-      phoneNumber:  op.phoneNumber,
-      status:       op.status,
-      stats:        this.computeStats(offersByOperator.get(op.id) ?? []),
-    }));
+    const ratingsByOperator = new Map<string, { _avg: { score: number | null }; _count: { score: number } }>();
+    for (const group of ratingGroups) {
+      ratingsByOperator.set(group.operatorId, { _avg: group._avg, _count: group._count });
+    }
+
+    return operators.map((op) => {
+      const ratingAgg = ratingsByOperator.get(op.id);
+      return {
+        operatorId:   op.id,
+        businessName: op.businessName,
+        phoneNumber:  op.phoneNumber,
+        status:       op.status,
+        stats: {
+          ...this.computeStats(offersByOperator.get(op.id) ?? []),
+          averageRating: ratingAgg?._avg.score ?? null,
+          ratingCount: ratingAgg?._count.score ?? 0,
+        },
+      };
+    });
   }
 
   // ══════════════════════════════════════════════════════

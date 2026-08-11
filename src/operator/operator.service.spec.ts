@@ -10,12 +10,17 @@ describe('OperatorService', () => {
   let prisma: {
     operator: { findMany: jest.Mock };
     dispatchOffer: { findMany: jest.Mock };
+    rating: { aggregate: jest.Mock; groupBy: jest.Mock };
   };
 
   beforeEach(async () => {
     prisma = {
       operator: { findMany: jest.fn() },
       dispatchOffer: { findMany: jest.fn().mockResolvedValue([]) },
+      rating: {
+        aggregate: jest.fn().mockResolvedValue({ _avg: { score: null }, _count: { score: 0 } }),
+        groupBy: jest.fn().mockResolvedValue([]),
+      },
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -30,6 +35,39 @@ describe('OperatorService', () => {
 
   it('should be defined', () => {
     expect(service).toBeDefined();
+  });
+
+  describe('getOperatorStats — ratings', () => {
+    it('includes averageRating and ratingCount, scoped to ratings received', async () => {
+      (prisma.dispatchOffer.findMany as jest.Mock).mockResolvedValue([]);
+      (prisma.rating.aggregate as jest.Mock).mockResolvedValue({
+        _avg: { score: 4.5 },
+        _count: { score: 2 },
+      });
+
+      const result = await service.getOperatorStats('op-1');
+
+      expect(prisma.rating.aggregate).toHaveBeenCalledWith({
+        where: { operatorId: 'op-1', direction: 'MOTORIST_TO_OPERATOR' },
+        _avg: { score: true },
+        _count: { score: true },
+      });
+      expect(result.averageRating).toBe(4.5);
+      expect(result.ratingCount).toBe(2);
+    });
+
+    it('returns null averageRating and 0 ratingCount for an operator with no ratings', async () => {
+      (prisma.dispatchOffer.findMany as jest.Mock).mockResolvedValue([]);
+      (prisma.rating.aggregate as jest.Mock).mockResolvedValue({
+        _avg: { score: null },
+        _count: { score: 0 },
+      });
+
+      const result = await service.getOperatorStats('op-1');
+
+      expect(result.averageRating).toBeNull();
+      expect(result.ratingCount).toBe(0);
+    });
   });
 
   describe('findAndRankCandidates truck-class filtering', () => {
