@@ -7,6 +7,8 @@ import { TwilioService } from '../integrations/twilio/twilio.service';
 import { OperatorService } from '../operator/operator.service';
 import { S3Service } from '../integrations/s3/s3.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
+import { RatingService } from '../rating/rating.service';
+import { WhatsAppFlowState } from './state/whatsapp-session.types';
 
 describe('RescueRequestService', () => {
   let service: RescueRequestService;
@@ -23,6 +25,7 @@ describe('RescueRequestService', () => {
         { provide: OperatorService, useValue: {} },
         { provide: S3Service, useValue: {} },
         { provide: PlatformConfigService, useValue: {} },
+        { provide: RatingService, useValue: {} },
       ],
     }).compile();
 
@@ -83,6 +86,7 @@ describe('RescueRequestService', () => {
           { provide: OperatorService, useValue: {} },
           { provide: S3Service, useValue: {} },
           { provide: PlatformConfigService, useValue: platformConfigService },
+          { provide: RatingService, useValue: {} },
         ],
       }).compile();
 
@@ -173,6 +177,119 @@ describe('RescueRequestService', () => {
       await expect(
         detailService.detailForUser({ role: 'CUSTOMER', userId: 'someone-else' }, 'req-1'),
       ).rejects.toThrow('You do not have access to this rescue request');
+    });
+  });
+
+  describe('handleRatingReply (via WhatsApp router)', () => {
+    let ratingTestService: RescueRequestService;
+    let prisma: { rescueRequest: { findUnique: jest.Mock } };
+    let sessionStore: { update: jest.Mock; getOrCreate: jest.Mock };
+    let ratingServiceMock: { create: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = { rescueRequest: { findUnique: jest.fn() } };
+      sessionStore = { update: jest.fn(), getOrCreate: jest.fn() };
+      ratingServiceMock = { create: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestService,
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: S3Service, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: RatingService, useValue: ratingServiceMock },
+        ],
+      }).compile();
+
+      ratingTestService = module.get<RescueRequestService>(RescueRequestService);
+    });
+
+    it('creates a MOTORIST_TO_OPERATOR rating for a valid customer-side reply', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({ customerId: 'cust-1', assignedOperatorId: 'op-1' });
+      ratingServiceMock.create.mockResolvedValue({ id: 'rating-1' });
+
+      await (ratingTestService as any).handleRatingReply('cust-1', '5', 'req-1', 'MOTORIST_TO_OPERATOR');
+
+      expect(ratingServiceMock.create).toHaveBeenCalledWith({
+        rescueRequestId: 'req-1', direction: 'MOTORIST_TO_OPERATOR', operatorId: 'op-1', customerId: 'cust-1', score: 5,
+      });
+    });
+
+    it('creates an OPERATOR_TO_MOTORIST rating for a valid operator-side reply', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({ customerId: 'cust-1', assignedOperatorId: 'op-1' });
+      ratingServiceMock.create.mockResolvedValue({ id: 'rating-2' });
+
+      await (ratingTestService as any).handleRatingReply('op-user-1', '4', 'req-1', 'OPERATOR_TO_MOTORIST');
+
+      expect(ratingServiceMock.create).toHaveBeenCalledWith({
+        rescueRequestId: 'req-1', direction: 'OPERATOR_TO_MOTORIST', operatorId: 'op-1', customerId: 'cust-1', score: 4,
+      });
+    });
+
+    it('re-prompts and does not create a rating for invalid input', async () => {
+      await (ratingTestService as any).handleRatingReply('cust-1', 'banana', 'req-1', 'MOTORIST_TO_OPERATOR');
+
+      expect(ratingServiceMock.create).not.toHaveBeenCalled();
+      expect(sessionStore.update).not.toHaveBeenCalled();
+    });
+
+    it('re-prompts and does not create a rating for an out-of-range number', async () => {
+      await (ratingTestService as any).handleRatingReply('cust-1', '7', 'req-1', 'MOTORIST_TO_OPERATOR');
+
+      expect(ratingServiceMock.create).not.toHaveBeenCalled();
+      expect(sessionStore.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('handleOperatorMessage — rating branch ordering', () => {
+    let orderingService: RescueRequestService;
+    let prisma: { operator: { findUnique: jest.Mock }; rescueRequest: { findUnique: jest.Mock } };
+    let sessionStore: { update: jest.Mock };
+    let ratingServiceMock: { create: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = { operator: { findUnique: jest.fn() }, rescueRequest: { findUnique: jest.fn() } };
+      sessionStore = { update: jest.fn() };
+      ratingServiceMock = { create: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestService,
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: S3Service, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: RatingService, useValue: ratingServiceMock },
+        ],
+      }).compile();
+
+      orderingService = module.get<RescueRequestService>(RescueRequestService);
+    });
+
+    it('routes a WAITING_FOR_RATING operator reply to the rating handler, not the quote parser', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({ customerId: 'cust-1', assignedOperatorId: 'op-1' });
+      ratingServiceMock.create.mockResolvedValue({ id: 'rating-3' });
+
+      const session = { state: WhatsAppFlowState.WAITING_FOR_RATING, rescueRequestId: 'req-1' } as any;
+      const operator = { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341111111111' };
+
+      await (orderingService as any).handleOperatorMessage('+2341111111111', 'op-user-1', '4', session, operator);
+
+      // handleOperatorQuoteOrDecline's quote path always starts with an
+      // operator.findUnique lookup — asserting it was never called proves
+      // the numeric reply was routed to the rating handler instead, not
+      // treated as a bogus price quote.
+      expect(prisma.operator.findUnique).not.toHaveBeenCalled();
+      expect(ratingServiceMock.create).toHaveBeenCalledWith({
+        rescueRequestId: 'req-1', direction: 'OPERATOR_TO_MOTORIST', operatorId: 'op-1', customerId: 'cust-1', score: 4,
+      });
     });
   });
 });

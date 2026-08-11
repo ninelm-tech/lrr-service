@@ -8,7 +8,7 @@ import {
   WhatsAppFlowState,
 } from './state/whatsapp-session.types';
 import { PrismaService } from '../prisma/prisma.service';
-import { RescueRequestStatus, UserRole, VehicleType, MediaType } from '@prisma/client';
+import { RescueRequestStatus, UserRole, VehicleType, MediaType, RatingDirection } from '@prisma/client';
 import {
   getEligibleTruckClasses,
   mapVehicleTypeReply,
@@ -24,6 +24,7 @@ import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { OperatorService } from '../operator/operator.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
+import { RatingService } from '../rating/rating.service';
 import {
   RescueRequestListResponseDto,
   RescueRequestListItemDto,
@@ -58,6 +59,7 @@ export class RescueRequestService {
     private readonly operatorService: OperatorService,
     private readonly s3Service: S3Service,
     private readonly platformConfigService: PlatformConfigService,
+    private readonly ratingService: RatingService,
   ) {}
 
   /**
@@ -82,6 +84,25 @@ export class RescueRequestService {
    */
   private readonly graceTimers = new Map<string, NodeJS.Timeout>();
   private readonly QUOTE_GRACE_MS = 25 * 1000;
+
+  private readonly RATING_TIMEOUT_MS = 10 * 60 * 1000;
+
+  /**
+   * If a rating prompt goes unanswered, silently clear that party's session
+   * back to IDLE after RATING_TIMEOUT_MS — ratings don't block anything, so
+   * this is quiet cleanup, not a hard deadline. Checks the session is still
+   * WAITING_FOR_RATING for the SAME rescueRequestId before clearing, so it
+   * can't clobber a state the party has since moved past (already rated, or
+   * started a fresh SOS).
+   */
+  private scheduleRatingTimeout(userId: string, rescueRequestId: string) {
+    setTimeout(async () => {
+      const fresh = await this.sessionStore.getOrCreate(userId);
+      if (fresh.state === WhatsAppFlowState.WAITING_FOR_RATING && fresh.rescueRequestId === rescueRequestId) {
+        await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
+      }
+    }, this.RATING_TIMEOUT_MS);
+  }
 
   // ═══════════════════════════════════════════════════════
   //  WHATSAPP FLOW — incoming message handler
@@ -383,6 +404,13 @@ export class RescueRequestService {
       );
     }
 
+    // ── Step 5: Waiting for post-job rating (motorist rates operator) ─────
+    if (session.state === WhatsAppFlowState.WAITING_FOR_RATING) {
+      return this.handleRatingReply(
+        userId, rawMessage, session.rescueRequestId, RatingDirection.MOTORIST_TO_OPERATOR,
+      );
+    }
+
     return this.reply(
       `👋 Welcome to Lagos Roadside Rescue.\n\nSend HELP or SOS if you need roadside assistance.`,
     );
@@ -430,6 +458,16 @@ export class RescueRequestService {
     session: Awaited<ReturnType<WhatsAppSessionStore['getOrCreate']>>,
     operator: { id: string; businessName: string; phoneNumber: string },
   ) {
+    // ── Waiting for post-job rating (operator rates motorist) ─────────────
+    // MUST come before the quote-parsing check below, which treats any bare
+    // digit as a dispatch-offer price quote — without this ordering, a
+    // rating reply would be silently swallowed as a bogus quote attempt.
+    if (session.state === WhatsAppFlowState.WAITING_FOR_RATING) {
+      return this.handleRatingReply(
+        userId, message, session.rescueRequestId, RatingDirection.OPERATOR_TO_MOTORIST,
+      );
+    }
+
     // ── Dispatch quote / decline ─────────────────────────────────────────
     if (message === 'no' || message === 'decline') {
       return this.handleOperatorQuoteOrDecline(phoneNumber, userId, undefined);
@@ -848,35 +886,44 @@ export class RescueRequestService {
       data:  { balancePaid: true, status: RescueRequestStatus.COMPLETED },
     });
 
-    // Notify customer — payment confirmed
+    // Notify customer — payment confirmed, then prompt to rate the operator
     const customerId    = rescueRequest.customerId;
     const customerPhone = rescueRequest.customer.phoneNumber;
     const balanceNaira  = ((rescueRequest.balanceAmount ?? 0) / 100).toLocaleString();
+    const operator = rescueRequest.assignedOperator;
     if (customerPhone) {
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
         `✅ Payment of ₦${balanceNaira} confirmed! Thank you for using Lagos Roadside Rescue 🙏`,
       );
+      const operatorName = operator?.businessName ?? 'your operator';
+      await this.twilioService.sendWhatsAppMessage(
+        customerPhone,
+        `How was your experience with ${operatorName}? Reply with a number from 1 to 5 to rate them.`,
+      );
     }
-    // Clear customer session
     await this.sessionStore.update(customerId, {
-      state: WhatsAppFlowState.IDLE,
-      rescueRequestId: undefined,
+      state: WhatsAppFlowState.WAITING_FOR_RATING,
+      rescueRequestId: rescueRequest.id,
     });
+    this.scheduleRatingTimeout(customerId, rescueRequest.id);
 
-    // Notify operator — release the vehicle
-    const operator = rescueRequest.assignedOperator;
+    // Notify operator — release the vehicle, then prompt to rate the motorist
     if (operator?.phoneNumber) {
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(operator.phoneNumber),
         `💵 *Payment received!*\n\nThe customer has paid the ₦${balanceNaira} balance in full.\n\n✅ You may now *release the vehicle*. Job complete — well done!\n\nYour payment will be remitted within 24 hours.`,
       );
-      // Clear operator session
+      await this.twilioService.sendWhatsAppMessage(
+        toWhatsAppAddress(operator.phoneNumber),
+        `How was your experience with this customer? Reply with a number from 1 to 5 to rate them.`,
+      );
       const opUser = await this.findOrCreateCustomer(operator.phoneNumber);
       await this.sessionStore.update(opUser.id, {
-        state: WhatsAppFlowState.IDLE,
-        rescueRequestId: undefined,
+        state: WhatsAppFlowState.WAITING_FOR_RATING,
+        rescueRequestId: rescueRequest.id,
       });
+      this.scheduleRatingTimeout(opUser.id, rescueRequest.id);
     }
 
     console.log(`✅ Job ${rescueRequest.id} completed — operator and customer notified`);
@@ -1246,6 +1293,58 @@ export class RescueRequestService {
         ),
       );
     }, this.QUOTE_SELECTION_WINDOW_MS);
+  }
+
+  private async handleRatingReply(
+    reviewerUserId: string,
+    rawMessage: string,
+    rescueRequestId: string | undefined,
+    direction: RatingDirection,
+  ) {
+    const score = Number(rawMessage.trim());
+    if (!Number.isInteger(score) || score < 1 || score > 5) {
+      return this.reply(`Please reply with a number from 1 to 5.`);
+    }
+
+    if (!rescueRequestId) {
+      await this.sessionStore.update(reviewerUserId, { state: WhatsAppFlowState.IDLE });
+      return this.reply(`Thanks for your feedback!`);
+    }
+
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      select: { customerId: true, assignedOperatorId: true },
+    });
+
+    if (!rescueRequest?.assignedOperatorId) {
+      await this.sessionStore.update(reviewerUserId, {
+        state: WhatsAppFlowState.IDLE,
+        rescueRequestId: undefined,
+      });
+      return this.reply(`Thanks for your feedback!`);
+    }
+
+    // Create the rating BEFORE clearing the session — if this throws (DB
+    // error), the session stays WAITING_FOR_RATING so the reviewer's next
+    // message re-enters this handler and can retry, instead of silently
+    // losing the rating while the session has already moved to IDLE.
+    const rating = await this.ratingService.create({
+      rescueRequestId,
+      direction,
+      operatorId: rescueRequest.assignedOperatorId,
+      customerId: rescueRequest.customerId,
+      score,
+    });
+
+    await this.sessionStore.update(reviewerUserId, {
+      state: WhatsAppFlowState.IDLE,
+      rescueRequestId: undefined,
+    });
+
+    const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
+    return this.reply(
+      `Thanks for rating us ${score}/5! 🙏\n\nWant to add more detail? Tell us more here: ${frontendUrl}/feedback/${rating.id}`,
+    );
   }
 
   private async handleQuoteSelected(phoneNumber: string, userId: string, choice: number) {
