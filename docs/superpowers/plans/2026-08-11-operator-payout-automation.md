@@ -17,13 +17,13 @@
 - `PayoutService.processPayout` must never throw back to its caller — every failure path is caught internally, Sentry-logged, and reflected in the `Payout` row's status/reason fields. This is critical because it's called from `handleBalancePaymentConfirmed`, which must not have the customer/operator notification and rating-prompt flow disrupted by a payout problem.
 - Transfers are asynchronous: `initiateTransfer`'s synchronous response only means "accepted for processing" (→ `PROCESSING`), not "money moved." Final confirmation is via the `transfer.success`/`transfer.failed`/`transfer.reversed` Paystack webhook events, added to the existing single dispatcher in `payment.service.ts`'s `handlePaystackWebhook` switch (reached via the already signature-verified `POST /webhooks/paystack` endpoint — do not add a new webhook route).
 - `accountName` on `Operator` is only ever populated from Paystack's account-resolution response — never accept it as raw user input.
-- Saving new bank details clears the operator's cached `paystackRecipientCode` (a stale recipient tied to old bank details must not be reused).
+- **Data minimization:** the full bank account number and bank code are never persisted. `Operator` stores only `bankName`, `accountName`, `accountNumberLast4` (display-safe) and `paystackRecipientCode` (the only field payouts actually use). `resolveAccountNumber` and `createTransferRecipient` are both called synchronously at bank-details-save time (`OperatorService.saveBankDetails`) — `createTransferRecipient` is called ONLY there, never lazily inside `PayoutService`. By the time a payout runs, the recipient must already exist; if `paystackRecipientCode` is missing, that's a `NO_BANK_DETAILS` block, not a trigger to create one.
 - One shared endpoint (`POST /operators/:id/bank-details`) serves both the operator self-service case and the admin-edit case, role-checked via the existing `assertCanManageOperator` helper (`src/operator/operator.service.ts:368`) — do not create two separate endpoints.
 - No `ValidationPipe` is wired up globally in this app (a pre-existing gap, confirmed in the rating-service work) — request DTOs still use `class-validator` decorators per convention, but any endpoint that must actually enforce validation needs a manual check in the controller/service, same pattern as `RatingController`'s `PATCH /:id`.
 
 ---
 
-### Task 1: Prisma schema — `Payout` model, `Operator` bank fields
+### Task 1: Prisma schema — `Payout` model, `Operator` bank fields — DONE (revised, see Step 1 note)
 
 **Files:**
 - Modify: `prisma/schema.prisma`
@@ -32,19 +32,20 @@
 **Interfaces:**
 - Produces: `Payout` model, `PayoutStatus`/`PayoutBlockReason` enums, `Operator.bankCode`/`bankName`/`accountNumber`/`accountName`/`paystackRecipientCode`/`payouts` fields — consumed by every later task.
 
-- [ ] **Step 1: Add the bank fields to `Operator`**
+- [x] **Step 1: Add the bank fields to `Operator`** — DONE, then revised
 
-In `prisma/schema.prisma`, find the `Operator` model (starts around line 126) and add these fields just before its closing `}` (alongside the other relation fields like `ratings Rating[]`):
+In `prisma/schema.prisma`, find the `Operator` model (starts around line 126) and add these fields just before its closing `}` (alongside the other relation fields like `ratings Rating[]`). **Note:** this step originally shipped with `bankCode`/`accountNumber` (full) as stored fields; that was revised for data-minimization (see Global Constraints) before Task 3 began — the fields actually committed are:
 
 ```prisma
-  bankCode              String?
-  bankName              String?
-  accountNumber         String?
-  accountName           String?
-  paystackRecipientCode String?
+  bankName              String?   // display only
+  accountName           String?   // display only, from Paystack's resolve-account response
+  accountNumberLast4    String?   // display only — never the full number
+  paystackRecipientCode String?   // created once via Paystack, the only field payouts actually use
 
   payouts        Payout[]
 ```
+
+(This required a second migration, `payout_bank_details_minimization`, applied after the original `add_operator_payouts` migration — both are already in `prisma/migrations/`.)
 
 - [ ] **Step 2: Add `payout` back-relation to `RescueRequest`**
 
@@ -127,7 +128,7 @@ git commit -m "feat(schema): add Payout model and operator bank-detail fields"
 
 ---
 
-### Task 2: `PaystackService` — transfer-related methods
+### Task 2: `PaystackService` — transfer-related methods — DONE
 
 **Files:**
 - Modify: `src/integrations/paystack/paystack.service.ts`
@@ -373,8 +374,10 @@ git commit -m "feat(paystack): add transfer, recipient, balance, and bank-list m
 - Test: `src/payout/payout.service.spec.ts`
 
 **Interfaces:**
-- Consumes: `PaystackService` methods from Task 2 (`createTransferRecipient`, `checkBalance`, `initiateTransfer`), `Payout`/`PayoutStatus`/`PayoutBlockReason` from Task 1's Prisma client.
+- Consumes: `PaystackService` methods from Task 2 (`checkBalance`, `initiateTransfer` — NOT `createTransferRecipient`, which is now only called from Task 6's `saveBankDetails`), `Payout`/`PayoutStatus`/`PayoutBlockReason` from Task 1's Prisma client.
 - Produces: `PayoutService.createAndProcessPayout(rescueRequestId: string, operatorId: string, amount: number): Promise<void>` — consumed by `RescueRequestService` in Task 4. `PayoutService.retryPayout(payoutId: string): Promise<void>` — consumed by the admin retry endpoint in Task 6. `PayoutService.confirmTransferOutcome(transferCode: string, outcome: 'SUCCESS' | 'FAILED', failureReason?: string): Promise<void>` — consumed by the webhook handler in Task 5.
+
+**Note on data minimization (see Global Constraints):** `PayoutService` never creates a Paystack transfer recipient. That only happens once, synchronously, inside `OperatorService.saveBankDetails` (Task 6) — the one place the full account number is ever available. By the time a payout runs, `operator.paystackRecipientCode` either already exists or the payout is blocked with `NO_BANK_DETAILS`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -390,10 +393,9 @@ describe('PayoutService', () => {
   let service: PayoutService;
   let prisma: {
     payout: { create: jest.Mock; update: jest.Mock; findUnique: jest.Mock };
-    operator: { findUnique: jest.Mock; update: jest.Mock };
+    operator: { findUnique: jest.Mock };
   };
   let paystack: {
-    createTransferRecipient: jest.Mock;
     checkBalance: jest.Mock;
     initiateTransfer: jest.Mock;
     generateReference: jest.Mock;
@@ -402,10 +404,9 @@ describe('PayoutService', () => {
   beforeEach(async () => {
     prisma = {
       payout: { create: jest.fn(), update: jest.fn(), findUnique: jest.fn() },
-      operator: { findUnique: jest.fn(), update: jest.fn() },
+      operator: { findUnique: jest.fn() },
     };
     paystack = {
-      createTransferRecipient: jest.fn(),
       checkBalance: jest.fn(),
       initiateTransfer: jest.fn(),
       generateReference: jest.fn().mockReturnValue('PAYOUT_test123'),
@@ -423,10 +424,10 @@ describe('PayoutService', () => {
   });
 
   describe('createAndProcessPayout', () => {
-    it('blocks with NO_BANK_DETAILS when the operator has no recipient code and no bank details', async () => {
+    it('blocks with NO_BANK_DETAILS when the operator has no recipient code', async () => {
       prisma.payout.create.mockResolvedValue({ id: 'payout-1' });
       prisma.operator.findUnique.mockResolvedValue({
-        id: 'op-1', paystackRecipientCode: null, bankCode: null, accountNumber: null, accountName: null, businessName: 'Swift Towing',
+        id: 'op-1', paystackRecipientCode: null, businessName: 'Swift Towing',
       });
 
       await service.createAndProcessPayout('req-1', 'op-1', 250000);
@@ -444,7 +445,7 @@ describe('PayoutService', () => {
     it('blocks with INSUFFICIENT_BALANCE when the platform balance cannot cover the amount', async () => {
       prisma.payout.create.mockResolvedValue({ id: 'payout-1' });
       prisma.operator.findUnique.mockResolvedValue({
-        id: 'op-1', paystackRecipientCode: 'RCP_existing', bankCode: '058', accountNumber: '0123456789', accountName: 'JOHN DOE', businessName: 'Swift Towing',
+        id: 'op-1', paystackRecipientCode: 'RCP_existing', businessName: 'Swift Towing',
       });
       paystack.checkBalance.mockResolvedValue(100000);
 
@@ -457,25 +458,18 @@ describe('PayoutService', () => {
       expect(paystack.initiateTransfer).not.toHaveBeenCalled();
     });
 
-    it('creates a recipient when missing, then initiates a transfer and sets PROCESSING on success', async () => {
+    it('initiates a transfer and sets PROCESSING on success', async () => {
       prisma.payout.create.mockResolvedValue({ id: 'payout-1' });
       prisma.operator.findUnique.mockResolvedValue({
-        id: 'op-1', paystackRecipientCode: null, bankCode: '058', accountNumber: '0123456789', accountName: 'JOHN DOE', businessName: 'Swift Towing',
+        id: 'op-1', paystackRecipientCode: 'RCP_existing', businessName: 'Swift Towing',
       });
-      paystack.createTransferRecipient.mockResolvedValue({ recipientCode: 'RCP_new123' });
       paystack.checkBalance.mockResolvedValue(1000000);
       paystack.initiateTransfer.mockResolvedValue({ transferCode: 'TRF_test123', status: 'pending' });
 
       await service.createAndProcessPayout('req-1', 'op-1', 250000);
 
-      expect(paystack.createTransferRecipient).toHaveBeenCalledWith({
-        accountNumber: '0123456789', bankCode: '058', accountName: 'JOHN DOE', businessName: 'Swift Towing',
-      });
-      expect(prisma.operator.update).toHaveBeenCalledWith({
-        where: { id: 'op-1' }, data: { paystackRecipientCode: 'RCP_new123' },
-      });
       expect(paystack.initiateTransfer).toHaveBeenCalledWith({
-        recipientCode: 'RCP_new123', amount: 250000, reference: 'PAYOUT_test123', reason: 'Job payout — req-1',
+        recipientCode: 'RCP_existing', amount: 250000, reference: 'PAYOUT_test123', reason: 'Job payout — req-1',
       });
       expect(prisma.payout.update).toHaveBeenCalledWith({
         where: { id: 'payout-1' },
@@ -486,7 +480,7 @@ describe('PayoutService', () => {
     it('marks FAILED when the transfer API call throws', async () => {
       prisma.payout.create.mockResolvedValue({ id: 'payout-1' });
       prisma.operator.findUnique.mockResolvedValue({
-        id: 'op-1', paystackRecipientCode: 'RCP_existing', bankCode: '058', accountNumber: '0123456789', accountName: 'JOHN DOE', businessName: 'Swift Towing',
+        id: 'op-1', paystackRecipientCode: 'RCP_existing', businessName: 'Swift Towing',
       });
       paystack.checkBalance.mockResolvedValue(1000000);
       paystack.initiateTransfer.mockRejectedValue(new Error('Paystack 500'));
@@ -593,37 +587,21 @@ export class PayoutService {
     await this.attemptPayout(payoutId, payout.operatorId, payout.amount, payout.rescueRequestId);
   }
 
+  /**
+   * Never creates a Paystack recipient here — that only happens once,
+   * synchronously, inside OperatorService.saveBankDetails (the one place
+   * the full account number is ever available). This method only ever
+   * consumes an already-existing paystackRecipientCode.
+   */
   private async attemptPayout(payoutId: string, operatorId: string, amount: number, rescueRequestId: string): Promise<void> {
     try {
       const operator = await this.prisma.operator.findUnique({ where: { id: operatorId } });
-      if (!operator) {
+      if (!operator?.paystackRecipientCode) {
         await this.prisma.payout.update({
           where: { id: payoutId },
           data: { status: 'PENDING', blockReason: 'NO_BANK_DETAILS', failureReason: null },
         });
         return;
-      }
-
-      let recipientCode = operator.paystackRecipientCode;
-      if (!recipientCode) {
-        if (!operator.bankCode || !operator.accountNumber || !operator.accountName) {
-          await this.prisma.payout.update({
-            where: { id: payoutId },
-            data: { status: 'PENDING', blockReason: 'NO_BANK_DETAILS', failureReason: null },
-          });
-          return;
-        }
-        const created = await this.paystackService.createTransferRecipient({
-          accountNumber: operator.accountNumber,
-          bankCode: operator.bankCode,
-          accountName: operator.accountName,
-          businessName: operator.businessName,
-        });
-        recipientCode = created.recipientCode;
-        await this.prisma.operator.update({
-          where: { id: operatorId },
-          data: { paystackRecipientCode: recipientCode },
-        });
       }
 
       const balance = await this.paystackService.checkBalance();
@@ -637,7 +615,7 @@ export class PayoutService {
 
       const reference = this.paystackService.generateReference('PAYOUT');
       const transfer = await this.paystackService.initiateTransfer({
-        recipientCode,
+        recipientCode: operator.paystackRecipientCode,
         amount,
         reference,
         reason: `Job payout — ${rescueRequestId}`,
@@ -1011,31 +989,38 @@ git commit -m "feat(payment): confirm payout outcomes from Paystack transfer web
 
 - [ ] **Step 1: Write the failing test for `saveBankDetails`**
 
-Add to `src/operator/operator.service.spec.ts`, following its existing mock pattern:
+Add to `src/operator/operator.service.spec.ts`, following its existing mock pattern. **Data minimization (see Global Constraints):** this creates the Paystack transfer recipient immediately (the only place that ever happens) and persists only display-safe fields plus the recipient code — never the full account number or bank code:
 
 ```typescript
   describe('saveBankDetails', () => {
-    it('resolves the account, saves bank details, and clears the cached recipient code', async () => {
-      const paystackMock = { resolveAccountNumber: jest.fn().mockResolvedValue({ accountName: 'JOHN DOE' }) };
-      (service as any).paystackService = paystackMock; // or inject via TestingModule provider, per file's existing pattern
-      (prisma.operator.findUnique as jest.Mock).mockResolvedValue({ id: 'op-1' });
+    it('resolves the account, creates a recipient, and saves only display-safe fields', async () => {
+      const paystackMock = {
+        resolveAccountNumber: jest.fn().mockResolvedValue({ accountName: 'JOHN DOE' }),
+        createTransferRecipient: jest.fn().mockResolvedValue({ recipientCode: 'RCP_new123' }),
+      };
+      // Inject via the TestingModule's providers array, per the file's existing DI pattern —
+      // { provide: PaystackService, useValue: paystackMock }.
+      (prisma.operator.findUnique as jest.Mock).mockResolvedValue({ id: 'op-1', businessName: 'Swift Towing' });
       (prisma.operator.update as jest.Mock).mockResolvedValue({
-        id: 'op-1', bankCode: '058', accountNumber: '0123456789', accountName: 'JOHN DOE',
+        id: 'op-1', bankName: 'GTBank', accountName: 'JOHN DOE', accountNumberLast4: '6789', paystackRecipientCode: 'RCP_new123',
       });
 
-      const result = await service.saveBankDetails('op-1', { bankCode: '058', accountNumber: '0123456789' });
+      const result = await service.saveBankDetails('op-1', { bankCode: '058', bankName: 'GTBank', accountNumber: '0123456789' });
 
       expect(paystackMock.resolveAccountNumber).toHaveBeenCalledWith('0123456789', '058');
+      expect(paystackMock.createTransferRecipient).toHaveBeenCalledWith({
+        accountNumber: '0123456789', bankCode: '058', accountName: 'JOHN DOE', businessName: 'Swift Towing',
+      });
       expect(prisma.operator.update).toHaveBeenCalledWith({
         where: { id: 'op-1' },
-        data: { bankCode: '058', accountNumber: '0123456789', accountName: 'JOHN DOE', paystackRecipientCode: null },
+        data: { bankName: 'GTBank', accountName: 'JOHN DOE', accountNumberLast4: '6789', paystackRecipientCode: 'RCP_new123' },
       });
       expect(result.accountName).toBe('JOHN DOE');
     });
   });
 ```
 
-Check the file's actual `TestingModule` providers array first (it currently only provides `PrismaService`) — add `{ provide: PaystackService, useValue: <mock> }` there rather than the `(service as any)` workaround shown above, which is illustrative only; use whatever real DI mechanism the file already establishes for other dependencies.
+Check the file's actual `TestingModule` providers array first (it currently only provides `PrismaService`) — add `{ provide: PaystackService, useValue: paystackMock }` there.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -1065,22 +1050,33 @@ Add this method near `updateProfile` (around line 397):
   /**
    * Save an operator's payout bank details. accountName always comes from
    * Paystack's resolve-account response, never from the request body.
-   * Clears paystackRecipientCode — a stale recipient tied to the old bank
-   * details must not be reused; PayoutService recreates it on next use.
+   * Creates the Paystack transfer recipient right here — the ONLY place
+   * this ever happens, since this is the only point the full account
+   * number is available. bankCode and the full accountNumber are used for
+   * the two Paystack calls below and are never persisted — only display
+   * data (bankName, accountName, accountNumberLast4) and the resulting
+   * recipientCode are stored. Changing bank details later simply repeats
+   * this whole flow, overwriting paystackRecipientCode with a new one.
    */
   async saveBankDetails(id: string, dto: SaveBankDetailsDto) {
     const operator = await this.prisma.operator.findUnique({ where: { id } });
     if (!operator) throw new NotFoundException('Operator not found');
 
     const { accountName } = await this.paystackService.resolveAccountNumber(dto.accountNumber, dto.bankCode);
+    const { recipientCode } = await this.paystackService.createTransferRecipient({
+      accountNumber: dto.accountNumber,
+      bankCode: dto.bankCode,
+      accountName,
+      businessName: operator.businessName,
+    });
 
     return this.prisma.operator.update({
       where: { id },
       data: {
-        bankCode: dto.bankCode,
-        accountNumber: dto.accountNumber,
+        bankName: dto.bankName,
         accountName,
-        paystackRecipientCode: null,
+        accountNumberLast4: dto.accountNumber.slice(-4),
+        paystackRecipientCode: recipientCode,
       },
     });
   }
@@ -1099,6 +1095,10 @@ export class SaveBankDetailsDto {
   @IsString()
   @IsNotEmpty()
   bankCode: string;
+
+  @IsString()
+  @IsNotEmpty()
+  bankName: string;
 
   @IsString()
   @IsNotEmpty()
@@ -1127,8 +1127,8 @@ In `src/operator/operator.controller.ts`, add the import for `SaveBankDetailsDto
     @Body() dto: SaveBankDetailsDto,
   ) {
     await this.operatorService.assertCanManageOperator(req.user, id);
-    if (!dto.bankCode?.trim() || !dto.accountNumber?.trim()) {
-      throw new BadRequestException('bankCode and accountNumber are required');
+    if (!dto.bankCode?.trim() || !dto.bankName?.trim() || !dto.accountNumber?.trim()) {
+      throw new BadRequestException('bankCode, bankName, and accountNumber are required');
     }
     const operator = await this.operatorService.saveBankDetails(id, dto);
     return { message: 'Payout bank details saved', data: operator };
@@ -1317,19 +1317,18 @@ git commit -m "feat(payout): add bank-details, bank-list, and admin payout endpo
 
 - [ ] **Step 1: Add bank fields to the frontend `Operator` interface**
 
-In `app/hooks/useOperatorApi.ts`, add to the `Operator` interface (alongside the existing fields, following the exact pattern used for `averageRating`/`ratingCount` in the prior rating-service work):
+In `app/hooks/useOperatorApi.ts`, add to the `Operator` interface (alongside the existing fields, following the exact pattern used for `averageRating`/`ratingCount` in the prior rating-service work). Note: matches the minimized backend storage — no `bankCode`, no full `accountNumber`:
 
 ```typescript
-  bankCode:              string | null;
   bankName:              string | null;
-  accountNumber:         string | null;
   accountName:           string | null;
+  accountNumberLast4:    string | null;
   paystackRecipientCode: string | null;
 ```
 
 - [ ] **Step 2: Add `fetchBanks` and `saveBankDetails` to the hook**
 
-Add near `updateOperator` in `app/hooks/useOperatorApi.ts`:
+Add near `updateOperator` in `app/hooks/useOperatorApi.ts`. The request body still sends the full `bankCode`/`accountNumber` (the backend needs them for the one-time Paystack resolve+recipient calls) — they're just never echoed back or stored client-side beyond that request:
 
 ```typescript
   const fetchBanks = useCallback(async (): Promise<Array<{ name: string; code: string }>> => {
@@ -1343,7 +1342,7 @@ Add near `updateOperator` in `app/hooks/useOperatorApi.ts`:
 
   const saveBankDetails = useCallback(async (
     id: string,
-    data: { bankCode: string; accountNumber: string },
+    data: { bankCode: string; bankName: string; accountNumber: string },
   ): Promise<Operator> => {
     setLoading(true);
     setError(null);
@@ -1381,11 +1380,9 @@ In `app/components/OperatorProfileForm.tsx`, add `fetchBanks`/`saveBankDetails` 
   const [bankMsg, setBankMsg] = useState<{ msg: string; ok: boolean } | null>(null);
 ```
 
-In the existing `useEffect` that calls `fetchMe()`, seed the bank state from the loaded operator (alongside the existing `setBusinessName`/etc. calls) and separately load the bank list:
+`bankCode` and `accountNumber` are pure input state for the save request — they are never seeded from the loaded operator, since the backend never returns the full number or the code back (data minimization). What *is* seeded is the already-saved display data:
 
 ```typescript
-        setBankCode(op.bankCode ?? "");
-        setAccountNumber(op.accountNumber ?? "");
         setResolvedName(op.accountName ?? null);
 ```
 
@@ -1395,7 +1392,7 @@ In the existing `useEffect` that calls `fetchMe()`, seed the bank state from the
   }, [fetchBanks]);
 ```
 
-Add a handler:
+Add a handler. Note `bankName` is looked up from the selected `bankCode` against the already-loaded `banks` list, since the backend DTO needs both:
 
 ```typescript
   async function handleSaveBankDetails() {
@@ -1403,9 +1400,11 @@ Add a handler:
     setBankMsg(null);
     setResolving(true);
     try {
-      const updated = await saveBankDetails(operator.id, { bankCode, accountNumber });
+      const bankName = banks.find((b) => b.code === bankCode)?.name ?? "";
+      const updated = await saveBankDetails(operator.id, { bankCode, bankName, accountNumber });
       setOperator(updated);
       setResolvedName(updated.accountName);
+      setAccountNumber("");
       setBankMsg({ msg: "Payout bank details saved.", ok: true });
     } catch (err) {
       setBankMsg({ msg: err instanceof Error ? err.message : "Failed to save bank details", ok: false });
@@ -1415,7 +1414,7 @@ Add a handler:
   }
 ```
 
-Add the section's JSX after the existing "Fleet / truck classes" block and before the closing `</div>` of the form's field container (this is a second, independent action — not part of the main "Save business profile" submit — since bank details need their own verify-then-save step):
+Add the section's JSX after the existing "Fleet / truck classes" block and before the closing `</div>` of the form's field container (this is a second, independent action — not part of the main "Save business profile" submit — since bank details need their own verify-then-save step). The existing saved account is shown via `operator.bankName`/`accountNumberLast4` (masked), never the full number, since the frontend never has it after the initial save request completes:
 
 ```tsx
       <div style={{ marginTop: "1.5rem", paddingTop: "1.25rem", borderTop: "1px solid #dde8f8" }}>
@@ -1425,6 +1424,11 @@ Add the section's JSX after the existing "Fleet / truck classes" block and befor
         <p style={{ margin: "0 0 1rem", color: "#6c7890", fontSize: "0.85rem" }}>
           Where we send your earnings after a job's balance is paid.
         </p>
+        {operator.bankName && operator.accountNumberLast4 && (
+          <p style={{ margin: "0 0 1rem", fontSize: "0.85rem", color: "#333" }}>
+            Currently: {operator.bankName} ····{operator.accountNumberLast4} ({operator.accountName})
+          </p>
+        )}
         <div style={{ display: "flex", flexDirection: "column", gap: "0.9rem" }}>
           <div>
             <label htmlFor="op-bank" style={labelStyle}>Bank</label>
@@ -1442,11 +1446,6 @@ Add the section's JSX after the existing "Fleet / truck classes" block and befor
               onChange={(e) => { setAccountNumber(e.target.value); setResolvedName(null); }}
             />
           </div>
-          {resolvedName && (
-            <p style={{ margin: 0, fontSize: "0.85rem", color: "#19a56b", fontWeight: 600 }}>
-              Account name: {resolvedName}
-            </p>
-          )}
           <button
             type="button"
             onClick={handleSaveBankDetails}
@@ -1457,7 +1456,7 @@ Add the section's JSX after the existing "Fleet / truck classes" block and befor
               cursor: resolving ? "not-allowed" : "pointer", opacity: resolving ? 0.6 : 1,
             }}
           >
-            {resolving ? "Verifying…" : "Verify & save"}
+            {resolving ? "Verifying & saving…" : "Verify & save"}
           </button>
           {bankMsg && (
             <p style={{ margin: 0, fontSize: "0.85rem", fontWeight: 600, color: bankMsg.ok ? "#19a56b" : "#dc2626" }}>
@@ -1504,18 +1503,20 @@ There is currently no existing "admin edits an operator's business profile" scre
 
 In `app/components/tabs/OperatorsTab.tsx`, update `StatsModalProps` and the `StatsModal` function signature to accept the save capability:
 
+Note: `bankCode` input state is NOT seeded from `operator.bankCode` (that field no longer exists — see Global Constraints' data-minimization note); it's always a fresh empty input, same reasoning as Task 7.
+
 ```typescript
 interface StatsModalProps {
   operator: Operator;
   stats: OperatorStats | null;
   onClose: () => void;
   banks: Array<{ name: string; code: string }>;
-  onSaveBankDetails: (bankCode: string, accountNumber: string) => Promise<void>;
+  onSaveBankDetails: (bankCode: string, bankName: string, accountNumber: string) => Promise<void>;
 }
 
 function StatsModal({ operator, stats, onClose, banks, onSaveBankDetails }: StatsModalProps) {
-  const [bankCode, setBankCode] = useState(operator.bankCode ?? "");
-  const [accountNumber, setAccountNumber] = useState(operator.accountNumber ?? "");
+  const [bankCode, setBankCode] = useState("");
+  const [accountNumber, setAccountNumber] = useState("");
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<{ msg: string; ok: boolean } | null>(null);
 
@@ -1523,7 +1524,9 @@ function StatsModal({ operator, stats, onClose, banks, onSaveBankDetails }: Stat
     setSaving(true);
     setMsg(null);
     try {
-      await onSaveBankDetails(bankCode, accountNumber);
+      const bankName = banks.find((b) => b.code === bankCode)?.name ?? "";
+      await onSaveBankDetails(bankCode, bankName, accountNumber);
+      setAccountNumber("");
       setMsg({ msg: "Bank details saved.", ok: true });
     } catch (err) {
       setMsg({ msg: err instanceof Error ? err.message : "Failed to save bank details", ok: false });
@@ -1563,8 +1566,10 @@ Add this after the existing "30-Day Performance" block (before the "Close" butto
             {saving ? "Saving…" : "Save"}
           </button>
         </div>
-        {operator.accountName && (
-          <p style={{ margin: "0.5rem 0 0", fontSize: "0.85rem", color: "#666" }}>Current: {operator.accountName}</p>
+        {operator.bankName && operator.accountNumberLast4 && (
+          <p style={{ margin: "0.5rem 0 0", fontSize: "0.85rem", color: "#666" }}>
+            Current: {operator.bankName} ····{operator.accountNumberLast4} ({operator.accountName})
+          </p>
         )}
         {msg && (
           <p style={{ margin: "0.5rem 0 0", fontSize: "0.85rem", fontWeight: 600, color: msg.ok ? "#19a56b" : "#dc2626" }}>{msg.msg}</p>
@@ -1591,8 +1596,8 @@ Find where `<StatsModal ... />` is currently rendered and pass the two new props
           stats={statsMap[selectedOp.id] ?? null}
           onClose={() => setSelectedOp(null)}
           banks={banks}
-          onSaveBankDetails={async (bankCode, accountNumber) => {
-            const updated = await saveBankDetails(selectedOp.id, { bankCode, accountNumber });
+          onSaveBankDetails={async (bankCode, bankName, accountNumber) => {
+            const updated = await saveBankDetails(selectedOp.id, { bankCode, bankName, accountNumber });
             setSelectedOp(updated);
           }}
         />
