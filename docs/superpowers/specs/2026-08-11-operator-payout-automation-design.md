@@ -55,14 +55,26 @@ the accepted `DispatchOffer`.
 
 ## Data model
 
+**Data minimization:** the full account number is only ever handled
+transiently — sent to Paystack to resolve the account name and create a
+transfer recipient, then discarded. It is never persisted. `bankCode` is
+likewise transient (needed only for that same resolve/create call). What
+gets stored is display-safe data (`bankName`, `accountName`,
+`accountNumberLast4`) plus the `paystackRecipientCode` that future payouts
+actually use. This follows Paystack's own recommended flow (recipient
+creation is designed to be a one-time step whose code you cache and reuse)
+and meaningfully shrinks what a database compromise would expose — no
+operator's full bank account number sits in LRR's database. Payout bank
+details are personal data under Nigeria's NDPA/NDPR, so minimizing what's
+retained is also a straightforward compliance win, not just a security one.
+
 ```prisma
 model Operator {
   // ...existing fields...
-  bankCode              String?
-  bankName              String?
-  accountNumber         String?
-  accountName           String?   // from Paystack's resolve-account response, never hand-typed
-  paystackRecipientCode String?   // created once via Paystack, cached here
+  bankName              String?   // display only
+  accountName           String?   // display only, from Paystack's resolve-account response, never hand-typed
+  accountNumberLast4    String?   // display only ("····6789") — never the full number
+  paystackRecipientCode String?   // created once via Paystack, the only field payouts actually use
 
   payouts               Payout[]
 }
@@ -127,11 +139,12 @@ needed).
   account-resolution endpoint, returns the verified `account_name`. Used at
   bank-details-save time; the account name is never typed by a human, only
   ever accepted from this response.
-- `createTransferRecipient(operator)` — creates a Paystack transfer
-  recipient from `bankCode`/`accountNumber`/`accountName`, returns
-  `recipient_code`. Called once per operator, result cached as
-  `paystackRecipientCode`; re-created if bank details are ever changed
-  (saving new bank details clears the cached code).
+- `createTransferRecipient(accountNumber, bankCode, accountName, businessName)`
+  — creates a Paystack transfer recipient, returns `recipient_code`. Called
+  once, at bank-details-save time (not lazily at payout time — see Bank
+  details capture below), immediately after `resolveAccountNumber`. Its
+  inputs (`accountNumber`, `bankCode`) are never stored — only the returned
+  `recipient_code` is persisted.
 - `checkBalance()` — calls Paystack's balance endpoint, returns the
   available balance in kobo.
 - `initiateTransfer(recipientCode, amount, reference)` — calls Paystack's
@@ -148,23 +161,21 @@ prevent the customer/operator from being notified or prompted to rate):
 
 1. Create the `Payout` row (`PENDING`, `blockReason: null`) with the
    computed `amount`.
-2. If the operator has no `paystackRecipientCode`:
-   - If they also have no bank details on file, set
-     `blockReason: NO_BANK_DETAILS` and stop — status stays `PENDING`,
-     nothing was attempted.
-   - Otherwise call `createTransferRecipient`. If this call itself throws
-     (a real attempt that failed, distinct from simply lacking details),
-     go to step 5.
+2. If the operator has no `paystackRecipientCode`, set
+   `blockReason: NO_BANK_DETAILS` and stop — status stays `PENDING`,
+   nothing was attempted. (Recipient creation no longer happens here — by
+   the time a payout is processed, the recipient must already exist from
+   bank-details-save time, since that's the only point the full account
+   number is ever available to create one from.)
 3. Call `checkBalance()`. If it can't cover `amount`, set
    `blockReason: INSUFFICIENT_BALANCE` and stop — status stays `PENDING`.
 4. Call `initiateTransfer()`. On success, set status to `PROCESSING`,
    `blockReason: null`, and store `paystackTransferCode`. Final
    confirmation arrives asynchronously via webhook (step below).
-5. Any thrown error from an actual attempt (recipient creation or transfer
-   initiation — network failure, Paystack 4xx/5xx, etc.) is caught, logged
-   to Sentry, and recorded as `status: FAILED` with the error message as
-   `failureReason`. This method never throws back up into
-   `handleBalancePaymentConfirmed`.
+5. Any thrown error from an actual attempt (transfer initiation — network
+   failure, Paystack 4xx/5xx, etc.) is caught, logged to Sentry, and
+   recorded as `status: FAILED` with the error message as `failureReason`.
+   This method never throws back up into `handleBalancePaymentConfirmed`.
 
 A `PENDING` payout blocked on `NO_BANK_DETAILS` does **not** automatically
 retry when the operator later adds their bank details — for MVP it stays
@@ -193,15 +204,26 @@ signature-verified `POST /webhooks/paystack` endpoint) gains:
 One endpoint serves both the operator self-service case and the admin
 edit case, role-checked rather than duplicated:
 
-`POST /operators/:id/bank-details` — body: `{ bankCode, accountNumber }`.
+`POST /operators/:id/bank-details` — body: `{ bankCode, bankName, accountNumber }`
+(`bankName` comes along from the frontend's bank dropdown, which already
+has it — no separate bank-name lookup needed server-side).
 - Callable by the operator themselves (existing operator-auth guard,
   `:id` must match the authenticated operator) or by an admin (existing
   admin-auth guard, any `:id`).
 - Calls `resolveAccountNumber` to get the verified `accountName`.
-- Saves `bankCode`/`accountNumber`/`accountName` on the `Operator`.
-- Clears `paystackRecipientCode` (a stale recipient pointing at old bank
-  details must not be reused — `processPayout` will recreate it on next
-  use).
+- Calls `createTransferRecipient` immediately, using `bankCode`,
+  `accountNumber`, the resolved `accountName`, and the operator's
+  `businessName`, to get a `recipient_code`. This is the *only* place a
+  transfer recipient is ever created — `PayoutService` never creates one
+  lazily (see Trigger & flow).
+- Saves `bankName`, `accountName`, `accountNumberLast4` (the last 4 digits
+  of `accountNumber`), and `paystackRecipientCode` (the new recipient code)
+  on the `Operator`. `bankCode` and the full `accountNumber` are used only
+  for the two Paystack calls above and are never written to the database.
+- Changing bank details later simply repeats this whole flow — resolve,
+  create a *new* recipient, overwrite `paystackRecipientCode` — there is no
+  "clear and lazily recreate" step anymore, since recipient creation always
+  happens here, synchronously, before the save completes.
 
 `lrr-web`:
 - **Operator settings** (`SettingsTab` or equivalent operator-portal page)
@@ -232,12 +254,17 @@ edit case, role-checked rather than duplicated:
 
 | Situation | status | blockReason | failureReason |
 |---|---|---|---|
-| No bank details on file (nothing attempted) | `PENDING` | `NO_BANK_DETAILS` | — |
+| No bank details on file / recipient not yet created (nothing attempted) | `PENDING` | `NO_BANK_DETAILS` | — |
 | Insufficient platform balance (nothing attempted) | `PENDING` | `INSUFFICIENT_BALANCE` | — |
-| Recipient creation fails (an attempt) | `FAILED` | — | Paystack error message |
 | Transfer API call fails (an attempt) | `FAILED` | — | Paystack error message |
 | Transfer accepted, webhook reports failure/reversal | `FAILED` | — | Webhook's reason field |
 | Any unexpected exception during an attempt | `FAILED` | — | Exception message |
+
+Recipient-creation failure is no longer a `PayoutService` error path — it
+happens synchronously inside the bank-details save request instead (see
+Bank details capture), where a failure simply means the save itself fails
+and the operator sees an error on that form — there's no `Payout` row
+involved yet at that point.
 
 This split keeps `FAILED` meaning what it says — an attempt was made and
 didn't succeed — so the admin dashboard's failure count isn't inflated by
@@ -258,9 +285,10 @@ that should have moved and hasn't).
 - **Paystack balance funding:** transfers draw from the platform's Paystack
   balance, which must be kept funded/topped-up independently of this
   feature. The balance pre-check (`checkBalance`) turns an underfunded
-  balance into a visible `FAILED` payout with a clear reason, rather than a
-  cryptic Paystack API error — it does not solve the funding problem
-  itself, which remains an operational responsibility.
+  balance into a visible `PENDING`/`INSUFFICIENT_BALANCE` payout with a
+  clear reason, rather than a cryptic Paystack API error or a misleading
+  `FAILED` — it does not solve the funding problem itself, which remains an
+  operational responsibility.
 - **Settlement timing:** Paystack's settlement-to-bank schedule (typically
   next-business-day for Nigerian merchants, but account-specific and
   changeable by Paystack) does not gate transfers, since transfers draw
