@@ -429,7 +429,7 @@ Expected: no errors.
 
 - [ ] **Step 7: Manual verification**
 
-Log in as a customer whose test account has at least one `COMPLETED` request with both `depositPaid`/`balancePaid` true (e.g. the E2E test flow from the operator-quotes work). Confirm: rows without full payment show no "Receipt →" hint and clicking does nothing; the fully-paid completed row shows the hint, and clicking opens the modal with correct vehicle/destination/operator/dates/amounts and the "✓ Paid in full" total. Click Print and confirm the browser print preview shows only the receipt card, not the page chrome. Click Close and confirm the modal dismisses.
+Log in as a customer whose test account has at least one `COMPLETED` request with both `depositPaid`/`balancePaid` true (e.g. the E2E test flow from the operator-quotes work). Confirm: the list table no longer has a "Service" column (Operator/Date/Status only); rows without full payment show no "Receipt →" hint and clicking does nothing; the fully-paid completed row shows the hint, and clicking opens the classic-receipt modal (LRR logo, dashed dividers, itemized deposit/balance/TOTAL) with correct vehicle/destination/operator/date and the "✓ PAID IN FULL" banner. Click Print and confirm the browser print preview shows only the receipt card, not the page chrome. Click Close and confirm the modal dismisses.
 
 - [ ] **Step 8: Commit**
 
@@ -437,5 +437,18 @@ Log in as a customer whose test account has at least one `COMPLETED` request wit
 git add app/types.ts app/components/customer/RequestsTab.tsx
 git commit -m "feat(customer): add printable receipt view for completed, paid requests"
 ```
+
+**Implementation note (post-Step 6, before commit):** the modal content in
+Step 5 above was superseded by a visual-companion mockup session — the
+human approved a classic paper-receipt style (LRR logo letterhead, dashed
+dividers, itemized deposit/balance/TOTAL, "✓ PAID IN FULL" banner) instead
+of the plain two-column data grid originally drafted. The list table's
+"Service" column (`r.issueType`) was also dropped entirely per a separate
+request, reducing the table to Operator/Date/Status (`colSpan` values
+updated 4→3 accordingly). The modal's "Service" row now reads
+`receipt.vehicleType ?? "—"` with no `issueType` fallback. See the updated
+design spec (`docs/superpowers/specs/2026-08-10-motorist-receipt-view-design.md`)
+for the final approved layout. The actual committed code is the source of
+truth over this plan's original Step 5 snippet.
 
 ---
