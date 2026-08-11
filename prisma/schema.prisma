@@ -114,6 +114,7 @@ model User {
   rescueRequests      RescueRequest[]
   subscriptions       Subscription[]
   whatsAppSession     WhatsAppSession?
+  ratings             Rating[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -147,6 +148,7 @@ model Operator {
   members        OperatorMember[]
   rescueRequests RescueRequest[]
   dispatchOffers DispatchOffer[]
+  ratings        Rating[]
 
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
@@ -207,6 +209,7 @@ model RescueRequest {
 
   dispatchOffers     DispatchOffer[]
   media              RequestMedia[]
+  ratings            Rating[]
 
   @@index([customerId])
   @@index([status])
@@ -261,6 +264,38 @@ model DispatchOffer {
   @@index([rescueRequestId])
   @@index([operatorId])
   @@index([status])
+}
+
+enum RatingDirection {
+  MOTORIST_TO_OPERATOR
+  OPERATOR_TO_MOTORIST
+}
+
+// Two-way post-job rating — one row per direction per completed job,
+// collected via WhatsApp (score) and an optional unauthenticated web link
+// (comment), sent right after balance payment confirms.
+model Rating {
+  id               String          @id @default(cuid())
+
+  rescueRequestId  String
+  rescueRequest    RescueRequest   @relation(fields: [rescueRequestId], references: [id])
+
+  direction        RatingDirection
+
+  operatorId       String
+  operator         Operator        @relation(fields: [operatorId], references: [id])
+
+  customerId       String
+  customer         User            @relation(fields: [customerId], references: [id])
+
+  score            Int
+  comment          String?
+
+  createdAt        DateTime        @default(now())
+
+  @@unique([rescueRequestId, direction])
+  @@index([operatorId])
+  @@index([customerId])
 }
 
 // WhatsApp conversation sessions (DB-backed, survives restarts)
