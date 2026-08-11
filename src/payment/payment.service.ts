@@ -4,6 +4,7 @@ import * as crypto from 'crypto';
 import * as Sentry from '@sentry/node';
 import { RescueRequestService } from '../rescue-request/rescue-request.service';
 import { SubscriptionService } from '../subscription/subscription.service';
+import { PayoutService } from '../payout/payout.service';
 
 @Injectable()
 export class PaymentService {
@@ -13,6 +14,7 @@ export class PaymentService {
     private readonly rescueRequestService: RescueRequestService,
     @Inject(forwardRef(() => SubscriptionService))
     private readonly subscriptionService: SubscriptionService,
+    private readonly payoutService: PayoutService,
   ) {}
 
   /**
@@ -84,6 +86,18 @@ export class PaymentService {
       case 'subscription.create': {
         // Store the subscription_code so we can cancel/manage it later.
         await this.subscriptionService.handleSubscriptionCreate(data);
+        break;
+      }
+
+      // ── Operator payout transfer outcome ──────────────────────────────────
+      case 'transfer.success': {
+        await this.payoutService.confirmTransferOutcome(data.transfer_code, 'SUCCESS');
+        break;
+      }
+
+      case 'transfer.failed':
+      case 'transfer.reversed': {
+        await this.payoutService.confirmTransferOutcome(data.transfer_code, 'FAILED', data.reason);
         break;
       }
 
