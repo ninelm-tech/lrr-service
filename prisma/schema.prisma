@@ -145,10 +145,12 @@ model Operator {
   verifiedAt    DateTime?
   notes         String?
 
-  bankCode              String?
+  // Payout bank details, minimized: the full account number is sent to
+  // Paystack to create a transfer recipient and then discarded — only
+  // display-safe data and the resulting recipient code are kept.
   bankName              String?
-  accountNumber         String?
   accountName           String?
+  accountNumberLast4    String?
   paystackRecipientCode String?
 
   members        OperatorMember[]
@@ -406,7 +408,7 @@ model Payout {
   amount               Int
   status               PayoutStatus       @default(PENDING)
   blockReason          PayoutBlockReason?
-  paystackTransferCode String?
+  paystackTransferCode String?            @unique
   failureReason        String?
 
   createdAt            DateTime           @default(now())
