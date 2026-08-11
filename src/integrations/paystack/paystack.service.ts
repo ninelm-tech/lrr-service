@@ -249,4 +249,92 @@ export class PaystackService {
     });
     return (await res.json() as any).data;
   }
+
+  private banksCache: Array<{ name: string; code: string }> | null = null;
+
+  // ── Transfers / Payouts ──────────────────────────────────────────────────
+
+  /** Verify a bank account belongs to a real, named holder before saving it. */
+  async resolveAccountNumber(accountNumber: string, bankCode: string): Promise<{ accountName: string }> {
+    const res = await fetch(
+      `${this.baseUrl}/bank/resolve?account_number=${accountNumber}&bank_code=${bankCode}`,
+      { headers: { Authorization: `Bearer ${this.secretKey}` } },
+    );
+    const data = await res.json() as any;
+    console.log('Paystack resolve account:', data);
+    return { accountName: data.data.account_name };
+  }
+
+  /** List Nigerian banks (name + code) for the bank-selection dropdown. Cached for the process lifetime. */
+  async listBanks(): Promise<Array<{ name: string; code: string }>> {
+    if (this.banksCache) return this.banksCache;
+    const res = await fetch(`${this.baseUrl}/bank?country=nigeria`, {
+      headers: { Authorization: `Bearer ${this.secretKey}` },
+    });
+    const data = await res.json() as any;
+    this.banksCache = (data.data ?? []).map((b: any) => ({ name: b.name, code: b.code }));
+    return this.banksCache!;
+  }
+
+  /** Create a Paystack transfer recipient — call once per operator, cache the returned code. */
+  async createTransferRecipient(params: {
+    accountNumber: string;
+    bankCode: string;
+    accountName: string;
+    businessName: string;
+  }): Promise<{ recipientCode: string }> {
+    const res = await fetch(`${this.baseUrl}/transferrecipient`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.secretKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        type: 'nuban',
+        name: params.businessName,
+        account_number: params.accountNumber,
+        bank_code: params.bankCode,
+        currency: 'NGN',
+      }),
+    });
+    const data = await res.json() as any;
+    console.log('Paystack create transfer recipient:', data);
+    return { recipientCode: data.data.recipient_code };
+  }
+
+  /** Available NGN balance, in kobo. */
+  async checkBalance(): Promise<number> {
+    const res = await fetch(`${this.baseUrl}/balance`, {
+      headers: { Authorization: `Bearer ${this.secretKey}` },
+    });
+    const data = await res.json() as any;
+    const ngn = (data.data ?? []).find((b: any) => b.currency === 'NGN');
+    return ngn?.balance ?? 0;
+  }
+
+  /** Initiate a transfer from the platform balance to a saved recipient. */
+  async initiateTransfer(params: {
+    recipientCode: string;
+    amount: number;
+    reference: string;
+    reason: string;
+  }): Promise<{ transferCode: string; status: string }> {
+    const res = await fetch(`${this.baseUrl}/transfer`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.secretKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        source: 'balance',
+        amount: params.amount,
+        recipient: params.recipientCode,
+        reference: params.reference,
+        reason: params.reason,
+      }),
+    });
+    const data = await res.json() as any;
+    console.log('Paystack initiate transfer:', data);
+    return { transferCode: data.data.transfer_code, status: data.data.status };
+  }
 }
