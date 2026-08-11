@@ -5,6 +5,8 @@ import * as bcrypt from 'bcrypt';
 import { normalizePhone } from '../common/phone.util';
 import { CreateOperatorDto } from './dto/create-operator.dto';
 import { UpdateOperatorProfileDto } from './dto/update-operator-profile.dto';
+import { SaveBankDetailsDto } from './dto/save-bank-details.dto';
+import { PaystackService } from '../integrations/paystack/paystack.service';
 
 // ── Scoring weights ────────────────────────────────────────────────────────────
 // Distance is the dominant factor but reliability and speed matter.
@@ -50,7 +52,10 @@ export interface OperatorStatsWithRating extends OperatorStats {
 
 @Injectable()
 export class OperatorService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly paystackService: PaystackService,
+  ) {}
 
   // ══════════════════════════════════════════════════════
   //  REGISTRATION
@@ -387,6 +392,40 @@ export class OperatorService {
     if (!membership) {
       throw new ForbiddenException('You are not a member of this operator');
     }
+  }
+
+  /**
+   * Save an operator's payout bank details. accountName always comes from
+   * Paystack's resolve-account response, never from the request body.
+   * Creates the Paystack transfer recipient right here — the ONLY place
+   * this ever happens, since this is the only point the full account
+   * number is available. bankCode and the full accountNumber are used for
+   * the two Paystack calls below and are never persisted — only display
+   * data (bankName, accountName, accountNumberLast4) and the resulting
+   * recipientCode are stored. Changing bank details later simply repeats
+   * this whole flow, overwriting paystackRecipientCode with a new one.
+   */
+  async saveBankDetails(id: string, dto: SaveBankDetailsDto) {
+    const operator = await this.prisma.operator.findUnique({ where: { id } });
+    if (!operator) throw new NotFoundException('Operator not found');
+
+    const { accountName } = await this.paystackService.resolveAccountNumber(dto.accountNumber, dto.bankCode);
+    const { recipientCode } = await this.paystackService.createTransferRecipient({
+      accountNumber: dto.accountNumber,
+      bankCode: dto.bankCode,
+      accountName,
+      businessName: operator.businessName,
+    });
+
+    return this.prisma.operator.update({
+      where: { id },
+      data: {
+        bankName: dto.bankName,
+        accountName,
+        accountNumberLast4: dto.accountNumber.slice(-4),
+        paystackRecipientCode: recipientCode,
+      },
+    });
   }
 
   /**

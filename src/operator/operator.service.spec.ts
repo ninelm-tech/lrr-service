@@ -2,31 +2,38 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException } from '@nestjs/common';
 import { OperatorService } from './operator.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TruckClass } from '@prisma/client';
 import { CreateOperatorDto } from './dto/create-operator.dto';
 
 describe('OperatorService', () => {
   let service: OperatorService;
   let prisma: {
-    operator: { findMany: jest.Mock };
+    operator: { findMany: jest.Mock; findUnique: jest.Mock; update: jest.Mock };
     dispatchOffer: { findMany: jest.Mock };
     rating: { aggregate: jest.Mock; groupBy: jest.Mock };
   };
+  let paystackMock: { resolveAccountNumber: jest.Mock; createTransferRecipient: jest.Mock };
 
   beforeEach(async () => {
     prisma = {
-      operator: { findMany: jest.fn() },
+      operator: { findMany: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
       dispatchOffer: { findMany: jest.fn().mockResolvedValue([]) },
       rating: {
         aggregate: jest.fn().mockResolvedValue({ _avg: { score: null }, _count: { score: 0 } }),
         groupBy: jest.fn().mockResolvedValue([]),
       },
     };
+    paystackMock = {
+      resolveAccountNumber: jest.fn(),
+      createTransferRecipient: jest.fn(),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         OperatorService,
         { provide: PrismaService, useValue: prisma },
+        { provide: PaystackService, useValue: paystackMock },
       ],
     }).compile();
 
@@ -35,6 +42,29 @@ describe('OperatorService', () => {
 
   it('should be defined', () => {
     expect(service).toBeDefined();
+  });
+
+  describe('saveBankDetails', () => {
+    it('resolves the account, creates a recipient, and saves only display-safe fields', async () => {
+      paystackMock.resolveAccountNumber.mockResolvedValue({ accountName: 'JOHN DOE' });
+      paystackMock.createTransferRecipient.mockResolvedValue({ recipientCode: 'RCP_new123' });
+      prisma.operator.findUnique.mockResolvedValue({ id: 'op-1', businessName: 'Swift Towing' });
+      prisma.operator.update.mockResolvedValue({
+        id: 'op-1', bankName: 'GTBank', accountName: 'JOHN DOE', accountNumberLast4: '6789', paystackRecipientCode: 'RCP_new123',
+      });
+
+      const result = await service.saveBankDetails('op-1', { bankCode: '058', bankName: 'GTBank', accountNumber: '0123456789' });
+
+      expect(paystackMock.resolveAccountNumber).toHaveBeenCalledWith('0123456789', '058');
+      expect(paystackMock.createTransferRecipient).toHaveBeenCalledWith({
+        accountNumber: '0123456789', bankCode: '058', accountName: 'JOHN DOE', businessName: 'Swift Towing',
+      });
+      expect(prisma.operator.update).toHaveBeenCalledWith({
+        where: { id: 'op-1' },
+        data: { bankName: 'GTBank', accountName: 'JOHN DOE', accountNumberLast4: '6789', paystackRecipientCode: 'RCP_new123' },
+      });
+      expect(result.accountName).toBe('JOHN DOE');
+    });
   });
 
   describe('getOperatorStats — ratings', () => {

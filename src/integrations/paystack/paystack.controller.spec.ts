@@ -1,25 +1,35 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { PaystackController } from './paystack.controller';
 import { PaystackService } from './paystack.service';
 
-// Note: Paystack has no dedicated controller — webhooks route through WebhooksModule.
-// This spec validates the service can be instantiated.
-describe('PaystackService', () => {
-  let service: PaystackService;
+describe('PaystackController', () => {
+  let controller: PaystackController;
+  let paystackService: { listBanks: jest.Mock };
 
   beforeEach(async () => {
+    paystackService = { listBanks: jest.fn() };
+
     const module: TestingModule = await Test.createTestingModule({
+      controllers: [PaystackController],
       providers: [
-        {
-          provide: PaystackService,
-          useValue: {},
-        },
+        { provide: PaystackService, useValue: paystackService },
       ],
     }).compile();
 
-    service = module.get<PaystackService>(PaystackService);
+    controller = module.get<PaystackController>(PaystackController);
   });
 
   it('should be defined', () => {
-    expect(service).toBeDefined();
+    expect(controller).toBeDefined();
+  });
+
+  describe('listBanks', () => {
+    it('returns the bank list from PaystackService', async () => {
+      paystackService.listBanks.mockResolvedValue([{ name: 'GTBank', code: '058' }]);
+
+      const result = await controller.listBanks();
+
+      expect(result).toEqual({ data: [{ name: 'GTBank', code: '058' }] });
+    });
   });
 });

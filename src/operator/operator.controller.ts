@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
@@ -14,6 +15,7 @@ import {
 import { OperatorService } from './operator.service';
 import { CreateOperatorDto } from './dto/create-operator.dto';
 import { UpdateOperatorProfileDto } from './dto/update-operator-profile.dto';
+import { SaveBankDetailsDto } from './dto/save-bank-details.dto';
 import { OperatorMemberRole, OperatorStatus, OperatorType, UserRole } from '@prisma/client';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
@@ -106,6 +108,25 @@ export class OperatorController {
     await this.operatorService.assertCanManageOperator(req.user, id);
     const operator = await this.operatorService.updateProfile(id, dto);
     return { message: 'Operator profile updated', data: operator };
+  }
+
+  /**
+   * Save payout bank details. Allowed: admins, or OWNER/MANAGER members of
+   * this operator — same permission check as updateProfile.
+   */
+  @UseGuards(AuthGuard)
+  @Patch(':id/bank-details')
+  async saveBankDetails(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() dto: SaveBankDetailsDto,
+  ) {
+    await this.operatorService.assertCanManageOperator(req.user, id);
+    if (!dto.bankCode?.trim() || !dto.bankName?.trim() || !dto.accountNumber?.trim()) {
+      throw new BadRequestException('bankCode, bankName, and accountNumber are required');
+    }
+    const operator = await this.operatorService.saveBankDetails(id, dto);
+    return { message: 'Payout bank details saved', data: operator };
   }
 
   /**
