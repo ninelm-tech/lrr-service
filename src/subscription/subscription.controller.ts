@@ -86,7 +86,7 @@ export class SubscriptionController {
    */
   @Delete(':id')
   @UseGuards(RolesGuard)
-  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @Roles(UserRole.SUPER_ADMIN)
   async cancelSubscription(@Param('id') id: string) {
     return this.subscriptionService.cancelSubscription(id);
   }

@@ -32,6 +32,7 @@ enum DispatchOfferStatus {
 enum UserRole {
   CUSTOMER
   OPERATOR
+  PRODUCT
   ADMIN
   SUPER_ADMIN
 }

@@ -13,7 +13,7 @@ export class PlatformConfigController {
 
   @Get()
   @UseGuards(RolesGuard)
-  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @Roles(UserRole.SUPER_ADMIN)
   async getSettings() {
     const data = await this.platformConfigService.getConfig();
     return { data };
@@ -21,7 +21,7 @@ export class PlatformConfigController {
 
   @Patch()
   @UseGuards(RolesGuard)
-  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @Roles(UserRole.SUPER_ADMIN)
   async updateSettings(@Body() dto: UpdatePlatformConfigDto) {
     const data = await this.platformConfigService.updateConfig(dto);
     return { data };

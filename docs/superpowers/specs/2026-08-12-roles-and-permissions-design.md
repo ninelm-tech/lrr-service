@@ -46,10 +46,10 @@ work rather than left as a trap for a future reader.
 ## Role matrix
 
 Built from an inventory of every `@Roles(...)`-gated endpoint in the
-backend, plus two previously-ungated-but-sensitive ones (`POST
-/payouts/:id/retry` money-adjacent action was already gated; `GET
-/platform-config` was NOT gated to any role before this change — see
-Backend changes).
+backend. Both `GET` and `PATCH /platform-config` already had
+`@Roles(ADMIN, SUPER_ADMIN)` before this change (an earlier draft of this
+spec incorrectly claimed the `GET` was ungated) — this change narrows both
+to `SUPER_ADMIN`, not newly guards either.
 
 | Capability | CUSTOMER | OPERATOR | PRODUCT | ADMIN | SUPER_ADMIN |
 |---|---|---|---|---|---|

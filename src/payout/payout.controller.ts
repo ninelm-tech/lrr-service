@@ -8,7 +8,7 @@ import { UserRole, PayoutStatus } from '@prisma/client';
 
 @Controller('payouts')
 @UseGuards(AuthGuard, RolesGuard)
-@Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+@Roles(UserRole.SUPER_ADMIN)
 export class PayoutController {
   constructor(
     private readonly prisma: PrismaService,

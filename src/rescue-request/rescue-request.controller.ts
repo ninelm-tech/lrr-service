@@ -50,7 +50,7 @@ export class RescueRequestController {
   /** Live + recent dispatch state across all requests, for the admin ops board. */
   @Get('dispatch-board')
   @UseGuards(RolesGuard)
-  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.PRODUCT)
   async dispatchBoard() {
     const rows = await this.rescueRequestService.getDispatchBoard();
     return { data: rows };
