@@ -218,10 +218,14 @@ export class AuthService {
     // Normalise phone to E.164 at the registration boundary
     const phoneNumber = normalizePhone(dto.phoneNumber);
 
-    // Check if user already exists
-    const existingUser = await this.prisma.user.findUnique({ where: { email: dto.email } });
+    // Check if user already exists (by email or phone number — both are
+    // unique on User, and an uncaught collision on either would otherwise
+    // surface as a raw Prisma error / 500 from user.create below).
+    const existingUser = await this.prisma.user.findFirst({
+      where: { OR: [{ email: dto.email }, { phoneNumber }] },
+    });
     if (existingUser) {
-      throw new ConflictException('Email already registered');
+      throw new ConflictException('Email or phone number already registered');
     }
 
     // Check if operator already exists (by businessName or phoneNumber)
