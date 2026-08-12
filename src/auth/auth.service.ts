@@ -92,49 +92,37 @@ export class AuthService {
   /**
    * Register a new user (generic - for admin use)
    */
-  async register(data: {
+  /**
+   * Admin action: create a staff account (ADMIN or PRODUCT only — never
+   * SUPER_ADMIN, never CUSTOMER/OPERATOR, which have their own dedicated
+   * self-registration flows). Role restriction is enforced by the
+   * controller before this is called; this method trusts its input.
+   */
+  async createStaff(data: {
     email: string;
-    password: string;
-    name?: string;
-    role?: UserRole;
-  }): Promise<AuthResponse> {
-    // Check if email already exists
+    name: string;
+    role: UserRole;
+    temporaryPassword: string;
+  }): Promise<{ id: string; email: string; name: string | null; role: UserRole }> {
     const existingUser = await this.prisma.user.findUnique({
       where: { email: data.email },
     });
-
     if (existingUser) {
       throw new ConflictException('Email already registered');
     }
 
-    // Hash password
-    const passwordHash = await this.hashPassword(data.password);
+    const passwordHash = await this.hashPassword(data.temporaryPassword);
 
-    // Create user
     const user = await this.prisma.user.create({
       data: {
         email: data.email,
-        passwordHash,
         name: data.name,
-        role: data.role || UserRole.CUSTOMER,
+        role: data.role,
+        passwordHash,
       },
     });
 
-    const accessToken = this.generateToken({
-      id: user.id,
-      email: user.email!,
-      role: user.role,
-    });
-
-    return {
-      accessToken,
-      user: {
-        id: user.id,
-        email: user.email!,
-        name: user.name,
-        role: user.role,
-      },
-    };
+    return { id: user.id, email: user.email!, name: user.name, role: user.role };
   }
 
   /**

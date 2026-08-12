@@ -1,8 +1,12 @@
 import { Body, Controller, Get, Patch, Post, UseGuards, Request, Query, BadRequestException } from '@nestjs/common';
+import { UserRole } from '@prisma/client';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { AuthGuard } from '../auth/auth.guard';
+import { RolesGuard } from './guards/roles.guard';
+import { Roles } from './decorators/roles.decorator';
 import { RegisterOperatorDto } from './dto/register-operator.dto';
+import { CreateStaffDto } from './dto/create-staff.dto';
 
 export class UpdateProfileDto {
   name?: string;
@@ -18,12 +22,6 @@ export class ChangePasswordDto {
 export class LoginDto {
   email: string;
   password: string;
-}
-
-export class RegisterDto {
-  email: string;
-  password: string;
-  name?: string;
 }
 
 /**
@@ -51,15 +49,20 @@ export class AuthController {
   }
 
   /**
-   * Register a new user (for testing/admin)
+   * Create a staff account (SUPER_ADMIN only). role is restricted to
+   * ADMIN or PRODUCT — SUPER_ADMIN is never created through this endpoint,
+   * even by a SUPER_ADMIN caller (no self-service path to a second
+   * SUPER_ADMIN account).
    */
-  @Post('register')
-  async register(@Body() dto: RegisterDto) {
-    return this.authService.register({
-      email: dto.email,
-      password: dto.password,
-      name: dto.name,
-    });
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles(UserRole.SUPER_ADMIN)
+  @Post('staff')
+  async createStaff(@Body() dto: CreateStaffDto) {
+    if (dto.role !== UserRole.ADMIN && dto.role !== UserRole.PRODUCT) {
+      throw new BadRequestException('role must be ADMIN or PRODUCT');
+    }
+    const user = await this.authService.createStaff(dto);
+    return { message: 'Staff account created', data: user };
   }
 
   /**
@@ -112,18 +115,15 @@ export class AuthController {
    * List all users — Super Admin only.
    * Supports ?role=CUSTOMER|OPERATOR|ADMIN|SUPER_ADMIN&search=&page=&limit=
    */
-  @UseGuards(AuthGuard)
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
   @Get('users')
   async listUsers(
-    @Request() req: any,
     @Query('role') role?: string,
     @Query('search') search?: string,
     @Query('page') page = '1',
     @Query('limit') limit = '25',
   ) {
-    if (req.user.role !== 'SUPER_ADMIN' && req.user.role !== 'ADMIN') {
-      throw new BadRequestException('Forbidden');
-    }
     return this.authService.listUsers({ role, search, page: +page, limit: +limit });
   }
 }
