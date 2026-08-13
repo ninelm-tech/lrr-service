@@ -1,6 +1,7 @@
 import { Injectable, UnauthorizedException, ConflictException, BadRequestException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
+import { logger } from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
 import { UserRole } from '@prisma/client';
 import { normalizePhone } from '../common/phone.util';
@@ -64,13 +65,17 @@ export class AuthService {
     });
 
     if (!user || !user.passwordHash) {
+      logger.warn('login: no account for this email', { email });
       throw new UnauthorizedException('Invalid email or password');
     }
 
     const isPasswordValid = await this.verifyPassword(password, user.passwordHash);
     if (!isPasswordValid) {
+      logger.warn('login: wrong password', { userId: user.id, role: user.role });
       throw new UnauthorizedException('Invalid email or password');
     }
+
+    logger.info('login: success', { userId: user.id, role: user.role });
 
     const accessToken = this.generateToken({
       id: user.id,
@@ -168,13 +173,19 @@ export class AuthService {
         };
       }
 
+      logger.warn('registerCustomer: phone already registered to a non-customer account', {
+        phoneNumber, existingRole: existingPhone.role,
+      });
       throw new ConflictException('Phone number already registered to a different account type.');
     }
 
     // Check email uniqueness if provided
     if (dto.email) {
       const existingEmail = await this.prisma.user.findUnique({ where: { email: dto.email } });
-      if (existingEmail) throw new ConflictException('Email already registered.');
+      if (existingEmail) {
+        logger.warn('registerCustomer: email already registered', { email: dto.email });
+        throw new ConflictException('Email already registered.');
+      }
     }
 
     const passwordHash = dto.password ? await this.hashPassword(dto.password) : null;
@@ -188,6 +199,7 @@ export class AuthService {
         role:         UserRole.CUSTOMER,
       },
     });
+    logger.info('registerCustomer: account created', { userId: user.id });
 
     const accessToken = this.generateToken({
       id:    user.id,
@@ -199,85 +211,6 @@ export class AuthService {
       accessToken,
       user: { id: user.id, email: user.email!, name: user.name, role: user.role },
     };
-  }
-
-  /**
-   * Register a new operator
-   */
-  async registerOperator(dto: {
-    businessName: string;
-    contactName: string;
-    phoneNumber: string;
-    email: string;
-    address: string;
-    latitude: number;
-    longitude: number;
-    type: string;
-    password: string;
-  }) {
-    // Normalise phone to E.164 at the registration boundary
-    const phoneNumber = normalizePhone(dto.phoneNumber);
-
-    // Check if user already exists (by email or phone number — both are
-    // unique on User, and an uncaught collision on either would otherwise
-    // surface as a raw Prisma error / 500 from user.create below).
-    const existingUser = await this.prisma.user.findFirst({
-      where: { OR: [{ email: dto.email }, { phoneNumber }] },
-    });
-    if (existingUser) {
-      throw new ConflictException('Email or phone number already registered');
-    }
-
-    // Check if operator already exists (by businessName or phoneNumber)
-    const existingOperator = await this.prisma.operator.findFirst({
-      where: {
-        OR: [
-          { businessName: dto.businessName },
-          { phoneNumber },
-        ],
-      },
-    });
-    if (existingOperator) {
-      throw new ConflictException('Operator with this business name or phone number already exists');
-    }
-
-    const passwordHash = await this.hashPassword(dto.password);
-
-    // Create user
-    const user = await this.prisma.user.create({
-      data: {
-        phoneNumber,
-        email: dto.email,
-        passwordHash,
-        name: dto.contactName,
-        role: 'OPERATOR',
-      },
-    });
-
-    // Create operator
-    const operator = await this.prisma.operator.create({
-      data: {
-        businessName: dto.businessName,
-        contactName: dto.contactName,
-        phoneNumber,
-        email: dto.email,
-        address: dto.address,
-        latitude: Number(dto.latitude),
-        longitude: Number(dto.longitude),
-        type: dto.type as any, // Cast to enum, or use Prisma.OperatorType if imported
-      },
-    });
-
-    // Create OperatorMember (OWNER)
-    const operatorMember = await this.prisma.operatorMember.create({
-      data: {
-        userId: user.id,
-        operatorId: operator.id,
-        role: 'OWNER',
-      },
-    });
-
-    return { user, operator, operatorMember };
   }
 
   /**

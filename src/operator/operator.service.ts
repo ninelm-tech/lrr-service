@@ -1,4 +1,5 @@
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { logger } from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
 import { OperatorStatus, OperatorType, UserRole, OperatorMemberRole, TruckClass } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
@@ -70,6 +71,22 @@ export class OperatorService {
       throw new BadRequestException(`Invalid truck class(es): ${invalidTruckClasses.join(', ')}`);
     }
 
+    const phoneNumber = normalizePhone(data.phoneNumber);
+
+    // Check for a colliding user (by email or phone) before opening the
+    // transaction — User.email and User.phoneNumber are both @unique, and an
+    // uncaught collision inside tx.user.create() below surfaces as a raw
+    // Prisma error / 500 instead of a clean 409.
+    const existingUser = await this.prisma.user.findFirst({
+      where: { OR: [{ email: data.email }, { phoneNumber }] },
+    });
+    if (existingUser) {
+      logger.warn('operator.create: email or phone already registered', {
+        email: data.email, existingUserId: existingUser.id,
+      });
+      throw new ConflictException('Email or phone number already registered');
+    }
+
     const passwordHash = await bcrypt.hash(data.password, 10);
 
     return this.prisma.$transaction(async (tx) => {
@@ -78,7 +95,7 @@ export class OperatorService {
           email:        data.email,
           passwordHash,
           name:         data.name,
-          phoneNumber:  data.phoneNumber,
+          phoneNumber,
           role:         UserRole.OPERATOR,
         },
       });
@@ -89,7 +106,7 @@ export class OperatorService {
           truckClasses:  data.truckClasses,
           businessName:  data.businessName,
           contactName:   data.contactName,
-          phoneNumber:   data.phoneNumber,
+          phoneNumber,
           email:         data.email,
           address:       data.address,
           latitude:      data.latitude,
@@ -107,6 +124,9 @@ export class OperatorService {
         },
       });
 
+      logger.info('operator.create: registered, pending approval', {
+        userId: user.id, operatorId: operator.id,
+      });
       return { user, operator, operatorMember };
     });
   }

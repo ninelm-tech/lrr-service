@@ -24,6 +24,12 @@ Sentry.init({
 
   environment: process.env.NODE_ENV,
 
+  // Structured logs (Sentry.logger.*) — lets us follow a user's journey
+  // (registration attempts, conflicts, login failures) without needing an
+  // exception to be thrown, so a route can be "working" and still show where
+  // real users get stuck.
+  enableLogs: true,
+
   // 100% tracing in dev + staging; 20% in production to control volume/cost
   tracesSampleRate: isProd ? 0.2 : 1.0,
 

@@ -12,6 +12,8 @@ describe('OperatorService', () => {
     operator: { findMany: jest.Mock; findUnique: jest.Mock; update: jest.Mock };
     dispatchOffer: { findMany: jest.Mock };
     rating: { aggregate: jest.Mock; groupBy: jest.Mock };
+    user: { findFirst: jest.Mock };
+    $transaction: jest.Mock;
   };
   let paystackMock: { resolveAccountNumber: jest.Mock; createTransferRecipient: jest.Mock };
 
@@ -23,6 +25,8 @@ describe('OperatorService', () => {
         aggregate: jest.fn().mockResolvedValue({ _avg: { score: null }, _count: { score: 0 } }),
         groupBy: jest.fn().mockResolvedValue([]),
       },
+      user: { findFirst: jest.fn() },
+      $transaction: jest.fn(),
     };
     paystackMock = {
       resolveAccountNumber: jest.fn(),
@@ -167,6 +171,14 @@ describe('OperatorService', () => {
       const dto = { ...baseDto(), truckClasses: ['NOT_A_REAL_CLASS'] as unknown as TruckClass[] };
 
       await expect(service.create(dto)).rejects.toThrow(BadRequestException);
+    });
+
+    it('throws ConflictException when the email or phone number is already registered', async () => {
+      (prisma.user.findFirst as jest.Mock).mockResolvedValue({ id: 'existing-user' });
+      const dto = baseDto();
+
+      await expect(service.create(dto)).rejects.toThrow('Email or phone number already registered');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
     });
   });
 });

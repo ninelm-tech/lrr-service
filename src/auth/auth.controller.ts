@@ -5,7 +5,6 @@ import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from './guards/roles.guard';
 import { Roles } from './decorators/roles.decorator';
-import { RegisterOperatorDto } from './dto/register-operator.dto';
 import { CreateStaffDto } from './dto/create-staff.dto';
 
 export class UpdateProfileDto {
@@ -73,14 +72,6 @@ export class AuthController {
   @Post('register/customer')
   async registerCustomer(@Body() dto: RegisterCustomerDto) {
     return this.authService.registerCustomer(dto);
-  }
-
-  /**
-   * Register a new operator
-   */
-  @Post('register/operator')
-  async registerOperator(@Body() dto: RegisterOperatorDto) {
-    return this.authService.registerOperator(dto);
   }
 
   /**
