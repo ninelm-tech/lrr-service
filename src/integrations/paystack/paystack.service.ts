@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
 interface InitializePaymentParams {
@@ -262,6 +262,9 @@ export class PaystackService {
     );
     const data = await res.json() as any;
     console.log('Paystack resolve account:', data);
+    if (!data.status || !data.data) {
+      throw new BadRequestException(data.message || 'Could not verify that account number');
+    }
     return { accountName: data.data.account_name };
   }
 

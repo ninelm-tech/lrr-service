@@ -35,6 +35,15 @@ describe('PaystackService', () => {
       );
       expect(result).toEqual({ accountName: 'JOHN DOE' });
     });
+
+    it('throws a BadRequestException instead of crashing on unresolvable/invalid accounts', async () => {
+      const fetchMock = jest.fn().mockResolvedValue({
+        json: async () => ({ status: false, message: 'Invalid account number' }),
+      });
+      global.fetch = fetchMock as any;
+
+      await expect(service.resolveAccountNumber('123', '058')).rejects.toThrow('Invalid account number');
+    });
   });
 
   describe('createTransferRecipient', () => {

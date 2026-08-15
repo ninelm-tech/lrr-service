@@ -130,6 +130,19 @@ export class OperatorController {
   }
 
   /**
+   * Clear payout bank details — same permission check as saveBankDetails.
+   * Only one account is stored per operator; this is how you remove it
+   * without immediately replacing it with another.
+   */
+  @UseGuards(AuthGuard)
+  @Delete(':id/bank-details')
+  async clearBankDetails(@Req() req: any, @Param('id') id: string) {
+    await this.operatorService.assertCanManageOperator(req.user, id);
+    const operator = await this.operatorService.clearBankDetails(id);
+    return { message: 'Payout bank details removed', data: operator };
+  }
+
+  /**
    * Update operator status (verification) — admin only.
    */
   @UseGuards(AuthGuard, RolesGuard)

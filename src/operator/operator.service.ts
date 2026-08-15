@@ -426,6 +426,13 @@ export class OperatorService {
    * this whole flow, overwriting paystackRecipientCode with a new one.
    */
   async saveBankDetails(id: string, dto: SaveBankDetailsDto) {
+    // Manual check, not just the DTO's decorators — this app has no global
+    // ValidationPipe wired up yet, so class-validator decorators alone
+    // don't currently run (see rating.controller.ts for the same gap).
+    if (!/^\d{10}$/.test(dto.accountNumber)) {
+      throw new BadRequestException('accountNumber must be exactly 10 digits');
+    }
+
     const operator = await this.prisma.operator.findUnique({ where: { id } });
     if (!operator) throw new NotFoundException('Operator not found');
 
@@ -444,6 +451,22 @@ export class OperatorService {
         accountName,
         accountNumberLast4: dto.accountNumber.slice(-4),
         paystackRecipientCode: recipientCode,
+      },
+    });
+  }
+
+  /** Removes the stored payout account. Does not touch the Paystack recipient itself, only our reference to it. */
+  async clearBankDetails(id: string) {
+    const operator = await this.prisma.operator.findUnique({ where: { id } });
+    if (!operator) throw new NotFoundException('Operator not found');
+
+    return this.prisma.operator.update({
+      where: { id },
+      data: {
+        bankName: null,
+        accountName: null,
+        accountNumberLast4: null,
+        paystackRecipientCode: null,
       },
     });
   }

@@ -69,6 +69,36 @@ describe('OperatorService', () => {
       });
       expect(result.accountName).toBe('JOHN DOE');
     });
+
+    it('rejects an account number that is not exactly 10 digits (ValidationPipe is not wired up, so this is enforced manually)', async () => {
+      await expect(
+        service.saveBankDetails('op-1', { bankCode: '058', bankName: 'GTBank', accountNumber: '123' }),
+      ).rejects.toThrow('accountNumber must be exactly 10 digits');
+      expect(paystackMock.resolveAccountNumber).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('clearBankDetails', () => {
+    it('nulls out all stored bank fields', async () => {
+      prisma.operator.findUnique.mockResolvedValue({ id: 'op-1', businessName: 'Swift Towing' });
+      prisma.operator.update.mockResolvedValue({
+        id: 'op-1', bankName: null, accountName: null, accountNumberLast4: null, paystackRecipientCode: null,
+      });
+
+      await service.clearBankDetails('op-1');
+
+      expect(prisma.operator.update).toHaveBeenCalledWith({
+        where: { id: 'op-1' },
+        data: { bankName: null, accountName: null, accountNumberLast4: null, paystackRecipientCode: null },
+      });
+    });
+
+    it('throws NotFoundException for a nonexistent operator', async () => {
+      prisma.operator.findUnique.mockResolvedValue(null);
+
+      await expect(service.clearBankDetails('missing')).rejects.toThrow('Operator not found');
+      expect(prisma.operator.update).not.toHaveBeenCalled();
+    });
   });
 
   describe('getOperatorStats — ratings', () => {

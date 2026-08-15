@@ -1,4 +1,4 @@
-import { IsNotEmpty, IsString } from 'class-validator';
+import { IsNotEmpty, IsString, Matches } from 'class-validator';
 
 export class SaveBankDetailsDto {
   @IsString()
@@ -9,7 +9,8 @@ export class SaveBankDetailsDto {
   @IsNotEmpty()
   bankName: string;
 
+  /** Nigerian NUBAN account numbers are exactly 10 digits. */
   @IsString()
-  @IsNotEmpty()
+  @Matches(/^\d{10}$/)
   accountNumber: string;
 }
