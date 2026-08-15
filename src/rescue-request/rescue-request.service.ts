@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import * as Sentry from '@sentry/node';
+import { logger } from '@sentry/node';
 import * as crypto from 'crypto';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
@@ -40,9 +41,7 @@ const DEPOSIT_AMOUNT_KOBO = 500000;   // ₦5,000
 
 // ── Dispatch config ────────────────────────────────────────────────────────────
 const BATCH_SIZE = 3;                  // operators offered per round simultaneously
-const CUSTOMER_BUDGET_MINUTES = 10;   // max total customer wait before radius expands
-const MIN_WINDOW_SECONDS = 90;        // floor: operators always get at least 90s
-const MAX_WINDOW_SECONDS = 180;       // ceiling: never more than 3 min per batch
+const BATCH_WINDOW_SECONDS = 5 * 60;  // time each batch of operators has to respond before the round expires
 const DISPATCH_RETRY_MINUTES         = Number(process.env.DISPATCH_RETRY_MINUTES  ?? 5);   // set to 1 in dev
 const MAX_FAILED_ROUNDS_BEFORE_ALERT = Number(process.env.DISPATCH_MAX_ALERT_ROUND ?? 2);
 const MAX_ROUNDS_BEFORE_AUTO_CANCEL  = Number(process.env.DISPATCH_MAX_ROUNDS     ?? 4);   // ~RETRY*MAX min total
@@ -443,6 +442,7 @@ export class RescueRequestService {
         data: { rescueRequestId, mediaType, s3Key, contentType },
       });
 
+      logger.info('media: attachment saved', { rescueRequestId, mediaType, contentType });
       return true;
     } catch (error) {
       console.error('Failed to capture media attachment:', error);
@@ -526,6 +526,7 @@ export class RescueRequestService {
         where: { id: offer.id },
         data: { status: 'DECLINED', respondedAt: new Date() },
       });
+      logger.info('dispatch: offer declined', { rescueRequestId: offer.rescueRequestId, offerId: offer.id });
       await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.expiresAt);
       return { quoted: false, message: `Understood. We'll offer this job to another operator.` };
     }
@@ -534,6 +535,7 @@ export class RescueRequestService {
       where: { id: offer.id },
       data: { status: 'QUOTED', quotedPrice: quotedPriceKobo, respondedAt: new Date() },
     });
+    logger.info('dispatch: offer quoted', { rescueRequestId: offer.rescueRequestId, offerId: offer.id, quotedPriceKobo });
     await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.expiresAt);
     this.scheduleGraceResolve(offer.rescueRequestId, offer.expiresAt);
 
@@ -980,6 +982,13 @@ export class RescueRequestService {
       lat, lon, alreadyOffered, extraRadiusKm, undefined, eligibleTruckClasses,
     );
 
+    logger.info('dispatch: candidate search', {
+      rescueRequestId, round, radiusExpansionKm: extraRadiusKm,
+      alreadyOfferedOperatorIds: alreadyOffered,
+      candidateCount: candidates.length,
+      candidateIds: candidates.map((c) => c.id),
+    });
+
     if (candidates.length === 0) {
       // Fast-fail: check if there are ANY active operators near this location
       // (ignoring isAvailable — counts busy ones too).
@@ -1074,13 +1083,12 @@ export class RescueRequestService {
     const batch = candidates.slice(0, BATCH_SIZE);
     const batchOperatorIds = batch.map((op) => op.id);
 
-    // Dynamic window: spread customer budget evenly across expected batches
-    const totalBatches = Math.ceil(candidates.length / BATCH_SIZE);
-    const windowSeconds = Math.min(
-      MAX_WINDOW_SECONDS,
-      Math.max(MIN_WINDOW_SECONDS, Math.floor((CUSTOMER_BUDGET_MINUTES * 60) / totalBatches)),
-    );
+    logger.info('dispatch: batch offered', {
+      rescueRequestId, round, radiusExpansionKm: extraRadiusKm,
+      offered: batch.map((op) => ({ operatorId: op.id, businessName: op.businessName, distanceKm: Number(op.distance.toFixed(1)) })),
+    });
 
+    const windowSeconds = BATCH_WINDOW_SECONDS;
     const expiresAt = new Date(Date.now() + windowSeconds * 1000);
 
     // Create all offers in one batch insert
@@ -1119,7 +1127,7 @@ export class RescueRequestService {
       batch.map((op) =>
         this.twilioService.sendWhatsAppMessage(
           toWhatsAppAddress(op.phoneNumber),
-          `🚨 *NEW RESCUE JOB*\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: https://maps.google.com/?q=${lat},${lon}${mediaSection}\n\n💰 Reply with your price to bid, e.g. "25000".\nEst. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.\nReply *NO* to decline.\nYou have ${windowSeconds} seconds.`,
+          `🚨 *NEW RESCUE JOB*\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: https://maps.google.com/?q=${lat},${lon}${mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\nEst. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.\nReply *NO* to decline.\nYou have ${windowSeconds} seconds to respond.`,
         ),
       ),
     );
@@ -1327,7 +1335,7 @@ export class RescueRequestService {
 
     await this.twilioService.sendWhatsAppMessage(
       toWhatsAppAddress(operator.phoneNumber),
-      `🚨 *NEW RESCUE JOB*\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nLocation: https://maps.google.com/?q=${lat},${lon}${mediaSection}\n\n💰 Reply with your price to bid, e.g. "25000".\nReply *NO* to decline.\nYou have 5 minutes.`,
+      `🚨 *NEW RESCUE JOB*\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nLocation: https://maps.google.com/?q=${lat},${lon}${mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\nReply *NO* to decline.\nYou have 5 minutes to respond.`,
     );
 
     const currentRadius = (session.dispatchRound ?? 0) * RADIUS_EXPANSION_KM;
@@ -1386,7 +1394,7 @@ export class RescueRequestService {
     if (customerPhone) {
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
-        `🚗 *Operator quotes received!*\n\n${lines.join('\n')}\n\nReply with the number of your choice.`,
+        `🚗 *Operator quotes received!*\n\n${lines.join('\n')}\n\n⚠️ *ACTION NEEDED* — reply with the number of your choice (e.g. "1") to select an operator.`,
       );
     }
 
