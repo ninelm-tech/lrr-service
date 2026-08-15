@@ -6,7 +6,10 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // rawBody: true preserves the exact request bytes on req.rawBody alongside
+  // the parsed body — required to verify the Paystack webhook HMAC signature,
+  // which is computed over Paystack's original bytes, not a re-serialized copy.
+  const app = await NestFactory.create(AppModule, { rawBody: true });
 
   const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
 

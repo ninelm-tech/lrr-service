@@ -18,13 +18,17 @@ export class PaymentService {
   ) {}
 
   /**
-   * Verify Paystack webhook signature
+   * Verify a Paystack webhook signature against the exact request bytes
+   * Paystack signed. Must be the raw body (Buffer/string) — re-serializing
+   * the parsed JSON object does not reliably reproduce the original bytes
+   * (key order, number formatting), so that comparison silently rejects
+   * genuine webhooks.
    */
-  verifyWebhookSignature(body: any, signature: string): boolean {
+  verifyWebhookSignature(rawBody: Buffer | string, signature: string): boolean {
     const secretKey = this.configService.get<string>('PAYSTACK_SECRET_KEY') || '';
     const hash = crypto
       .createHmac('sha512', secretKey)
-      .update(JSON.stringify(body))
+      .update(rawBody)
       .digest('hex');
     return hash === signature;
   }

@@ -49,6 +49,33 @@ describe('PaymentService', () => {
     expect(service).toBeDefined();
   });
 
+  describe('verifyWebhookSignature', () => {
+    it('accepts a signature computed over the exact raw bytes', () => {
+      const crypto = require('crypto');
+      const rawBody = Buffer.from(JSON.stringify({ event: 'charge.success', data: { reference: 'DEP_1' } }));
+      const validSignature = crypto.createHmac('sha512', '').update(rawBody).digest('hex');
+
+      expect(service.verifyWebhookSignature(rawBody, validSignature)).toBe(true);
+    });
+
+    it('rejects a signature computed over a re-serialized (not raw) body', () => {
+      // Re-stringifying a parsed object isn't guaranteed to reproduce the
+      // original bytes — this is exactly the bug that made real Paystack
+      // webhooks fail signature verification.
+      const crypto = require('crypto');
+      const original = { data: { reference: 'DEP_1' }, event: 'charge.success' };
+      const rawBody = Buffer.from(JSON.stringify(original));
+      const validSignature = crypto.createHmac('sha512', '').update(rawBody).digest('hex');
+
+      const reserialized = JSON.stringify(JSON.parse(rawBody.toString()), Object.keys(original).reverse());
+      expect(service.verifyWebhookSignature(reserialized, validSignature)).toBe(false);
+    });
+
+    it('rejects a mismatched signature', () => {
+      expect(service.verifyWebhookSignature(Buffer.from('{}'), 'not-a-real-signature')).toBe(false);
+    });
+  });
+
   describe('handlePaystackWebhook — transfer events', () => {
     it('confirms SUCCESS on transfer.success', async () => {
       await service.handlePaystackWebhook({
