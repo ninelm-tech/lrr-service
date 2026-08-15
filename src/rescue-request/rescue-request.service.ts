@@ -1801,30 +1801,122 @@ export class RescueRequestService {
     return this.buildListResponse(where, Number(page), Number(limit));
   }
 
-  async assignOperator(id: string, dto: { operatorId: string }) {
+  /**
+   * Manually assign an operator with an admin-agreed price. Runs the same
+   * fee split and deposit-payment-link flow as a customer selecting a quote
+   * themselves (see handleQuoteSelected) — the admin is standing in for the
+   * bidding round, not skipping payment collection.
+   *
+   * Manual validation, not just the DTO's decorators — this app has no
+   * global ValidationPipe wired up yet, so class-validator decorators alone
+   * don't currently run (see rating.controller.ts for the same gap).
+   */
+  async assignOperator(id: string, dto: { operatorId: string; priceKobo: number }) {
     if (!dto.operatorId) throw new BadRequestException('operatorId is required');
+    if (!Number.isInteger(dto.priceKobo) || dto.priceKobo <= 0) {
+      throw new BadRequestException('priceKobo must be a positive integer');
+    }
 
     const operator = await this.prisma.operator.findUnique({ where: { id: dto.operatorId } });
     if (!operator) throw new NotFoundException('Operator not found');
+    if (operator.status !== 'ACTIVE') throw new BadRequestException('Target is not an active operator');
 
-    const request = await this.prisma.rescueRequest.findUnique({ where: { id } });
+    const request = await this.prisma.rescueRequest.findUnique({ where: { id }, include: { customer: true } });
     if (!request) throw new NotFoundException('Rescue request not found');
     if (([RescueRequestStatus.COMPLETED, RescueRequestStatus.CANCELLED] as RescueRequestStatus[]).includes(request.status)) {
       throw new BadRequestException(`Cannot assign an operator to a ${request.status} request`);
     }
+    if (!request.customer.phoneNumber) {
+      throw new BadRequestException('Customer has no phone number on file — cannot send a payment link');
+    }
+
+    const config = await this.platformConfigService.getConfig();
+    const serviceFeeAmount = Math.round((dto.priceKobo * config.serviceFeePercent) / 100);
+    const total = dto.priceKobo + serviceFeeAmount;
+    const depositAmount = Math.round((total * config.depositPercent) / 100);
+    const balanceAmount = total - depositAmount;
+
+    const MANUAL_ASSIGN_WINDOW_MS = 5 * 60 * 1000;
+    const offer = await this.prisma.dispatchOffer.create({
+      data: {
+        rescueRequestId: id,
+        operatorId:      dto.operatorId,
+        status:          'SELECTED_PENDING_PAYMENT',
+        quotedPrice:     dto.priceKobo,
+        respondedAt:     new Date(),
+        expiresAt:       new Date(Date.now() + MANUAL_ASSIGN_WINDOW_MS),
+      },
+    });
+
+    const reference = this.paystackService.generateReference('DEP');
+    const email = request.customer.email ?? `${request.customer.phoneNumber.replace(/\D/g, '')}@lrr.ng`;
+    const paymentResponse = await this.paystackService.initializePayment({
+      email,
+      amount: depositAmount,
+      reference,
+      metadata: {
+        rescueRequestId: id,
+        customerId:      request.customerId,
+        phoneNumber:     request.customer.phoneNumber,
+        type: 'deposit',
+      },
+    });
+    if (!paymentResponse.status) {
+      // Roll back the offer so a retry isn't blocked by a stale row.
+      await this.prisma.dispatchOffer.delete({ where: { id: offer.id } });
+      throw new BadRequestException(`Couldn't generate a payment link — please try again`);
+    }
 
     const updated = await this.prisma.rescueRequest.update({
       where: { id },
-      data:  { assignedOperatorId: dto.operatorId, status: RescueRequestStatus.OPERATOR_ASSIGNED },
+      data: {
+        assignedOperatorId: dto.operatorId,
+        status:             RescueRequestStatus.WAITING_FOR_DEPOSIT,
+        serviceFeeAmount,
+        depositAmount,
+        balanceAmount,
+        depositReference:   reference,
+      },
       include: { customer: true, assignedOperator: true },
     });
 
-    if (updated.customer.phoneNumber) {
-      await this.twilioService.sendWhatsAppMessage(
-        updated.customer.phoneNumber,
-        `🚗 An operator has been assigned to your request.\n\nBusiness: ${updated.assignedOperator?.businessName}\nPhone: ${updated.assignedOperator?.phoneNumber}`,
+    const customerPhone = toWhatsAppAddress(request.customer.phoneNumber);
+    const operatorPhone = toWhatsAppAddress(operator.phoneNumber);
+    const depositNaira = (depositAmount / 100).toLocaleString();
+    const balanceNaira = (balanceAmount / 100).toLocaleString();
+
+    void this.twilioService.sendWhatsAppMessage(
+      customerPhone,
+      `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⏳ You have *5 minutes* to confirm:\n\n${paymentResponse.data.authorization_url}\n\nReply CANCEL to cancel (no charge).`,
+    );
+    void this.twilioService.sendWhatsAppMessage(
+      operatorPhone,
+      `🚗 You've been assigned a job (₦${(dto.priceKobo / 100).toLocaleString()}). Waiting for the customer to confirm payment.`,
+    );
+
+    setTimeout(async () => {
+      const fresh = await this.prisma.rescueRequest.findUnique({ where: { id }, select: { status: true } });
+      if (fresh?.status !== RescueRequestStatus.WAITING_FOR_DEPOSIT) return;
+
+      await this.prisma.dispatchOffer.update({
+        where: { id: offer.id },
+        data:  { status: 'TIMED_OUT', respondedAt: new Date() },
+      });
+      await this.prisma.rescueRequest.update({
+        where: { id },
+        data:  { assignedOperatorId: null, status: RescueRequestStatus.DISPATCHING },
+      });
+      void this.twilioService.sendWhatsAppMessage(
+        customerPhone,
+        `⏰ Payment window expired. We're still looking for an operator for you.`,
       );
-    }
+      void this.twilioService.sendWhatsAppMessage(
+        operatorPhone,
+        `⏰ The customer did not pay within 5 minutes. You have been released.`,
+      );
+      void this.startDispatch(id, request.customerId);
+    }, MANUAL_ASSIGN_WINDOW_MS);
+
     return { data: this.mapToDetailDto(updated) };
   }
 

@@ -688,4 +688,172 @@ describe('RescueRequestService', () => {
       }
     });
   });
+
+  describe('assignOperator', () => {
+    let assignService: RescueRequestService;
+    let prisma: {
+      operator: { findUnique: jest.Mock };
+      rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
+      dispatchOffer: { create: jest.Mock; delete: jest.Mock; update: jest.Mock };
+    };
+    let paystackService: { generateReference: jest.Mock; initializePayment: jest.Mock };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
+    let platformConfigService: { getConfig: jest.Mock };
+
+    const operator = { id: 'op-1', status: 'ACTIVE', businessName: 'Acme Towing', phoneNumber: '+2348011111111' };
+    const request = {
+      id: 'req-1',
+      status: 'DISPATCHING',
+      customerId: 'cust-1',
+      customer: { id: 'cust-1', phoneNumber: '+2348022222222', email: null },
+    };
+
+    beforeEach(async () => {
+      prisma = {
+        operator: { findUnique: jest.fn().mockResolvedValue(operator) },
+        rescueRequest: {
+          findUnique: jest.fn().mockResolvedValue(request),
+          update: jest.fn().mockImplementation(({ data }) => ({ ...request, ...data, assignedOperator: operator })),
+        },
+        dispatchOffer: {
+          create: jest.fn().mockResolvedValue({ id: 'offer-1' }),
+          delete: jest.fn(),
+          update: jest.fn(),
+        },
+      };
+      paystackService = {
+        generateReference: jest.fn().mockReturnValue('DEP_ref123'),
+        initializePayment: jest.fn().mockResolvedValue({
+          status: true,
+          data: { authorization_url: 'https://paystack.test/pay/xyz' },
+        }),
+      };
+      twilioService = { sendWhatsAppMessage: jest.fn() };
+      platformConfigService = {
+        getConfig: jest.fn().mockResolvedValue({ serviceFeePercent: 10, depositPercent: 20 }),
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestService,
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaystackService, useValue: paystackService },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: OperatorService, useValue: {} },
+          { provide: S3Service, useValue: {} },
+          { provide: PlatformConfigService, useValue: platformConfigService },
+          { provide: RatingService, useValue: {} },
+          { provide: PayoutService, useValue: {} },
+        ],
+      }).compile();
+
+      assignService = module.get<RescueRequestService>(RescueRequestService);
+    });
+
+    it('splits the price into service fee, deposit, and balance, and creates a payment link', async () => {
+      // Fake timers so the 5-minute deposit-window setTimeout this schedules
+      // never becomes a real leaked OS timer.
+      jest.useFakeTimers();
+      try {
+        // price 100_000 kobo, 10% fee -> total 110_000, 20% deposit -> 22_000 deposit, 88_000 balance
+        const result = await assignService.assignOperator('req-1', { operatorId: 'op-1', priceKobo: 100_000 });
+
+        expect(prisma.dispatchOffer.create).toHaveBeenCalledWith({
+          data: expect.objectContaining({
+            rescueRequestId: 'req-1',
+            operatorId: 'op-1',
+            status: 'SELECTED_PENDING_PAYMENT',
+            quotedPrice: 100_000,
+          }),
+        });
+        expect(paystackService.initializePayment).toHaveBeenCalledWith(
+          expect.objectContaining({ amount: 22_000 }),
+        );
+        expect(prisma.rescueRequest.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              assignedOperatorId: 'op-1',
+              status: 'WAITING_FOR_DEPOSIT',
+              serviceFeeAmount: 10_000,
+              depositAmount: 22_000,
+              balanceAmount: 88_000,
+            }),
+          }),
+        );
+        expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.stringContaining('https://paystack.test/pay/xyz'),
+        );
+        expect(result.data).toBeDefined();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('rejects a non-active operator', async () => {
+      prisma.operator.findUnique.mockResolvedValue({ ...operator, status: 'PENDING' });
+
+      await expect(
+        assignService.assignOperator('req-1', { operatorId: 'op-1', priceKobo: 100_000 }),
+      ).rejects.toThrow('Target is not an active operator');
+      expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects a non-positive price (ValidationPipe is not wired up, so this is enforced manually)', async () => {
+      await expect(
+        assignService.assignOperator('req-1', { operatorId: 'op-1', priceKobo: 0 }),
+      ).rejects.toThrow('priceKobo must be a positive integer');
+      expect(prisma.operator.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('rejects when the customer has no phone number on file', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        ...request,
+        customer: { ...request.customer, phoneNumber: null },
+      });
+
+      await expect(
+        assignService.assignOperator('req-1', { operatorId: 'op-1', priceKobo: 100_000 }),
+      ).rejects.toThrow('Customer has no phone number on file');
+    });
+
+    it('rolls back the created offer if the payment link fails to generate', async () => {
+      paystackService.initializePayment.mockResolvedValue({ status: false });
+
+      await expect(
+        assignService.assignOperator('req-1', { operatorId: 'op-1', priceKobo: 100_000 }),
+      ).rejects.toThrow(`Couldn't generate a payment link`);
+
+      expect(prisma.dispatchOffer.delete).toHaveBeenCalledWith({ where: { id: 'offer-1' } });
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+    });
+
+    it('releases the operator and reopens dispatch if the deposit window expires unpaid', async () => {
+      jest.useFakeTimers();
+      try {
+        prisma.rescueRequest.findUnique
+          .mockResolvedValueOnce(request) // initial lookup inside assignOperator
+          .mockResolvedValueOnce({ status: 'WAITING_FOR_DEPOSIT' }); // still-unpaid check in the timeout
+
+        const startDispatchSpy = jest.spyOn(assignService as any, 'startDispatch').mockResolvedValue(undefined);
+
+        await assignService.assignOperator('req-1', { operatorId: 'op-1', priceKobo: 100_000 });
+
+        await jest.advanceTimersByTimeAsync(5 * 60 * 1000);
+
+        expect(prisma.dispatchOffer.update).toHaveBeenCalledWith({
+          where: { id: 'offer-1' },
+          data: expect.objectContaining({ status: 'TIMED_OUT' }),
+        });
+        expect(prisma.rescueRequest.update).toHaveBeenLastCalledWith({
+          where: { id: 'req-1' },
+          data: { assignedOperatorId: null, status: 'DISPATCHING' },
+        });
+        expect(startDispatchSpy).toHaveBeenCalledWith('req-1', 'cust-1');
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+  });
 });

@@ -4,6 +4,7 @@ import { UserRole } from '@prisma/client';
 import { RescueRequestService } from './rescue-request.service';
 import type { Request } from 'express';
 import { AdminRescueRequestQueryDto } from './dto/admin-rescue-request.dto';
+import { AssignOperatorDto } from './dto/assign-operator.dto';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -79,15 +80,19 @@ export class RescueRequestController {
 
   // ── Admin mutations ─────────────────────────────────────────────────────
 
-  /** Manually assign an operator (e.g. when auto-dispatch found nobody). */
+  /**
+   * Manually assign an operator (e.g. when auto-dispatch found nobody).
+   * Requires the agreed price — this goes through the same fee split and
+   * deposit-payment-link flow as a customer selecting a quote themselves.
+   */
   @Patch(':id/assign-operator')
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
   async assignOperator(
     @Param('id') id: string,
-    @Body() body: { operatorId: string },
+    @Body() dto: AssignOperatorDto,
   ) {
-    return this.rescueRequestService.assignOperator(id, { operatorId: body.operatorId });
+    return this.rescueRequestService.assignOperator(id, dto);
   }
 
   /** Update request status (admin override). */
