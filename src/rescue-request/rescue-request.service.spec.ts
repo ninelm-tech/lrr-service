@@ -6,6 +6,7 @@ import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { OperatorService } from '../operator/operator.service';
 import { S3Service } from '../integrations/s3/s3.service';
+import { GeocodingService } from '../integrations/geocoding/geocoding.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { RatingService } from '../rating/rating.service';
 import { PayoutService } from '../payout/payout.service';
@@ -13,9 +14,12 @@ import { WhatsAppFlowState } from './state/whatsapp-session.types';
 
 describe('RescueRequestService', () => {
   let service: RescueRequestService;
+  let geocodingService: { reverseGeocode: jest.Mock };
   const originalApiBaseUrl = process.env.API_BASE_URL;
 
   beforeEach(async () => {
+    geocodingService = { reverseGeocode: jest.fn().mockResolvedValue(null) };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         RescueRequestService,
@@ -25,6 +29,7 @@ describe('RescueRequestService', () => {
         { provide: TwilioService, useValue: {} },
         { provide: OperatorService, useValue: {} },
         { provide: S3Service, useValue: {} },
+        { provide: GeocodingService, useValue: geocodingService },
         { provide: PlatformConfigService, useValue: {} },
         { provide: RatingService, useValue: {} },
         { provide: PayoutService, useValue: {} },
@@ -36,6 +41,24 @@ describe('RescueRequestService', () => {
 
   afterEach(() => {
     process.env.API_BASE_URL = originalApiBaseUrl;
+  });
+
+  describe('formatLocationSection', () => {
+    it('returns the address plus a map link when reverse geocoding succeeds', async () => {
+      geocodingService.reverseGeocode.mockResolvedValue('12 Adeniyi Jones Ave, Ikeja, Lagos');
+
+      const result = await (service as any).formatLocationSection(6.5, 3.4);
+
+      expect(result).toBe('12 Adeniyi Jones Ave, Ikeja, Lagos\n📍 https://maps.google.com/?q=6.5,3.4');
+    });
+
+    it('falls back to the map link alone when reverse geocoding returns nothing', async () => {
+      geocodingService.reverseGeocode.mockResolvedValue(null);
+
+      const result = await (service as any).formatLocationSection(6.5, 3.4);
+
+      expect(result).toBe('https://maps.google.com/?q=6.5,3.4');
+    });
   });
 
   describe('buildMediaLinksSection', () => {
@@ -87,6 +110,7 @@ describe('RescueRequestService', () => {
           { provide: TwilioService, useValue: {} },
           { provide: OperatorService, useValue: {} },
           { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: { reverseGeocode: jest.fn().mockResolvedValue(null) } },
           { provide: PlatformConfigService, useValue: platformConfigService },
           { provide: RatingService, useValue: {} },
           { provide: PayoutService, useValue: {} },
@@ -203,6 +227,7 @@ describe('RescueRequestService', () => {
           { provide: TwilioService, useValue: {} },
           { provide: OperatorService, useValue: {} },
           { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: { reverseGeocode: jest.fn().mockResolvedValue(null) } },
           { provide: PlatformConfigService, useValue: {} },
           { provide: RatingService, useValue: ratingServiceMock },
           { provide: PayoutService, useValue: {} },
@@ -269,6 +294,7 @@ describe('RescueRequestService', () => {
           { provide: TwilioService, useValue: {} },
           { provide: OperatorService, useValue: {} },
           { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: { reverseGeocode: jest.fn().mockResolvedValue(null) } },
           { provide: PlatformConfigService, useValue: {} },
           { provide: RatingService, useValue: ratingServiceMock },
           { provide: PayoutService, useValue: {} },
@@ -338,6 +364,7 @@ describe('RescueRequestService', () => {
           { provide: TwilioService, useValue: twilioService },
           { provide: OperatorService, useValue: {} },
           { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: { reverseGeocode: jest.fn().mockResolvedValue(null) } },
           { provide: PlatformConfigService, useValue: {} },
           { provide: RatingService, useValue: {} },
           { provide: PayoutService, useValue: payoutServiceMock },
@@ -381,6 +408,7 @@ describe('RescueRequestService', () => {
           { provide: TwilioService, useValue: {} },
           { provide: OperatorService, useValue: {} },
           { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: { reverseGeocode: jest.fn().mockResolvedValue(null) } },
           { provide: PlatformConfigService, useValue: {} },
           { provide: RatingService, useValue: {} },
           { provide: PayoutService, useValue: {} },
@@ -491,6 +519,7 @@ describe('RescueRequestService', () => {
           { provide: TwilioService, useValue: {} },
           { provide: OperatorService, useValue: {} },
           { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: { reverseGeocode: jest.fn().mockResolvedValue(null) } },
           { provide: PlatformConfigService, useValue: {} },
           { provide: RatingService, useValue: {} },
           { provide: PayoutService, useValue: {} },
@@ -565,6 +594,7 @@ describe('RescueRequestService', () => {
           { provide: TwilioService, useValue: twilioService },
           { provide: OperatorService, useValue: {} },
           { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: { reverseGeocode: jest.fn().mockResolvedValue(null) } },
           { provide: PlatformConfigService, useValue: {} },
           { provide: RatingService, useValue: {} },
           { provide: PayoutService, useValue: {} },
@@ -714,6 +744,7 @@ describe('RescueRequestService', () => {
           { provide: TwilioService, useValue: {} },
           { provide: OperatorService, useValue: {} },
           { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: { reverseGeocode: jest.fn().mockResolvedValue(null) } },
           { provide: PlatformConfigService, useValue: {} },
           { provide: RatingService, useValue: {} },
           { provide: PayoutService, useValue: {} },
@@ -813,6 +844,7 @@ describe('RescueRequestService', () => {
           { provide: TwilioService, useValue: twilioService },
           { provide: OperatorService, useValue: {} },
           { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: { reverseGeocode: jest.fn().mockResolvedValue(null) } },
           { provide: PlatformConfigService, useValue: platformConfigService },
           { provide: RatingService, useValue: {} },
           { provide: PayoutService, useValue: {} },

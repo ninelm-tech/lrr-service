@@ -21,6 +21,7 @@ import {
   getExtensionFromContentType,
 } from './domain/media-classification';
 import { S3Service } from '../integrations/s3/s3.service';
+import { GeocodingService } from '../integrations/geocoding/geocoding.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { OperatorService } from '../operator/operator.service';
@@ -58,6 +59,7 @@ export class RescueRequestService {
     private readonly twilioService: TwilioService,
     private readonly operatorService: OperatorService,
     private readonly s3Service: S3Service,
+    private readonly geocodingService: GeocodingService,
     private readonly platformConfigService: PlatformConfigService,
     private readonly ratingService: RatingService,
     private readonly payoutService: PayoutService,
@@ -891,11 +893,12 @@ export class RescueRequestService {
         state:           WhatsAppFlowState.OPERATOR_ON_JOB,
         rescueRequestId: rescueRequest.id,
       });
-      const lat = rescueRequest.latitude;
-      const lon = rescueRequest.longitude;
+      const lat = Number(rescueRequest.latitude);
+      const lon = Number(rescueRequest.longitude);
+      const locationSection = await this.formatLocationSection(lat, lon);
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(operator.phoneNumber),
-        `💰 *Payment confirmed — job is live!*\n\nCustomer: ${customerPhone}\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType as VehicleType) : 'Unknown'}\nLocation: https://maps.google.com/?q=${lat},${lon}\n\nHead over now and send *ARRIVED* when you reach them.`,
+        `💰 *Payment confirmed — job is live!*\n\nCustomer: ${customerPhone}\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType as VehicleType) : 'Unknown'}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
       );
     } else {
       // Edge case: no operator was pre-assigned (e.g. admin manually sent a payment link)
@@ -1156,13 +1159,14 @@ export class RescueRequestService {
         return [];
       });
     const mediaSection = this.buildMediaLinksSection(mediaItems);
+    const locationSection = await this.formatLocationSection(lat, lon);
 
     // Notify all batch operators simultaneously
     await Promise.all(
       batch.map((op) =>
         this.twilioService.sendWhatsAppMessage(
           toWhatsAppAddress(op.phoneNumber),
-          `🚨 *NEW RESCUE JOB* — ${this.formatJobRef(rescueRequestId)}\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: https://maps.google.com/?q=${lat},${lon}${mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\nEst. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.\nReply *NO* to decline.\nYou have ${config.dispatchWindowMinutes} minute${config.dispatchWindowMinutes === 1 ? '' : 's'} to respond.\n\n📌 If you have more than one job open at once, reply "${this.formatJobRef(rescueRequestId).replace('Job #', '')} 25000" instead of just the price, so we know which job you mean.`,
+          `🚨 *NEW RESCUE JOB* — ${this.formatJobRef(rescueRequestId)}\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: ${locationSection}${mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\nEst. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.\nReply *NO* to decline.\nYou have ${config.dispatchWindowMinutes} minute${config.dispatchWindowMinutes === 1 ? '' : 's'} to respond.\n\n📌 If you have more than one job open at once, reply "${this.formatJobRef(rescueRequestId).replace('Job #', '')} 25000" instead of just the price, so we know which job you mean.`,
         ),
       ),
     );
@@ -1367,10 +1371,11 @@ export class RescueRequestService {
         return [];
       });
     const mediaSection = this.buildMediaLinksSection(mediaItems);
+    const locationSection = await this.formatLocationSection(lat, lon);
 
     await this.twilioService.sendWhatsAppMessage(
       toWhatsAppAddress(operator.phoneNumber),
-      `🚨 *NEW RESCUE JOB* — ${this.formatJobRef(rescueRequestId)}\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nLocation: https://maps.google.com/?q=${lat},${lon}${mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\nReply *NO* to decline.\nYou have 5 minutes to respond.\n\n📌 If you have more than one job open at once, reply "${this.formatJobRef(rescueRequestId).replace('Job #', '')} 25000" instead of just the price, so we know which job you mean.`,
+      `🚨 *NEW RESCUE JOB* — ${this.formatJobRef(rescueRequestId)}\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nLocation: ${locationSection}${mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\nReply *NO* to decline.\nYou have 5 minutes to respond.\n\n📌 If you have more than one job open at once, reply "${this.formatJobRef(rescueRequestId).replace('Job #', '')} 25000" instead of just the price, so we know which job you mean.`,
     );
 
     const currentRadius = (session.dispatchRound ?? 0) * RADIUS_EXPANSION_KM;
@@ -2333,6 +2338,20 @@ export class RescueRequestService {
    */
   private formatJobRef(rescueRequestId: string): string {
     return `Job #${rescueRequestId.slice(-6).toUpperCase()}`;
+  }
+
+  /**
+   * Operators were only ever given a raw Google Maps link for the pickup
+   * point — no address, no area name, nothing readable without clicking
+   * through. Reverse-geocodes so the message itself carries the full
+   * picture (address if resolvable, map link always). Best-effort: a
+   * failed/unconfigured geocode falls back to the map link alone rather
+   * than blocking dispatch.
+   */
+  private async formatLocationSection(lat: number, lon: number): Promise<string> {
+    const address = await this.geocodingService.reverseGeocode(lat, lon);
+    const mapLink = `https://maps.google.com/?q=${lat},${lon}`;
+    return address ? `${address}\n📍 ${mapLink}` : mapLink;
   }
 
   private buildMediaLinksSection(mediaItems: Array<{ id: string }>): string {

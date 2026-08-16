@@ -7,6 +7,7 @@ import { RescueRequestController } from './rescue-request.controller';
 import { PaystackModule } from '../integrations/paystack/paystack.module';
 import { TwilioModule } from '../integrations/twilio/twilio.module';
 import { S3Module } from '../integrations/s3/s3.module';
+import { GeocodingModule } from '../integrations/geocoding/geocoding.module';
 import { OperatorModule } from '../operator/operator.module';
 import { PlatformConfigModule } from '../platform-config/platform-config.module';
 import { RatingModule } from '../rating/rating.module';
@@ -19,6 +20,7 @@ import { AuthGuard } from '../auth/auth.guard';
     PaystackModule,
     TwilioModule,
     S3Module,
+    GeocodingModule,
     OperatorModule,
     PlatformConfigModule,
     RatingModule,
