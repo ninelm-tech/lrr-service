@@ -689,6 +689,77 @@ describe('RescueRequestService', () => {
     });
   });
 
+  describe('handleOperatorQuoteOrDecline — concurrent-offer disambiguation', () => {
+    let quoteService: RescueRequestService;
+    let prisma: {
+      operator: { findUnique: jest.Mock };
+      dispatchOffer: { findMany: jest.Mock };
+    };
+
+    const offerA = { id: 'offer-a', rescueRequestId: 'req-aaaaaaAAAAAA', expiresAt: new Date() };
+    const offerB = { id: 'offer-b', rescueRequestId: 'req-bbbbbbBBBBBB', expiresAt: new Date() };
+
+    beforeEach(async () => {
+      prisma = {
+        operator: { findUnique: jest.fn().mockResolvedValue({ id: 'op-1' }) },
+        dispatchOffer: { findMany: jest.fn() },
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestService,
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: S3Service, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PayoutService, useValue: {} },
+        ],
+      }).compile();
+
+      quoteService = module.get<RescueRequestService>(RescueRequestService);
+      jest.spyOn(quoteService as any, 'processQuoteOrDecline').mockResolvedValue({ quoted: true, message: 'ok' });
+    });
+
+    it('uses the single pending offer when a bare price is given (unchanged, common case)', async () => {
+      prisma.dispatchOffer.findMany.mockResolvedValue([offerA]);
+
+      await (quoteService as any).handleOperatorQuoteOrDecline('+2341', 'user-1', 2500000);
+
+      expect((quoteService as any).processQuoteOrDecline).toHaveBeenCalledWith(offerA, 2500000);
+    });
+
+    it('asks the operator to disambiguate instead of guessing when multiple offers are pending and no ref is given', async () => {
+      prisma.dispatchOffer.findMany.mockResolvedValue([offerB, offerA]);
+
+      const result = await (quoteService as any).handleOperatorQuoteOrDecline('+2341', 'user-1', 2500000);
+
+      expect((quoteService as any).processQuoteOrDecline).not.toHaveBeenCalled();
+      expect(result).toContain('AAAAAA');
+      expect(result).toContain('BBBBBB');
+    });
+
+    it('matches the correct offer when a job ref is given', async () => {
+      prisma.dispatchOffer.findMany.mockResolvedValue([offerB, offerA]);
+
+      await (quoteService as any).handleOperatorQuoteOrDecline('+2341', 'user-1', 2500000, 'AAAAAA');
+
+      expect((quoteService as any).processQuoteOrDecline).toHaveBeenCalledWith(offerA, 2500000);
+    });
+
+    it('rejects a job ref that matches none of the pending offers', async () => {
+      prisma.dispatchOffer.findMany.mockResolvedValue([offerA]);
+
+      const result = await (quoteService as any).handleOperatorQuoteOrDecline('+2341', 'user-1', 2500000, 'ZZZZZZ');
+
+      expect((quoteService as any).processQuoteOrDecline).not.toHaveBeenCalled();
+      expect(result).toContain("doesn't match");
+    });
+  });
+
   describe('assignOperator', () => {
     let assignService: RescueRequestService;
     let prisma: {

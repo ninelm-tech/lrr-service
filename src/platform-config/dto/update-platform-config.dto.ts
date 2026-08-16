@@ -1,4 +1,4 @@
-import { IsNumber, IsOptional, Max, Min } from 'class-validator';
+import { IsInt, IsNumber, IsOptional, Max, Min } from 'class-validator';
 
 export class UpdatePlatformConfigDto {
   @IsNumber()
@@ -12,4 +12,10 @@ export class UpdatePlatformConfigDto {
   @Max(100)
   @IsOptional()
   depositPercent?: number;
+
+  @IsInt()
+  @Min(1)
+  @Max(60)
+  @IsOptional()
+  dispatchWindowMinutes?: number;
 }

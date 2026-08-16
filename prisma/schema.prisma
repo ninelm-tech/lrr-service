@@ -233,10 +233,13 @@ model RescueRequest {
 // Read fresh at quote-selection time; never cached, never re-read after a
 // job's amounts are persisted onto its RescueRequest.
 model PlatformConfig {
-  id                String   @id @default(cuid())
-  serviceFeePercent Decimal  @default(10.0)
-  depositPercent    Decimal  @default(10.0)
-  updatedAt         DateTime @updatedAt
+  id                    String   @id @default(cuid())
+  serviceFeePercent     Decimal  @default(10.0)
+  depositPercent        Decimal  @default(10.0)
+  // How long (minutes) each batch of offered operators has to respond
+  // (quote or decline) before the round expires and dispatch retries.
+  dispatchWindowMinutes Int      @default(10)
+  updatedAt             DateTime @updatedAt
 }
 
 // Photos/video/audio submitted by the motorist for a request, forwarded

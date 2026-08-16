@@ -30,11 +30,12 @@ describe('PlatformConfigService', () => {
         id: 'default',
         serviceFeePercent: { toNumber: () => 10 },
         depositPercent: { toNumber: () => 10 },
+        dispatchWindowMinutes: 10,
       });
 
       const result = await service.getConfig();
 
-      expect(result).toEqual({ serviceFeePercent: 10, depositPercent: 10 });
+      expect(result).toEqual({ serviceFeePercent: 10, depositPercent: 10, dispatchWindowMinutes: 10 });
     });
   });
 
@@ -47,21 +48,27 @@ describe('PlatformConfigService', () => {
       await expect(service.updateConfig({ depositPercent: 101 })).rejects.toThrow(BadRequestException);
     });
 
+    it('rejects a dispatchWindowMinutes outside 1-60', async () => {
+      await expect(service.updateConfig({ dispatchWindowMinutes: 0 })).rejects.toThrow(BadRequestException);
+      await expect(service.updateConfig({ dispatchWindowMinutes: 61 })).rejects.toThrow(BadRequestException);
+    });
+
     it('updates the singleton row when values are valid', async () => {
       prisma.platformConfig.findFirst.mockResolvedValue({ id: 'default' });
       prisma.platformConfig.update.mockResolvedValue({
         id: 'default',
         serviceFeePercent: { toNumber: () => 15 },
         depositPercent: { toNumber: () => 10 },
+        dispatchWindowMinutes: 15,
       });
 
-      const result = await service.updateConfig({ serviceFeePercent: 15 });
+      const result = await service.updateConfig({ serviceFeePercent: 15, dispatchWindowMinutes: 15 });
 
       expect(prisma.platformConfig.update).toHaveBeenCalledWith({
         where: { id: 'default' },
-        data: { serviceFeePercent: 15 },
+        data: { serviceFeePercent: 15, dispatchWindowMinutes: 15 },
       });
-      expect(result).toEqual({ serviceFeePercent: 15, depositPercent: 10 });
+      expect(result).toEqual({ serviceFeePercent: 15, depositPercent: 10, dispatchWindowMinutes: 15 });
     });
   });
 });

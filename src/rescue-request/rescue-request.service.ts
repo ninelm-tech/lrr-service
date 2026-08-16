@@ -41,7 +41,6 @@ const DEPOSIT_AMOUNT_KOBO = 500000;   // ₦5,000
 
 // ── Dispatch config ────────────────────────────────────────────────────────────
 const BATCH_SIZE = 3;                  // operators offered per round simultaneously
-const BATCH_WINDOW_SECONDS = 5 * 60;  // time each batch of operators has to respond before the round expires
 const DISPATCH_RETRY_MINUTES         = Number(process.env.DISPATCH_RETRY_MINUTES  ?? 5);   // set to 1 in dev
 const MAX_FAILED_ROUNDS_BEFORE_ALERT = Number(process.env.DISPATCH_MAX_ALERT_ROUND ?? 2);
 const MAX_ROUNDS_BEFORE_AUTO_CANCEL  = Number(process.env.DISPATCH_MAX_ROUNDS     ?? 4);   // ~RETRY*MAX min total
@@ -472,6 +471,17 @@ export class RescueRequestService {
     }
 
     // ── Dispatch quote / decline ─────────────────────────────────────────
+    // "JOBREF PRICE" / "JOBREF NO" disambiguates which job this reply is for
+    // when an operator has more than one offer open at once — see
+    // handleOperatorQuoteOrDecline for what happens when it's left out.
+    const refAndDecline = message.match(/^([a-z0-9]{6})\s+(no|decline)$/i);
+    if (refAndDecline) {
+      return this.handleOperatorQuoteOrDecline(phoneNumber, userId, undefined, refAndDecline[1].toUpperCase());
+    }
+    const refAndPrice = message.match(/^([a-z0-9]{6})\s+(\d+)$/i);
+    if (refAndPrice) {
+      return this.handleOperatorQuoteOrDecline(phoneNumber, userId, Number(refAndPrice[2]) * 100, refAndPrice[1].toUpperCase());
+    }
     if (message === 'no' || message === 'decline') {
       return this.handleOperatorQuoteOrDecline(phoneNumber, userId, undefined);
     }
@@ -528,7 +538,7 @@ export class RescueRequestService {
       });
       logger.info('dispatch: offer declined', { rescueRequestId: offer.rescueRequestId, offerId: offer.id });
       await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.expiresAt);
-      return { quoted: false, message: `Understood. We'll offer this job to another operator.` };
+      return { quoted: false, message: `Understood — ${this.formatJobRef(offer.rescueRequestId)} declined. We'll offer this job to another operator.` };
     }
 
     await this.prisma.dispatchOffer.update({
@@ -541,7 +551,7 @@ export class RescueRequestService {
 
     return {
       quoted: true,
-      message: `✅ Quote of ₦${(quotedPriceKobo / 100).toLocaleString()} submitted! We'll notify you if you're selected.`,
+      message: `✅ Quote of ₦${(quotedPriceKobo / 100).toLocaleString()} submitted for ${this.formatJobRef(offer.rescueRequestId)}! We'll notify you if you're selected.`,
     };
   }
 
@@ -578,22 +588,46 @@ export class RescueRequestService {
   /**
    * Operator replied to a dispatch offer with either a price (quote) or NO
    * (decline) over WhatsApp. `quotedPriceKobo` is undefined for a decline.
+   *
+   * `jobRef` is the 6-char tag from formatJobRef, present when the operator
+   * replied "JOBREF PRICE" instead of a bare price. With only one offer
+   * pending, a bare reply is unambiguous and works as before. With more than
+   * one pending, guessing which job a bare reply is for is exactly the bug
+   * this disambiguates — the previous behavior (most-recently-offered wins)
+   * could silently apply a quote to the wrong job.
    */
   private async handleOperatorQuoteOrDecline(
     operatorPhone: string,
     operatorUserId: string,
     quotedPriceKobo: number | undefined,
+    jobRef?: string,
   ) {
     const operator = await this.prisma.operator.findUnique({
       where: { phoneNumber: operatorPhone },
     });
     if (!operator) return this.xmlOk();
 
-    const offer = await this.prisma.dispatchOffer.findFirst({
+    const pendingOffers = await this.prisma.dispatchOffer.findMany({
       where: { operatorId: operator.id, status: 'PENDING' },
       orderBy: { offeredAt: 'desc' },
     });
-    if (!offer) return this.xmlOk();
+    if (pendingOffers.length === 0) return this.xmlOk();
+
+    let offer = pendingOffers[0];
+    if (jobRef) {
+      const matched = pendingOffers.find((o) => this.formatJobRef(o.rescueRequestId).endsWith(jobRef));
+      if (!matched) {
+        return this.reply(`That job reference doesn't match any of your open offers. Reply "NO" or just your price if you only have one job open.`);
+      }
+      offer = matched;
+    } else if (pendingOffers.length > 1) {
+      const list = pendingOffers
+        .map((o) => `• ${this.formatJobRef(o.rescueRequestId)}`)
+        .join('\n');
+      return this.reply(
+        `You have ${pendingOffers.length} jobs open at once — reply with the job reference and your price so we know which one, e.g. "${this.formatJobRef(pendingOffers[0].rescueRequestId).replace('Job #', '')} 25000":\n\n${list}`,
+      );
+    }
 
     const result = await this.processQuoteOrDecline(offer, quotedPriceKobo);
     return this.reply(result.message);
@@ -792,7 +826,7 @@ export class RescueRequestService {
       : `💰 *One-time fee: ₦50,000* (paid in full now)\n`;
 
     return this.reply(
-      `Issue: ${this.formatIssueType(issueType)}${note}\n\n${costBreakdown}\nPay ${isStandardDeposit ? '₦5,000 deposit' : '₦50,000'} to confirm your rescue:\n\n${paymentResponse.data.authorization_url}\n\n⏱ Slot held for 5 minutes.`,
+      `Issue: ${this.formatIssueType(issueType)}${note}\n\n${costBreakdown}\n⚠️ *ACTION NEEDED* — tap the link below to pay ${isStandardDeposit ? '₦5,000 deposit' : '₦50,000'} and confirm your rescue:\n\n👉 ${paymentResponse.data.authorization_url}\n\n⏱ Slot held for 5 minutes.`,
     );
   }
 
@@ -1088,7 +1122,8 @@ export class RescueRequestService {
       offered: batch.map((op) => ({ operatorId: op.id, businessName: op.businessName, distanceKm: Number(op.distance.toFixed(1)) })),
     });
 
-    const windowSeconds = BATCH_WINDOW_SECONDS;
+    const config = await this.platformConfigService.getConfig();
+    const windowSeconds = config.dispatchWindowMinutes * 60;
     const expiresAt = new Date(Date.now() + windowSeconds * 1000);
 
     // Create all offers in one batch insert
@@ -1127,7 +1162,7 @@ export class RescueRequestService {
       batch.map((op) =>
         this.twilioService.sendWhatsAppMessage(
           toWhatsAppAddress(op.phoneNumber),
-          `🚨 *NEW RESCUE JOB*\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: https://maps.google.com/?q=${lat},${lon}${mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\nEst. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.\nReply *NO* to decline.\nYou have ${windowSeconds} seconds to respond.`,
+          `🚨 *NEW RESCUE JOB* — ${this.formatJobRef(rescueRequestId)}\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: https://maps.google.com/?q=${lat},${lon}${mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\nEst. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.\nReply *NO* to decline.\nYou have ${config.dispatchWindowMinutes} minute${config.dispatchWindowMinutes === 1 ? '' : 's'} to respond.\n\n📌 If you have more than one job open at once, reply "${this.formatJobRef(rescueRequestId).replace('Job #', '')} 25000" instead of just the price, so we know which job you mean.`,
         ),
       ),
     );
@@ -1335,7 +1370,7 @@ export class RescueRequestService {
 
     await this.twilioService.sendWhatsAppMessage(
       toWhatsAppAddress(operator.phoneNumber),
-      `🚨 *NEW RESCUE JOB*\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nLocation: https://maps.google.com/?q=${lat},${lon}${mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\nReply *NO* to decline.\nYou have 5 minutes to respond.`,
+      `🚨 *NEW RESCUE JOB* — ${this.formatJobRef(rescueRequestId)}\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nLocation: https://maps.google.com/?q=${lat},${lon}${mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\nReply *NO* to decline.\nYou have 5 minutes to respond.\n\n📌 If you have more than one job open at once, reply "${this.formatJobRef(rescueRequestId).replace('Job #', '')} 25000" instead of just the price, so we know which job you mean.`,
     );
 
     const currentRadius = (session.dispatchRound ?? 0) * RADIUS_EXPANSION_KM;
@@ -1603,7 +1638,7 @@ export class RescueRequestService {
 
     void this.twilioService.sendWhatsAppMessage(
       phoneNumber,
-      `🚗 *Operator selected!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⏳ You have *5 minutes* to confirm:\n\n${paymentResponse.data.authorization_url}\n\nThe operator is standing by. Reply CANCEL to cancel (no charge).`,
+      `🚗 *Operator selected!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *5 minutes*:\n\n👉 ${paymentResponse.data.authorization_url}\n\nThe operator is standing by. Reply CANCEL to cancel (no charge).`,
     );
 
     const DEPOSIT_WINDOW_MS = 5 * 60 * 1000;
@@ -1779,7 +1814,7 @@ export class RescueRequestService {
     const balanceNaira = (balanceAmount / 100).toLocaleString();
     await this.twilioService.sendWhatsAppMessage(
       customerPhone,
-      `✅ Your tow is complete!\n\nPlease pay the ₦${balanceNaira} balance:\n\n${paymentResponse.data.authorization_url}\n\nThank you for using Lagos Roadside Rescue 🚗`,
+      `✅ Your tow is complete!\n\n⚠️ *ACTION NEEDED* — tap the link below to pay the ₦${balanceNaira} balance:\n\n👉 ${paymentResponse.data.authorization_url}\n\nThank you for using Lagos Roadside Rescue 🚗`,
     );
   }
 
@@ -1895,7 +1930,7 @@ export class RescueRequestService {
 
     void this.twilioService.sendWhatsAppMessage(
       customerPhone,
-      `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⏳ You have *5 minutes* to confirm:\n\n${paymentResponse.data.authorization_url}\n\nReply CANCEL to cancel (no charge).`,
+      `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *5 minutes*:\n\n👉 ${paymentResponse.data.authorization_url}\n\nReply CANCEL to cancel (no charge).`,
     );
     void this.twilioService.sendWhatsAppMessage(
       operatorPhone,
@@ -2289,6 +2324,17 @@ export class RescueRequestService {
    * message. Best-effort: if API_BASE_URL isn't configured, the section is
    * simply omitted — this must never block the dispatch offer itself.
    */
+  /**
+   * A short, stable tag an operator can use to tell concurrent jobs apart
+   * across WhatsApp messages — otherwise "reply with your price" for three
+   * simultaneous dispatches reads as one indistinguishable stream. Not
+   * cryptographically anything, just the tail of the request's cuid,
+   * uppercased for readability (e.g. "Job #A1B2C3").
+   */
+  private formatJobRef(rescueRequestId: string): string {
+    return `Job #${rescueRequestId.slice(-6).toUpperCase()}`;
+  }
+
   private buildMediaLinksSection(mediaItems: Array<{ id: string }>): string {
     if (mediaItems.length === 0) return '';
 
