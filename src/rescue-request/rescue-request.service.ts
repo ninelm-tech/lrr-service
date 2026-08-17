@@ -86,7 +86,7 @@ export class RescueRequestService {
    * some other way by the time it goes off.
    */
   private readonly graceTimers = new Map<string, NodeJS.Timeout>();
-  private readonly QUOTE_GRACE_MS = 25 * 1000;
+  private readonly QUOTE_GRACE_MS = 5 * 60 * 1000;
 
   private readonly RATING_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -566,6 +566,8 @@ export class RescueRequestService {
   private scheduleGraceResolve(rescueRequestId: string, batchExpiresAt: Date) {
     if (this.graceTimers.has(rescueRequestId)) return; // already scheduled for this batch
 
+    void this.notifyPendingOperatorsOfCountdown(rescueRequestId, batchExpiresAt);
+
     const timer = setTimeout(async () => {
       this.graceTimers.delete(rescueRequestId);
       const batchOffers = await this.prisma.dispatchOffer.findMany({
@@ -585,6 +587,30 @@ export class RescueRequestService {
     }, this.QUOTE_GRACE_MS);
 
     this.graceTimers.set(rescueRequestId, timer);
+  }
+
+  /**
+   * Tells the rest of the batch a countdown has started, so a silent
+   * operator knows why the job might close sooner than the original
+   * response-window estimate — without this they'd have no signal that
+   * someone else already bid.
+   */
+  private async notifyPendingOperatorsOfCountdown(rescueRequestId: string, batchExpiresAt: Date) {
+    const stillPending = await this.prisma.dispatchOffer.findMany({
+      where: { rescueRequestId, expiresAt: batchExpiresAt, status: 'PENDING' },
+      include: { operator: true },
+    });
+    if (stillPending.length === 0) return;
+
+    const graceMinutes = Math.round(this.QUOTE_GRACE_MS / 60000);
+    await Promise.all(
+      stillPending.map((offer) =>
+        this.twilioService.sendWhatsAppMessage(
+          toWhatsAppAddress(offer.operator.phoneNumber),
+          `⏱ *Countdown started* — ${this.formatJobRef(rescueRequestId)}\n\nAnother operator just placed a bid. You have *${graceMinutes} minute${graceMinutes === 1 ? '' : 's'}* left to submit your price if you still want this job.`,
+        ),
+      ),
+    );
   }
 
   /**
