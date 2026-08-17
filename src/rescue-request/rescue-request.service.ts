@@ -1774,8 +1774,7 @@ export class RescueRequestService {
       data:  { status: RescueRequestStatus.COMPLETED },
     });
 
-    const subscription = await this.getActiveSubscription(rescueRequest.customerId);
-    if (!subscription && !rescueRequest.balancePaid) {
+    if (!rescueRequest.balancePaid) {
       await this.sendBalancePaymentLink(rescueRequest);
     }
   }
@@ -2201,16 +2200,6 @@ export class RescueRequestService {
       where:  { phoneNumber },
       update: {},
       create: { phoneNumber, role: UserRole.CUSTOMER },
-    });
-  }
-
-  private async getActiveSubscription(userId: string) {
-    return this.prisma.subscription.findFirst({
-      where: {
-        userId,
-        status: 'ACTIVE',
-        currentPeriodEnd: { gte: new Date() },
-      },
     });
   }
 

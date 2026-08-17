@@ -8,17 +8,6 @@ datasource db {
 
 // ============== ENUMS ==============
 
-enum SubscriptionPlan {
-  INDIVIDUAL
-  COMMERCIAL
-}
-
-enum SubscriptionStatus {
-  ACTIVE
-  EXPIRED
-  CANCELLED
-}
-
 enum DispatchOfferStatus {
   PENDING
   QUOTED
@@ -113,7 +102,6 @@ model User {
 
   operatorMemberships OperatorMember[]
   rescueRequests      RescueRequest[]
-  subscriptions       Subscription[]
   whatsAppSession     WhatsAppSession?
   ratings             Rating[]
 
@@ -347,40 +335,6 @@ model WhatsAppSession {
 
   updatedAt DateTime @updatedAt
   createdAt DateTime @default(now())
-}
-
-// Customer subscriptions (Individual or Commercial/Fleet)
-model Subscription {
-  id               String             @id @default(cuid())
-
-  userId           String
-  user             User               @relation(fields: [userId], references: [id])
-
-  plan             SubscriptionPlan
-  status           SubscriptionStatus @default(ACTIVE)
-
-  // Billing
-  paystackCustomerCode String?
-  paystackSubscriptionCode String?
-  monthlyAmountKobo    Int            // e.g. 300000 for ₦3,000
-
-  // Tow allowance
-  towsIncludedPerMonth Int            @default(2)
-  towsUsedThisMonth    Int            @default(0)
-
-  // Period
-  currentPeriodStart  DateTime
-  currentPeriodEnd    DateTime
-
-  // For fleet — optional vehicle identifier
-  vehicleRef           String?
-
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-
-  @@index([userId])
-  @@index([status])
-  @@index([currentPeriodEnd])
 }
 
 enum PayoutStatus {

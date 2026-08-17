@@ -3,7 +3,6 @@ import { ConfigService } from '@nestjs/config';
 import * as crypto from 'crypto';
 import * as Sentry from '@sentry/node';
 import { RescueRequestService } from '../rescue-request/rescue-request.service';
-import { SubscriptionService } from '../subscription/subscription.service';
 import { PayoutService } from '../payout/payout.service';
 
 @Injectable()
@@ -12,8 +11,6 @@ export class PaymentService {
     private readonly configService: ConfigService,
     @Inject(forwardRef(() => RescueRequestService))
     private readonly rescueRequestService: RescueRequestService,
-    @Inject(forwardRef(() => SubscriptionService))
-    private readonly subscriptionService: SubscriptionService,
     private readonly payoutService: PayoutService,
   ) {}
 
@@ -35,7 +32,7 @@ export class PaymentService {
 
   /**
    * Central Paystack webhook dispatcher.
-   * All events from Paystack come here — both deposit/balance and subscription events.
+   * All events from Paystack come here.
    */
   async handlePaystackWebhook(body: any) {
     const event = body.event;
@@ -55,41 +52,10 @@ export class PaymentService {
         } else if (metadata?.type === 'balance') {
           await this.rescueRequestService.handleBalancePaymentConfirmed(reference);
 
-        } else if (metadata?.type === 'subscription_init') {
-          // First charge of a plan subscription — Paystack fires charge.success here,
-          // NOT invoice.payment_success (that's mainly renewals). Activate now.
-          await this.subscriptionService.handleSubscriptionInitCharge(data);
-
         } else {
           console.warn('⚠️ Unknown charge metadata type:', metadata?.type);
           Sentry.captureMessage(`Paystack charge.success with unknown metadata type: ${metadata?.type}`, 'warning');
         }
-        break;
-      }
-
-      // ── Subscription renewal / first activation ──────────────────────────
-      case 'invoice.payment_success': {
-        await this.subscriptionService.handleInvoicePaymentSuccess(data);
-        break;
-      }
-
-      // ── Subscription cancelled by customer on Paystack side ──────────────
-      case 'subscription.not_renew':
-      case 'subscription.disable': {
-        await this.subscriptionService.handleSubscriptionExpired(data);
-        break;
-      }
-
-      // ── Renewal payment failed ───────────────────────────────────────────
-      case 'invoice.payment_failed': {
-        await this.subscriptionService.handleSubscriptionExpired(data);
-        break;
-      }
-
-      // ── Subscription created on Paystack side ────────────────────────────
-      case 'subscription.create': {
-        // Store the subscription_code so we can cancel/manage it later.
-        await this.subscriptionService.handleSubscriptionCreate(data);
         break;
       }
 

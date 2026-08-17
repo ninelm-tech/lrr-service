@@ -2,7 +2,6 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { PaymentService } from './payment.service';
 import { RescueRequestService } from '../rescue-request/rescue-request.service';
-import { SubscriptionService } from '../subscription/subscription.service';
 import { PayoutService } from '../payout/payout.service';
 
 describe('PaymentService', () => {
@@ -11,24 +10,12 @@ describe('PaymentService', () => {
     handleDepositPaymentConfirmed: jest.Mock;
     handleBalancePaymentConfirmed: jest.Mock;
   };
-  let subscriptionService: {
-    handleSubscriptionInitCharge: jest.Mock;
-    handleInvoicePaymentSuccess: jest.Mock;
-    handleSubscriptionExpired: jest.Mock;
-    handleSubscriptionCreate: jest.Mock;
-  };
   let payoutService: { confirmTransferOutcome: jest.Mock };
 
   beforeEach(async () => {
     rescueRequestService = {
       handleDepositPaymentConfirmed: jest.fn(),
       handleBalancePaymentConfirmed: jest.fn(),
-    };
-    subscriptionService = {
-      handleSubscriptionInitCharge: jest.fn(),
-      handleInvoicePaymentSuccess: jest.fn(),
-      handleSubscriptionExpired: jest.fn(),
-      handleSubscriptionCreate: jest.fn(),
     };
     payoutService = { confirmTransferOutcome: jest.fn() };
 
@@ -37,7 +24,6 @@ describe('PaymentService', () => {
         PaymentService,
         { provide: ConfigService, useValue: { get: () => undefined } },
         { provide: RescueRequestService, useValue: rescueRequestService },
-        { provide: SubscriptionService, useValue: subscriptionService },
         { provide: PayoutService, useValue: payoutService },
       ],
     }).compile();

@@ -10,7 +10,6 @@ import { PaymentModule } from './payment/payment.module';
 import { OperatorModule } from './operator/operator.module';
 import { AuthModule } from './auth/auth.module';
 import { WebhooksModule } from './webhooks/webhooks.module';
-import { SubscriptionModule } from './subscription/subscription.module';
 import { MediaModule } from './media/media.module';
 import { PlatformConfigModule } from './platform-config/platform-config.module';
 import { RatingModule } from './rating/rating.module';
@@ -28,7 +27,6 @@ import { SentryInterceptor } from './common/sentry.interceptor';
     PaymentModule,
     OperatorModule,
     WebhooksModule,
-    SubscriptionModule,
     MediaModule,
     PlatformConfigModule,
     RatingModule,
