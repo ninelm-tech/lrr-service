@@ -71,20 +71,48 @@ export class OperatorService {
       throw new BadRequestException(`Invalid truck class(es): ${invalidTruckClasses.join(', ')}`);
     }
 
-    const phoneNumber = normalizePhone(data.phoneNumber);
+    const personalPhone = normalizePhone(data.phoneNumber);
+    const businessPhone = normalizePhone(data.businessPhoneNumber);
 
-    // Check for a colliding user (by email or phone) before opening the
-    // transaction — User.email and User.phoneNumber are both @unique, and an
-    // uncaught collision inside tx.user.create() below surfaces as a raw
+    // Check for a colliding user (by email or personal phone) before opening
+    // the transaction — User.email and User.phoneNumber are both @unique, and
+    // an uncaught collision inside tx.user.create() below surfaces as a raw
     // Prisma error / 500 instead of a clean 409.
     const existingUser = await this.prisma.user.findFirst({
-      where: { OR: [{ email: data.email }, { phoneNumber }] },
+      where: { OR: [{ email: data.email }, { phoneNumber: personalPhone }] },
     });
     if (existingUser) {
       logger.warn('operator.create: email or phone already registered', {
         email: data.email, existingUserId: existingUser.id,
       });
       throw new ConflictException('Email or phone number already registered');
+    }
+
+    // The personal and business numbers are checked against BOTH tables:
+    // an operator's own login number must not already be claimed as some
+    // other business's dispatch line, and the business's dispatch line must
+    // not already be claimed as an existing customer's number — either
+    // direction leaves that number permanently unreachable via WhatsApp for
+    // whichever role loses the routing race in handleIncomingWhatsAppMessage.
+    const personalPhoneClaimedByOperator = await this.prisma.operator.findUnique({
+      where: { phoneNumber: personalPhone },
+    });
+    if (personalPhoneClaimedByOperator) {
+      throw new ConflictException('This phone number is already registered as a business dispatch line.');
+    }
+
+    const businessPhoneClaimedByOperator = await this.prisma.operator.findUnique({
+      where: { phoneNumber: businessPhone },
+    });
+    if (businessPhoneClaimedByOperator) {
+      throw new ConflictException('This business phone number is already registered.');
+    }
+
+    const businessPhoneClaimedByCustomer = await this.prisma.user.findFirst({
+      where: { phoneNumber: businessPhone },
+    });
+    if (businessPhoneClaimedByCustomer) {
+      throw new ConflictException('This business phone number is already registered as a customer account. Use a different number for your business line.');
     }
 
     const passwordHash = await bcrypt.hash(data.password, 10);
@@ -95,7 +123,7 @@ export class OperatorService {
           email:        data.email,
           passwordHash,
           name:         data.name,
-          phoneNumber,
+          phoneNumber:  personalPhone,
           role:         UserRole.OPERATOR,
         },
       });
@@ -106,7 +134,7 @@ export class OperatorService {
           truckClasses:  data.truckClasses,
           businessName:  data.businessName,
           contactName:   data.contactName,
-          phoneNumber,
+          phoneNumber:   businessPhone,
           email:         data.email,
           address:       data.address,
           latitude:      data.latitude,

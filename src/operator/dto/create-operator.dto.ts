@@ -10,8 +10,8 @@ export class CreateOperatorDto {
   password: string;
 
   @IsString()
-  @IsOptional()
-  name?: string;
+  @IsNotEmpty()
+  name: string;
 
   @IsEnum(OperatorType)
   @IsOptional()
@@ -25,9 +25,19 @@ export class CreateOperatorDto {
   @IsNotEmpty()
   contactName: string;
 
+  // The registrant's own number — becomes User.phoneNumber (their login/
+  // identity). Distinct from businessPhoneNumber, which is the number
+  // motorists and dispatch actually text.
   @IsString()
   @IsNotEmpty()
   phoneNumber: string;
+
+  // The business's dispatch WhatsApp line — becomes Operator.phoneNumber.
+  // Usually the same as phoneNumber (solo operators); the frontend defaults
+  // to copying it but lets it diverge.
+  @IsString()
+  @IsNotEmpty()
+  businessPhoneNumber: string;
 
   @IsString()
   @IsNotEmpty()

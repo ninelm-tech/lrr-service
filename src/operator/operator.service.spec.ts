@@ -175,9 +175,11 @@ describe('OperatorService', () => {
     const baseDto = (): CreateOperatorDto => ({
       email: 'op@example.com',
       password: 'password123',
+      name: 'Jane Doe',
       businessName: 'Acme Towing',
       contactName: 'Jane Doe',
       phoneNumber: '+2348012345678',
+      businessPhoneNumber: '+2348012345678',
       address: '1 Test Street',
       latitude: 6.5,
       longitude: 3.4,
@@ -208,6 +210,18 @@ describe('OperatorService', () => {
       const dto = baseDto();
 
       await expect(service.create(dto)).rejects.toThrow('Email or phone number already registered');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('throws ConflictException when the business phone number is already a registered customer account', async () => {
+      const dto = { ...baseDto(), phoneNumber: '+2348012345678', businessPhoneNumber: '+2348099999999' };
+      (prisma.user.findFirst as jest.Mock)
+        .mockResolvedValueOnce(null) // personal email/phone collision check — clear
+        .mockResolvedValueOnce({ id: 'existing-customer' }); // business phone vs User check
+
+      await expect(service.create(dto)).rejects.toThrow(
+        'This business phone number is already registered as a customer account. Use a different number for your business line.',
+      );
       expect(prisma.$transaction).not.toHaveBeenCalled();
     });
   });
