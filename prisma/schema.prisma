@@ -344,6 +344,30 @@ model WhatsAppSession {
   createdAt DateTime @default(now())
 }
 
+// Short-lived rows backing WhatsApp OTP verification — used to prove
+// ownership of a phone number before letting an existing customer
+// register as an operator on the same number. Rows are cheap to accumulate;
+// no cleanup job in this pass, expiry is enforced at query time only.
+model PhoneVerification {
+  id                      String    @id @default(cuid())
+
+  phoneNumber             String
+  createdAt               DateTime  @default(now())
+
+  codeHash                String
+  expiresAt               DateTime
+  verifiedAt              DateTime?
+  attempts                Int       @default(0)
+
+  // Issued on successful verify — proves this row was already validated
+  // once, without re-exposing the original code.
+  verificationTokenHash   String?
+  tokenExpiresAt          DateTime?
+  consumedAt              DateTime?
+
+  @@index([phoneNumber])
+}
+
 enum PayoutStatus {
   PENDING     // created; either not yet attempted, or blocked from attempting (see blockReason)
   PROCESSING  // transfer initiated, awaiting webhook confirmation
