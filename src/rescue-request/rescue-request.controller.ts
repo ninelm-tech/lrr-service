@@ -2,6 +2,7 @@
 import { Body, Controller, Get, Param, Patch, Post, Query, Req, UseGuards } from '@nestjs/common';
 import { UserRole } from '@prisma/client';
 import { RescueRequestService } from './rescue-request.service';
+import { DisputeService } from './dispute.service';
 import type { Request } from 'express';
 import { AdminRescueRequestQueryDto } from './dto/admin-rescue-request.dto';
 import { AssignOperatorDto } from './dto/assign-operator.dto';
@@ -12,7 +13,10 @@ import { Roles } from '../auth/decorators/roles.decorator';
 @UseGuards(AuthGuard)
 @Controller('rescue-requests')
 export class RescueRequestController {
-  constructor(private readonly rescueRequestService: RescueRequestService) {}
+  constructor(
+    private readonly rescueRequestService: RescueRequestService,
+    private readonly disputeService: DisputeService,
+  ) {}
 
   @Get()
   async list(@Req() req: Request, @Query() query: AdminRescueRequestQueryDto) {
@@ -122,6 +126,6 @@ export class RescueRequestController {
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
   async resolveDispute(@Param('id') id: string) {
-    return this.rescueRequestService.resolveDispute(id);
+    return this.disputeService.resolveDispute(id);
   }
 }
