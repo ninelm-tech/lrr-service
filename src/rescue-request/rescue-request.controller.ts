@@ -1,9 +1,9 @@
 
 import { Body, Controller, Get, Param, Patch, Post, Query, Req, UseGuards } from '@nestjs/common';
 import { UserRole } from '@prisma/client';
-import { RescueRequestService } from './rescue-request.service';
 import { DisputeService } from './dispute.service';
 import { RescueRequestAdminService } from './rescue-request-admin.service';
+import { DispatchService } from './dispatch.service';
 import type { Request } from 'express';
 import { AdminRescueRequestQueryDto } from './dto/admin-rescue-request.dto';
 import { AssignOperatorDto } from './dto/assign-operator.dto';
@@ -15,9 +15,9 @@ import { Roles } from '../auth/decorators/roles.decorator';
 @Controller('rescue-requests')
 export class RescueRequestController {
   constructor(
-    private readonly rescueRequestService: RescueRequestService,
     private readonly disputeService: DisputeService,
     private readonly rescueRequestAdminService: RescueRequestAdminService,
+    private readonly dispatchService: DispatchService,
   ) {}
 
   @Get()
@@ -34,7 +34,7 @@ export class RescueRequestController {
   @UseGuards(RolesGuard)
   @Roles(UserRole.OPERATOR)
   async myOffers(@Req() req: Request) {
-    return this.rescueRequestService.listMyPendingOffers((req.user as any).userId);
+    return this.dispatchService.listMyPendingOffers((req.user as any).userId);
   }
 
   /** Submit a quote or decline a pending offer from the dashboard. */
@@ -47,7 +47,7 @@ export class RescueRequestController {
     @Body() body: { priceNaira?: number },
   ) {
     const priceKobo = body.priceNaira !== undefined ? Math.round(body.priceNaira * 100) : undefined;
-    return this.rescueRequestService.respondToOffer(
+    return this.dispatchService.respondToOffer(
       (req.user as any).userId,
       offerId,
       priceKobo,
@@ -59,7 +59,7 @@ export class RescueRequestController {
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.PRODUCT)
   async dispatchBoard() {
-    const rows = await this.rescueRequestService.getDispatchBoard();
+    const rows = await this.dispatchService.getDispatchBoard();
     return { data: rows };
   }
 
@@ -67,7 +67,7 @@ export class RescueRequestController {
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
   async expandRadius(@Param('id') id: string) {
-    await this.rescueRequestService.expandRadiusNow(id);
+    await this.dispatchService.expandRadiusNow(id);
     return { message: 'Radius expansion triggered' };
   }
 
@@ -75,7 +75,7 @@ export class RescueRequestController {
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
   async offerToOperator(@Param('id') id: string, @Param('operatorId') operatorId: string) {
-    await this.rescueRequestService.manualOfferToOperator(id, operatorId);
+    await this.dispatchService.manualOfferToOperator(id, operatorId);
     return { message: 'Offer sent' };
   }
 

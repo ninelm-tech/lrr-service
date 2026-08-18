@@ -6,6 +6,7 @@ import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PayoutService } from '../payout/payout.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { RescueRequestService } from './rescue-request.service';
+import { DispatchService } from './dispatch.service';
 
 describe('PaymentEventsService', () => {
   let service: PaymentEventsService;
@@ -19,8 +20,8 @@ describe('PaymentEventsService', () => {
     findOrCreateCustomer: jest.Mock;
     scheduleRatingTimeout: jest.Mock;
     formatLocationSection: jest.Mock;
-    startDispatch: jest.Mock;
   };
+  let dispatchService: { startDispatch: jest.Mock };
 
   beforeEach(async () => {
     prisma = {
@@ -45,8 +46,8 @@ describe('PaymentEventsService', () => {
       findOrCreateCustomer: jest.fn().mockResolvedValue({ id: 'op-user-1' }),
       scheduleRatingTimeout: jest.fn(),
       formatLocationSection: jest.fn().mockResolvedValue('https://maps.google.com/?q=6.5,3.4'),
-      startDispatch: jest.fn(),
     };
+    dispatchService = { startDispatch: jest.fn() };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -57,6 +58,7 @@ describe('PaymentEventsService', () => {
         { provide: PayoutService, useValue: payoutServiceMock },
         { provide: WhatsAppSessionStore, useValue: sessionStore },
         { provide: RescueRequestService, useValue: rescueRequestService },
+        { provide: DispatchService, useValue: dispatchService },
       ],
     }).compile();
 

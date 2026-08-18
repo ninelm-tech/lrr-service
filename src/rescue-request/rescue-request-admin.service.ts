@@ -14,12 +14,7 @@ import {
   DispatchOfferAdminDto,
   PaginationMetaDto,
 } from './dto/rescue-request-response.dto';
-// Temporary — startDispatch hasn't been extracted to DispatchService yet
-// (a later task in the same decomposition). Depending on the old service
-// for just this one call, inside assignOperator's payment-timeout callback,
-// is intentional and temporary — narrows to nothing once DispatchService
-// exists.
-import { RescueRequestService } from './rescue-request.service';
+import { DispatchService } from './dispatch.service';
 
 @Injectable()
 export class RescueRequestAdminService {
@@ -29,8 +24,8 @@ export class RescueRequestAdminService {
     private readonly twilioService: TwilioService,
     private readonly platformConfigService: PlatformConfigService,
     private readonly paymentEventsService: PaymentEventsService,
-    @Inject(forwardRef(() => RescueRequestService))
-    private readonly rescueRequestService: RescueRequestService,
+    @Inject(forwardRef(() => DispatchService))
+    private readonly dispatchService: DispatchService,
   ) {}
 
   async adminList(query: any) {
@@ -168,7 +163,7 @@ export class RescueRequestAdminService {
         operatorPhone,
         `⏰ The customer did not pay within 5 minutes. You have been released.`,
       );
-      void this.rescueRequestService.startDispatch(id, request.customerId);
+      void this.dispatchService.startDispatch(id, request.customerId);
     }, MANUAL_ASSIGN_WINDOW_MS);
 
     return { data: this.mapToDetailDto(updated) };

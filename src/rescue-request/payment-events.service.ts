@@ -9,13 +9,14 @@ import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { RescueRequestStatus, VehicleType } from '@prisma/client';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { formatVehicleType } from './domain/vehicle-truck-mapping';
-// Temporary — startDispatch, findOrCreateCustomer, formatLocationSection,
-// scheduleRatingTimeout haven't been extracted to their real homes yet
-// (DispatchService / domain formatting / WhatsAppCustomerFlowService are
-// later tasks in the same decomposition). Depending on the old service for
-// just these four calls is intentional and temporary, not a new permanent
-// coupling — narrows to nothing as those tasks land.
+// Temporary — findOrCreateCustomer, formatLocationSection, scheduleRatingTimeout
+// haven't been extracted to their real homes yet (domain formatting /
+// WhatsAppCustomerFlowService are later tasks in the same decomposition).
+// Depending on the old service for just these three calls is intentional
+// and temporary, not a new permanent coupling — narrows to nothing as
+// those tasks land.
 import { RescueRequestService } from './rescue-request.service';
+import { DispatchService } from './dispatch.service';
 
 @Injectable()
 export class PaymentEventsService {
@@ -27,6 +28,8 @@ export class PaymentEventsService {
     private readonly sessionStore: WhatsAppSessionStore,
     @Inject(forwardRef(() => RescueRequestService))
     private readonly rescueRequestService: RescueRequestService,
+    @Inject(forwardRef(() => DispatchService))
+    private readonly dispatchService: DispatchService,
   ) {}
 
   async handleDepositPaymentConfirmed(reference: string) {
@@ -95,7 +98,7 @@ export class PaymentEventsService {
       );
     } else {
       // Edge case: no operator was pre-assigned (e.g. admin manually sent a payment link)
-      void this.rescueRequestService.startDispatch(rescueRequest.id, customerId);
+      void this.dispatchService.startDispatch(rescueRequest.id, customerId);
     }
   }
 

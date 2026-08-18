@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { RescueRequestAdminService } from './rescue-request-admin.service';
-import { RescueRequestService } from './rescue-request.service';
+import { DispatchService } from './dispatch.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
@@ -31,7 +31,7 @@ describe('RescueRequestAdminService', () => {
           { provide: TwilioService, useValue: {} },
           { provide: PlatformConfigService, useValue: platformConfigService },
           { provide: PaymentEventsService, useValue: {} },
-          { provide: RescueRequestService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
         ],
       }).compile();
 
@@ -135,7 +135,7 @@ describe('RescueRequestAdminService', () => {
     let paystackService: { generateReference: jest.Mock; initializePayment: jest.Mock };
     let twilioService: { sendWhatsAppMessage: jest.Mock };
     let platformConfigService: { getConfig: jest.Mock };
-    let rescueRequestService: { startDispatch: jest.Mock };
+    let dispatchService: { startDispatch: jest.Mock };
 
     const operator = { id: 'op-1', status: 'ACTIVE', businessName: 'Acme Towing', phoneNumber: '+2348011111111' };
     const request = {
@@ -169,7 +169,7 @@ describe('RescueRequestAdminService', () => {
       platformConfigService = {
         getConfig: jest.fn().mockResolvedValue({ serviceFeePercent: 10, depositPercent: 20 }),
       };
-      rescueRequestService = { startDispatch: jest.fn().mockResolvedValue(undefined) };
+      dispatchService = { startDispatch: jest.fn().mockResolvedValue(undefined) };
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
@@ -179,7 +179,7 @@ describe('RescueRequestAdminService', () => {
           { provide: TwilioService, useValue: twilioService },
           { provide: PlatformConfigService, useValue: platformConfigService },
           { provide: PaymentEventsService, useValue: {} },
-          { provide: RescueRequestService, useValue: rescueRequestService },
+          { provide: DispatchService, useValue: dispatchService },
         ],
       }).compile();
 
@@ -283,7 +283,7 @@ describe('RescueRequestAdminService', () => {
           where: { id: 'req-1' },
           data: { assignedOperatorId: null, status: 'DISPATCHING' },
         });
-        expect(rescueRequestService.startDispatch).toHaveBeenCalledWith('req-1', 'cust-1');
+        expect(dispatchService.startDispatch).toHaveBeenCalledWith('req-1', 'cust-1');
       } finally {
         jest.useRealTimers();
       }
