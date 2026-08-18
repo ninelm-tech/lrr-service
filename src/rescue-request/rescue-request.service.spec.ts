@@ -11,6 +11,7 @@ import { PlatformConfigService } from '../platform-config/platform-config.servic
 import { RatingService } from '../rating/rating.service';
 import { PayoutService } from '../payout/payout.service';
 import { DisputeService } from './dispute.service';
+import { PaymentEventsService } from './payment-events.service';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
 
 describe('RescueRequestService', () => {
@@ -35,6 +36,7 @@ describe('RescueRequestService', () => {
         { provide: RatingService, useValue: {} },
         { provide: PayoutService, useValue: {} },
         { provide: DisputeService, useValue: {} },
+        { provide: PaymentEventsService, useValue: {} },
       ],
     }).compile();
 
@@ -117,6 +119,7 @@ describe('RescueRequestService', () => {
           { provide: RatingService, useValue: {} },
           { provide: PayoutService, useValue: {} },
           { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
         ],
       }).compile();
 
@@ -235,6 +238,7 @@ describe('RescueRequestService', () => {
           { provide: RatingService, useValue: ratingServiceMock },
           { provide: PayoutService, useValue: {} },
           { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
         ],
       }).compile();
 
@@ -303,6 +307,7 @@ describe('RescueRequestService', () => {
           { provide: RatingService, useValue: ratingServiceMock },
           { provide: PayoutService, useValue: {} },
           { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
         ],
       }).compile();
 
@@ -326,94 +331,6 @@ describe('RescueRequestService', () => {
       expect(ratingServiceMock.create).toHaveBeenCalledWith({
         rescueRequestId: 'req-1', direction: 'OPERATOR_TO_MOTORIST', operatorId: 'op-1', customerId: 'cust-1', score: 4,
       });
-    });
-  });
-
-  describe('handleBalancePaymentConfirmed — payout trigger', () => {
-    let payoutTestService: RescueRequestService;
-    let prisma: {
-      rescueRequest: { findFirst: jest.Mock; update: jest.Mock };
-      user: { upsert: jest.Mock };
-    };
-    let payoutServiceMock: { createAndProcessPayout: jest.Mock };
-    let sessionStore: { update: jest.Mock; getOrCreate: jest.Mock };
-    let twilioService: { sendWhatsAppMessage: jest.Mock };
-
-    beforeEach(async () => {
-      prisma = {
-        rescueRequest: {
-          findFirst: jest.fn().mockResolvedValue({
-            id: 'req-1',
-            customerId: 'cust-1',
-            balanceAmount: 200000,
-            depositAmount: 50000,
-            serviceFeeAmount: 25000,
-            assignedOperatorId: 'op-1',
-            customer: { phoneNumber: '+2348012345678' },
-            assignedOperator: { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2349012345678' },
-          }),
-          update: jest.fn(),
-        },
-        user: { upsert: jest.fn().mockResolvedValue({ id: 'op-user-1' }) },
-      };
-      payoutServiceMock = { createAndProcessPayout: jest.fn() };
-      sessionStore = { update: jest.fn(), getOrCreate: jest.fn().mockResolvedValue({ state: 'IDLE' }) };
-      twilioService = { sendWhatsAppMessage: jest.fn() };
-
-      const module: TestingModule = await Test.createTestingModule({
-        providers: [
-          RescueRequestService,
-          { provide: WhatsAppSessionStore, useValue: sessionStore },
-          { provide: PrismaService, useValue: prisma },
-          { provide: PaystackService, useValue: {} },
-          { provide: TwilioService, useValue: twilioService },
-          { provide: OperatorService, useValue: {} },
-          { provide: S3Service, useValue: {} },
-          { provide: GeocodingService, useValue: { reverseGeocode: jest.fn().mockResolvedValue(null) } },
-          { provide: PlatformConfigService, useValue: {} },
-          { provide: RatingService, useValue: {} },
-          { provide: PayoutService, useValue: payoutServiceMock },
-          { provide: DisputeService, useValue: {} },
-        ],
-      }).compile();
-
-      payoutTestService = module.get<RescueRequestService>(RescueRequestService);
-      jest.useFakeTimers();
-    });
-
-    afterEach(() => {
-      jest.useRealTimers();
-    });
-
-    it('triggers a payout for depositAmount + balanceAmount - serviceFeeAmount', async () => {
-      await payoutTestService.handleBalancePaymentConfirmed('BAL_ref');
-
-      expect(payoutServiceMock.createAndProcessPayout).toHaveBeenCalledWith('req-1', 'op-1', 225000);
-    });
-
-    it('invites a phone-only customer to create a portal account', async () => {
-      await payoutTestService.handleBalancePaymentConfirmed('BAL_ref');
-
-      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
-        '+2348012345678',
-        expect.stringContaining('/register/customer'),
-      );
-    });
-
-    it('tells a customer who already has portal credentials to log in instead', async () => {
-      prisma.rescueRequest.findFirst.mockResolvedValue({
-        id: 'req-1', customerId: 'cust-1', balanceAmount: 200000, depositAmount: 50000, serviceFeeAmount: 25000,
-        assignedOperatorId: 'op-1',
-        customer: { phoneNumber: '+2348012345678', email: 'ada@example.com', passwordHash: 'hashed' },
-        assignedOperator: { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2349012345678' },
-      });
-
-      await payoutTestService.handleBalancePaymentConfirmed('BAL_ref');
-
-      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
-        '+2348012345678',
-        expect.stringContaining('/login'),
-      );
     });
   });
 
@@ -457,6 +374,7 @@ describe('RescueRequestService', () => {
           { provide: RatingService, useValue: {} },
           { provide: PayoutService, useValue: {} },
           { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
         ],
       }).compile();
 
@@ -543,6 +461,7 @@ describe('RescueRequestService', () => {
           { provide: RatingService, useValue: {} },
           { provide: PayoutService, useValue: {} },
           { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
         ],
       }).compile();
 
@@ -655,6 +574,7 @@ describe('RescueRequestService', () => {
           { provide: RatingService, useValue: {} },
           { provide: PayoutService, useValue: {} },
           { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
         ],
       }).compile();
 
@@ -731,6 +651,7 @@ describe('RescueRequestService', () => {
           { provide: RatingService, useValue: {} },
           { provide: PayoutService, useValue: {} },
           { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
         ],
       }).compile();
 
@@ -882,6 +803,7 @@ describe('RescueRequestService', () => {
           { provide: RatingService, useValue: {} },
           { provide: PayoutService, useValue: {} },
           { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
         ],
       }).compile();
 
@@ -983,6 +905,7 @@ describe('RescueRequestService', () => {
           { provide: RatingService, useValue: {} },
           { provide: PayoutService, useValue: {} },
           { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
         ],
       }).compile();
 

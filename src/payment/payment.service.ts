@@ -2,15 +2,15 @@ import { Injectable, forwardRef, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as crypto from 'crypto';
 import * as Sentry from '@sentry/node';
-import { RescueRequestService } from '../rescue-request/rescue-request.service';
+import { PaymentEventsService } from '../rescue-request/payment-events.service';
 import { PayoutService } from '../payout/payout.service';
 
 @Injectable()
 export class PaymentService {
   constructor(
     private readonly configService: ConfigService,
-    @Inject(forwardRef(() => RescueRequestService))
-    private readonly rescueRequestService: RescueRequestService,
+    @Inject(forwardRef(() => PaymentEventsService))
+    private readonly paymentEventsService: PaymentEventsService,
     private readonly payoutService: PayoutService,
   ) {}
 
@@ -47,10 +47,10 @@ export class PaymentService {
         const { reference, metadata } = data;
 
         if (metadata?.type === 'deposit') {
-          await this.rescueRequestService.handleDepositPaymentConfirmed(reference);
+          await this.paymentEventsService.handleDepositPaymentConfirmed(reference);
 
         } else if (metadata?.type === 'balance') {
-          await this.rescueRequestService.handleBalancePaymentConfirmed(reference);
+          await this.paymentEventsService.handleBalancePaymentConfirmed(reference);
 
         } else {
           console.warn('⚠️ Unknown charge metadata type:', metadata?.type);

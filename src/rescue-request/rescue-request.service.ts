@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException, UnauthorizedException, forwardRef, Inject } from '@nestjs/common';
 import * as Sentry from '@sentry/node';
 import { logger } from '@sentry/node';
 import * as crypto from 'crypto';
@@ -29,6 +29,7 @@ import { PlatformConfigService } from '../platform-config/platform-config.servic
 import { RatingService } from '../rating/rating.service';
 import { PayoutService } from '../payout/payout.service';
 import { DisputeService } from './dispute.service';
+import { PaymentEventsService } from './payment-events.service';
 import {
   RescueRequestListResponseDto,
   RescueRequestListItemDto,
@@ -65,6 +66,8 @@ export class RescueRequestService {
     private readonly ratingService: RatingService,
     private readonly payoutService: PayoutService,
     private readonly disputeService: DisputeService,
+    @Inject(forwardRef(() => PaymentEventsService))
+    private readonly paymentEventsService: PaymentEventsService,
   ) {}
 
   /**
@@ -100,7 +103,7 @@ export class RescueRequestService {
    * can't clobber a state the party has since moved past (already rated, or
    * started a fresh SOS).
    */
-  private scheduleRatingTimeout(userId: string, rescueRequestId: string) {
+  scheduleRatingTimeout(userId: string, rescueRequestId: string) {
     setTimeout(async () => {
       const fresh = await this.sessionStore.getOrCreate(userId);
       if (fresh.state === WhatsAppFlowState.WAITING_FOR_RATING && fresh.rescueRequestId === rescueRequestId) {
@@ -146,7 +149,7 @@ export class RescueRequestService {
     if (session.state === WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM) {
       if (message === 'confirm') {
         if (session.rescueRequestId) {
-          await this.markJobCompleted(session.rescueRequestId);
+          await this.paymentEventsService.markJobCompleted(session.rescueRequestId);
           await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
         }
         return this.xmlOk();
@@ -757,7 +760,7 @@ export class RescueRequestService {
       });
       if (fresh && fresh.status !== RescueRequestStatus.COMPLETED && fresh.status !== RescueRequestStatus.CANCELLED) {
         console.log(`⏱ Auto-completing request ${rescueRequestId} — customer did not confirm in 30 min`);
-        await this.markJobCompleted(rescueRequestId);
+        await this.paymentEventsService.markJobCompleted(rescueRequestId);
         await this.sessionStore.update(customerId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
       }
     }, 30 * 60 * 1000);
@@ -876,154 +879,6 @@ export class RescueRequestService {
     );
   }
 
-  // ══════════════════════════════════════════════════════
-  //  DEPOSIT CONFIRMED (webhook)
-  // ══════════════════════════════════════════════════════
-
-  async handleDepositPaymentConfirmed(reference: string) {
-    console.log('🔍 Deposit confirmed, reference:', reference);
-
-    const rescueRequest = await this.prisma.rescueRequest.findFirst({
-      where:   { depositReference: reference },
-      include: { customer: true, assignedOperator: true },
-    });
-    if (!rescueRequest) {
-      console.error('❌ No rescue request for deposit reference:', reference);
-      Sentry.captureMessage(`Deposit webhook: no request found for reference ${reference}`, 'error');
-      return;
-    }
-
-    const customerId    = rescueRequest.customerId;
-    const customerPhone = rescueRequest.customer.phoneNumber;
-
-    // Mark deposit paid and fully confirm the operator assignment
-    await this.prisma.rescueRequest.update({
-      where: { id: rescueRequest.id },
-      data:  { depositPaid: true, status: RescueRequestStatus.OPERATOR_ASSIGNED },
-    });
-
-    // The offer is only actually awarded now that payment is confirmed —
-    // selection alone (Task 8) only reached SELECTED_PENDING_PAYMENT.
-    if (rescueRequest.assignedOperatorId) {
-      await this.prisma.dispatchOffer.updateMany({
-        where: {
-          rescueRequestId: rescueRequest.id,
-          operatorId: rescueRequest.assignedOperatorId,
-          status: 'SELECTED_PENDING_PAYMENT',
-        },
-        data: { status: 'ACCEPTED' },
-      });
-    }
-
-    const operator = rescueRequest.assignedOperator;
-
-    // Customer: confirmed with operator details
-    await this.sessionStore.update(customerId, {
-      state: WhatsAppFlowState.REQUEST_CONFIRMED,
-    });
-    if (customerPhone) {
-      await this.twilioService.sendWhatsAppMessage(
-        customerPhone,
-        operator
-          ? `✅ *Payment confirmed — operator is on the way!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType as VehicleType) : 'Unknown'}\n\nYou'll be notified when they arrive.`
-          : `✅ Deposit confirmed! Finding the nearest tow operator...`,
-      );
-    }
-
-    if (operator) {
-      // Operator: job is now live — send customer location + details
-      const opUser = await this.findOrCreateCustomer(operator.phoneNumber);
-      await this.sessionStore.update(opUser.id, {
-        state:           WhatsAppFlowState.OPERATOR_ON_JOB,
-        rescueRequestId: rescueRequest.id,
-      });
-      const lat = Number(rescueRequest.latitude);
-      const lon = Number(rescueRequest.longitude);
-      const locationSection = await this.formatLocationSection(lat, lon);
-      await this.twilioService.sendWhatsAppMessage(
-        toWhatsAppAddress(operator.phoneNumber),
-        `💰 *Payment confirmed — job is live!*\n\nCustomer: ${customerPhone}\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType as VehicleType) : 'Unknown'}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
-      );
-    } else {
-      // Edge case: no operator was pre-assigned (e.g. admin manually sent a payment link)
-      void this.startDispatch(rescueRequest.id, customerId);
-    }
-  }
-
-  // ══════════════════════════════════════════════════════
-  //  BALANCE CONFIRMED (webhook)
-  // ══════════════════════════════════════════════════════
-
-  async handleBalancePaymentConfirmed(reference: string) {
-    console.log('💰 Balance confirmed, reference:', reference);
-
-    const rescueRequest = await this.prisma.rescueRequest.findFirst({
-      where: { balanceReference: reference },
-      include: { customer: true, assignedOperator: true },
-    });
-    if (!rescueRequest) {
-      console.error('❌ No rescue request for balance reference:', reference);
-      Sentry.captureMessage(`Balance webhook: no request found for reference ${reference}`, 'error');
-      return;
-    }
-
-    await this.prisma.rescueRequest.update({
-      where: { id: rescueRequest.id },
-      data:  { balancePaid: true, status: RescueRequestStatus.COMPLETED },
-    });
-
-    // Notify customer — payment confirmed, then prompt to rate the operator
-    const customerId    = rescueRequest.customerId;
-    const customerPhone = rescueRequest.customer.phoneNumber;
-    const balanceNaira  = ((rescueRequest.balanceAmount ?? 0) / 100).toLocaleString();
-    const operator = rescueRequest.assignedOperator;
-    if (customerPhone) {
-      await this.twilioService.sendWhatsAppMessage(
-        customerPhone,
-        `✅ Payment of ₦${balanceNaira} confirmed! Thank you for using Lagos Roadside Rescue 🙏`,
-      );
-      const operatorName = operator?.businessName ?? 'your operator';
-      const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
-      const hasPortalAccount = Boolean(rescueRequest.customer.email && rescueRequest.customer.passwordHash);
-      const portalLine = hasPortalAccount
-        ? `\n\nWant to see your receipt? Log in at ${frontendUrl}/login`
-        : `\n\nWant to see your receipt and past requests? Create an account at ${frontendUrl}/register/customer`;
-      await this.twilioService.sendWhatsAppMessage(
-        customerPhone,
-        `How was your experience with ${operatorName}? Reply with a number from 1 to 5 to rate them.${portalLine}`,
-      );
-    }
-    await this.sessionStore.update(customerId, {
-      state: WhatsAppFlowState.WAITING_FOR_RATING,
-      rescueRequestId: rescueRequest.id,
-    });
-    this.scheduleRatingTimeout(customerId, rescueRequest.id);
-
-    // Notify operator — release the vehicle, then prompt to rate the motorist
-    if (operator?.phoneNumber) {
-      await this.twilioService.sendWhatsAppMessage(
-        toWhatsAppAddress(operator.phoneNumber),
-        `💵 *Payment received!*\n\nThe customer has paid the ₦${balanceNaira} balance in full.\n\n✅ You may now *release the vehicle*. Job complete — well done!\n\nYour payment will be remitted within 24 hours.`,
-      );
-      await this.twilioService.sendWhatsAppMessage(
-        toWhatsAppAddress(operator.phoneNumber),
-        `How was your experience with this customer? Reply with a number from 1 to 5 to rate them.`,
-      );
-      const opUser = await this.findOrCreateCustomer(operator.phoneNumber);
-      await this.sessionStore.update(opUser.id, {
-        state: WhatsAppFlowState.WAITING_FOR_RATING,
-        rescueRequestId: rescueRequest.id,
-      });
-      this.scheduleRatingTimeout(opUser.id, rescueRequest.id);
-    }
-
-    if (rescueRequest.assignedOperatorId) {
-      const payoutAmount = (rescueRequest.depositAmount ?? 0) + (rescueRequest.balanceAmount ?? 0) - (rescueRequest.serviceFeeAmount ?? 0);
-      await this.payoutService.createAndProcessPayout(rescueRequest.id, rescueRequest.assignedOperatorId, payoutAmount);
-    }
-
-    console.log(`✅ Job ${rescueRequest.id} completed — operator and customer notified`);
-  }
 
   // ══════════════════════════════════════════════════════
   //  DISPATCH — parallel batch offer, dynamic window, retry + radius expansion
@@ -1808,70 +1663,6 @@ export class RescueRequestService {
   }
 
   // ══════════════════════════════════════════════════════
-  //  MARK JOB COMPLETED → trigger balance payment
-  // ══════════════════════════════════════════════════════
-
-  async markJobCompleted(rescueRequestId: string) {
-    const rescueRequest = await this.prisma.rescueRequest.findUnique({
-      where: { id: rescueRequestId },
-      include: { customer: true },
-    });
-    if (!rescueRequest) throw new Error('Rescue request not found');
-
-    await this.prisma.rescueRequest.update({
-      where: { id: rescueRequestId },
-      data:  { status: RescueRequestStatus.COMPLETED },
-    });
-
-    if (!rescueRequest.balancePaid) {
-      await this.sendBalancePaymentLink(rescueRequest);
-    }
-  }
-
-  private async sendBalancePaymentLink(rescueRequest: any) {
-    const customerPhone = rescueRequest.customer.phoneNumber;
-    if (!customerPhone) return;
-
-    const balanceAmount = rescueRequest.balanceAmount;
-    if (!balanceAmount) {
-      console.error('No balanceAmount persisted for rescue request:', rescueRequest.id);
-      Sentry.captureMessage(`sendBalancePaymentLink: missing balanceAmount for ${rescueRequest.id}`, 'error');
-      return;
-    }
-
-    const reference = this.paystackService.generateReference('BAL');
-    const email = rescueRequest.customer.email || `${customerPhone.replace(/\D/g, '')}@lrr.ng`;
-
-    const paymentResponse = await this.paystackService.initializePayment({
-      email,
-      amount: balanceAmount,
-      reference,
-      metadata: {
-        rescueRequestId: rescueRequest.id,
-        customerId:      rescueRequest.customerId,
-        phoneNumber:     customerPhone,
-        type: 'balance',
-      },
-    });
-
-    if (!paymentResponse.status) {
-      console.error('Failed to create balance payment link:', paymentResponse);
-      return;
-    }
-
-    await this.prisma.rescueRequest.update({
-      where: { id: rescueRequest.id },
-      data:  { balanceReference: reference },
-    });
-
-    const balanceNaira = (balanceAmount / 100).toLocaleString();
-    await this.twilioService.sendWhatsAppMessage(
-      customerPhone,
-      `✅ Your tow is complete!\n\n⚠️ *ACTION NEEDED* — tap the link below to pay the ₦${balanceNaira} balance:\n\n👉 ${paymentResponse.data.authorization_url}\n\nThank you for using Lagos Roadside Rescue 🚗`,
-    );
-  }
-
-  // ══════════════════════════════════════════════════════
   //  ADMIN API (fully implemented)
   // ══════════════════════════════════════════════════════
 
@@ -2028,7 +1819,7 @@ export class RescueRequestService {
     });
 
     if (status === RescueRequestStatus.COMPLETED) {
-      await this.markJobCompleted(id);
+      await this.paymentEventsService.markJobCompleted(id);
     }
     return { data: this.mapToDetailDto(updated) };
   }
@@ -2244,7 +2035,7 @@ export class RescueRequestService {
   //  PRIVATE HELPERS
   // ══════════════════════════════════════════════════════
 
-  private async findOrCreateCustomer(phoneNumber: string) {
+  async findOrCreateCustomer(phoneNumber: string) {
     return this.prisma.user.upsert({
       where:  { phoneNumber },
       update: {},
@@ -2386,7 +2177,7 @@ export class RescueRequestService {
    * failed/unconfigured geocode falls back to the map link alone rather
    * than blocking dispatch.
    */
-  private async formatLocationSection(lat: number, lon: number): Promise<string> {
+  async formatLocationSection(lat: number, lon: number): Promise<string> {
     const address = await this.geocodingService.reverseGeocode(lat, lon);
     const mapLink = `https://maps.google.com/?q=${lat},${lon}`;
     return address ? `${address}\n📍 ${mapLink}` : mapLink;

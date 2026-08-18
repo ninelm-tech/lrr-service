@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
 import { RescueRequestService } from './rescue-request.service';
 import { DisputeService } from './dispute.service';
+import { PaymentEventsService } from './payment-events.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { PrismaModule } from '../prisma/prisma.module';
 import { RescueRequestController } from './rescue-request.controller';
@@ -32,7 +33,7 @@ import { AuthGuard } from '../auth/auth.guard';
     }),
   ],
   controllers: [RescueRequestController],
-  providers: [RescueRequestService, DisputeService, WhatsAppSessionStore, AuthGuard],
-  exports: [RescueRequestService],
+  providers: [RescueRequestService, DisputeService, PaymentEventsService, WhatsAppSessionStore, AuthGuard],
+  exports: [RescueRequestService, PaymentEventsService],
 })
 export class RescueRequestModule {}
