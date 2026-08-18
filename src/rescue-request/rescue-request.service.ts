@@ -118,6 +118,9 @@ export class RescueRequestService {
     const message = rawMessage.toLowerCase();
     const latitude  = body.Latitude  ? Number(body.Latitude)  : undefined;
     const longitude = body.Longitude ? Number(body.Longitude) : undefined;
+    // Present when a "search for a place" share includes WhatsApp's own
+    // formatted address/place name — absent for a bare "current location" pin.
+    const sharedAddress = body.Address ? String(body.Address).trim() : undefined;
 
     console.log('Incoming WhatsApp message:', { phoneNumber, message, latitude, longitude });
 
@@ -282,15 +285,31 @@ export class RescueRequestService {
         state: WhatsAppFlowState.WAITING_FOR_DESTINATION,
       });
       return this.reply(
-        `🚗 ${formatVehicleType(vehicleType)} noted!\n\nWhere would you like the car towed to? (e.g. a workshop name or address)`,
+        `🚗 ${formatVehicleType(vehicleType)} noted!\n\nWhere would you like the car towed to? Type an address, or share a location pin.`,
       );
     }
 
     // ── Step 3: Waiting for destination ────────────────────────────────────
     if (session.state === WhatsAppFlowState.WAITING_FOR_DESTINATION) {
-      const destination = rawMessage;
+      let destination: string | undefined;
+
+      if (latitude !== undefined && longitude !== undefined) {
+        // A "search for a place" share includes WhatsApp's own formatted
+        // address — prefer it. A bare "current location" pin has none, so
+        // fall back to reverse-geocoding, and to raw coordinates only if
+        // that also comes up empty, rather than losing the pin entirely.
+        if (sharedAddress) {
+          destination = sharedAddress;
+        } else {
+          const geocoded = await this.geocodingService.reverseGeocode(latitude, longitude);
+          destination = geocoded ?? `${latitude}, ${longitude}`;
+        }
+      } else if (rawMessage) {
+        destination = rawMessage;
+      }
+
       if (!destination) {
-        return this.reply(`Please type where you'd like the car towed to.`);
+        return this.reply(`Please type where you'd like the car towed to, or share a location pin.`);
       }
 
       const customer = await this.findOrCreateCustomer(phoneNumber);
@@ -1082,7 +1101,7 @@ export class RescueRequestService {
         if (customerPhone) {
           await this.twilioService.sendWhatsAppMessage(
             customerPhone,
-            `😔 Sorry, there are no tow operators available in your area at the moment.\n\nYour request has been cancelled and *you have not been charged*.\n\nPlease try again later or call your breakdown provider.`,
+            `😔 Sorry, there are no tow operators available in your area at the moment.\n\nYour request has been cancelled.\n\nPlease try again later or call your breakdown provider.`,
           );
         }
         await this.alertAdminNoOperator(rescueRequestId, lat, lon, 0);
@@ -1110,7 +1129,7 @@ export class RescueRequestService {
         if (customerPhone) {
           await this.twilioService.sendWhatsAppMessage(
             customerPhone,
-            `😔 We're sorry — no tow operator was available near you after an extended search.\n\nYour request has been automatically cancelled and *you were not charged*.\n\nPlease try again shortly or call your breakdown cover provider.`,
+            `😔 We're sorry — no tow operator was available near you after an extended search.\n\nYour request has been automatically cancelled.\n\nPlease try again shortly or call your breakdown cover provider.`,
           );
         }
 

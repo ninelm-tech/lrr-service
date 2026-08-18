@@ -411,6 +411,104 @@ describe('RescueRequestService', () => {
     });
   });
 
+  describe('WAITING_FOR_DESTINATION (via WhatsApp router)', () => {
+    let destService: RescueRequestService;
+    let prisma: {
+      user: { upsert: jest.Mock };
+      operator: { findUnique: jest.Mock };
+      rescueRequest: { create: jest.Mock };
+    };
+    let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
+    let geocodingService: { reverseGeocode: jest.Mock };
+    const phoneNumber = '+2348012345678';
+
+    beforeEach(async () => {
+      prisma = {
+        user: { upsert: jest.fn().mockResolvedValue({ id: 'user-1' }) },
+        operator: { findUnique: jest.fn().mockResolvedValue(null) },
+        rescueRequest: { create: jest.fn().mockResolvedValue({ id: 'req-1' }) },
+      };
+      sessionStore = {
+        getOrCreate: jest.fn().mockResolvedValue({
+          state: WhatsAppFlowState.WAITING_FOR_DESTINATION,
+          latitude: 6.5, longitude: 3.4, vehicleType: 'SEDAN',
+        }),
+        update: jest.fn(),
+      };
+      geocodingService = { reverseGeocode: jest.fn().mockResolvedValue(null) };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestService,
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: { sendWhatsAppMessage: jest.fn() } },
+          { provide: OperatorService, useValue: {} },
+          { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: geocodingService },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PayoutService, useValue: {} },
+        ],
+      }).compile();
+
+      destService = module.get<RescueRequestService>(RescueRequestService);
+    });
+
+    it('uses WhatsApp\'s own formatted address when a "search for a place" share includes one', async () => {
+      await destService.handleIncomingWhatsAppMessage({
+        From: `whatsapp:${phoneNumber}`, Body: '', Latitude: '6.6', Longitude: '3.5', Address: 'Mechanic Village, Ojodu',
+      });
+
+      expect(geocodingService.reverseGeocode).not.toHaveBeenCalled();
+      expect(prisma.rescueRequest.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ destination: 'Mechanic Village, Ojodu' }),
+      }));
+    });
+
+    it('reverse-geocodes a bare "current location" pin with no Address field', async () => {
+      geocodingService.reverseGeocode.mockResolvedValue('14 Adeniyi Jones Ave, Ikeja, Lagos');
+
+      await destService.handleIncomingWhatsAppMessage({
+        From: `whatsapp:${phoneNumber}`, Body: '', Latitude: '6.6', Longitude: '3.5',
+      });
+
+      expect(geocodingService.reverseGeocode).toHaveBeenCalledWith(6.6, 3.5);
+      expect(prisma.rescueRequest.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ destination: '14 Adeniyi Jones Ave, Ikeja, Lagos' }),
+      }));
+    });
+
+    it('falls back to raw coordinates when a pin is shared but geocoding fails', async () => {
+      geocodingService.reverseGeocode.mockResolvedValue(null);
+
+      await destService.handleIncomingWhatsAppMessage({
+        From: `whatsapp:${phoneNumber}`, Body: '', Latitude: '6.6', Longitude: '3.5',
+      });
+
+      expect(prisma.rescueRequest.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ destination: '6.6, 3.5' }),
+      }));
+    });
+
+    it('still accepts typed text destinations unchanged', async () => {
+      await destService.handleIncomingWhatsAppMessage({ From: `whatsapp:${phoneNumber}`, Body: 'Mainland Towing Yard' });
+
+      expect(geocodingService.reverseGeocode).not.toHaveBeenCalled();
+      expect(prisma.rescueRequest.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ destination: 'Mainland Towing Yard' }),
+      }));
+    });
+
+    it('prompts again when neither text nor a pin is provided', async () => {
+      const result = await destService.handleIncomingWhatsAppMessage({ From: `whatsapp:${phoneNumber}`, Body: '' });
+
+      expect(prisma.rescueRequest.create).not.toHaveBeenCalled();
+      expect(result).toContain('type where you');
+    });
+  });
+
   describe('DISPUTE handling (via WhatsApp router)', () => {
     let disputeTestService: RescueRequestService;
     let prisma: {
