@@ -6,6 +6,7 @@ export interface PlatformConfigValues {
   serviceFeePercent: number;
   depositPercent: number;
   dispatchWindowMinutes: number;
+  disputeAlertPhoneNumber: string | null;
 }
 
 @Injectable()
@@ -18,6 +19,7 @@ export class PlatformConfigService {
       serviceFeePercent: row!.serviceFeePercent.toNumber(),
       depositPercent: row!.depositPercent.toNumber(),
       dispatchWindowMinutes: row!.dispatchWindowMinutes,
+      disputeAlertPhoneNumber: row!.disputeAlertPhoneNumber,
     };
   }
 
@@ -34,10 +36,11 @@ export class PlatformConfigService {
 
     const existing = await this.prisma.platformConfig.findFirst();
 
-    const data: Record<string, number> = {};
+    const data: Record<string, number | string> = {};
     if (dto.serviceFeePercent !== undefined) data.serviceFeePercent = dto.serviceFeePercent;
     if (dto.depositPercent !== undefined) data.depositPercent = dto.depositPercent;
     if (dto.dispatchWindowMinutes !== undefined) data.dispatchWindowMinutes = dto.dispatchWindowMinutes;
+    if (dto.disputeAlertPhoneNumber !== undefined) data.disputeAlertPhoneNumber = dto.disputeAlertPhoneNumber;
 
     const updated = await this.prisma.platformConfig.update({
       where: { id: existing!.id },
@@ -48,6 +51,7 @@ export class PlatformConfigService {
       serviceFeePercent: updated.serviceFeePercent.toNumber(),
       depositPercent: updated.depositPercent.toNumber(),
       dispatchWindowMinutes: updated.dispatchWindowMinutes,
+      disputeAlertPhoneNumber: updated.disputeAlertPhoneNumber,
     };
   }
 }

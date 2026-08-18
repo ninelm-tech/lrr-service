@@ -1,4 +1,4 @@
-import { IsInt, IsNumber, IsOptional, Max, Min } from 'class-validator';
+import { IsInt, IsNumber, IsOptional, IsString, Max, Min } from 'class-validator';
 
 export class UpdatePlatformConfigDto {
   @IsNumber()
@@ -18,4 +18,8 @@ export class UpdatePlatformConfigDto {
   @Max(60)
   @IsOptional()
   dispatchWindowMinutes?: number;
+
+  @IsString()
+  @IsOptional()
+  disputeAlertPhoneNumber?: string;
 }

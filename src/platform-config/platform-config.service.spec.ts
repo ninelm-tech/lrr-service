@@ -31,11 +31,26 @@ describe('PlatformConfigService', () => {
         serviceFeePercent: { toNumber: () => 10 },
         depositPercent: { toNumber: () => 10 },
         dispatchWindowMinutes: 10,
+        disputeAlertPhoneNumber: null,
       });
 
       const result = await service.getConfig();
 
-      expect(result).toEqual({ serviceFeePercent: 10, depositPercent: 10, dispatchWindowMinutes: 10 });
+      expect(result).toEqual({ serviceFeePercent: 10, depositPercent: 10, dispatchWindowMinutes: 10, disputeAlertPhoneNumber: null });
+    });
+
+    it('includes disputeAlertPhoneNumber, null when unset', async () => {
+      prisma.platformConfig.findFirst.mockResolvedValue({
+        id: 'cfg-1',
+        serviceFeePercent: { toNumber: () => 10 },
+        depositPercent: { toNumber: () => 10 },
+        dispatchWindowMinutes: 10,
+        disputeAlertPhoneNumber: null,
+      });
+
+      const result = await service.getConfig();
+
+      expect(result.disputeAlertPhoneNumber).toBeNull();
     });
   });
 
@@ -60,6 +75,7 @@ describe('PlatformConfigService', () => {
         serviceFeePercent: { toNumber: () => 15 },
         depositPercent: { toNumber: () => 10 },
         dispatchWindowMinutes: 15,
+        disputeAlertPhoneNumber: null,
       });
 
       const result = await service.updateConfig({ serviceFeePercent: 15, dispatchWindowMinutes: 15 });
@@ -68,7 +84,26 @@ describe('PlatformConfigService', () => {
         where: { id: 'default' },
         data: { serviceFeePercent: 15, dispatchWindowMinutes: 15 },
       });
-      expect(result).toEqual({ serviceFeePercent: 15, depositPercent: 10, dispatchWindowMinutes: 15 });
+      expect(result).toEqual({ serviceFeePercent: 15, depositPercent: 10, dispatchWindowMinutes: 15, disputeAlertPhoneNumber: null });
+    });
+
+    it('persists a new disputeAlertPhoneNumber', async () => {
+      prisma.platformConfig.findFirst.mockResolvedValue({ id: 'cfg-1' });
+      prisma.platformConfig.update.mockResolvedValue({
+        id: 'cfg-1',
+        serviceFeePercent: { toNumber: () => 10 },
+        depositPercent: { toNumber: () => 10 },
+        dispatchWindowMinutes: 10,
+        disputeAlertPhoneNumber: '+2348012345678',
+      });
+
+      const result = await service.updateConfig({ disputeAlertPhoneNumber: '+2348012345678' });
+
+      expect(prisma.platformConfig.update).toHaveBeenCalledWith({
+        where: { id: 'cfg-1' },
+        data: { disputeAlertPhoneNumber: '+2348012345678' },
+      });
+      expect(result.disputeAlertPhoneNumber).toBe('+2348012345678');
     });
   });
 });
