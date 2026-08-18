@@ -3,6 +3,7 @@ import { Body, Controller, Get, Param, Patch, Post, Query, Req, UseGuards } from
 import { UserRole } from '@prisma/client';
 import { RescueRequestService } from './rescue-request.service';
 import { DisputeService } from './dispute.service';
+import { RescueRequestAdminService } from './rescue-request-admin.service';
 import type { Request } from 'express';
 import { AdminRescueRequestQueryDto } from './dto/admin-rescue-request.dto';
 import { AssignOperatorDto } from './dto/assign-operator.dto';
@@ -16,12 +17,13 @@ export class RescueRequestController {
   constructor(
     private readonly rescueRequestService: RescueRequestService,
     private readonly disputeService: DisputeService,
+    private readonly rescueRequestAdminService: RescueRequestAdminService,
   ) {}
 
   @Get()
   async list(@Req() req: Request, @Query() query: AdminRescueRequestQueryDto) {
     // req.user will have userId, phone, role
-    return this.rescueRequestService.listForUser(req.user, query);
+    return this.rescueRequestAdminService.listForUser(req.user, query);
   }
 
   // ── Dispatch offers (operator dashboard) ─────────────────────────────────
@@ -79,7 +81,7 @@ export class RescueRequestController {
 
   @Get(':id')
   async detail(@Req() req: Request, @Param('id') id: string) {
-    return this.rescueRequestService.detailForUser(req.user, id);
+    return this.rescueRequestAdminService.detailForUser(req.user, id);
   }
 
   // ── Admin mutations ─────────────────────────────────────────────────────
@@ -96,7 +98,7 @@ export class RescueRequestController {
     @Param('id') id: string,
     @Body() dto: AssignOperatorDto,
   ) {
-    return this.rescueRequestService.assignOperator(id, dto);
+    return this.rescueRequestAdminService.assignOperator(id, dto);
   }
 
   /** Update request status (admin override). */
@@ -107,7 +109,7 @@ export class RescueRequestController {
     @Param('id') id: string,
     @Body() body: { status: string },
   ) {
-    return this.rescueRequestService.updateStatus(id, { status: body.status });
+    return this.rescueRequestAdminService.updateStatus(id, { status: body.status });
   }
 
   /** Cancel a request, optionally with a reason sent to the customer. */
@@ -118,7 +120,7 @@ export class RescueRequestController {
     @Param('id') id: string,
     @Body() body: { reason?: string },
   ) {
-    return this.rescueRequestService.cancel(id, { reason: body.reason });
+    return this.rescueRequestAdminService.cancel(id, { reason: body.reason });
   }
 
   /** Mark a disputed request resolved. Idempotent — safe to call more than once. */
