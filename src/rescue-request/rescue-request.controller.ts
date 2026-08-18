@@ -116,4 +116,12 @@ export class RescueRequestController {
   ) {
     return this.rescueRequestService.cancel(id, { reason: body.reason });
   }
+
+  /** Mark a disputed request resolved. Idempotent — safe to call more than once. */
+  @Patch(':id/resolve-dispute')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async resolveDispute(@Param('id') id: string) {
+    return this.rescueRequestService.resolveDispute(id);
+  }
 }

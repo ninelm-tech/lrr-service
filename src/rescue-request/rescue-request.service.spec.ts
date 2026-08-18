@@ -507,6 +507,46 @@ describe('RescueRequestService', () => {
         expect.stringContaining('reopened'),
       );
     });
+
+    describe('resolveDispute', () => {
+      it('rejects when the request was never disputed', async () => {
+        prisma.rescueRequest.findUnique.mockResolvedValue({ id: rescueRequestId, disputed: false, disputeResolvedAt: null });
+
+        await expect(disputeTestService.resolveDispute(rescueRequestId)).rejects.toThrow('never been disputed');
+        expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+      });
+
+      it('is a no-op when already resolved — no DB write, no re-notification', async () => {
+        prisma.rescueRequest.findUnique.mockResolvedValue({
+          id: rescueRequestId, disputed: true, disputeResolvedAt: new Date('2026-01-01'),
+          customer: { phoneNumber: customerPhone }, assignedOperator: null,
+        });
+
+        const result = await disputeTestService.resolveDispute(rescueRequestId);
+
+        expect(result).toEqual({ resolved: true });
+        expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+        expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+      });
+
+      it('resolves, notifies customer and assigned operator, best-effort on Twilio failure', async () => {
+        prisma.rescueRequest.findUnique.mockResolvedValue({
+          id: rescueRequestId, disputed: true, disputeResolvedAt: null,
+          customer: { phoneNumber: customerPhone },
+          assignedOperator: { phoneNumber: '+2348099999999' },
+        });
+        prisma.rescueRequest.update.mockResolvedValue({});
+        twilioService.sendWhatsAppMessage.mockRejectedValueOnce(new Error('Twilio down'));
+
+        await expect(disputeTestService.resolveDispute(rescueRequestId)).resolves.toEqual({ resolved: true });
+
+        expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+          where: { id: rescueRequestId },
+          data: { disputeResolvedAt: expect.any(Date) },
+        });
+        expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledTimes(2); // customer + operator, even though first rejected
+      });
+    });
   });
 
   describe('getDispatchBoard', () => {
