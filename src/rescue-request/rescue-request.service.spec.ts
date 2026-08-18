@@ -386,6 +386,129 @@ describe('RescueRequestService', () => {
     });
   });
 
+  describe('DISPUTE handling (via WhatsApp router)', () => {
+    let disputeTestService: RescueRequestService;
+    let prisma: {
+      user: { upsert: jest.Mock };
+      operator: { findUnique: jest.Mock };
+      rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
+    };
+    let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
+    let platformConfigService: { getConfig: jest.Mock };
+
+    const rescueRequestId = 'req-1';
+    const customerPhone = '+2348012345678';
+
+    beforeEach(async () => {
+      prisma = {
+        user: { upsert: jest.fn().mockResolvedValue({ id: 'user-1' }) },
+        operator: { findUnique: jest.fn().mockResolvedValue(null) },
+        rescueRequest: { findUnique: jest.fn(), update: jest.fn() },
+      };
+      sessionStore = {
+        getOrCreate: jest.fn().mockResolvedValue({
+          state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
+          rescueRequestId,
+        }),
+        update: jest.fn(),
+      };
+      twilioService = { sendWhatsAppMessage: jest.fn() };
+      platformConfigService = { getConfig: jest.fn().mockResolvedValue({ disputeAlertPhoneNumber: null }) };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestService,
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: OperatorService, useValue: {} },
+          { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: { reverseGeocode: jest.fn().mockResolvedValue(null) } },
+          { provide: PlatformConfigService, useValue: platformConfigService },
+          { provide: RatingService, useValue: {} },
+          { provide: PayoutService, useValue: {} },
+        ],
+      }).compile();
+
+      disputeTestService = module.get<RescueRequestService>(RescueRequestService);
+    });
+
+    it('first raise: sets disputed + disputeRaisedAt, sends customer ack, alerts staff when configured', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: rescueRequestId, disputed: false, disputeResolvedAt: null,
+        status: 'ARRIVED', assignedOperator: { businessName: 'Swift Towing' },
+        balanceAmount: 22500, depositAmount: 2500, customer: { phoneNumber: customerPhone },
+      });
+      platformConfigService.getConfig.mockResolvedValue({ disputeAlertPhoneNumber: '+2348099999999' });
+
+      await disputeTestService.handleIncomingWhatsAppMessage({ From: `whatsapp:${customerPhone}`, Body: 'dispute' });
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: rescueRequestId },
+        data: { disputed: true, disputeRaisedAt: expect.any(Date) },
+      });
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining(customerPhone),
+        expect.stringContaining('dispute has been logged'),
+      );
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        'whatsapp:+2348099999999',
+        expect.stringContaining('Swift Towing'),
+      );
+    });
+
+    it('skips the staff alert cleanly when disputeAlertPhoneNumber is unset', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: rescueRequestId, disputed: false, disputeResolvedAt: null,
+        status: 'ARRIVED', assignedOperator: null, balanceAmount: 22500, depositAmount: null,
+        customer: { phoneNumber: customerPhone },
+      });
+      platformConfigService.getConfig.mockResolvedValue({ disputeAlertPhoneNumber: null });
+
+      await disputeTestService.handleIncomingWhatsAppMessage({ From: `whatsapp:${customerPhone}`, Body: 'dispute' });
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledTimes(1); // customer ack only
+    });
+
+    it('repeat while unresolved: no DB write, no re-alert, distinct reply', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: rescueRequestId, disputed: true, disputeResolvedAt: null,
+        status: 'ARRIVED', assignedOperator: null, balanceAmount: null, depositAmount: null,
+        customer: { phoneNumber: customerPhone },
+      });
+
+      await disputeTestService.handleIncomingWhatsAppMessage({ From: `whatsapp:${customerPhone}`, Body: 'dispute' });
+
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining(customerPhone),
+        expect.stringContaining('already flagged'),
+      );
+    });
+
+    it('reopen after resolution: clears disputeResolvedAt, refreshes disputeRaisedAt, re-alerts staff', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: rescueRequestId, disputed: true, disputeResolvedAt: new Date('2026-01-01'),
+        status: 'ARRIVED', assignedOperator: null, balanceAmount: null, depositAmount: null,
+        customer: { phoneNumber: customerPhone },
+      });
+      platformConfigService.getConfig.mockResolvedValue({ disputeAlertPhoneNumber: '+2348099999999' });
+
+      await disputeTestService.handleIncomingWhatsAppMessage({ From: `whatsapp:${customerPhone}`, Body: 'dispute' });
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: rescueRequestId },
+        data: { disputed: true, disputeRaisedAt: expect.any(Date), disputeResolvedAt: null },
+      });
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining(customerPhone),
+        expect.stringContaining('reopened'),
+      );
+    });
+  });
+
   describe('getDispatchBoard', () => {
     let boardService: RescueRequestService;
     let prisma: {

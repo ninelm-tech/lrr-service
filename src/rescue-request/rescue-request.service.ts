@@ -147,12 +147,9 @@ export class RescueRequestService {
         return this.xmlOk();
       }
       if (message === 'dispute') {
-        // Notify admin and hold the request — do not auto-complete
-        await this.alertAdminNoOperator(session.rescueRequestId ?? '', 0, 0, -1); // reuse alert channel
-        await this.twilioService.sendWhatsAppMessage(
-          phoneNumber,
-          `⚠️ Your dispute has been logged. Our team will contact you within 30 minutes.\n\nDo NOT release the vehicle until you hear from us.`,
-        );
+        if (session.rescueRequestId) {
+          await this.raiseDispute(session.rescueRequestId, phoneNumber);
+        }
         return this.xmlOk();
       }
       // Any other message — remind them what to do
@@ -2227,6 +2224,117 @@ export class RescueRequestService {
       update: {},
       create: { phoneNumber, role: UserRole.CUSTOMER },
     });
+  }
+
+  /**
+   * Handles a customer's WhatsApp DISPUTE reply. Three explicit cases so
+   * repeat messages can't corrupt state: first raise, no-op while already
+   * open (prevents duplicate staff pings / disputeRaisedAt drift), and
+   * reopen if the customer disputes again after resolution.
+   */
+  private async raiseDispute(rescueRequestId: string, customerPhoneNumber: string) {
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      include: { customer: true, assignedOperator: true },
+    });
+    if (!rescueRequest) return;
+
+    if (rescueRequest.disputed && !rescueRequest.disputeResolvedAt) {
+      // Already open — no DB write, no re-alert.
+      await this.twilioService.sendWhatsAppMessage(
+        toWhatsAppAddress(customerPhoneNumber),
+        `This request is already flagged as disputed — our team is on it.`,
+      );
+      return;
+    }
+
+    const isReopen = rescueRequest.disputed && !!rescueRequest.disputeResolvedAt;
+
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequestId },
+      data: isReopen
+        ? { disputed: true, disputeRaisedAt: new Date(), disputeResolvedAt: null }
+        : { disputed: true, disputeRaisedAt: new Date() },
+    });
+
+    await this.twilioService.sendWhatsAppMessage(
+      toWhatsAppAddress(customerPhoneNumber),
+      isReopen
+        ? `⚠️ Your dispute has been reopened. Our team is on it.\n\nDo NOT release the vehicle until you hear from us.`
+        : `⚠️ Your dispute has been logged. Our team will contact you within 30 minutes.\n\nDo NOT release the vehicle until you hear from us.`,
+    );
+
+    await this.sendStaffDisputeAlert(rescueRequest);
+  }
+
+  /** Best-effort — a failed staff alert never blocks the customer-facing flow. */
+  private async sendStaffDisputeAlert(rescueRequest: any) {
+    try {
+      const config = await this.platformConfigService.getConfig();
+      if (!config.disputeAlertPhoneNumber) return;
+
+      const amount = rescueRequest.balanceAmount ?? rescueRequest.depositAmount;
+      const amountLine = amount ? `\nAmount: ₦${(amount / 100).toLocaleString()}` : '';
+      const operatorLine = rescueRequest.assignedOperator
+        ? `\nOperator: ${rescueRequest.assignedOperator.businessName}`
+        : '';
+      const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
+
+      await this.twilioService.sendWhatsAppMessage(
+        toWhatsAppAddress(config.disputeAlertPhoneNumber),
+        `🚨 *Dispute raised* — ${this.formatJobRef(rescueRequest.id)}\n\nStatus: ${rescueRequest.status}${operatorLine}${amountLine}\n\n${frontendUrl}/requests?highlight=${rescueRequest.id}`,
+      );
+    } catch (error) {
+      console.error('Failed to send dispute staff alert:', error);
+    }
+  }
+
+  /**
+   * Marks a disputed request resolved. Idempotent: never-disputed is
+   * rejected, already-resolved returns successfully with no side effects
+   * (safe to retry), and the real case notifies both parties best-effort.
+   */
+  async resolveDispute(rescueRequestId: string): Promise<{ resolved: boolean }> {
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      include: { customer: true, assignedOperator: true },
+    });
+    if (!rescueRequest) throw new NotFoundException('Rescue request not found');
+
+    if (!rescueRequest.disputed) {
+      throw new BadRequestException('This request has never been disputed.');
+    }
+
+    if (rescueRequest.disputeResolvedAt) {
+      // Already resolved — safe to call again, no-op.
+      return { resolved: true };
+    }
+
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequestId },
+      data: { disputeResolvedAt: new Date() },
+    });
+
+    const jobRef = this.formatJobRef(rescueRequestId);
+    const message = `The dispute on request ${jobRef} has been marked as resolved. Our team has completed the dispute review.`;
+
+    try {
+      if (rescueRequest.customer?.phoneNumber) {
+        await this.twilioService.sendWhatsAppMessage(toWhatsAppAddress(rescueRequest.customer.phoneNumber), message);
+      }
+    } catch (error) {
+      console.error('Failed to notify customer of dispute resolution:', error);
+    }
+
+    try {
+      if (rescueRequest.assignedOperator?.phoneNumber) {
+        await this.twilioService.sendWhatsAppMessage(toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber), message);
+      }
+    } catch (error) {
+      console.error('Failed to notify operator of dispute resolution:', error);
+    }
+
+    return { resolved: true };
   }
 
   private async alertAdminNoOperator(
