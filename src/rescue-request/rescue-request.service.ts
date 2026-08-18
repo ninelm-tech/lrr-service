@@ -2273,16 +2273,11 @@ export class RescueRequestService {
       const config = await this.platformConfigService.getConfig();
       if (!config.disputeAlertPhoneNumber) return;
 
-      const amount = rescueRequest.balanceAmount ?? rescueRequest.depositAmount;
-      const amountLine = amount ? `\nAmount: ₦${(amount / 100).toLocaleString()}` : '';
-      const operatorLine = rescueRequest.assignedOperator
-        ? `\nOperator: ${rescueRequest.assignedOperator.businessName}`
-        : '';
       const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
 
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(config.disputeAlertPhoneNumber),
-        `🚨 *Dispute raised* — ${this.formatJobRef(rescueRequest.id)}\n\nStatus: ${rescueRequest.status}${operatorLine}${amountLine}\n\n${frontendUrl}/requests?highlight=${rescueRequest.id}`,
+        `🚨 New dispute raised — Job ${this.formatJobRef(rescueRequest.id)}\n\nLog in to view: ${frontendUrl}/requests?highlight=${rescueRequest.id}`,
       );
     } catch (error) {
       console.error('Failed to send dispute staff alert:', error);

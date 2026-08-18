@@ -455,7 +455,7 @@ describe('RescueRequestService', () => {
       );
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
         'whatsapp:+2348099999999',
-        expect.stringContaining('Swift Towing'),
+        expect.stringContaining('New dispute raised'),
       );
     });
 
