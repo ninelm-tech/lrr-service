@@ -65,30 +65,6 @@ describe('RescueRequestService', () => {
     });
   });
 
-  describe('buildMediaLinksSection', () => {
-    it('returns an empty string when there are no media items', () => {
-      process.env.API_BASE_URL = 'https://api.lrr.ninelm.com';
-      const result = (service as any).buildMediaLinksSection([]);
-      expect(result).toBe('');
-    });
-
-    it('returns an empty string when API_BASE_URL is not configured', () => {
-      delete process.env.API_BASE_URL;
-      const result = (service as any).buildMediaLinksSection([{ id: 'media-1' }]);
-      expect(result).toBe('');
-    });
-
-    it('builds one /media/:id link per item under API_BASE_URL/api/v1', () => {
-      process.env.API_BASE_URL = 'https://api.lrr.ninelm.com';
-      const result = (service as any).buildMediaLinksSection([
-        { id: 'media-1' },
-        { id: 'media-2' },
-      ]);
-      expect(result).toBe(
-        '\n\n📎 Photos/Video/Audio:\nhttps://api.lrr.ninelm.com/api/v1/media/media-1\nhttps://api.lrr.ninelm.com/api/v1/media/media-2',
-      );
-    });
-  });
 
   describe('detailForUser — quote-compliance data', () => {
     let detailService: RescueRequestService;

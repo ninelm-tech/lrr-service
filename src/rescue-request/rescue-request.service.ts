@@ -16,6 +16,7 @@ import {
   formatVehicleType,
 } from './domain/vehicle-truck-mapping';
 import { estimateEtaMinutes, rankQuotes } from './domain/quote-ranking';
+import { formatIssueType, formatStatus, formatJobRef, buildMediaLinksSection } from './domain/rescue-request-formatting';
 import {
   classifyMediaType,
   getExtensionFromContentType,
@@ -190,7 +191,7 @@ export class RescueRequestService {
           });
         } else if (openRequest) {
           return this.reply(
-            `⚠️ You already have an active rescue request (${this.formatStatus(openRequest.status)}).\n\nWe're on it! Reply CANCEL to cancel the current request.`,
+            `⚠️ You already have an active rescue request (${formatStatus(openRequest.status)}).\n\nWe're on it! Reply CANCEL to cancel the current request.`,
           );
         }
       }
@@ -561,7 +562,7 @@ export class RescueRequestService {
       });
       logger.info('dispatch: offer declined', { rescueRequestId: offer.rescueRequestId, offerId: offer.id });
       await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.expiresAt);
-      return { quoted: false, message: `Understood — ${this.formatJobRef(offer.rescueRequestId)} declined. We'll offer this job to another operator.` };
+      return { quoted: false, message: `Understood — ${formatJobRef(offer.rescueRequestId)} declined. We'll offer this job to another operator.` };
     }
 
     await this.prisma.dispatchOffer.update({
@@ -574,7 +575,7 @@ export class RescueRequestService {
 
     return {
       quoted: true,
-      message: `✅ Quote of ₦${(quotedPriceKobo / 100).toLocaleString()} submitted for ${this.formatJobRef(offer.rescueRequestId)}! We'll notify you if you're selected.`,
+      message: `✅ Quote of ₦${(quotedPriceKobo / 100).toLocaleString()} submitted for ${formatJobRef(offer.rescueRequestId)}! We'll notify you if you're selected.`,
     };
   }
 
@@ -628,7 +629,7 @@ export class RescueRequestService {
       stillPending.map((offer) =>
         this.twilioService.sendWhatsAppMessage(
           toWhatsAppAddress(offer.operator.phoneNumber),
-          `⏱ *Countdown started* — ${this.formatJobRef(rescueRequestId)}\n\nAnother operator just placed a bid. You have *${graceMinutes} minute${graceMinutes === 1 ? '' : 's'}* left to submit your price if you still want this job.`,
+          `⏱ *Countdown started* — ${formatJobRef(rescueRequestId)}\n\nAnother operator just placed a bid. You have *${graceMinutes} minute${graceMinutes === 1 ? '' : 's'}* left to submit your price if you still want this job.`,
         ),
       ),
     );
@@ -664,17 +665,17 @@ export class RescueRequestService {
 
     let offer = pendingOffers[0];
     if (jobRef) {
-      const matched = pendingOffers.find((o) => this.formatJobRef(o.rescueRequestId).endsWith(jobRef));
+      const matched = pendingOffers.find((o) => formatJobRef(o.rescueRequestId).endsWith(jobRef));
       if (!matched) {
         return this.reply(`That job reference doesn't match any of your open offers. Reply "NO" or just your price if you only have one job open.`);
       }
       offer = matched;
     } else if (pendingOffers.length > 1) {
       const list = pendingOffers
-        .map((o) => `• ${this.formatJobRef(o.rescueRequestId)}`)
+        .map((o) => `• ${formatJobRef(o.rescueRequestId)}`)
         .join('\n');
       return this.reply(
-        `You have ${pendingOffers.length} jobs open at once — reply with the job reference and your price so we know which one, e.g. "${this.formatJobRef(pendingOffers[0].rescueRequestId).replace('Job #', '')} 25000":\n\n${list}`,
+        `You have ${pendingOffers.length} jobs open at once — reply with the job reference and your price so we know which one, e.g. "${formatJobRef(pendingOffers[0].rescueRequestId).replace('Job #', '')} 25000":\n\n${list}`,
       );
     }
 
@@ -875,7 +876,7 @@ export class RescueRequestService {
       : `💰 *One-time fee: ₦50,000* (paid in full now)\n`;
 
     return this.reply(
-      `Issue: ${this.formatIssueType(issueType)}${note}\n\n${costBreakdown}\n⚠️ *ACTION NEEDED* — tap the link below to pay ${isStandardDeposit ? '₦5,000 deposit' : '₦50,000'} and confirm your rescue:\n\n👉 ${paymentResponse.data.authorization_url}\n\n⏱ Slot held for 5 minutes.`,
+      `Issue: ${formatIssueType(issueType)}${note}\n\n${costBreakdown}\n⚠️ *ACTION NEEDED* — tap the link below to pay ${isStandardDeposit ? '₦5,000 deposit' : '₦50,000'} and confirm your rescue:\n\n👉 ${paymentResponse.data.authorization_url}\n\n⏱ Slot held for 5 minutes.`,
     );
   }
 
@@ -1062,7 +1063,7 @@ export class RescueRequestService {
         Sentry.captureException(error);
         return [];
       });
-    const mediaSection = this.buildMediaLinksSection(mediaItems);
+    const mediaSection = buildMediaLinksSection(mediaItems);
     const locationSection = await this.formatLocationSection(lat, lon);
 
     // Notify all batch operators simultaneously
@@ -1070,7 +1071,7 @@ export class RescueRequestService {
       batch.map((op) =>
         this.twilioService.sendWhatsAppMessage(
           toWhatsAppAddress(op.phoneNumber),
-          `🚨 *NEW RESCUE JOB* — ${this.formatJobRef(rescueRequestId)}\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: ${locationSection}${mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\nEst. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.\nReply *NO* to decline.\nYou have ${config.dispatchWindowMinutes} minute${config.dispatchWindowMinutes === 1 ? '' : 's'} to respond.\n\n📌 If you have more than one job open at once, reply "${this.formatJobRef(rescueRequestId).replace('Job #', '')} 25000" instead of just the price, so we know which job you mean.`,
+          `🚨 *NEW RESCUE JOB* — ${formatJobRef(rescueRequestId)}\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: ${locationSection}${mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\nEst. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.\nReply *NO* to decline.\nYou have ${config.dispatchWindowMinutes} minute${config.dispatchWindowMinutes === 1 ? '' : 's'} to respond.\n\n📌 If you have more than one job open at once, reply "${formatJobRef(rescueRequestId).replace('Job #', '')} 25000" instead of just the price, so we know which job you mean.`,
         ),
       ),
     );
@@ -1274,12 +1275,12 @@ export class RescueRequestService {
         Sentry.captureException(error);
         return [];
       });
-    const mediaSection = this.buildMediaLinksSection(mediaItems);
+    const mediaSection = buildMediaLinksSection(mediaItems);
     const locationSection = await this.formatLocationSection(lat, lon);
 
     await this.twilioService.sendWhatsAppMessage(
       toWhatsAppAddress(operator.phoneNumber),
-      `🚨 *NEW RESCUE JOB* — ${this.formatJobRef(rescueRequestId)}\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nLocation: ${locationSection}${mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\nReply *NO* to decline.\nYou have 5 minutes to respond.\n\n📌 If you have more than one job open at once, reply "${this.formatJobRef(rescueRequestId).replace('Job #', '')} 25000" instead of just the price, so we know which job you mean.`,
+      `🚨 *NEW RESCUE JOB* — ${formatJobRef(rescueRequestId)}\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nLocation: ${locationSection}${mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\nReply *NO* to decline.\nYou have 5 minutes to respond.\n\n📌 If you have more than one job open at once, reply "${formatJobRef(rescueRequestId).replace('Job #', '')} 25000" instead of just the price, so we know which job you mean.`,
     );
 
     const currentRadius = (session.dispatchRound ?? 0) * RADIUS_EXPANSION_KM;
@@ -2145,30 +2146,6 @@ export class RescueRequestService {
     return map[message];
   }
 
-  private formatIssueType(issueType: IssueType): string {
-    return issueType.replace('_', ' ').toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
-  }
-
-  private formatStatus(status: RescueRequestStatus): string {
-    return status.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
-  }
-
-  /**
-   * Builds the "Photos/Video/Audio" section appended to the operator offer
-   * message. Best-effort: if API_BASE_URL isn't configured, the section is
-   * simply omitted — this must never block the dispatch offer itself.
-   */
-  /**
-   * A short, stable tag an operator can use to tell concurrent jobs apart
-   * across WhatsApp messages — otherwise "reply with your price" for three
-   * simultaneous dispatches reads as one indistinguishable stream. Not
-   * cryptographically anything, just the tail of the request's cuid,
-   * uppercased for readability (e.g. "Job #A1B2C3").
-   */
-  private formatJobRef(rescueRequestId: string): string {
-    return `Job #${rescueRequestId.slice(-6).toUpperCase()}`;
-  }
-
   /**
    * Operators were only ever given a raw Google Maps link for the pickup
    * point — no address, no area name, nothing readable without clicking
@@ -2181,19 +2158,6 @@ export class RescueRequestService {
     const address = await this.geocodingService.reverseGeocode(lat, lon);
     const mapLink = `https://maps.google.com/?q=${lat},${lon}`;
     return address ? `${address}\n📍 ${mapLink}` : mapLink;
-  }
-
-  private buildMediaLinksSection(mediaItems: Array<{ id: string }>): string {
-    if (mediaItems.length === 0) return '';
-
-    const apiBaseUrl = process.env.API_BASE_URL;
-    if (!apiBaseUrl) return '';
-
-    const links = mediaItems
-      .map((item) => `${apiBaseUrl}/api/v1/media/${item.id}`)
-      .join('\n');
-
-    return `\n\n📎 Photos/Video/Audio:\n${links}`;
   }
 
   private reply(message: string): string {

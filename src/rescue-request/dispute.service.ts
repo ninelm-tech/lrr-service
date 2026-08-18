@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { toWhatsAppAddress } from '../common/phone.util';
+import { formatJobRef } from './domain/rescue-request-formatting';
 
 @Injectable()
 export class DisputeService {
@@ -68,7 +69,7 @@ export class DisputeService {
       if (!config.disputeAlertPhoneNumber) return;
 
       const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
-      const jobRef = this.formatJobRef(rescueRequest.id); // "Job #A1B2C3"
+      const jobRef = formatJobRef(rescueRequest.id); // "Job #A1B2C3"
       const dashboardLink = `${frontendUrl}/requests?highlight=${rescueRequest.id}`;
       const templateSid = process.env.TWILIO_DISPUTE_TEMPLATE_SID;
 
@@ -118,7 +119,7 @@ export class DisputeService {
       data: { disputeResolvedAt: new Date() },
     });
 
-    const jobRef = this.formatJobRef(rescueRequestId);
+    const jobRef = formatJobRef(rescueRequestId);
     const message = `The dispute on request ${jobRef} has been marked as resolved. Our team has completed the dispute review.`;
 
     try {
@@ -138,11 +139,5 @@ export class DisputeService {
     }
 
     return { resolved: true };
-  }
-
-  // Temporary local copy — removed once Task 4 extracts
-  // domain/rescue-request-formatting.ts and this imports the shared one.
-  private formatJobRef(rescueRequestId: string): string {
-    return `Job #${rescueRequestId.slice(-6).toUpperCase()}`;
   }
 }
