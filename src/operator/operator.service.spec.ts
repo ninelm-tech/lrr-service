@@ -254,6 +254,7 @@ describe('OperatorService', () => {
       });
 
       it('existing customer with a valid token: reuses the User row transactionally, consumes the token', async () => {
+        (service as any).otpUpgradeEnabled = true; // OTP Authentication template approved
         const dto = { ...baseDto(), phoneVerificationToken: 'valid-token' };
         (prisma.user.findUnique as jest.Mock).mockImplementation(({ where }: any) => {
           if (where.phoneNumber) return Promise.resolve({ id: 'existing-customer', role: 'CUSTOMER', phoneNumber: dto.phoneNumber, email: 'old@example.com' });
@@ -286,6 +287,7 @@ describe('OperatorService', () => {
       });
 
       it('existing customer without a valid token: blocked with the specific error, transaction never starts', async () => {
+        (service as any).otpUpgradeEnabled = true; // OTP Authentication template approved
         const dto = baseDto();
         (prisma.user.findUnique as jest.Mock).mockImplementation(({ where }: any) => {
           if (where.phoneNumber) return Promise.resolve({ id: 'existing-customer', role: 'CUSTOMER', phoneNumber: dto.phoneNumber });
@@ -294,6 +296,18 @@ describe('OperatorService', () => {
         (otpService.findValidTokenRow as jest.Mock).mockResolvedValue(null);
 
         await expect(service.create(dto)).rejects.toThrow('verify your number');
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+      });
+
+      it('upgrade path disabled by default: existing customer blocked even with a valid token', async () => {
+        const dto = { ...baseDto(), phoneVerificationToken: 'valid-token' };
+        (prisma.user.findUnique as jest.Mock).mockImplementation(({ where }: any) => {
+          if (where.phoneNumber) return Promise.resolve({ id: 'existing-customer', role: 'CUSTOMER', phoneNumber: dto.phoneNumber });
+          return Promise.resolve(null);
+        });
+
+        await expect(service.create(dto)).rejects.toThrow('Email or phone number already registered');
+        expect(otpService.findValidTokenRow).not.toHaveBeenCalled();
         expect(prisma.$transaction).not.toHaveBeenCalled();
       });
 

@@ -54,6 +54,15 @@ export interface OperatorStatsWithRating extends OperatorStats {
 
 @Injectable()
 export class OperatorService {
+  // Flip to true once the WhatsApp OTP Authentication template is approved
+  // by Meta. Until then, sending the OTP code fails on any real (non-
+  // sandbox) number, so this stays off — an existing customer's number
+  // gets the same hard block as any other duplicate-account attempt,
+  // exactly the behavior before this feature existed. No silent bypass:
+  // turning this off never skips verification, it disables the upgrade
+  // path entirely.
+  private readonly otpUpgradeEnabled = false;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly paystackService: PaystackService,
@@ -100,9 +109,9 @@ export class OperatorService {
     let upgradeTokenRowId: string | null = null;
 
     if (existingByPhone) {
-      if (existingByPhone.role !== UserRole.CUSTOMER) {
-        logger.warn('operator.create: phone already registered to a non-customer account', {
-          existingUserId: existingByPhone.id, role: existingByPhone.role,
+      if (existingByPhone.role !== UserRole.CUSTOMER || !this.otpUpgradeEnabled) {
+        logger.warn('operator.create: phone already registered to a non-customer account or upgrade path disabled', {
+          existingUserId: existingByPhone.id, role: existingByPhone.role, otpUpgradeEnabled: this.otpUpgradeEnabled,
         });
         throw new ConflictException('Email or phone number already registered');
       }
