@@ -199,6 +199,10 @@ model RescueRequest {
   balanceAmount      Int?
   balanceReference   String?
 
+  disputed           Boolean             @default(false)
+  disputeRaisedAt    DateTime?
+  disputeResolvedAt  DateTime?
+
   assignedOperatorId String?
   assignedOperator   Operator?           @relation(fields: [assignedOperatorId], references: [id])
 
@@ -227,6 +231,9 @@ model PlatformConfig {
   // How long (minutes) each batch of offered operators has to respond
   // (quote or decline) before the round expires and dispatch retries.
   dispatchWindowMinutes Int      @default(10)
+  // WhatsApp number staff disputes are alerted to. Optional — unset means
+  // the staff alert step is skipped, not an error.
+  disputeAlertPhoneNumber String?
   updatedAt             DateTime @updatedAt
 }
 
