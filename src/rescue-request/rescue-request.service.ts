@@ -962,9 +962,14 @@ export class RescueRequestService {
         `✅ Payment of ₦${balanceNaira} confirmed! Thank you for using Lagos Roadside Rescue 🙏`,
       );
       const operatorName = operator?.businessName ?? 'your operator';
+      const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
+      const hasPortalAccount = Boolean(rescueRequest.customer.email && rescueRequest.customer.passwordHash);
+      const portalLine = hasPortalAccount
+        ? `\n\nWant to see your receipt? Log in at ${frontendUrl}/login`
+        : `\n\nWant to see your receipt and past requests? Create an account at ${frontendUrl}/register/customer`;
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
-        `How was your experience with ${operatorName}? Reply with a number from 1 to 5 to rate them.`,
+        `How was your experience with ${operatorName}? Reply with a number from 1 to 5 to rate them.${portalLine}`,
       );
     }
     await this.sessionStore.update(customerId, {

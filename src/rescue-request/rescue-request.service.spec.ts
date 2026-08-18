@@ -384,6 +384,31 @@ describe('RescueRequestService', () => {
 
       expect(payoutServiceMock.createAndProcessPayout).toHaveBeenCalledWith('req-1', 'op-1', 225000);
     });
+
+    it('invites a phone-only customer to create a portal account', async () => {
+      await payoutTestService.handleBalancePaymentConfirmed('BAL_ref');
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        '+2348012345678',
+        expect.stringContaining('/register/customer'),
+      );
+    });
+
+    it('tells a customer who already has portal credentials to log in instead', async () => {
+      prisma.rescueRequest.findFirst.mockResolvedValue({
+        id: 'req-1', customerId: 'cust-1', balanceAmount: 200000, depositAmount: 50000, serviceFeeAmount: 25000,
+        assignedOperatorId: 'op-1',
+        customer: { phoneNumber: '+2348012345678', email: 'ada@example.com', passwordHash: 'hashed' },
+        assignedOperator: { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2349012345678' },
+      });
+
+      await payoutTestService.handleBalancePaymentConfirmed('BAL_ref');
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        '+2348012345678',
+        expect.stringContaining('/login'),
+      );
+    });
   });
 
   describe('DISPUTE handling (via WhatsApp router)', () => {
