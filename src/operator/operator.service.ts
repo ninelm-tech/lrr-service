@@ -8,6 +8,7 @@ import { CreateOperatorDto } from './dto/create-operator.dto';
 import { UpdateOperatorProfileDto } from './dto/update-operator-profile.dto';
 import { SaveBankDetailsDto } from './dto/save-bank-details.dto';
 import { PaystackService } from '../integrations/paystack/paystack.service';
+import { OtpService } from '../otp/otp.service';
 
 // ── Scoring weights ────────────────────────────────────────────────────────────
 // Distance is the dominant factor but reliability and speed matter.
@@ -56,6 +57,7 @@ export class OperatorService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly paystackService: PaystackService,
+    private readonly otpService: OtpService,
   ) {}
 
   // ══════════════════════════════════════════════════════
@@ -74,18 +76,46 @@ export class OperatorService {
     const personalPhone = normalizePhone(data.phoneNumber);
     const businessPhone = normalizePhone(data.businessPhoneNumber);
 
-    // Check for a colliding user (by email or personal phone) before opening
-    // the transaction — User.email and User.phoneNumber are both @unique, and
-    // an uncaught collision inside tx.user.create() below surfaces as a raw
-    // Prisma error / 500 instead of a clean 409.
-    const existingUser = await this.prisma.user.findFirst({
-      where: { OR: [{ email: data.email }, { phoneNumber: personalPhone }] },
-    });
-    if (existingUser) {
-      logger.warn('operator.create: email or phone already registered', {
-        email: data.email, existingUserId: existingUser.id,
-      });
+    // Two separate, explicit lookups — never a combined OR — so the decision
+    // never depends on which row Prisma happens to return first. A combined
+    // findFirst({ OR: [{email},{phoneNumber}] }) could match the phone via
+    // one row and reason about an unrelated row's email, misattributing a
+    // conflict or an upgrade-eligibility check to the wrong account.
+    const existingByPhone = await this.prisma.user.findUnique({ where: { phoneNumber: personalPhone } });
+    // email is required on CreateOperatorDto today — always a real string
+    // here. If email ever becomes optional, this lookup must be skipped
+    // when absent rather than passed through.
+    const existingByEmail = await this.prisma.user.findUnique({ where: { email: data.email } });
+
+    if (existingByEmail && existingByEmail.id !== existingByPhone?.id) {
+      logger.warn('operator.create: email already registered', { email: data.email, existingUserId: existingByEmail.id });
       throw new ConflictException('Email or phone number already registered');
+    }
+
+    // The upgrade path: an existing CUSTOMER re-using their own number to
+    // become an operator, gated by WhatsApp OTP ownership verification.
+    // Never applies to an existing OPERATOR/ADMIN on that phone — that's a
+    // genuine duplicate-account attempt, not a legitimate ownership case.
+    let upgradeUserId: string | null = null;
+    let upgradeTokenRowId: string | null = null;
+
+    if (existingByPhone) {
+      if (existingByPhone.role !== UserRole.CUSTOMER) {
+        logger.warn('operator.create: phone already registered to a non-customer account', {
+          existingUserId: existingByPhone.id, role: existingByPhone.role,
+        });
+        throw new ConflictException('Email or phone number already registered');
+      }
+
+      if (!data.phoneVerificationToken) {
+        throw new ConflictException('This number belongs to an existing account — verify your number first.');
+      }
+      const tokenRow = await this.otpService.findValidTokenRow(personalPhone, data.phoneVerificationToken);
+      if (!tokenRow) {
+        throw new ConflictException('This number belongs to an existing account — verify your number first.');
+      }
+      upgradeUserId = existingByPhone.id;
+      upgradeTokenRowId = tokenRow.id;
     }
 
     // The personal and business numbers are checked against BOTH tables:
@@ -118,15 +148,45 @@ export class OperatorService {
     const passwordHash = await bcrypt.hash(data.password, 10);
 
     return this.prisma.$transaction(async (tx) => {
-      const user = await tx.user.create({
-        data: {
-          email:        data.email,
-          passwordHash,
-          name:         data.name,
-          phoneNumber:  personalPhone,
-          role:         UserRole.OPERATOR,
-        },
-      });
+      let user;
+
+      if (upgradeUserId) {
+        // Re-check inside the transaction — close the gap if state changed
+        // between the pre-check above and this write.
+        const freshTokenRow = await tx.phoneVerification.findUnique({ where: { id: upgradeTokenRowId! } });
+        if (!freshTokenRow || freshTokenRow.consumedAt || !freshTokenRow.tokenExpiresAt || freshTokenRow.tokenExpiresAt < new Date()) {
+          throw new ConflictException('This number belongs to an existing account — verify your number first.');
+        }
+        const stillFree = await tx.user.findUnique({ where: { email: data.email } });
+        if (stillFree && stillFree.id !== upgradeUserId) {
+          throw new ConflictException('Email or phone number already registered');
+        }
+
+        user = await tx.user.update({
+          where: { id: upgradeUserId },
+          data: {
+            email:        data.email,
+            passwordHash,
+            name:         data.name,
+            role:         UserRole.OPERATOR,
+          },
+        });
+
+        await tx.phoneVerification.update({
+          where: { id: upgradeTokenRowId! },
+          data: { consumedAt: new Date() },
+        });
+      } else {
+        user = await tx.user.create({
+          data: {
+            email:        data.email,
+            passwordHash,
+            name:         data.name,
+            phoneNumber:  personalPhone,
+            role:         UserRole.OPERATOR,
+          },
+        });
+      }
 
       const operator = await tx.operator.create({
         data: {

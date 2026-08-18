@@ -56,4 +56,10 @@ export class CreateOperatorDto {
   @IsArray()
   @IsEnum(TruckClass, { each: true })
   truckClasses: TruckClass[];
+
+  // Only required when phoneNumber already belongs to an existing CUSTOMER
+  // account — proves ownership before that account is upgraded to OPERATOR.
+  @IsString()
+  @IsOptional()
+  phoneVerificationToken?: string;
 }

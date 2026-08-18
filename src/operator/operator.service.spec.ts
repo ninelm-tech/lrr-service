@@ -3,41 +3,49 @@ import { BadRequestException } from '@nestjs/common';
 import { OperatorService } from './operator.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
+import { OtpService } from '../otp/otp.service';
 import { TruckClass } from '@prisma/client';
 import { CreateOperatorDto } from './dto/create-operator.dto';
 
 describe('OperatorService', () => {
   let service: OperatorService;
   let prisma: {
-    operator: { findMany: jest.Mock; findUnique: jest.Mock; update: jest.Mock };
+    operator: { findMany: jest.Mock; findUnique: jest.Mock; update: jest.Mock; create: jest.Mock };
     dispatchOffer: { findMany: jest.Mock };
     rating: { aggregate: jest.Mock; groupBy: jest.Mock };
-    user: { findFirst: jest.Mock };
+    user: { findFirst: jest.Mock; findUnique: jest.Mock; create: jest.Mock; update: jest.Mock };
+    operatorMember: { create: jest.Mock };
+    phoneVerification: { update: jest.Mock };
     $transaction: jest.Mock;
   };
   let paystackMock: { resolveAccountNumber: jest.Mock; createTransferRecipient: jest.Mock };
+  let otpService: { findValidTokenRow: jest.Mock };
 
   beforeEach(async () => {
     prisma = {
-      operator: { findMany: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
+      operator: { findMany: jest.fn(), findUnique: jest.fn(), update: jest.fn(), create: jest.fn() },
       dispatchOffer: { findMany: jest.fn().mockResolvedValue([]) },
       rating: {
         aggregate: jest.fn().mockResolvedValue({ _avg: { score: null }, _count: { score: 0 } }),
         groupBy: jest.fn().mockResolvedValue([]),
       },
-      user: { findFirst: jest.fn() },
+      user: { findFirst: jest.fn(), findUnique: jest.fn(), create: jest.fn(), update: jest.fn() },
+      operatorMember: { create: jest.fn() },
+      phoneVerification: { update: jest.fn() },
       $transaction: jest.fn(),
     };
     paystackMock = {
       resolveAccountNumber: jest.fn(),
       createTransferRecipient: jest.fn(),
     };
+    otpService = { findValidTokenRow: jest.fn() };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         OperatorService,
         { provide: PrismaService, useValue: prisma },
         { provide: PaystackService, useValue: paystackMock },
+        { provide: OtpService, useValue: otpService },
       ],
     }).compile();
 
@@ -205,24 +213,100 @@ describe('OperatorService', () => {
       await expect(service.create(dto)).rejects.toThrow(BadRequestException);
     });
 
-    it('throws ConflictException when the email or phone number is already registered', async () => {
-      (prisma.user.findFirst as jest.Mock).mockResolvedValue({ id: 'existing-user' });
-      const dto = baseDto();
-
-      await expect(service.create(dto)).rejects.toThrow('Email or phone number already registered');
-      expect(prisma.$transaction).not.toHaveBeenCalled();
-    });
-
     it('throws ConflictException when the business phone number is already a registered customer account', async () => {
       const dto = { ...baseDto(), phoneNumber: '+2348012345678', businessPhoneNumber: '+2348099999999' };
-      (prisma.user.findFirst as jest.Mock)
-        .mockResolvedValueOnce(null) // personal email/phone collision check — clear
-        .mockResolvedValueOnce({ id: 'existing-customer' }); // business phone vs User check
+      (prisma.user.findUnique as jest.Mock).mockResolvedValue(null); // existingByPhone, existingByEmail — clear
+      (prisma.operator.findUnique as jest.Mock).mockResolvedValue(null);
+      (prisma.user.findFirst as jest.Mock).mockResolvedValue({ id: 'existing-customer' }); // business phone vs User check
 
       await expect(service.create(dto)).rejects.toThrow(
         'This business phone number is already registered as a customer account. Use a different number for your business line.',
       );
       expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    describe('existing-customer upgrade path', () => {
+      it('fresh number: unchanged normal signup', async () => {
+        (prisma.user.findUnique as jest.Mock).mockResolvedValue(null); // existingByPhone, existingByEmail
+        (prisma.operator.findUnique as jest.Mock).mockResolvedValue(null);
+        (prisma.user.findFirst as jest.Mock).mockResolvedValue(null);
+        prisma.$transaction.mockImplementation(async (fn: any) => fn(prisma));
+        (prisma.user.create as jest.Mock).mockResolvedValue({ id: 'u-new' });
+        (prisma.operator.create as jest.Mock).mockResolvedValue({ id: 'op-new' });
+        (prisma.operatorMember.create as jest.Mock).mockResolvedValue({});
+
+        await service.create(baseDto());
+
+        expect(prisma.user.create).toHaveBeenCalled();
+        expect(otpService.findValidTokenRow).not.toHaveBeenCalled();
+      });
+
+      it('email belongs to a different existing user than the phone match: conflict, not misattributed', async () => {
+        const dto = baseDto();
+        (prisma.user.findUnique as jest.Mock).mockImplementation(({ where }: any) => {
+          if (where.phoneNumber) return Promise.resolve(null); // no phone match
+          if (where.email) return Promise.resolve({ id: 'other-user' }); // different account owns this email
+          return Promise.resolve(null);
+        });
+
+        await expect(service.create(dto)).rejects.toThrow('Email or phone number already registered');
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+      });
+
+      it('existing customer with a valid token: reuses the User row transactionally, consumes the token', async () => {
+        const dto = { ...baseDto(), phoneVerificationToken: 'valid-token' };
+        (prisma.user.findUnique as jest.Mock).mockImplementation(({ where }: any) => {
+          if (where.phoneNumber) return Promise.resolve({ id: 'existing-customer', role: 'CUSTOMER', phoneNumber: dto.phoneNumber, email: 'old@example.com' });
+          if (where.email) return Promise.resolve({ id: 'existing-customer', role: 'CUSTOMER' }); // same account — not a conflict
+          return Promise.resolve(null);
+        });
+        (prisma.operator.findUnique as jest.Mock).mockResolvedValue(null);
+        (prisma.user.findFirst as jest.Mock).mockResolvedValue(null);
+        (otpService.findValidTokenRow as jest.Mock).mockResolvedValue({ id: 'pv-1' });
+        prisma.$transaction.mockImplementation(async (fn: any) => fn(prisma));
+        (prisma.phoneVerification as any).findUnique = jest.fn().mockResolvedValue({
+          id: 'pv-1', consumedAt: null, tokenExpiresAt: new Date(Date.now() + 60_000),
+        });
+        (prisma.user.update as jest.Mock).mockResolvedValue({ id: 'existing-customer' });
+        (prisma.operator.create as jest.Mock).mockResolvedValue({ id: 'op-new' });
+        (prisma.operatorMember.create as jest.Mock).mockResolvedValue({});
+        (prisma.phoneVerification.update as jest.Mock).mockResolvedValue({});
+
+        await service.create(dto);
+
+        expect(prisma.user.create).not.toHaveBeenCalled();
+        expect(prisma.user.update).toHaveBeenCalledWith(expect.objectContaining({
+          where: { id: 'existing-customer' },
+          data: expect.objectContaining({ role: 'OPERATOR' }),
+        }));
+        expect(prisma.phoneVerification.update).toHaveBeenCalledWith({
+          where: { id: 'pv-1' },
+          data: { consumedAt: expect.any(Date) },
+        });
+      });
+
+      it('existing customer without a valid token: blocked with the specific error, transaction never starts', async () => {
+        const dto = baseDto();
+        (prisma.user.findUnique as jest.Mock).mockImplementation(({ where }: any) => {
+          if (where.phoneNumber) return Promise.resolve({ id: 'existing-customer', role: 'CUSTOMER', phoneNumber: dto.phoneNumber });
+          return Promise.resolve(null);
+        });
+        (otpService.findValidTokenRow as jest.Mock).mockResolvedValue(null);
+
+        await expect(service.create(dto)).rejects.toThrow('verify your number');
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+      });
+
+      it('existing operator/admin on that phone: hard block, no OTP path', async () => {
+        const dto = baseDto();
+        (prisma.user.findUnique as jest.Mock).mockImplementation(({ where }: any) => {
+          if (where.phoneNumber) return Promise.resolve({ id: 'existing-op', role: 'OPERATOR', phoneNumber: dto.phoneNumber });
+          return Promise.resolve(null);
+        });
+
+        await expect(service.create(dto)).rejects.toThrow('Email or phone number already registered');
+        expect(otpService.findValidTokenRow).not.toHaveBeenCalled();
+      });
     });
   });
 });
