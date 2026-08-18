@@ -394,13 +394,15 @@ describe('RescueRequestService', () => {
       rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
     };
     let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
-    let twilioService: { sendWhatsAppMessage: jest.Mock };
+    let twilioService: { sendWhatsAppMessage: jest.Mock; sendWhatsAppTemplateMessage: jest.Mock };
     let platformConfigService: { getConfig: jest.Mock };
+    const originalTemplateSid = process.env.TWILIO_DISPUTE_TEMPLATE_SID;
 
     const rescueRequestId = 'req-1';
     const customerPhone = '+2348012345678';
 
     beforeEach(async () => {
+      delete process.env.TWILIO_DISPUTE_TEMPLATE_SID;
       prisma = {
         user: { upsert: jest.fn().mockResolvedValue({ id: 'user-1' }) },
         operator: { findUnique: jest.fn().mockResolvedValue(null) },
@@ -413,7 +415,7 @@ describe('RescueRequestService', () => {
         }),
         update: jest.fn(),
       };
-      twilioService = { sendWhatsAppMessage: jest.fn() };
+      twilioService = { sendWhatsAppMessage: jest.fn(), sendWhatsAppTemplateMessage: jest.fn() };
       platformConfigService = { getConfig: jest.fn().mockResolvedValue({ disputeAlertPhoneNumber: null }) };
 
       const module: TestingModule = await Test.createTestingModule({
@@ -433,6 +435,30 @@ describe('RescueRequestService', () => {
       }).compile();
 
       disputeTestService = module.get<RescueRequestService>(RescueRequestService);
+    });
+
+    afterEach(() => {
+      if (originalTemplateSid === undefined) delete process.env.TWILIO_DISPUTE_TEMPLATE_SID;
+      else process.env.TWILIO_DISPUTE_TEMPLATE_SID = originalTemplateSid;
+    });
+
+    it('sends the staff alert via the approved Content Template when TWILIO_DISPUTE_TEMPLATE_SID is set', async () => {
+      process.env.TWILIO_DISPUTE_TEMPLATE_SID = 'HXtest123';
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: rescueRequestId, disputed: false, disputeResolvedAt: null,
+        status: 'ARRIVED', assignedOperator: null, balanceAmount: null, depositAmount: null,
+        customer: { phoneNumber: customerPhone },
+      });
+      platformConfigService.getConfig.mockResolvedValue({ disputeAlertPhoneNumber: '+2348099999999' });
+
+      await disputeTestService.handleIncomingWhatsAppMessage({ From: `whatsapp:${customerPhone}`, Body: 'dispute' });
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        'whatsapp:+2348099999999',
+        'HXtest123',
+        { '1': expect.any(String), '2': expect.stringContaining('/requests?highlight=') },
+      );
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledTimes(1); // customer ack only, not the staff line
     });
 
     it('first raise: sets disputed + disputeRaisedAt, sends customer ack, alerts staff when configured', async () => {

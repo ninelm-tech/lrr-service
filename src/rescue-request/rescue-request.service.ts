@@ -2267,18 +2267,40 @@ export class RescueRequestService {
     await this.sendStaffDisputeAlert(rescueRequest);
   }
 
-  /** Best-effort — a failed staff alert never blocks the customer-facing flow. */
+  /**
+   * Best-effort — a failed staff alert never blocks the customer-facing
+   * flow. This is always a business-initiated message (staff never texts
+   * first), so on a real (non-sandbox) number it MUST go through the
+   * approved `dispute_raised_alert` Content Template — a freeform body
+   * gets rejected by Meta outside a session window. Falls back to a
+   * freeform send only when TWILIO_DISPUTE_TEMPLATE_SID isn't configured
+   * (e.g. local/sandbox testing before the template exists).
+   */
   private async sendStaffDisputeAlert(rescueRequest: any) {
     try {
       const config = await this.platformConfigService.getConfig();
       if (!config.disputeAlertPhoneNumber) return;
 
       const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
+      const jobRef = this.formatJobRef(rescueRequest.id); // "Job #A1B2C3"
+      const dashboardLink = `${frontendUrl}/requests?highlight=${rescueRequest.id}`;
+      const templateSid = process.env.TWILIO_DISPUTE_TEMPLATE_SID;
 
-      await this.twilioService.sendWhatsAppMessage(
-        toWhatsAppAddress(config.disputeAlertPhoneNumber),
-        `🚨 New dispute raised — Job ${this.formatJobRef(rescueRequest.id)}\n\nLog in to view: ${frontendUrl}/requests?highlight=${rescueRequest.id}`,
-      );
+      if (templateSid) {
+        // Template body is "...Job {{1}}. Log in to review: {{2}} now." —
+        // {{1}} needs the bare ref, "Job " is already static text in the
+        // approved template itself.
+        await this.twilioService.sendWhatsAppTemplateMessage(
+          toWhatsAppAddress(config.disputeAlertPhoneNumber),
+          templateSid,
+          { '1': jobRef.replace('Job #', ''), '2': dashboardLink },
+        );
+      } else {
+        await this.twilioService.sendWhatsAppMessage(
+          toWhatsAppAddress(config.disputeAlertPhoneNumber),
+          `🚨 New dispute raised — ${jobRef}\n\nLog in to view: ${dashboardLink}`,
+        );
+      }
     } catch (error) {
       console.error('Failed to send dispute staff alert:', error);
     }

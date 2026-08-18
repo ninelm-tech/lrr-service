@@ -37,6 +37,30 @@ export class TwilioService {
   }
 
   /**
+   * Send a WhatsApp message using an approved Content Template.
+   * Required for any business-initiated message outside a 24-hour customer
+   * session window (e.g. an OTP code, a staff alert) — Meta rejects a
+   * freeform `sendWhatsAppMessage` body in that case. `variables` maps
+   * template placeholder numbers to values, e.g. { "1": "A1B2C3", "2": "https://..." }
+   * for a template body using {{1}} and {{2}}.
+   */
+  async sendWhatsAppTemplateMessage(to: string, contentSid: string, variables: Record<string, string>): Promise<void> {
+    try {
+      const formattedTo = to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
+      const result = await this.client.messages.create({
+        from: `whatsapp:${this.whatsappFrom}`,
+        to:   formattedTo,
+        contentSid,
+        contentVariables: JSON.stringify(variables),
+      });
+      console.log('WhatsApp template message sent:', result.sid);
+    } catch (error) {
+      console.error('Failed to send WhatsApp template message:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Download media (photo/video/audio) from a Twilio-hosted MediaUrl.
    * Twilio media URLs require HTTP Basic Auth with the account SID/auth token.
    */
