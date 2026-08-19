@@ -1,15 +1,14 @@
-import { Body, Controller, Post, Header, Headers, Inject, forwardRef, HttpCode, Req } from '@nestjs/common';
+import { Body, Controller, Post, Header, Headers, HttpCode, Req } from '@nestjs/common';
 import type { RawBodyRequest } from '@nestjs/common';
 import type { Request } from 'express';
 import * as Sentry from '@sentry/node';
-import { RescueRequestService } from '../rescue-request/rescue-request.service';
+import { WhatsAppInboundService } from '../rescue-request/whatsapp-inbound.service';
 import { PaymentService } from '../payment/payment.service';
 
 @Controller('webhooks')
 export class WebhooksController {
   constructor(
-    @Inject(forwardRef(() => RescueRequestService))
-    private readonly rescueRequestService: RescueRequestService,
+    private readonly whatsAppInboundService: WhatsAppInboundService,
     private readonly paymentService: PaymentService,
   ) {}
 
@@ -18,7 +17,7 @@ export class WebhooksController {
   @Header('Content-Type', 'text/xml')
   async handleTwilioWebhook(@Body() body: Record<string, any>) {
     console.log('🔔 Twilio webhook received');
-    return this.rescueRequestService.handleIncomingWhatsAppMessage(body);
+    return this.whatsAppInboundService.handleIncomingWhatsAppMessage(body);
   }
 
   // Paystack webhook

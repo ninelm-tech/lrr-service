@@ -1,4 +1,4 @@
-import { Injectable, forwardRef, Inject } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { RescueRequestStatus, RatingDirection } from '@prisma/client';
@@ -10,23 +10,13 @@ import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { toWhatsAppAddress } from '../common/phone.util';
 
-// This service sits in a require cycle with DispatchService,
-// PaymentEventsService, WhatsAppCustomerFlowService, and RescueRequestService
-// (they all reference each other, directly or transitively). Without
-// forwardRef, whichever of these modules happens to load first can capture
-// an undefined class reference in its constructor's design:paramtypes
-// metadata before the cyclic import finishes resolving — forwardRef defers
-// that resolution until DI actually runs, after every module has loaded.
 @Injectable()
 export class WhatsAppOperatorFlowService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly twilioService: TwilioService,
-    @Inject(forwardRef(() => DispatchService))
     private readonly dispatchService: DispatchService,
-    @Inject(forwardRef(() => PaymentEventsService))
     private readonly paymentEventsService: PaymentEventsService,
-    @Inject(forwardRef(() => WhatsAppCustomerFlowService))
     private readonly customerFlowService: WhatsAppCustomerFlowService,
     private readonly sessionStore: WhatsAppSessionStore,
   ) {}

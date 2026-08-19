@@ -20,17 +20,10 @@ import { PlatformConfigService } from '../platform-config/platform-config.servic
 import { RatingService } from '../rating/rating.service';
 import { DispatchService } from './dispatch.service';
 import { DisputeService } from './dispute.service';
-// Temporary forwardRef — PaymentEventsService.handleDepositPaymentConfirmed
-// (CONFIRM path via markJobCompleted) closes a real two-way dependency with
-// this service (this needs markJobCompleted; PaymentEventsService needs
-// scheduleRatingTimeout). Same established pattern as the other cross-service
-// forwardRefs in this decomposition.
+// markJobCompleted (CONFIRM path) closes a real two-way dependency with this
+// service — PaymentEventsService needs scheduleRatingTimeout in return.
 import { PaymentEventsService } from './payment-events.service';
-// Temporary — findOrCreateCustomer hasn't been extracted to its real home
-// yet (WhatsAppInboundService is a later task in the same decomposition).
-// Depending on the old service for just this one call is intentional and
-// temporary — narrows to nothing once that task lands.
-import { RescueRequestService } from './rescue-request.service';
+import { RescueRequestSharedService } from './rescue-request-shared.service';
 
 const DEPOSIT_AMOUNT_KOBO = 500000;   // ₦5,000
 const MAX_MEDIA_ITEMS = 5;
@@ -48,14 +41,12 @@ export class WhatsAppCustomerFlowService {
     private readonly paystackService: PaystackService,
     private readonly platformConfigService: PlatformConfigService,
     private readonly operatorService: OperatorService,
-    @Inject(forwardRef(() => DispatchService))
     private readonly dispatchService: DispatchService,
     private readonly disputeService: DisputeService,
     @Inject(forwardRef(() => PaymentEventsService))
     private readonly paymentEventsService: PaymentEventsService,
     private readonly sessionStore: WhatsAppSessionStore,
-    @Inject(forwardRef(() => RescueRequestService))
-    private readonly rescueRequestService: RescueRequestService,
+    private readonly sharedService: RescueRequestSharedService,
   ) {}
 
   /**
@@ -263,7 +254,7 @@ export class WhatsAppCustomerFlowService {
         return this.reply(`Please type where you'd like the car towed to, or share a location pin.`);
       }
 
-      const customer = await this.rescueRequestService.findOrCreateCustomer(phoneNumber);
+      const customer = await this.sharedService.findOrCreateCustomer(phoneNumber);
       const rescueRequest = await this.prisma.rescueRequest.create({
         data: {
           customerId:  customer.id,

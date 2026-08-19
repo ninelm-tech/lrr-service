@@ -6,7 +6,7 @@ import { TwilioService } from '../integrations/twilio/twilio.service';
 import { OperatorService } from '../operator/operator.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
-import { RescueRequestService } from './rescue-request.service';
+import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { ConfigModule } from '@nestjs/config';
 
 describe('DispatchService', () => {
@@ -42,7 +42,7 @@ describe('DispatchService', () => {
           { provide: OperatorService, useValue: {} },
           { provide: PlatformConfigService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: {} },
-          { provide: RescueRequestService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
         ],
       }).compile();
 
@@ -149,7 +149,7 @@ describe('DispatchService', () => {
           { provide: OperatorService, useValue: {} },
           { provide: PlatformConfigService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: sessionStore },
-          { provide: RescueRequestService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
         ],
       }).compile();
 
@@ -198,7 +198,7 @@ describe('DispatchService', () => {
     };
     let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
     let twilioService: { sendWhatsAppMessage: jest.Mock };
-    let rescueRequestService: { formatLocationSection: jest.Mock };
+    let sharedService: { formatLocationSection: jest.Mock };
 
     beforeEach(async () => {
       prisma = {
@@ -212,7 +212,7 @@ describe('DispatchService', () => {
         update: jest.fn(),
       };
       twilioService = { sendWhatsAppMessage: jest.fn() };
-      rescueRequestService = {
+      sharedService = {
         formatLocationSection: jest.fn().mockResolvedValue('https://maps.google.com/?q=6.5,3.4'),
       };
 
@@ -224,7 +224,7 @@ describe('DispatchService', () => {
           { provide: OperatorService, useValue: {} },
           { provide: PlatformConfigService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: sessionStore },
-          { provide: RescueRequestService, useValue: rescueRequestService },
+          { provide: RescueRequestSharedService, useValue: sharedService },
         ],
       }).compile();
 

@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException, forwardRef, Inject } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import * as Sentry from '@sentry/node';
 import { logger } from '@sentry/node';
 import { toWhatsAppAddress } from '../common/phone.util';
@@ -13,12 +13,7 @@ import { TwilioService } from '../integrations/twilio/twilio.service';
 import { OperatorService } from '../operator/operator.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { DispatchBoardRowDto } from './dto/rescue-request-response.dto';
-// Temporary — formatLocationSection hasn't been extracted (it needs
-// GeocodingService, and Task 4 kept it on the old service since that was
-// its primary caller at the time). Depending on the old service for just
-// this one call is intentional and temporary — narrows to nothing once
-// formatLocationSection finds its real home.
-import { RescueRequestService } from './rescue-request.service';
+import { RescueRequestSharedService } from './rescue-request-shared.service';
 
 // ── Dispatch config ────────────────────────────────────────────────────────────
 const BATCH_SIZE = 3;                  // operators offered per round simultaneously
@@ -35,8 +30,7 @@ export class DispatchService {
     private readonly operatorService: OperatorService,
     private readonly platformConfigService: PlatformConfigService,
     private readonly sessionStore: WhatsAppSessionStore,
-    @Inject(forwardRef(() => RescueRequestService))
-    private readonly rescueRequestService: RescueRequestService,
+    private readonly sharedService: RescueRequestSharedService,
   ) {}
 
   /**
@@ -335,7 +329,7 @@ export class DispatchService {
         return [];
       });
     const mediaSection = buildMediaLinksSection(mediaItems);
-    const locationSection = await this.rescueRequestService.formatLocationSection(lat, lon);
+    const locationSection = await this.sharedService.formatLocationSection(lat, lon);
 
     // Notify all batch operators simultaneously
     await Promise.all(
@@ -547,7 +541,7 @@ export class DispatchService {
         return [];
       });
     const mediaSection = buildMediaLinksSection(mediaItems);
-    const locationSection = await this.rescueRequestService.formatLocationSection(lat, lon);
+    const locationSection = await this.sharedService.formatLocationSection(lat, lon);
 
     await this.twilioService.sendWhatsAppMessage(
       toWhatsAppAddress(operator.phoneNumber),

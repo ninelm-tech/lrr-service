@@ -5,7 +5,7 @@ import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PayoutService } from '../payout/payout.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
-import { RescueRequestService } from './rescue-request.service';
+import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { DispatchService } from './dispatch.service';
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 
@@ -17,7 +17,7 @@ describe('PaymentEventsService', () => {
   let payoutServiceMock: { createAndProcessPayout: jest.Mock };
   let sessionStore: { update: jest.Mock };
   let twilioService: { sendWhatsAppMessage: jest.Mock };
-  let rescueRequestService: {
+  let sharedService: {
     findOrCreateCustomer: jest.Mock;
     formatLocationSection: jest.Mock;
   };
@@ -43,7 +43,7 @@ describe('PaymentEventsService', () => {
     payoutServiceMock = { createAndProcessPayout: jest.fn() };
     sessionStore = { update: jest.fn() };
     twilioService = { sendWhatsAppMessage: jest.fn() };
-    rescueRequestService = {
+    sharedService = {
       findOrCreateCustomer: jest.fn().mockResolvedValue({ id: 'op-user-1' }),
       formatLocationSection: jest.fn().mockResolvedValue('https://maps.google.com/?q=6.5,3.4'),
     };
@@ -58,7 +58,7 @@ describe('PaymentEventsService', () => {
         { provide: TwilioService, useValue: twilioService },
         { provide: PayoutService, useValue: payoutServiceMock },
         { provide: WhatsAppSessionStore, useValue: sessionStore },
-        { provide: RescueRequestService, useValue: rescueRequestService },
+        { provide: RescueRequestSharedService, useValue: sharedService },
         { provide: DispatchService, useValue: dispatchService },
         { provide: WhatsAppCustomerFlowService, useValue: customerFlowService },
       ],

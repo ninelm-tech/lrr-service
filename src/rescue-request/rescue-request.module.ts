@@ -1,12 +1,13 @@
 import { Module } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
-import { RescueRequestService } from './rescue-request.service';
 import { DisputeService } from './dispute.service';
 import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestAdminService } from './rescue-request-admin.service';
 import { DispatchService } from './dispatch.service';
 import { WhatsAppOperatorFlowService } from './whatsapp-operator-flow.service';
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
+import { WhatsAppInboundService } from './whatsapp-inbound.service';
+import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { PrismaModule } from '../prisma/prisma.module';
 import { RescueRequestController } from './rescue-request.controller';
@@ -38,10 +39,10 @@ import { AuthGuard } from '../auth/auth.guard';
   ],
   controllers: [RescueRequestController],
   providers: [
-    RescueRequestService, DisputeService, PaymentEventsService, RescueRequestAdminService,
-    DispatchService, WhatsAppOperatorFlowService, WhatsAppCustomerFlowService,
+    RescueRequestSharedService, DisputeService, PaymentEventsService, RescueRequestAdminService,
+    DispatchService, WhatsAppOperatorFlowService, WhatsAppCustomerFlowService, WhatsAppInboundService,
     WhatsAppSessionStore, AuthGuard,
   ],
-  exports: [RescueRequestService, PaymentEventsService, RescueRequestAdminService, DispatchService],
+  exports: [PaymentEventsService, RescueRequestAdminService, DispatchService, WhatsAppInboundService],
 })
 export class RescueRequestModule {}

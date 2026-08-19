@@ -12,7 +12,7 @@ import { DispatchService } from './dispatch.service';
 import { DisputeService } from './dispute.service';
 import { PaymentEventsService } from './payment-events.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
-import { RescueRequestService } from './rescue-request.service';
+import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
 
 describe('WhatsAppCustomerFlowService', () => {
@@ -42,7 +42,7 @@ describe('WhatsAppCustomerFlowService', () => {
           { provide: DisputeService, useValue: {} },
           { provide: PaymentEventsService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: sessionStore },
-          { provide: RescueRequestService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
         ],
       }).compile();
 
@@ -93,7 +93,7 @@ describe('WhatsAppCustomerFlowService', () => {
     };
     let sessionStore: { update: jest.Mock };
     let geocodingService: { reverseGeocode: jest.Mock };
-    let rescueRequestService: { findOrCreateCustomer: jest.Mock };
+    let sharedService: { findOrCreateCustomer: jest.Mock };
     const phoneNumber = '+2348012345678';
     const userId = 'user-1';
     const baseSession = {
@@ -107,7 +107,7 @@ describe('WhatsAppCustomerFlowService', () => {
       };
       sessionStore = { update: jest.fn() };
       geocodingService = { reverseGeocode: jest.fn().mockResolvedValue(null) };
-      rescueRequestService = { findOrCreateCustomer: jest.fn().mockResolvedValue({ id: 'cust-1' }) };
+      sharedService = { findOrCreateCustomer: jest.fn().mockResolvedValue({ id: 'cust-1' }) };
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
@@ -124,7 +124,7 @@ describe('WhatsAppCustomerFlowService', () => {
           { provide: DisputeService, useValue: {} },
           { provide: PaymentEventsService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: sessionStore },
-          { provide: RescueRequestService, useValue: rescueRequestService },
+          { provide: RescueRequestSharedService, useValue: sharedService },
         ],
       }).compile();
 

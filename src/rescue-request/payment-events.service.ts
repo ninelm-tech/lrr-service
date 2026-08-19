@@ -9,13 +9,11 @@ import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { RescueRequestStatus, VehicleType } from '@prisma/client';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { formatVehicleType } from './domain/vehicle-truck-mapping';
-// Temporary — findOrCreateCustomer/formatLocationSection haven't been
-// extracted to their real home yet (WhatsAppInboundService is a later task
-// in the same decomposition). Depending on the old service for just these
-// two calls is intentional and temporary, not a new permanent coupling —
-// narrows to nothing once that task lands.
-import { RescueRequestService } from './rescue-request.service';
+import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { DispatchService } from './dispatch.service';
+// scheduleRatingTimeout closes a real two-way dependency with this service
+// (this needs scheduleRatingTimeout; WhatsAppCustomerFlowService needs
+// markJobCompleted for its CONFIRM branch) — forwardRef required on both sides.
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 
 @Injectable()
@@ -26,9 +24,7 @@ export class PaymentEventsService {
     private readonly twilioService: TwilioService,
     private readonly payoutService: PayoutService,
     private readonly sessionStore: WhatsAppSessionStore,
-    @Inject(forwardRef(() => RescueRequestService))
-    private readonly rescueRequestService: RescueRequestService,
-    @Inject(forwardRef(() => DispatchService))
+    private readonly sharedService: RescueRequestSharedService,
     private readonly dispatchService: DispatchService,
     @Inject(forwardRef(() => WhatsAppCustomerFlowService))
     private readonly customerFlowService: WhatsAppCustomerFlowService,
@@ -86,14 +82,14 @@ export class PaymentEventsService {
 
     if (operator) {
       // Operator: job is now live — send customer location + details
-      const opUser = await this.rescueRequestService.findOrCreateCustomer(operator.phoneNumber);
+      const opUser = await this.sharedService.findOrCreateCustomer(operator.phoneNumber);
       await this.sessionStore.update(opUser.id, {
         state:           WhatsAppFlowState.OPERATOR_ON_JOB,
         rescueRequestId: rescueRequest.id,
       });
       const lat = Number(rescueRequest.latitude);
       const lon = Number(rescueRequest.longitude);
-      const locationSection = await this.rescueRequestService.formatLocationSection(lat, lon);
+      const locationSection = await this.sharedService.formatLocationSection(lat, lon);
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(operator.phoneNumber),
         `💰 *Payment confirmed — job is live!*\n\nCustomer: ${customerPhone}\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType as VehicleType) : 'Unknown'}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
@@ -159,7 +155,7 @@ export class PaymentEventsService {
         toWhatsAppAddress(operator.phoneNumber),
         `How was your experience with this customer? Reply with a number from 1 to 5 to rate them.`,
       );
-      const opUser = await this.rescueRequestService.findOrCreateCustomer(operator.phoneNumber);
+      const opUser = await this.sharedService.findOrCreateCustomer(operator.phoneNumber);
       await this.sessionStore.update(opUser.id, {
         state: WhatsAppFlowState.WAITING_FOR_RATING,
         rescueRequestId: rescueRequest.id,
