@@ -5,6 +5,8 @@ import { DisputeService } from './dispute.service';
 import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestAdminService } from './rescue-request-admin.service';
 import { DispatchService } from './dispatch.service';
+import { WhatsAppOperatorFlowService } from './whatsapp-operator-flow.service';
+import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { PrismaModule } from '../prisma/prisma.module';
 import { RescueRequestController } from './rescue-request.controller';
@@ -35,7 +37,11 @@ import { AuthGuard } from '../auth/auth.guard';
     }),
   ],
   controllers: [RescueRequestController],
-  providers: [RescueRequestService, DisputeService, PaymentEventsService, RescueRequestAdminService, DispatchService, WhatsAppSessionStore, AuthGuard],
+  providers: [
+    RescueRequestService, DisputeService, PaymentEventsService, RescueRequestAdminService,
+    DispatchService, WhatsAppOperatorFlowService, WhatsAppCustomerFlowService,
+    WhatsAppSessionStore, AuthGuard,
+  ],
   exports: [RescueRequestService, PaymentEventsService, RescueRequestAdminService, DispatchService],
 })
 export class RescueRequestModule {}

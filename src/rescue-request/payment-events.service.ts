@@ -9,14 +9,14 @@ import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { RescueRequestStatus, VehicleType } from '@prisma/client';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { formatVehicleType } from './domain/vehicle-truck-mapping';
-// Temporary — findOrCreateCustomer, formatLocationSection, scheduleRatingTimeout
-// haven't been extracted to their real homes yet (domain formatting /
-// WhatsAppCustomerFlowService are later tasks in the same decomposition).
-// Depending on the old service for just these three calls is intentional
-// and temporary, not a new permanent coupling — narrows to nothing as
-// those tasks land.
+// Temporary — findOrCreateCustomer/formatLocationSection haven't been
+// extracted to their real home yet (WhatsAppInboundService is a later task
+// in the same decomposition). Depending on the old service for just these
+// two calls is intentional and temporary, not a new permanent coupling —
+// narrows to nothing once that task lands.
 import { RescueRequestService } from './rescue-request.service';
 import { DispatchService } from './dispatch.service';
+import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 
 @Injectable()
 export class PaymentEventsService {
@@ -30,6 +30,8 @@ export class PaymentEventsService {
     private readonly rescueRequestService: RescueRequestService,
     @Inject(forwardRef(() => DispatchService))
     private readonly dispatchService: DispatchService,
+    @Inject(forwardRef(() => WhatsAppCustomerFlowService))
+    private readonly customerFlowService: WhatsAppCustomerFlowService,
   ) {}
 
   async handleDepositPaymentConfirmed(reference: string) {
@@ -145,7 +147,7 @@ export class PaymentEventsService {
       state: WhatsAppFlowState.WAITING_FOR_RATING,
       rescueRequestId: rescueRequest.id,
     });
-    this.rescueRequestService.scheduleRatingTimeout(customerId, rescueRequest.id);
+    this.customerFlowService.scheduleRatingTimeout(customerId, rescueRequest.id);
 
     // Notify operator — release the vehicle, then prompt to rate the motorist
     if (operator?.phoneNumber) {
@@ -162,7 +164,7 @@ export class PaymentEventsService {
         state: WhatsAppFlowState.WAITING_FOR_RATING,
         rescueRequestId: rescueRequest.id,
       });
-      this.rescueRequestService.scheduleRatingTimeout(opUser.id, rescueRequest.id);
+      this.customerFlowService.scheduleRatingTimeout(opUser.id, rescueRequest.id);
     }
 
     if (rescueRequest.assignedOperatorId) {

@@ -7,6 +7,7 @@ import { PayoutService } from '../payout/payout.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { RescueRequestService } from './rescue-request.service';
 import { DispatchService } from './dispatch.service';
+import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 
 describe('PaymentEventsService', () => {
   let service: PaymentEventsService;
@@ -18,10 +19,10 @@ describe('PaymentEventsService', () => {
   let twilioService: { sendWhatsAppMessage: jest.Mock };
   let rescueRequestService: {
     findOrCreateCustomer: jest.Mock;
-    scheduleRatingTimeout: jest.Mock;
     formatLocationSection: jest.Mock;
   };
   let dispatchService: { startDispatch: jest.Mock };
+  let customerFlowService: { scheduleRatingTimeout: jest.Mock };
 
   beforeEach(async () => {
     prisma = {
@@ -44,10 +45,10 @@ describe('PaymentEventsService', () => {
     twilioService = { sendWhatsAppMessage: jest.fn() };
     rescueRequestService = {
       findOrCreateCustomer: jest.fn().mockResolvedValue({ id: 'op-user-1' }),
-      scheduleRatingTimeout: jest.fn(),
       formatLocationSection: jest.fn().mockResolvedValue('https://maps.google.com/?q=6.5,3.4'),
     };
     dispatchService = { startDispatch: jest.fn() };
+    customerFlowService = { scheduleRatingTimeout: jest.fn() };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -59,6 +60,7 @@ describe('PaymentEventsService', () => {
         { provide: WhatsAppSessionStore, useValue: sessionStore },
         { provide: RescueRequestService, useValue: rescueRequestService },
         { provide: DispatchService, useValue: dispatchService },
+        { provide: WhatsAppCustomerFlowService, useValue: customerFlowService },
       ],
     }).compile();
 
