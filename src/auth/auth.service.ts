@@ -5,6 +5,7 @@ import { logger } from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
 import { UserRole } from '@prisma/client';
 import { normalizePhone } from '../common/phone.util';
+import { OtpService } from '../otp/otp.service';
 
 export interface JwtPayload {
   sub: string;
@@ -27,6 +28,7 @@ export class AuthService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
+    private readonly otpService: OtpService,
   ) {}
 
   /**
@@ -211,6 +213,112 @@ export class AuthService {
       accessToken,
       user: { id: user.id, email: user.email!, name: user.name, role: user.role },
     };
+  }
+
+  // ══════════════════════════════════════════════════════
+  //  FORGOT PASSWORD
+  // ══════════════════════════════════════════════════════
+
+  // Flip to true once the WhatsApp OTP Authentication template is approved
+  // by Meta. Until then, requestPasswordReset resets the password directly
+  // off identifier + newPassword alone — no proof of ownership. That's a
+  // deliberate, explicitly-accepted interim state (not an oversight): once
+  // this flips, the same call only sends a code, and the password itself
+  // only changes via resetPasswordWithCode after that code is verified.
+  private readonly otpPasswordResetEnabled = false;
+
+  /**
+   * Resolves the account by email first, then phone number — two separate
+   * lookups, never a combined OR, so the decision never depends on which
+   * row Prisma happens to match first (same convention as operator.service.ts).
+   * The response message never reveals whether an account was found or
+   * eligible — only `otpRequired` tells the caller whether a second step
+   * (resetPasswordWithCode) is needed.
+   *
+   * - otpPasswordResetEnabled === false: resets the password immediately,
+   *   right here, using newPassword — no verification of any kind.
+   * - otpPasswordResetEnabled === true: newPassword is ignored; a code is
+   *   sent to the account's registered phone number instead, and the
+   *   caller must follow up with resetPasswordWithCode to actually apply it.
+   */
+  async requestPasswordReset(identifier: string, newPassword: string): Promise<{ message: string; otpRequired: boolean }> {
+    // ValidationPipe isn't wired up globally, so class-validator decorators
+    // on ForgotPasswordDto alone don't run — enforce the length rule here
+    // too (same pattern as e.g. rescue-request-admin.service.ts's manual
+    // priceKobo check).
+    if (newPassword.length < 8) {
+      throw new BadRequestException('newPassword must be at least 8 characters.');
+    }
+
+    const byEmail = await this.prisma.user.findUnique({ where: { email: identifier } });
+    const user = byEmail ?? await this.prisma.user.findUnique({ where: { phoneNumber: identifier } });
+
+    if (!this.otpPasswordResetEnabled) {
+      if (user && user.passwordHash) {
+        await this.prisma.user.update({
+          where: { id: user.id },
+          data: { passwordHash: await this.hashPassword(newPassword) },
+        });
+        logger.warn('requestPasswordReset: password reset with no OTP verification (otpPasswordResetEnabled=false)', { userId: user.id });
+      }
+      return { message: 'Password updated. You can now log in.', otpRequired: false };
+    }
+
+    const genericMessage = { message: "If an account exists, we've sent a reset code to its registered phone number.", otpRequired: true };
+    if (!user || !user.passwordHash || !user.phoneNumber) {
+      return genericMessage;
+    }
+
+    await this.otpService.sendPasswordResetCode(user.phoneNumber);
+    return genericMessage;
+  }
+
+  /**
+   * Verifies the code, then in one transaction consumes its token and
+   * updates the password — mirrors the transaction pattern in
+   * operator.service.ts's upgrade path (re-check the token row inside the
+   * transaction to close the gap between verifyCode and this write). Only
+   * reachable in practice once otpPasswordResetEnabled is true — requestPasswordReset
+   * never sends a code while it's off, so verifyCode below always fails
+   * "not found" for any code a caller might guess.
+   */
+  async resetPasswordWithCode(phoneNumber: string, code: string, newPassword: string): Promise<{ message: string }> {
+    if (newPassword.length < 8) {
+      throw new BadRequestException('newPassword must be at least 8 characters.');
+    }
+
+    const { token } = await this.otpService.verifyCode(phoneNumber, code);
+    const tokenRow = await this.otpService.findValidTokenRow(phoneNumber, token);
+    if (!tokenRow) {
+      throw new BadRequestException('Code expired — request a new one.');
+    }
+    const passwordHash = await this.hashPassword(newPassword);
+
+    await this.prisma.$transaction(async (tx) => {
+      // Re-check inside the transaction — close the gap if the token was
+      // consumed between the pre-check above and this write.
+      const freshTokenRow = await tx.phoneVerification.findUnique({ where: { id: tokenRow.id } });
+      if (!freshTokenRow || freshTokenRow.consumedAt || !freshTokenRow.tokenExpiresAt || freshTokenRow.tokenExpiresAt < new Date()) {
+        throw new BadRequestException('Code expired — request a new one.');
+      }
+
+      const user = await tx.user.findUnique({ where: { phoneNumber } });
+      if (!user || !user.passwordHash) {
+        throw new BadRequestException('No account found for this number.');
+      }
+
+      await tx.phoneVerification.update({
+        where: { id: tokenRow.id },
+        data: { consumedAt: new Date() },
+      });
+      await tx.user.update({
+        where: { id: user.id },
+        data: { passwordHash },
+      });
+    });
+
+    logger.info('resetPasswordWithCode: password updated', { phoneNumber });
+    return { message: 'Password updated. You can now log in.' };
   }
 
   /**

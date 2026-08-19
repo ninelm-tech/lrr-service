@@ -46,6 +46,28 @@ export class OtpService {
       return { required: false, available: false };
     }
 
+    await this.sendCodeToPhone(phoneNumber, 'verification code');
+    return { required: true };
+  }
+
+  /**
+   * Password-reset code delivery — unlike sendCode, eligibility here is
+   * "has a portal login" (any role), not "is a CUSTOMER" (upgrade
+   * eligibility). Deliberately kept as a separate method rather than
+   * loosening sendCode's role check, since the two callers have genuinely
+   * different eligibility rules.
+   */
+  async sendPasswordResetCode(phoneNumber: string): Promise<{ required: boolean }> {
+    const existingUser = await this.prisma.user.findUnique({ where: { phoneNumber } });
+    if (!existingUser || !existingUser.passwordHash) {
+      return { required: false };
+    }
+
+    await this.sendCodeToPhone(phoneNumber, 'password reset code');
+    return { required: true };
+  }
+
+  private async sendCodeToPhone(phoneNumber: string, label: string): Promise<void> {
     const recent = await this.prisma.phoneVerification.findMany({
       where: { phoneNumber, createdAt: { gte: new Date(Date.now() - SEND_WINDOW_MS) } },
       orderBy: { createdAt: 'desc' },
@@ -68,10 +90,8 @@ export class OtpService {
 
     await this.twilioService.sendWhatsAppMessage(
       toWhatsAppAddress(phoneNumber),
-      `Your LRR verification code is ${code}. It expires in 10 minutes.`,
+      `Your LRR ${label} is ${code}. It expires in 10 minutes.`,
     );
-
-    return { required: true };
   }
 
   async verifyCode(phoneNumber: string, code: string): Promise<{ token: string }> {

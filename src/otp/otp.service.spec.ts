@@ -83,6 +83,48 @@ describe('OtpService', () => {
     });
   });
 
+  describe('sendPasswordResetCode', () => {
+    it('responds required:false and sends nothing when no account exists for the number', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+
+      const result = await service.sendPasswordResetCode('+2348012345678');
+
+      expect(result).toEqual({ required: false });
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+
+    it('responds required:false and sends nothing when the account has no portal password', async () => {
+      prisma.user.findUnique.mockResolvedValue({ id: 'u-1', role: UserRole.CUSTOMER, passwordHash: null });
+
+      const result = await service.sendPasswordResetCode('+2348012345678');
+
+      expect(result).toEqual({ required: false });
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+
+    it('sends a code for any role that has a portal password, not just CUSTOMER', async () => {
+      prisma.user.findUnique.mockResolvedValue({ id: 'u-1', role: UserRole.OPERATOR, passwordHash: 'hashed' });
+      prisma.phoneVerification.findMany.mockResolvedValue([]);
+      prisma.phoneVerification.create.mockResolvedValue({ id: 'pv-1' });
+
+      const result = await service.sendPasswordResetCode('+2348012345678');
+
+      expect(result).toEqual({ required: true });
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348012345678'),
+        expect.stringContaining('password reset code'),
+      );
+    });
+
+    it('rejects when the resend cooldown has not elapsed', async () => {
+      prisma.user.findUnique.mockResolvedValue({ id: 'u-1', role: UserRole.ADMIN, passwordHash: 'hashed' });
+      prisma.phoneVerification.findMany.mockResolvedValue([{ createdAt: new Date() }]);
+
+      await expect(service.sendPasswordResetCode('+2348012345678')).rejects.toThrow('wait');
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+  });
+
   describe('verifyCode', () => {
     it('issues a token on a correct, unexpired code', async () => {
       prisma.phoneVerification.findFirst.mockResolvedValue({

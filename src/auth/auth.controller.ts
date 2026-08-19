@@ -6,6 +6,8 @@ import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from './guards/roles.guard';
 import { Roles } from './decorators/roles.decorator';
 import { CreateStaffDto } from './dto/create-staff.dto';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
 
 export class UpdateProfileDto {
   name?: string;
@@ -72,6 +74,24 @@ export class AuthController {
   @Post('register/customer')
   async registerCustomer(@Body() dto: RegisterCustomerDto) {
     return this.authService.registerCustomer(dto);
+  }
+
+  /**
+   * Request a password-reset code (email or phone). Unauthenticated by
+   * definition — the caller is locked out. Response is always generic,
+   * never reveals whether an account was found.
+   */
+  @Post('forgot-password')
+  async forgotPassword(@Body() dto: ForgotPasswordDto) {
+    return this.authService.requestPasswordReset(dto.identifier, dto.newPassword);
+  }
+
+  /**
+   * Verify a password-reset code and set the new password.
+   */
+  @Post('reset-password')
+  async resetPassword(@Body() dto: ResetPasswordDto) {
+    return this.authService.resetPasswordWithCode(dto.phoneNumber, dto.code, dto.newPassword);
   }
 
   /**
