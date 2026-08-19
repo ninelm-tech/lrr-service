@@ -34,6 +34,60 @@ export class DispatchService {
   ) {}
 
   /**
+   * Dispatch offers are business-initiated — WhatsApp only allows a
+   * freeform body if the operator has messaged us within the last 24h,
+   * which idle operators between jobs routinely won't have. On a real
+   * (non-sandbox) number this MUST go through the approved
+   * `dispatch_offer` Content Template — a freeform body gets rejected by
+   * Meta (error 63016) outside a session window. Falls back to a freeform
+   * send only when TWILIO_DISPATCH_OFFER_TEMPLATE_SID isn't configured
+   * (e.g. local/sandbox testing before the template exists). Same pattern
+   * as DisputeService.sendStaffDisputeAlert's TWILIO_DISPUTE_TEMPLATE_SID.
+   */
+  private async sendDispatchOfferMessage(
+    operatorPhone: string,
+    variables: {
+      jobRef: string; vehicle: string; destination: string;
+      /** '' or 'Distance: X km\n' — trailing newline included, absent when there's nothing to show (manualOfferToOperator). */
+      distanceLine: string;
+      location: string;
+      /** '' or the '\n\n📎 Photos/Video/Audio:\n...' block from buildMediaLinksSection — used as-is. */
+      mediaSection: string;
+      /** '' or 'Est. ETA: ~N min based on your registered location.\n' — trailing newline included. */
+      etaLine: string;
+      window: string;
+    },
+  ): Promise<void> {
+    const templateSid = process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
+    const to = toWhatsAppAddress(operatorPhone);
+
+    if (templateSid) {
+      // Template variables can't be empty — substitute a placeholder for
+      // the lines manualOfferToOperator doesn't have (no distance/ETA
+      // computed for that path today).
+      await this.twilioService.sendWhatsAppTemplateMessage(to, templateSid, {
+        '1': variables.jobRef,
+        '2': variables.vehicle,
+        '3': variables.destination,
+        '4': variables.distanceLine.trim() || 'Distance: N/A',
+        '5': variables.location,
+        '6': variables.mediaSection.trim() || 'No photos, video, or audio attached.',
+        '7': variables.etaLine.trim() || 'ETA: N/A',
+        '8': variables.window,
+      });
+    } else {
+      // Matches the original freeform layout exactly: Distance sits right
+      // after Destination (before Location); ETA is its own line after the
+      // bid prompt (before "Reply NO") — do not reorder these to "tidy up"
+      // the message, the wording/order is what's already familiar to operators.
+      await this.twilioService.sendWhatsAppMessage(
+        to,
+        `🚨 *NEW RESCUE JOB* — Job #${variables.jobRef}\n\nVehicle: ${variables.vehicle}\nDestination: ${variables.destination}\n${variables.distanceLine}Location: ${variables.location}${variables.mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\n${variables.etaLine}Reply *NO* to decline.\nYou have ${variables.window} to respond.\n\n📌 If you have more than one job open at once, reply "${variables.jobRef} 25000" instead of just the price, so we know which job you mean.`,
+      );
+    }
+  }
+
+  /**
    * In-memory map from rescueRequestId to the pending batch-window timer.
    * Doubles as a simple single-process mutex: whichever code path (the
    * timer firing, or an operator's response completing the batch early)
@@ -331,15 +385,33 @@ export class DispatchService {
     const mediaSection = buildMediaLinksSection(mediaItems);
     const locationSection = await this.sharedService.formatLocationSection(lat, lon);
 
-    // Notify all batch operators simultaneously
-    await Promise.all(
+    // Notify all batch operators simultaneously. allSettled (not all) —
+    // one operator's send failing (e.g. Twilio 63016, no open session with
+    // them) must not prevent the others in the same batch from being
+    // notified, and must not throw an unhandled rejection out of this
+    // fire-and-forget dispatch round.
+    const jobRef = formatJobRef(rescueRequestId);
+    const sendResults = await Promise.allSettled(
       batch.map((op) =>
-        this.twilioService.sendWhatsAppMessage(
-          toWhatsAppAddress(op.phoneNumber),
-          `🚨 *NEW RESCUE JOB* — ${formatJobRef(rescueRequestId)}\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nDistance: ${op.distance.toFixed(1)} km\nLocation: ${locationSection}${mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\nEst. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.\nReply *NO* to decline.\nYou have ${config.dispatchWindowMinutes} minute${config.dispatchWindowMinutes === 1 ? '' : 's'} to respond.\n\n📌 If you have more than one job open at once, reply "${formatJobRef(rescueRequestId).replace('Job #', '')} 25000" instead of just the price, so we know which job you mean.`,
-        ),
+        this.sendDispatchOfferMessage(op.phoneNumber, {
+          jobRef: jobRef.replace('Job #', ''),
+          vehicle: vehicleLabel,
+          destination: destinationLabel,
+          distanceLine: `Distance: ${op.distance.toFixed(1)} km\n`,
+          location: locationSection,
+          mediaSection,
+          etaLine: `Est. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.\n`,
+          window: `${config.dispatchWindowMinutes} minute${config.dispatchWindowMinutes === 1 ? '' : 's'}`,
+        }),
       ),
     );
+    sendResults.forEach((result, i) => {
+      if (result.status === 'rejected') {
+        const op = batch[i];
+        console.error(`Failed to send dispatch offer to operator ${op.id}:`, result.reason);
+        Sentry.captureException(result.reason, { extra: { rescueRequestId, operatorId: op.id } });
+      }
+    });
 
     // Single timeout covers the entire batch — stored so an early-resolved
     // batch (Step below) can prevent this from firing a second time.
@@ -543,10 +615,26 @@ export class DispatchService {
     const mediaSection = buildMediaLinksSection(mediaItems);
     const locationSection = await this.sharedService.formatLocationSection(lat, lon);
 
-    await this.twilioService.sendWhatsAppMessage(
-      toWhatsAppAddress(operator.phoneNumber),
-      `🚨 *NEW RESCUE JOB* — ${formatJobRef(rescueRequestId)}\n\nVehicle: ${vehicleLabel}\nDestination: ${destinationLabel}\nLocation: ${locationSection}${mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\nReply *NO* to decline.\nYou have 5 minutes to respond.\n\n📌 If you have more than one job open at once, reply "${formatJobRef(rescueRequestId).replace('Job #', '')} 25000" instead of just the price, so we know which job you mean.`,
-    );
+    try {
+      await this.sendDispatchOfferMessage(operator.phoneNumber, {
+        jobRef: formatJobRef(rescueRequestId).replace('Job #', ''),
+        vehicle: vehicleLabel,
+        destination: destinationLabel,
+        distanceLine: '', // not computed for a manual single-operator offer
+        location: locationSection,
+        mediaSection,
+        etaLine: '', // not computed for a manual single-operator offer
+        window: '5 minutes',
+      });
+    } catch (error) {
+      // Unlike the batch path (allSettled — a failed send must not block
+      // the other operators in the round), this is a single admin-triggered
+      // offer: the admin needs to see it failed, so re-throw after logging
+      // for visibility — don't silently succeed.
+      console.error(`Failed to send manual dispatch offer to operator ${operatorId}:`, error);
+      Sentry.captureException(error, { extra: { rescueRequestId, operatorId } });
+      throw error;
+    }
 
     const currentRadius = (session.dispatchRound ?? 0) * RADIUS_EXPANSION_KM;
     const timer = setTimeout(

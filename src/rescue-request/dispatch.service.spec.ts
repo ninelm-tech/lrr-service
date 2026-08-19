@@ -197,10 +197,17 @@ describe('DispatchService', () => {
       requestMedia: { findMany: jest.Mock };
     };
     let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
-    let twilioService: { sendWhatsAppMessage: jest.Mock };
+    let twilioService: { sendWhatsAppMessage: jest.Mock; sendWhatsAppTemplateMessage: jest.Mock };
     let sharedService: { formatLocationSection: jest.Mock };
+    const originalTemplateSid = process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
+
+    afterEach(() => {
+      if (originalTemplateSid === undefined) delete process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
+      else process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID = originalTemplateSid;
+    });
 
     beforeEach(async () => {
+      delete process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
       prisma = {
         rescueRequest: { findUnique: jest.fn() },
         operator: { findUnique: jest.fn() },
@@ -211,7 +218,7 @@ describe('DispatchService', () => {
         getOrCreate: jest.fn().mockResolvedValue({ offeredOperatorIds: ['op-already-tried'], dispatchRound: 1 }),
         update: jest.fn(),
       };
-      twilioService = { sendWhatsAppMessage: jest.fn() };
+      twilioService = { sendWhatsAppMessage: jest.fn(), sendWhatsAppTemplateMessage: jest.fn() };
       sharedService = {
         formatLocationSection: jest.fn().mockResolvedValue('https://maps.google.com/?q=6.5,3.4'),
       };
@@ -343,6 +350,148 @@ describe('DispatchService', () => {
         jest.useRealTimers();
         process.env.API_BASE_URL = prevApiBaseUrl;
       }
+    });
+
+    it('sends via the approved Content Template (with N/A placeholders for the distance/ETA lines this path never computes) when TWILIO_DISPATCH_OFFER_TEMPLATE_SID is set', async () => {
+      process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID = 'HXtest456';
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+        vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+      });
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1', status: 'ACTIVE', businessName: 'Swift Towing', phoneNumber: '+2349012345678',
+      });
+      prisma.dispatchOffer.updateMany.mockResolvedValue({ count: 0 });
+      prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
+
+      await manualService.manualOfferToOperator('req-1', 'op-1');
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2349012345678'),
+        'HXtest456',
+        expect.objectContaining({
+          '2': 'Sedan',
+          '3': 'Lekki',
+          '4': 'Distance: N/A',
+          '7': 'ETA: N/A',
+          '8': '5 minutes',
+        }),
+      );
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+
+      clearTimeout((manualService as any).batchTimers.get('req-1'));
+    });
+
+    it('logs to Sentry and re-throws (does not silently succeed) when the send fails', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+        vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+      });
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1', status: 'ACTIVE', businessName: 'Swift Towing', phoneNumber: '+2349012345678',
+      });
+      prisma.dispatchOffer.updateMany.mockResolvedValue({ count: 0 });
+      prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
+      twilioService.sendWhatsAppMessage.mockRejectedValue(new Error('63016: outside messaging window'));
+
+      await expect(manualService.manualOfferToOperator('req-1', 'op-1')).rejects.toThrow('63016');
+    });
+  });
+
+  describe('startDispatch — batch operator notification', () => {
+    let batchService: DispatchService;
+    let prisma: {
+      rescueRequest: { findUnique: jest.Mock };
+      user: { findUnique: jest.Mock };
+      operator: { count: jest.Mock };
+      dispatchOffer: { createMany: jest.Mock };
+      requestMedia: { findMany: jest.Mock };
+    };
+    let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
+    let operatorService: { findAndRankCandidates: jest.Mock };
+    let platformConfigService: { getConfig: jest.Mock };
+    let twilioService: { sendWhatsAppMessage: jest.Mock; sendWhatsAppTemplateMessage: jest.Mock };
+    let sharedService: { formatLocationSection: jest.Mock };
+    const originalTemplateSid = process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
+
+    const candidateA = { id: 'op-a', businessName: 'A Towing', phoneNumber: '+2349011111111', distance: 5.2 };
+    const candidateB = { id: 'op-b', businessName: 'B Towing', phoneNumber: '+2349022222222', distance: 8.1 };
+
+    afterEach(() => {
+      if (originalTemplateSid === undefined) delete process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
+      else process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID = originalTemplateSid;
+    });
+
+    beforeEach(async () => {
+      delete process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
+      prisma = {
+        rescueRequest: { findUnique: jest.fn().mockResolvedValue({
+          id: 'req-1', status: 'DISPATCHING', vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+        }) },
+        user: { findUnique: jest.fn().mockResolvedValue({ phoneNumber: '+2348000000000' }) },
+        operator: { count: jest.fn() },
+        dispatchOffer: { createMany: jest.fn() },
+        requestMedia: { findMany: jest.fn().mockResolvedValue([]) },
+      };
+      sessionStore = {
+        getOrCreate: jest.fn().mockResolvedValue({ offeredOperatorIds: [], dispatchRound: 0 }),
+        update: jest.fn(),
+      };
+      operatorService = { findAndRankCandidates: jest.fn().mockResolvedValue([candidateA, candidateB]) };
+      platformConfigService = { getConfig: jest.fn().mockResolvedValue({ dispatchWindowMinutes: 10 }) };
+      twilioService = { sendWhatsAppMessage: jest.fn(), sendWhatsAppTemplateMessage: jest.fn() };
+      sharedService = { formatLocationSection: jest.fn().mockResolvedValue('https://maps.google.com/?q=6.5,3.4') };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          DispatchService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: OperatorService, useValue: operatorService },
+          { provide: PlatformConfigService, useValue: platformConfigService },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: RescueRequestSharedService, useValue: sharedService },
+        ],
+      }).compile();
+
+      batchService = module.get<DispatchService>(DispatchService);
+    });
+
+    it('sends via the Content Template, with per-operator distance/ETA lines, when TWILIO_DISPATCH_OFFER_TEMPLATE_SID is set', async () => {
+      process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID = 'HXtest789';
+
+      await batchService.startDispatch('req-1', 'cust-1');
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2349011111111'),
+        'HXtest789',
+        expect.objectContaining({ '4': 'Distance: 5.2 km', '5': 'https://maps.google.com/?q=6.5,3.4' }),
+      );
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2349022222222'),
+        'HXtest789',
+        expect.objectContaining({ '4': 'Distance: 8.1 km' }),
+      );
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+
+      clearTimeout((batchService as any).batchTimers.get('req-1'));
+    });
+
+    it('one operator send failing does not block the others in the batch, and is reported instead of thrown', async () => {
+      twilioService.sendWhatsAppMessage.mockImplementation((to: string) => {
+        if (to.includes('+2349011111111')) return Promise.reject(new Error('63016: outside messaging window'));
+        return Promise.resolve();
+      });
+
+      await expect(batchService.startDispatch('req-1', 'cust-1')).resolves.toBeUndefined();
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledTimes(2); // both attempted
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2349022222222'),
+        expect.any(String),
+      ); // the other operator still got theirs
+
+      clearTimeout((batchService as any).batchTimers.get('req-1'));
     });
   });
 });
