@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import * as Sentry from '@sentry/node';
 import { Twilio } from 'twilio';
 
 @Injectable()
@@ -55,7 +56,32 @@ export class TwilioService {
       });
       console.log('WhatsApp template message sent:', result.sid);
     } catch (error) {
-      console.error('Failed to send WhatsApp template message:', error);
+      // Twilio's RestException carries the fields that actually identify
+      // the problem (e.g. 21656 = ContentVariables don't match the
+      // template's declared variables). error.message alone just says
+      // "The Content Variables parameter is invalid", which is not enough
+      // to tell a variable-shape bug from a bad ContentSid — attach the
+      // structured fields, plus which SID and variable keys we sent.
+      const twilioError = error as { code?: number; status?: number; moreInfo?: string; details?: unknown };
+      console.error('Failed to send WhatsApp template message:', {
+        code: twilioError.code,
+        status: twilioError.status,
+        moreInfo: twilioError.moreInfo,
+        details: twilioError.details,
+        contentSid,
+        sentVariableKeys: Object.keys(variables),
+        error,
+      });
+      Sentry.captureException(error, {
+        extra: {
+          twilioCode: twilioError.code,
+          twilioStatus: twilioError.status,
+          twilioMoreInfo: twilioError.moreInfo,
+          twilioDetails: twilioError.details,
+          contentSid,
+          sentVariableKeys: Object.keys(variables),
+        },
+      });
       throw error;
     }
   }

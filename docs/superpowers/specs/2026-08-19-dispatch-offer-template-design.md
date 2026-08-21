@@ -2,7 +2,14 @@
 
 **Goal:** Stop dispatch offers from silently failing (Twilio error 63016 — "Outside messaging window") whenever an operator hasn't messaged the current WhatsApp Business number within the last 24 hours, by sending the offer through an approved UTILITY-category Content Template instead of a freeform message.
 
-**Status:** Approved by user 2026-08-19, implemented 2026-08-19. Template SID: `HX52908fb16d9f48269b6376b8313f72d5` (`TWILIO_DISPATCH_OFFER_TEMPLATE_SID`). **Corrected 2026-08-21** after the first deployment hit Twilio error 21656 ("The Content Variables parameter is invalid") — the code's variable mapping didn't match the *actual* approved template body (see below); code fixed to match the real template rather than resubmitting it.
+**Status:** Approved by user 2026-08-19, implemented 2026-08-19. Template `new_rescue_job`, SID `HX52908fb16d9f48269b6376b8313f72d5` (`TWILIO_DISPATCH_OFFER_TEMPLATE_SID`).
+
+**Debugging history (2026-08-21)** — three deploys, all failing with Twilio **21656** ("The Content Variables parameter is invalid"). The first two "fixes" were guesses built on a hand-transcribed copy of the template body and did nothing:
+1. Remapped variables assuming `{{8}}` repeats the job ref — no effect.
+2. Assumed WhatsApp rejects newlines inside template parameters — unverified, also no effect. **Reverted.**
+3. **Actual fix:** fetched the template's real definition from `GET https://content.twilio.com/v1/Content/{sid}` — it declares exactly **seven** variables (`1`–`7`), and its body reuses `{{1}}` in the disambiguation line rather than having an `{{8}}`. We were sending an 8th key the template doesn't declare, which fails the entire send.
+
+**Lesson worth keeping:** the Content API is the only authoritative source for a template's variable set — reading the body text (or a copy of it) is not, since a repeated placeholder like `{{1}}` doesn't add a variable. Verify against the API before mapping. Twilio does not ignore extra keys or degrade gracefully.
 
 ## Background
 
@@ -20,7 +27,7 @@ Both `startDispatch`'s batch loop and `manualOfferToOperator` send the same cate
 **Template name:** `dispatch_offer` (UTILITY category)
 **Env var:** `TWILIO_DISPATCH_OFFER_TEMPLATE_SID`
 
-**Body — the actual approved template** (confirmed from Twilio Console 2026-08-21; supersedes the initial draft in this doc's earlier revisions, which had incorrectly split distance and ETA into separate variables):
+**Body — verbatim from the Content API** (`GET https://content.twilio.com/v1/Content/HX52908fb16d9f48269b6376b8313f72d5`, 2026-08-21). This, not a transcription of it, is the authoritative shape:
 
 ```
 🚨 NEW RESCUE JOB – Job #{{1}}
@@ -35,31 +42,28 @@ Location: {{5}}
 Reply NO to decline.
 You have {{7}} to respond.
 
-📌 If you have more than one job open at once, reply "{{8}} 25000" instead of just the price, so we know which job you mean.
+📌 If you have more than one job open at once, reply "{{1}} 25000" instead of just the price, so we know which job you mean.
 ```
 
-Two things that differ from the freeform message's structure, both driven by what got approved rather than by choice:
-- **No separate ETA line** — distance and ETA are combined into `{{4}}` (two lines within one variable), not split across two variables.
-- **`{{8}}` repeats the job ref** — `{{1}}` (header) and `{{8}}` (disambiguation-reply example) carry the same value; they are not sequential distinct content.
+Two structural facts that differ from the freeform message, and are easy to get wrong by eye:
+- **No separate ETA slot** — distance and ETA share `{{4}}` as two lines inside one variable.
+- **The disambiguation line reuses `{{1}}`** — it is *not* an 8th variable. The API's `variables` map declares exactly `1`–`7`; sending a key `8` fails the whole send with 21656.
 
-**Variables**:
+**Variables** (exactly seven — must match the API's declared set):
 
 | # | Content | `startDispatch` (batch) | `manualOfferToOperator` |
 |---|---|---|---|
-| 1 | bare job ref | `formatJobRef(id).replace('Job #','')` | same |
+| 1 | bare job ref (also fills the disambiguation line) | `formatJobRef(id).replace('Job #','')` | same |
 | 2 | vehicle label | `vehicleLabel` | same |
 | 3 | destination | `destinationLabel` | same |
-| 4 | distance + ETA, combined | `Distance: ${op.distance.toFixed(1)} km\nEst. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.` | `Distance: N/A` (this path doesn't compute either today — out of scope to add) |
+| 4 | distance + ETA, combined | `Distance: ${op.distance.toFixed(1)} km\nEst. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.` | `Distance: N/A` (this path computes neither today — out of scope to add) |
 | 5 | location | `locationSection` (unchanged) | same |
 | 6 | media | `mediaSection` if non-empty, else `No photos, video, or audio attached.` | same |
 | 7 | response window | `${config.dispatchWindowMinutes} minute(s)` | `5 minutes` |
-| 8 | bare job ref (same value as `{{1}}`) | same as `{{1}}` | same as `{{1}}` |
 
-**Sample variables** (for Twilio's Content Template Builder submission):
+**Sample values currently stored on the template** (from the same API response — these are what Meta reviewed):
 
-Batch scenario: `{{1}}` `3X8M8O` · `{{2}}` `Sedan` · `{{3}}` `Ikeja` · `{{4}}` `Distance: 21.1 km` · `{{5}}` `4 Wilmot Point Rd, Victoria Island, Lagos 106104, Lagos, Nigeria\n📍 https://maps.google.com/?q=6.42169134,3.40915073` · `{{6}}` `📎 Photos/Video/Audio:\nhttps://api-staging.lrr.ninelm.com/api/v1/media/cmt0j7r6x000501kq89ts2f6s\nhttps://api-staging.lrr.ninelm.com/api/v1/media/abc123` (submit with 2+ links — unconfirmed whether Meta accepts multi-line body variables, worth surfacing at review time) · `{{7}}` `Est. ETA: ~63 min based on your registered location.` · `{{8}}` `10 minutes`
-
-Manual-offer scenario: `{{4}}` `Distance: N/A` · `{{7}}` `ETA: N/A` · `{{8}}` `5 minutes`
+`{{1}}` `3X8M8O` · `{{2}}` `Sedan` · `{{3}}` `Ikeja` · `{{4}}` `Distance: 21.1 km\nEst. ETA: ~63 min based on your registered location.` · `{{5}}` `4 Wilmot Point Rd, Victoria Island, Lagos 106104, Lagos, Nigeria\n📍 https://maps.google.com/?q=6.42169134,3.40915073` · `{{6}}` `📎 Photos/Video/Audio:\nhttps://api-staging.lrr.ninelm.com/api/v1/media/cmt0j7r6x000501kq89ts2f6s` · `{{7}}` `10 minutes`
 
 ### Code changes
 

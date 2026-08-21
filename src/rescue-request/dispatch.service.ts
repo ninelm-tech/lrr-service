@@ -62,12 +62,15 @@ export class DispatchService {
     const to = toWhatsAppAddress(operatorPhone);
 
     if (templateSid) {
-      // The approved template body has no separate ETA line — distance and
-      // ETA are combined into {{4}}, and {{8}} repeats the job ref (used in
-      // the template's disambiguation line). This mapping must match the
-      // Twilio Content Template Builder submission exactly — Twilio
-      // rejects a mismatched shape with error 21656 "The Content Variables
-      // parameter is invalid", it does not degrade gracefully.
+      // Mapping is dictated by the live template (`new_rescue_job`), which
+      // declares exactly SEVEN variables — verified against
+      // GET https://content.twilio.com/v1/Content/{sid}. Two things that
+      // trip you up if you eyeball the body instead:
+      //   - there is no separate ETA slot; distance and ETA share {{4}}
+      //   - the disambiguation line reuses {{1}}, it is NOT an 8th variable
+      // Sending a key the template doesn't declare (e.g. '8') fails the
+      // whole send with Twilio 21656 "The Content Variables parameter is
+      // invalid" — it does not degrade gracefully or ignore extras.
       const distanceEta = [variables.distanceLine.trim(), variables.etaLine.trim()]
         .filter(Boolean)
         .join('\n') || 'Distance: N/A';
@@ -79,7 +82,6 @@ export class DispatchService {
         '5': variables.location,
         '6': variables.mediaSection.trim() || 'No photos, video, or audio attached.',
         '7': variables.window,
-        '8': variables.jobRef,
       });
     } else {
       // Matches the original freeform layout exactly: Distance sits right

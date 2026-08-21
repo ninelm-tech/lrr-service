@@ -369,17 +369,19 @@ describe('DispatchService', () => {
       expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
         expect.stringContaining('+2349012345678'),
         'HXtest456',
-        expect.objectContaining({
+        {
           '1': expect.any(String),
           '2': 'Sedan',
           '3': 'Lekki',
           '4': 'Distance: N/A',
+          '5': expect.any(String),
+          '6': expect.any(String),
           '7': '5 minutes',
-          '8': expect.any(String),
-        }),
+        },
       );
-      const call = twilioService.sendWhatsAppTemplateMessage.mock.calls[0][2];
-      expect(call['1']).toBe(call['8']); // {{1}} and {{8}} are the same job ref
+      // Exact-shape match above (not objectContaining) is deliberate: the
+      // live template declares exactly 7 variables, and sending an extra
+      // key fails the whole send with Twilio 21656.
       expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
 
       clearTimeout((manualService as any).batchTimers.get('req-1'));
@@ -468,20 +470,33 @@ describe('DispatchService', () => {
       expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
         expect.stringContaining('+2349011111111'),
         'HXtest789',
-        expect.objectContaining({
+        {
+          '1': expect.any(String),
+          '2': 'Sedan',
+          '3': 'Lekki',
           '4': expect.stringMatching(/^Distance: 5\.2 km\nEst\. ETA: ~\d+ min based on your registered location\.$/),
           '5': 'https://maps.google.com/?q=6.5,3.4',
+          '6': expect.any(String),
           '7': '10 minutes',
-        }),
+        },
       );
       expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
         expect.stringContaining('+2349022222222'),
         'HXtest789',
         expect.objectContaining({ '4': expect.stringContaining('Distance: 8.1 km') }),
       );
-      const firstCallVars = twilioService.sendWhatsAppTemplateMessage.mock.calls[0][2];
-      expect(firstCallVars['1']).toBe(firstCallVars['8']); // {{1}} and {{8}} are the same job ref
       expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+
+      clearTimeout((batchService as any).batchTimers.get('req-1'));
+    });
+
+    it('sends exactly the seven variables the live template declares — an extra key fails the whole send with Twilio 21656', async () => {
+      process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID = 'HXtest789';
+
+      await batchService.startDispatch('req-1', 'cust-1');
+
+      const vars = twilioService.sendWhatsAppTemplateMessage.mock.calls[0][2];
+      expect(Object.keys(vars).sort()).toEqual(['1', '2', '3', '4', '5', '6', '7']);
 
       clearTimeout((batchService as any).batchTimers.get('req-1'));
     });
