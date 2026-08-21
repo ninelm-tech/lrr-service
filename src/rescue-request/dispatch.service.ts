@@ -62,18 +62,24 @@ export class DispatchService {
     const to = toWhatsAppAddress(operatorPhone);
 
     if (templateSid) {
-      // Template variables can't be empty — substitute a placeholder for
-      // the lines manualOfferToOperator doesn't have (no distance/ETA
-      // computed for that path today).
+      // The approved template body has no separate ETA line — distance and
+      // ETA are combined into {{4}}, and {{8}} repeats the job ref (used in
+      // the template's disambiguation line). This mapping must match the
+      // Twilio Content Template Builder submission exactly — Twilio
+      // rejects a mismatched shape with error 21656 "The Content Variables
+      // parameter is invalid", it does not degrade gracefully.
+      const distanceEta = [variables.distanceLine.trim(), variables.etaLine.trim()]
+        .filter(Boolean)
+        .join('\n') || 'Distance: N/A';
       await this.twilioService.sendWhatsAppTemplateMessage(to, templateSid, {
         '1': variables.jobRef,
         '2': variables.vehicle,
         '3': variables.destination,
-        '4': variables.distanceLine.trim() || 'Distance: N/A',
+        '4': distanceEta,
         '5': variables.location,
         '6': variables.mediaSection.trim() || 'No photos, video, or audio attached.',
-        '7': variables.etaLine.trim() || 'ETA: N/A',
-        '8': variables.window,
+        '7': variables.window,
+        '8': variables.jobRef,
       });
     } else {
       // Matches the original freeform layout exactly: Distance sits right

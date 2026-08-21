@@ -2,7 +2,7 @@
 
 **Goal:** Stop dispatch offers from silently failing (Twilio error 63016 — "Outside messaging window") whenever an operator hasn't messaged the current WhatsApp Business number within the last 24 hours, by sending the offer through an approved UTILITY-category Content Template instead of a freeform message.
 
-**Status:** Approved by user 2026-08-19, implemented 2026-08-19. Template SID: `HX52908fb16d9f48269b6376b8313f72d5` (`TWILIO_DISPATCH_OFFER_TEMPLATE_SID`).
+**Status:** Approved by user 2026-08-19, implemented 2026-08-19. Template SID: `HX52908fb16d9f48269b6376b8313f72d5` (`TWILIO_DISPATCH_OFFER_TEMPLATE_SID`). **Corrected 2026-08-21** after the first deployment hit Twilio error 21656 ("The Content Variables parameter is invalid") — the code's variable mapping didn't match the *actual* approved template body (see below); code fixed to match the real template rather than resubmitting it.
 
 ## Background
 
@@ -20,7 +20,7 @@ Both `startDispatch`'s batch loop and `manualOfferToOperator` send the same cate
 **Template name:** `dispatch_offer` (UTILITY category)
 **Env var:** `TWILIO_DISPATCH_OFFER_TEMPLATE_SID`
 
-**Body** — matches today's freeform message's exact line order (**correction from the initial draft**: Distance sits right after Destination/before Location, and the ETA line comes *after* the bid-prompt line, before "Reply NO" — they are not adjacent in the original message, so they're two separate variables, not one merged one):
+**Body — the actual approved template** (confirmed from Twilio Console 2026-08-21; supersedes the initial draft in this doc's earlier revisions, which had incorrectly split distance and ETA into separate variables):
 
 ```
 🚨 NEW RESCUE JOB – Job #{{1}}
@@ -32,25 +32,28 @@ Location: {{5}}
 {{6}}
 
 ⚠️ ACTION NEEDED – reply with your price to bid, e.g. "25000".
-{{7}}
 Reply NO to decline.
-You have {{8}} to respond.
+You have {{7}} to respond.
 
-📌 If you have more than one job open at once, reply "{{1}} 25000" instead of just the price, so we know which job you mean.
+📌 If you have more than one job open at once, reply "{{8}} 25000" instead of just the price, so we know which job you mean.
 ```
 
-**Variables**, computed identically to today's freeform interpolation:
+Two things that differ from the freeform message's structure, both driven by what got approved rather than by choice:
+- **No separate ETA line** — distance and ETA are combined into `{{4}}` (two lines within one variable), not split across two variables.
+- **`{{8}}` repeats the job ref** — `{{1}}` (header) and `{{8}}` (disambiguation-reply example) carry the same value; they are not sequential distinct content.
+
+**Variables**:
 
 | # | Content | `startDispatch` (batch) | `manualOfferToOperator` |
 |---|---|---|---|
 | 1 | bare job ref | `formatJobRef(id).replace('Job #','')` | same |
 | 2 | vehicle label | `vehicleLabel` | same |
 | 3 | destination | `destinationLabel` | same |
-| 4 | distance line | `Distance: ${op.distance.toFixed(1)} km` | `Distance: N/A` (this path doesn't compute one today — out of scope to add) |
+| 4 | distance + ETA, combined | `Distance: ${op.distance.toFixed(1)} km\nEst. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.` | `Distance: N/A` (this path doesn't compute either today — out of scope to add) |
 | 5 | location | `locationSection` (unchanged) | same |
 | 6 | media | `mediaSection` if non-empty, else `No photos, video, or audio attached.` | same |
-| 7 | ETA line | `Est. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.` | `ETA: N/A` |
-| 8 | response window | `${config.dispatchWindowMinutes} minute(s)` | `5 minutes` |
+| 7 | response window | `${config.dispatchWindowMinutes} minute(s)` | `5 minutes` |
+| 8 | bare job ref (same value as `{{1}}`) | same as `{{1}}` | same as `{{1}}` |
 
 **Sample variables** (for Twilio's Content Template Builder submission):
 

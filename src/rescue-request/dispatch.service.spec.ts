@@ -352,7 +352,7 @@ describe('DispatchService', () => {
       }
     });
 
-    it('sends via the approved Content Template (with N/A placeholders for the distance/ETA lines this path never computes) when TWILIO_DISPATCH_OFFER_TEMPLATE_SID is set', async () => {
+    it('sends via the approved Content Template — matching its actual shape: no separate ETA slot, {{8}} repeats the job ref — when TWILIO_DISPATCH_OFFER_TEMPLATE_SID is set', async () => {
       process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID = 'HXtest456';
       prisma.rescueRequest.findUnique.mockResolvedValue({
         id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
@@ -370,13 +370,16 @@ describe('DispatchService', () => {
         expect.stringContaining('+2349012345678'),
         'HXtest456',
         expect.objectContaining({
+          '1': expect.any(String),
           '2': 'Sedan',
           '3': 'Lekki',
           '4': 'Distance: N/A',
-          '7': 'ETA: N/A',
-          '8': '5 minutes',
+          '7': '5 minutes',
+          '8': expect.any(String),
         }),
       );
+      const call = twilioService.sendWhatsAppTemplateMessage.mock.calls[0][2];
+      expect(call['1']).toBe(call['8']); // {{1}} and {{8}} are the same job ref
       expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
 
       clearTimeout((manualService as any).batchTimers.get('req-1'));
@@ -457,7 +460,7 @@ describe('DispatchService', () => {
       batchService = module.get<DispatchService>(DispatchService);
     });
 
-    it('sends via the Content Template, with per-operator distance/ETA lines, when TWILIO_DISPATCH_OFFER_TEMPLATE_SID is set', async () => {
+    it('sends via the Content Template, with per-operator distance+ETA combined into {{4}} (the template has no separate ETA slot), when TWILIO_DISPATCH_OFFER_TEMPLATE_SID is set', async () => {
       process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID = 'HXtest789';
 
       await batchService.startDispatch('req-1', 'cust-1');
@@ -465,13 +468,19 @@ describe('DispatchService', () => {
       expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
         expect.stringContaining('+2349011111111'),
         'HXtest789',
-        expect.objectContaining({ '4': 'Distance: 5.2 km', '5': 'https://maps.google.com/?q=6.5,3.4' }),
+        expect.objectContaining({
+          '4': expect.stringMatching(/^Distance: 5\.2 km\nEst\. ETA: ~\d+ min based on your registered location\.$/),
+          '5': 'https://maps.google.com/?q=6.5,3.4',
+          '7': '10 minutes',
+        }),
       );
       expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
         expect.stringContaining('+2349022222222'),
         'HXtest789',
-        expect.objectContaining({ '4': 'Distance: 8.1 km' }),
+        expect.objectContaining({ '4': expect.stringContaining('Distance: 8.1 km') }),
       );
+      const firstCallVars = twilioService.sendWhatsAppTemplateMessage.mock.calls[0][2];
+      expect(firstCallVars['1']).toBe(firstCallVars['8']); // {{1}} and {{8}} are the same job ref
       expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
 
       clearTimeout((batchService as any).batchTimers.get('req-1'));
