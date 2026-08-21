@@ -22,6 +22,23 @@ const MAX_FAILED_ROUNDS_BEFORE_ALERT = Number(process.env.DISPATCH_MAX_ALERT_ROU
 const MAX_ROUNDS_BEFORE_AUTO_CANCEL  = Number(process.env.DISPATCH_MAX_ROUNDS     ?? 4);   // ~RETRY*MAX min total
 const RADIUS_EXPANSION_KM = 2;
 
+/**
+ * WhatsApp rejects template *parameters* (not static body text) containing
+ * newlines, tabs, or more than four consecutive spaces; Twilio surfaces
+ * this as error 21656 — see https://www.twilio.com/docs/errors/21656.
+ * Several of our values (distance+ETA, address+map link, media links) are
+ * naturally multi-line, so collapse them onto a single line for the
+ * template branch only. The freeform fallback keeps real line breaks.
+ */
+function sanitizeTemplateVariable(value: string): string {
+  return value
+    .trim()
+    .replace(/[\t ]*[\r\n]+[\t ]*/g, ' · ')  // line breaks → visible separator
+    .replace(/\t+/g, ' ')                     // stray tabs
+    .replace(/ {2,}/g, ' ')                   // runs of spaces (4+ consecutive is rejected)
+    .trim();
+}
+
 @Injectable()
 export class DispatchService {
   constructor(
@@ -71,10 +88,14 @@ export class DispatchService {
       // Sending a key the template doesn't declare (e.g. '8') fails the
       // whole send with Twilio 21656 "The Content Variables parameter is
       // invalid" — it does not degrade gracefully or ignore extras.
+      //
+      // Every value also goes through sanitizeTemplateVariable: 21656 is
+      // equally triggered by newlines/tabs inside a value, and by a value
+      // that resolves to empty — hence the non-empty fallbacks below.
       const distanceEta = [variables.distanceLine.trim(), variables.etaLine.trim()]
         .filter(Boolean)
         .join('\n') || 'Distance: N/A';
-      await this.twilioService.sendWhatsAppTemplateMessage(to, templateSid, {
+      const templateVariables: Record<string, string> = {
         '1': variables.jobRef,
         '2': variables.vehicle,
         '3': variables.destination,
@@ -82,7 +103,11 @@ export class DispatchService {
         '5': variables.location,
         '6': variables.mediaSection.trim() || 'No photos, video, or audio attached.',
         '7': variables.window,
-      });
+      };
+      for (const key of Object.keys(templateVariables)) {
+        templateVariables[key] = sanitizeTemplateVariable(templateVariables[key]) || '—';
+      }
+      await this.twilioService.sendWhatsAppTemplateMessage(to, templateSid, templateVariables);
     } else {
       // Matches the original freeform layout exactly: Distance sits right
       // after Destination (before Location); ETA is its own line after the

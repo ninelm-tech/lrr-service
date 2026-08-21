@@ -4,12 +4,21 @@
 
 **Status:** Approved by user 2026-08-19, implemented 2026-08-19. Template `new_rescue_job`, SID `HX52908fb16d9f48269b6376b8313f72d5` (`TWILIO_DISPATCH_OFFER_TEMPLATE_SID`).
 
-**Debugging history (2026-08-21)** — three deploys, all failing with Twilio **21656** ("The Content Variables parameter is invalid"). The first two "fixes" were guesses built on a hand-transcribed copy of the template body and did nothing:
-1. Remapped variables assuming `{{8}}` repeats the job ref — no effect.
-2. Assumed WhatsApp rejects newlines inside template parameters — unverified, also no effect. **Reverted.**
-3. **Actual fix:** fetched the template's real definition from `GET https://content.twilio.com/v1/Content/{sid}` — it declares exactly **seven** variables (`1`–`7`), and its body reuses `{{1}}` in the disambiguation line rather than having an `{{8}}`. We were sending an 8th key the template doesn't declare, which fails the entire send.
+**Debugging history (2026-08-21)** — four deploys, all failing with Twilio **21656** ("The Content Variables parameter is invalid"). There were **two independent bugs**, both listed as causes on <https://www.twilio.com/docs/errors/21656>, which is why fixing one at a time made each fix look like a failure:
 
-**Lesson worth keeping:** the Content API is the only authoritative source for a template's variable set — reading the body text (or a copy of it) is not, since a repeated placeholder like `{{1}}` doesn't add a variable. Verify against the API before mapping. Twilio does not ignore extra keys or degrade gracefully.
+| Cause (per Twilio docs) | Our bug | Fix |
+|---|---|---|
+| #7 variable count mismatch | Sent 8 keys; template declares 7 (its disambiguation line reuses `{{1}}`, it is not an `{{8}}`) | Send exactly `1`–`7` |
+| #6 values containing newlines, tabs, or 4+ consecutive spaces | `{{4}}`, `{{5}}`, `{{6}}` each held a multi-line block | `sanitizeTemplateVariable` collapses to one line (` · ` separator) |
+
+Also relevant, cause **#5 "null or empty values"** — every variable now has a non-empty fallback.
+
+**Lessons worth keeping:**
+- The **Content API** (`GET https://content.twilio.com/v1/Content/{sid}`) is the only authoritative source for a template's variable set. Reading the body text — or a transcription of it — is not, since a repeated placeholder like `{{1}}` doesn't add a variable.
+- **Read the error's `moreInfo` docs page before theorising.** Doing that at the start would have surfaced both causes immediately; instead three deploys were spent on guesses, including one correct theory that got reverted on bad reasoning (assuming a `21xxx` code ruled out a content-format cause — it does not; Twilio pre-validates these rules itself).
+- Twilio does not ignore extra keys, degrade gracefully, or say *which* rule was violated. `TwilioService.sendWhatsAppTemplateMessage` now attaches `code`/`status`/`moreInfo`/`details` plus the sent variable keys to Sentry.
+
+**Known formatting consequence:** because parameters can't contain line breaks, the address/map-link, distance/ETA, and media-links groups render on one line separated by ` · ` rather than stacked. Restoring stacked layout requires a **redesigned template** where the line breaks live in the *static* body and variables hold only small dynamic values — a follow-up needing fresh Meta approval, and one that still can't fully stack the media links (their count varies per request, so they must share a single variable).
 
 ## Background
 

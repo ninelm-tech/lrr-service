@@ -474,7 +474,7 @@ describe('DispatchService', () => {
           '1': expect.any(String),
           '2': 'Sedan',
           '3': 'Lekki',
-          '4': expect.stringMatching(/^Distance: 5\.2 km\nEst\. ETA: ~\d+ min based on your registered location\.$/),
+          '4': expect.stringMatching(/^Distance: 5\.2 km · Est\. ETA: ~\d+ min based on your registered location\.$/),
           '5': 'https://maps.google.com/?q=6.5,3.4',
           '6': expect.any(String),
           '7': '10 minutes',
@@ -499,6 +499,38 @@ describe('DispatchService', () => {
       expect(Object.keys(vars).sort()).toEqual(['1', '2', '3', '4', '5', '6', '7']);
 
       clearTimeout((batchService as any).batchTimers.get('req-1'));
+    });
+
+    it('no variable contains a newline, tab, 4+ consecutive spaces, or is empty — all are Twilio 21656 triggers', async () => {
+      process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID = 'HXtest789';
+      const prevApiBaseUrl = process.env.API_BASE_URL;
+      process.env.API_BASE_URL = 'https://api.example.com';
+      try {
+        // Multi-line values are the realistic case: address + map link, and
+        // several media links, are what the live code actually produces.
+        sharedService.formatLocationSection.mockResolvedValue(
+          '4 Wilmot Point Rd, Victoria Island, Lagos\n📍 https://maps.google.com/?q=6.5,3.4',
+        );
+        prisma.requestMedia.findMany.mockResolvedValue([{ id: 'media-1' }, { id: 'media-2' }]);
+
+        await batchService.startDispatch('req-1', 'cust-1');
+
+        const vars = twilioService.sendWhatsAppTemplateMessage.mock.calls[0][2];
+        for (const [key, value] of Object.entries(vars)) {
+          expect(typeof value).toBe('string');
+          expect(value as string).not.toMatch(/[\r\n\t]/);
+          expect(value as string).not.toMatch(/ {4,}/);
+          expect((value as string).length).toBeGreaterThan(0);
+          expect(key).toMatch(/^[1-7]$/);
+        }
+        // Content survives flattening — both media links still present.
+        expect(vars['6']).toContain('media-1');
+        expect(vars['6']).toContain('media-2');
+
+        clearTimeout((batchService as any).batchTimers.get('req-1'));
+      } finally {
+        process.env.API_BASE_URL = prevApiBaseUrl;
+      }
     });
 
     it('one operator send failing does not block the others in the batch, and is reported instead of thrown', async () => {
