@@ -6,7 +6,7 @@ import { PaystackService } from '../integrations/paystack/paystack.service';
 describe('PayoutService', () => {
   let service: PayoutService;
   let prisma: {
-    payout: { create: jest.Mock; update: jest.Mock; findUnique: jest.Mock };
+    payout: { create: jest.Mock; update: jest.Mock; updateMany: jest.Mock; findUnique: jest.Mock };
     operator: { findUnique: jest.Mock };
   };
   let paystack: {
@@ -17,7 +17,12 @@ describe('PayoutService', () => {
 
   beforeEach(async () => {
     prisma = {
-      payout: { create: jest.fn(), update: jest.fn().mockResolvedValue({}), findUnique: jest.fn() },
+      payout: {
+        create: jest.fn(),
+        update: jest.fn().mockResolvedValue({}),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findUnique: jest.fn(),
+      },
       operator: { findUnique: jest.fn() },
     };
     paystack = {
@@ -111,6 +116,78 @@ describe('PayoutService', () => {
       prisma.payout.create.mockRejectedValue(new Error('DB unavailable'));
 
       await expect(service.createAndProcessPayout('req-1', 'op-1', 250000)).resolves.not.toThrow();
+    });
+  });
+
+  describe('retryPayout', () => {
+    const retryablePayout = (status: string) => ({
+      id: 'payout-1', operatorId: 'op-1', amount: 250000, rescueRequestId: 'req-1', status,
+    });
+
+    it('throws NotFoundException for an unknown payout', async () => {
+      prisma.payout.findUnique.mockResolvedValue(null);
+
+      await expect(service.retryPayout('nope')).rejects.toThrow('Payout not found');
+      expect(paystack.initiateTransfer).not.toHaveBeenCalled();
+    });
+
+    it.each(['SUCCESS', 'PROCESSING'])(
+      'refuses to retry a %s payout — a second transfer would pay the operator twice',
+      async (status) => {
+        prisma.payout.findUnique.mockResolvedValue(retryablePayout(status));
+        // No row matches the PENDING/FAILED claim condition.
+        prisma.payout.updateMany.mockResolvedValue({ count: 0 });
+
+        await expect(service.retryPayout('payout-1')).rejects.toThrow(
+          `Only blocked or failed payouts can be retried — this one is ${status}.`,
+        );
+        expect(paystack.initiateTransfer).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['PENDING', 'FAILED'])('retries a %s payout', async (status) => {
+      prisma.payout.findUnique.mockResolvedValue(retryablePayout(status));
+      prisma.payout.updateMany.mockResolvedValue({ count: 1 });
+      prisma.operator.findUnique.mockResolvedValue({ id: 'op-1', paystackRecipientCode: 'RCP_x' });
+      paystack.checkBalance.mockResolvedValue(1_000_000);
+      paystack.initiateTransfer.mockResolvedValue({ transferCode: 'TRF_retry' });
+
+      await service.retryPayout('payout-1');
+
+      expect(prisma.payout.updateMany).toHaveBeenCalledWith({
+        where: { id: 'payout-1', status: { in: ['PENDING', 'FAILED'] } },
+        data: { status: 'PROCESSING' },
+      });
+      expect(paystack.initiateTransfer).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns the re-blocked state when the operator still has no bank details, rather than reporting success', async () => {
+      prisma.payout.findUnique
+        .mockResolvedValueOnce(retryablePayout('PENDING'))   // initial read
+        .mockResolvedValueOnce({                              // state after the attempt
+          ...retryablePayout('PENDING'), blockReason: 'NO_BANK_DETAILS',
+        });
+      prisma.payout.updateMany.mockResolvedValue({ count: 1 });
+      prisma.operator.findUnique.mockResolvedValue({ id: 'op-1', paystackRecipientCode: null });
+
+      const result = await service.retryPayout('payout-1');
+
+      expect(paystack.initiateTransfer).not.toHaveBeenCalled();
+      expect(prisma.payout.update).toHaveBeenCalledWith({
+        where: { id: 'payout-1' },
+        data: { status: 'PENDING', blockReason: 'NO_BANK_DETAILS', failureReason: null },
+      });
+      expect(result).toMatchObject({ status: 'PENDING', blockReason: 'NO_BANK_DETAILS' });
+    });
+
+    it('loses the race safely — the admin whose claim matches no row gets rejected, not a second transfer', async () => {
+      // Status still reads PENDING (stale read), but a concurrent retry has
+      // already claimed the row, so the conditional update matches nothing.
+      prisma.payout.findUnique.mockResolvedValue(retryablePayout('PENDING'));
+      prisma.payout.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(service.retryPayout('payout-1')).rejects.toThrow('Only blocked or failed payouts');
+      expect(paystack.initiateTransfer).not.toHaveBeenCalled();
     });
   });
 

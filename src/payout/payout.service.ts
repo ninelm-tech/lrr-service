@@ -1,5 +1,6 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import * as Sentry from '@sentry/node';
+import { PayoutStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 
@@ -33,11 +34,50 @@ export class PayoutService {
     await this.attemptPayout(payoutId, operatorId, amount, rescueRequestId);
   }
 
-  /** Re-run a blocked or failed payout from scratch — admin-triggered only. */
-  async retryPayout(payoutId: string): Promise<void> {
+  /**
+   * Re-run a blocked (PENDING) or FAILED payout — admin-triggered only.
+   *
+   * Only those two states may be retried. Retrying a SUCCESS payout would
+   * initiate a SECOND real Paystack transfer and pay the operator twice;
+   * retrying PROCESSING would duplicate a transfer already in flight. The
+   * Payouts tab hides the Retry button for those rows, but a hidden button
+   * is not a safeguard — a direct API call or a UI regression would still
+   * move real money, so the rule is enforced here.
+   *
+   * The state transition is an atomic conditional update rather than a
+   * read-then-check, so two admins clicking Retry simultaneously can't both
+   * pass the check and fire two transfers. Whoever claims the row proceeds;
+   * the other gets the same rejection as any other non-retryable status.
+   *
+   * Trade-off worth knowing: if the process dies between claiming the row
+   * and attemptPayout resolving, the payout is stranded in PROCESSING with
+   * no transfer code and can't be retried without manual intervention.
+   * That's deliberate — a stuck row loses no money, a double transfer does.
+   *
+   * Returns the payout's resulting state so the caller can report what
+   * actually happened. A retry that immediately re-blocks (e.g. the
+   * operator still has no bank details) is a legitimate outcome, not a
+   * success — reporting it as "retry initiated" tells an admin the
+   * opposite of the truth.
+   */
+  async retryPayout(payoutId: string) {
     const payout = await this.prisma.payout.findUnique({ where: { id: payoutId } });
-    if (!payout) return;
+    if (!payout) {
+      throw new NotFoundException('Payout not found');
+    }
+
+    const claimed = await this.prisma.payout.updateMany({
+      where: { id: payoutId, status: { in: [PayoutStatus.PENDING, PayoutStatus.FAILED] } },
+      data: { status: PayoutStatus.PROCESSING },
+    });
+    if (claimed.count === 0) {
+      throw new BadRequestException(
+        `Only blocked or failed payouts can be retried — this one is ${payout.status}.`,
+      );
+    }
+
     await this.attemptPayout(payoutId, payout.operatorId, payout.amount, payout.rescueRequestId);
+    return this.prisma.payout.findUnique({ where: { id: payoutId } });
   }
 
   /**

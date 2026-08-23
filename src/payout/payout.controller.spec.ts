@@ -54,9 +54,50 @@ describe('PayoutController', () => {
 
   describe('retry', () => {
     it('delegates to PayoutService.retryPayout', async () => {
+      payoutService.retryPayout.mockResolvedValue({ status: 'PROCESSING', blockReason: null, failureReason: null });
+
       await controller.retry('payout-1');
 
       expect(payoutService.retryPayout).toHaveBeenCalledWith('payout-1');
+    });
+
+    it('reports a transfer actually being initiated', async () => {
+      payoutService.retryPayout.mockResolvedValue({ status: 'PROCESSING', blockReason: null, failureReason: null });
+
+      const result = await controller.retry('payout-1');
+
+      expect(result.message).toContain('Transfer initiated');
+    });
+
+    it('does NOT claim success when the retry immediately re-blocked on missing bank details', async () => {
+      payoutService.retryPayout.mockResolvedValue({
+        status: 'PENDING', blockReason: 'NO_BANK_DETAILS', failureReason: null,
+      });
+
+      const result = await controller.retry('payout-1');
+
+      expect(result.message).toContain('no bank details on file');
+      expect(result.message).not.toContain('initiated');
+    });
+
+    it('reports a balance block distinctly from a bank-details block', async () => {
+      payoutService.retryPayout.mockResolvedValue({
+        status: 'PENDING', blockReason: 'INSUFFICIENT_BALANCE', failureReason: null,
+      });
+
+      const result = await controller.retry('payout-1');
+
+      expect(result.message).toContain('Paystack balance is too low');
+    });
+
+    it('surfaces the failure reason when the transfer attempt failed outright', async () => {
+      payoutService.retryPayout.mockResolvedValue({
+        status: 'FAILED', blockReason: null, failureReason: 'Recipient account invalid',
+      });
+
+      const result = await controller.retry('payout-1');
+
+      expect(result.message).toContain('Recipient account invalid');
     });
   });
 });

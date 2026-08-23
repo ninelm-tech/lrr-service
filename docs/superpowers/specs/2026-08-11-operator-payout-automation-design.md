@@ -250,6 +250,25 @@ has it — no separate bank-name lookup needed server-side).
   `PENDING` row with no `blockReason` is mid-flight (about to be or
   currently being processed) and shows no Retry button.
 
+**Amendment 2026-08-22 — retry is enforced server-side, not just in the UI.**
+As originally written, "shows no Retry button" was the *only* thing stopping
+a `SUCCESS` or `PROCESSING` payout from being retried. `retryPayout` did no
+status check, so a direct API call, a UI regression, or two admins clicking
+at once would initiate a **second real Paystack transfer** and pay the
+operator twice. `PayoutService.retryPayout` now:
+- throws `NotFoundException` for an unknown payout;
+- claims the row with an atomic conditional update
+  (`updateMany where status in (PENDING, FAILED) → PROCESSING`) rather than
+  a read-then-check, so concurrent retries can't both pass;
+- throws `BadRequestException` when nothing was claimed, naming the actual
+  status.
+
+Accepted trade-off: if the process dies between claiming and `attemptPayout`
+resolving, the payout is stranded in `PROCESSING` with no transfer code and
+needs manual intervention. A stuck row loses no money; a duplicate transfer
+does. `PayoutsTab` surfaces the rejection message instead of silently
+stopping its spinner.
+
 ## Error handling summary
 
 | Situation | status | blockReason | failureReason |
