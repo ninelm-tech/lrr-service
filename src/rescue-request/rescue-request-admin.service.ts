@@ -14,6 +14,7 @@ import {
   DispatchOfferAdminDto,
   PaginationMetaDto,
 } from './dto/rescue-request-response.dto';
+import { formatJobRef } from './domain/rescue-request-formatting';
 import { DispatchService } from './dispatch.service';
 
 @Injectable()
@@ -161,7 +162,7 @@ export class RescueRequestAdminService {
       );
       void this.twilioService.sendWhatsAppMessage(
         operatorPhone,
-        `⏰ The customer did not pay within 5 minutes. You have been released.`,
+        `⏰ ${formatJobRef(id)} is no longer available — the customer did not pay within 5 minutes.`,
       );
       void this.dispatchService.startDispatch(id, request.customerId);
     }, MANUAL_ASSIGN_WINDOW_MS);

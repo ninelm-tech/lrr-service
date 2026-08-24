@@ -241,6 +241,23 @@ export class OperatorService {
    *
    * @param excludeIds  Operator IDs already offered this job (skip them)
    * @param extraRadiusKm  Radius expansion applied in retry rounds
+   *
+   * There is deliberately NO busy/in-flight filter here. An operator already
+   * selected for another job — or already driving to one — remains a full
+   * candidate and will keep receiving offers. That is intended, not an
+   * oversight: we don't know an operator's fleet size (the schema models a
+   * business, not its vehicles, and truckClasses is a list precisely because
+   * some run several trucks), so the platform cannot tell whether they have
+   * capacity for one more. The operator decides, by quoting or replying NO.
+   *
+   * The consequence is that one operator can legitimately hold several open
+   * offers at once, which is why WhatsAppOperatorFlowService has to
+   * disambiguate replies by job reference.
+   *
+   * isAvailable is the operator's OWN switch, set only via the admin
+   * availability endpoint. Nothing in dispatch or payment writes it, and
+   * nothing should start to — an automatic busy flag is the thing this
+   * comment exists to prevent.
    */
   async findAndRankCandidates(
     latitude: number,

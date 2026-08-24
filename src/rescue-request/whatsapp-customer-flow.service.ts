@@ -9,7 +9,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { RescueRequestStatus, UserRole, VehicleType, MediaType, RatingDirection } from '@prisma/client';
 import { mapVehicleTypeReply, formatVehicleType } from './domain/vehicle-truck-mapping';
 import { estimateEtaMinutes, rankQuotes } from './domain/quote-ranking';
-import { formatIssueType, formatStatus } from './domain/rescue-request-formatting';
+import { formatIssueType, formatStatus, formatJobRef } from './domain/rescue-request-formatting';
 import { classifyMediaType, getExtensionFromContentType } from './domain/media-classification';
 import { S3Service } from '../integrations/s3/s3.service';
 import { GeocodingService } from '../integrations/geocoding/geocoding.service';
@@ -188,7 +188,7 @@ export class WhatsAppCustomerFlowService {
         ) {
           await this.twilioService.sendWhatsAppMessage(
             toWhatsAppAddress(existing.assignedOperator.phoneNumber),
-            `❌ The customer cancelled before confirming payment. You have been released. Watch out for new offers!`,
+            `❌ ${formatJobRef(existing.id)} is no longer available — the customer cancelled before paying. Watch out for new offers!`,
           );
         }
 
@@ -354,7 +354,7 @@ export class WhatsAppCustomerFlowService {
     // ── Step 3: Operator found — waiting for customer to pay ──────────────
     if (session.state === WhatsAppFlowState.OPERATOR_FOUND_WAITING_PAYMENT) {
       return this.reply(
-        `🚗 An operator is standing by for you! Please pay using the link we sent you to confirm.\n\nYou have 5 minutes or the slot will be released.\n\nReply CANCEL to cancel (you will not be charged).`,
+        `🚗 Please pay using the link we sent you to confirm your operator.\n\nYou have 5 minutes before the request is cancelled.\n\nReply CANCEL to cancel (you will not be charged).`,
       );
     }
 
@@ -509,11 +509,11 @@ export class WhatsAppCustomerFlowService {
     const note = prefixNote ? `\n\n${prefixNote}` : '';
 
     const costBreakdown = isStandardDeposit
-      ? `💰 *Total cost: ₦50,000*\n   • ₦5,000 deposit now (holds your slot)\n   • ₦45,000 balance on job completion — car released after payment\n`
+      ? `💰 *Total cost: ₦50,000*\n   • ₦5,000 deposit now to confirm\n   • ₦45,000 balance on job completion — car released after payment\n`
       : `💰 *One-time fee: ₦50,000* (paid in full now)\n`;
 
     return this.reply(
-      `Issue: ${formatIssueType(issueType)}${note}\n\n${costBreakdown}\n⚠️ *ACTION NEEDED* — tap the link below to pay ${isStandardDeposit ? '₦5,000 deposit' : '₦50,000'} and confirm your rescue:\n\n👉 ${paymentResponse.data.authorization_url}\n\n⏱ Slot held for 5 minutes.`,
+      `Issue: ${formatIssueType(issueType)}${note}\n\n${costBreakdown}\n⚠️ *ACTION NEEDED* — tap the link below to pay ${isStandardDeposit ? '₦5,000 deposit' : '₦50,000'} and confirm your rescue:\n\n👉 ${paymentResponse.data.authorization_url}\n\n⏱ Pay within 5 minutes or the request is cancelled.`,
     );
   }
 
@@ -686,7 +686,7 @@ export class WhatsAppCustomerFlowService {
 
     void this.twilioService.sendWhatsAppMessage(
       phoneNumber,
-      `🚗 *Operator selected!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *5 minutes*:\n\n👉 ${paymentResponse.data.authorization_url}\n\nThe operator is standing by. Reply CANCEL to cancel (no charge).`,
+      `🚗 *Operator selected!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *5 minutes*:\n\n👉 ${paymentResponse.data.authorization_url}\n\nYour operator is confirmed once you pay. Reply CANCEL to cancel (no charge).`,
     );
 
     const DEPOSIT_WINDOW_MS = 5 * 60 * 1000;
@@ -717,7 +717,7 @@ export class WhatsAppCustomerFlowService {
       void this.dispatchService.startDispatch(rescueRequestId, rescueRequest.customerId);
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(operator.phoneNumber),
-        `⏰ The customer did not pay within 5 minutes. You have been released. Watch for new offers!`,
+        `⏰ ${formatJobRef(rescueRequestId)} is no longer available — the customer did not pay within 5 minutes. Watch for new offers!`,
       );
     }, DEPOSIT_WINDOW_MS);
 

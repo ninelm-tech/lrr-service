@@ -285,7 +285,7 @@ export class DispatchService {
 
     if (candidates.length === 0) {
       // Fast-fail: check if there are ANY active operators near this location
-      // (ignoring isAvailable — counts busy ones too).
+      // (ignoring isAvailable — counts operators who switched themselves off).
       // If zero, it's a geography/coverage gap — retrying with an expanded
       // radius won't help, so cancel immediately rather than making the
       // customer wait 15-20 minutes for the same result.
@@ -295,7 +295,7 @@ export class DispatchService {
       const COVERAGE_DELTA_DEG = 1.5;
       const nearbyOperatorCount = await this.prisma.operator.count({
         where: {
-          status: 'ACTIVE',           // isAvailable intentionally omitted
+          status: 'ACTIVE',           // isAvailable intentionally omitted (see findAndRankCandidates)
           latitude:  { gte: lat - COVERAGE_DELTA_DEG, lte: lat + COVERAGE_DELTA_DEG },
           longitude: { gte: lon - COVERAGE_DELTA_DEG, lte: lon + COVERAGE_DELTA_DEG },
         },
@@ -756,7 +756,7 @@ export class DispatchService {
         quotedOffers.map((offer) =>
           this.twilioService.sendWhatsAppMessage(
             toWhatsAppAddress(offer.operator.phoneNumber),
-            `⏰ The customer didn't respond in time. You've been released. Watch for new offers!`,
+            `⏰ ${formatJobRef(rescueRequestId)} is no longer available — the customer didn't choose a quote in time. Watch for new offers!`,
           ),
         ),
       );
