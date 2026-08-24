@@ -1,8 +1,9 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
-import { RescueRequestStatus, RatingDirection } from '@prisma/client';
+import { RescueRequestStatus, RatingDirection, VehicleType } from '@prisma/client';
 import { formatJobRef } from './domain/rescue-request-formatting';
+import { formatVehicleType } from './domain/vehicle-truck-mapping';
 import { DispatchService } from './dispatch.service';
 import { PaymentEventsService } from './payment-events.service';
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
@@ -45,13 +46,30 @@ export class WhatsAppOperatorFlowService {
     // "JOBREF PRICE" / "JOBREF NO" disambiguates which job this reply is for
     // when an operator has more than one offer open at once — see
     // handleOperatorQuoteOrDecline for what happens when it's left out.
-    const refAndDecline = message.match(/^([a-z0-9]{6})\s+(no|decline)$/i);
+    // The leading # is optional throughout: the offer message and the job
+    // list both render the ref as "Job #G8YJRD", so operators naturally
+    // copy the # along with it. Rejecting that is punishing them for
+    // reading the screen.
+    const refAndDecline = message.match(/^#?([a-z0-9]{6})\s+(no|decline)$/i);
     if (refAndDecline) {
       return this.handleOperatorQuoteOrDecline(phoneNumber, userId, undefined, refAndDecline[1].toUpperCase());
     }
-    const refAndPrice = message.match(/^([a-z0-9]{6})\s+(\d+)$/i);
+    const refAndPrice = message.match(/^#?([a-z0-9]{6})\s+(\d+)$/i);
     if (refAndPrice) {
       return this.handleOperatorQuoteOrDecline(phoneNumber, userId, Number(refAndPrice[2]) * 100, refAndPrice[1].toUpperCase());
+    }
+    // A ref on its own — the operator answered "which job?" but left out the
+    // price. Handled explicitly because silence is the worst possible reply:
+    // it looks identical to the system being down. Must come after the
+    // keyword branches below would have matched... except those need session
+    // state, so instead the ref is only accepted here when it actually
+    // matches one of this operator's open offers — see resolveBareRef.
+    // That keeps 6-letter commands like "onsite" and "cancel" from being
+    // mistaken for job references.
+    const bareRef = message.match(/^#?([a-z0-9]{6})$/i);
+    if (bareRef) {
+      const handled = await this.handleBareJobRef(phoneNumber, bareRef[1].toUpperCase());
+      if (handled) return handled;
     }
     if (message === 'no' || message === 'decline') {
       return this.handleOperatorQuoteOrDecline(phoneNumber, userId, undefined);
@@ -113,17 +131,7 @@ export class WhatsAppOperatorFlowService {
     });
     if (!operator) return this.xmlOk();
 
-    // expiresAt is filtered here, not just relied on via status: an offer is
-    // only flipped to TIMED_OUT by resolveBatch or the sweeper, so between a
-    // restart and the next sweep there can be PENDING rows that are long
-    // dead. Without this filter they count toward "how many jobs are open",
-    // and the operator gets asked to disambiguate between jobs that ended
-    // days ago. The dashboard equivalent (listMyPendingOffers) already
-    // filters this way — this brings the WhatsApp path in line.
-    const pendingOffers = await this.prisma.dispatchOffer.findMany({
-      where: { operatorId: operator.id, status: 'PENDING', expiresAt: { gt: new Date() } },
-      orderBy: { offeredAt: 'desc' },
-    });
+    const pendingOffers = await this.findOpenOffers(operator.id);
     if (pendingOffers.length === 0) return this.xmlOk();
 
     let offer = pendingOffers[0];
@@ -134,16 +142,91 @@ export class WhatsAppOperatorFlowService {
       }
       offer = matched;
     } else if (pendingOffers.length > 1) {
-      const list = pendingOffers
-        .map((o) => `• ${formatJobRef(o.rescueRequestId)}`)
-        .join('\n');
       return this.reply(
-        `You have ${pendingOffers.length} jobs open at once — reply with the job reference and your price so we know which one, e.g. "${formatJobRef(pendingOffers[0].rescueRequestId).replace('Job #', '')} 25000":\n\n${list}`,
+        `You have ${pendingOffers.length} jobs open at once — reply with the job reference and your price so we know which one, e.g. "${this.bareRef(pendingOffers[0].rescueRequestId)} 25000":\n\n${this.describeOffers(pendingOffers)}`,
       );
     }
 
     const result = await this.dispatchService.processQuoteOrDecline(offer, quotedPriceKobo);
     return this.reply(result.message);
+  }
+
+  /**
+   * This operator's genuinely live offers, newest first.
+   *
+   * expiresAt is filtered here, not just relied on via status: an offer is
+   * only flipped to TIMED_OUT by DispatchService.resolveBatch or the
+   * sweeper, so between a restart and the next sweep there can be PENDING
+   * rows that are long dead. Without this filter they count toward "how
+   * many jobs are open" and the operator is asked to disambiguate between
+   * jobs that ended days ago. The dashboard equivalent
+   * (DispatchService.listMyPendingOffers) already filters this way.
+   */
+  private async findOpenOffers(operatorId: string) {
+    return this.prisma.dispatchOffer.findMany({
+      where: { operatorId, status: 'PENDING', expiresAt: { gt: new Date() } },
+      orderBy: { offeredAt: 'desc' },
+      include: {
+        rescueRequest: { select: { vehicleType: true, destination: true } },
+      },
+    });
+  }
+
+  /** The 6-char tag alone, matching how operators are asked to reply. */
+  private bareRef(rescueRequestId: string): string {
+    return formatJobRef(rescueRequestId).replace('Job #', '');
+  }
+
+  /**
+   * Renders open offers as a list an operator can actually recognise.
+   *
+   * A bare job reference is meaningless to them — it's our identifier, not
+   * theirs. What distinguishes one open job from another in their head is
+   * the vehicle and where it's going, so each line carries those. Status is
+   * deliberately absent: every offer in this list is PENDING by definition,
+   * so printing it would add a column that never varies.
+   */
+  private describeOffers(
+    offers: { rescueRequestId: string; rescueRequest: { vehicleType: string | null; destination: string | null } }[],
+  ): string {
+    return offers.map((o) => `• ${this.describeOffer(o)}`).join('\n');
+  }
+
+  private describeOffer(offer: {
+    rescueRequestId: string;
+    rescueRequest: { vehicleType: string | null; destination: string | null };
+  }): string {
+    const vehicle = offer.rescueRequest.vehicleType
+      ? formatVehicleType(offer.rescueRequest.vehicleType as VehicleType)
+      : 'Vehicle not specified';
+    const destination = offer.rescueRequest.destination;
+    // Only append the destination when there is one — "Sedan → " reads as a
+    // rendering bug rather than as missing data.
+    return destination
+      ? `*${this.bareRef(offer.rescueRequestId)}* — ${vehicle} → ${destination}`
+      : `*${this.bareRef(offer.rescueRequestId)}* — ${vehicle}`;
+  }
+
+  /**
+   * The operator replied with a job reference and nothing else — they
+   * answered "which job?" but left out the price.
+   *
+   * Returns null when the text doesn't match one of their open offers, so
+   * the caller falls through to the ordinary command routing. That matters
+   * because real commands are six characters too ("onsite", "cancel") and
+   * must not be swallowed as job references.
+   */
+  private async handleBareJobRef(operatorPhone: string, jobRef: string): Promise<string | null> {
+    const operator = await this.prisma.operator.findUnique({ where: { phoneNumber: operatorPhone } });
+    if (!operator) return null;
+
+    const openOffers = await this.findOpenOffers(operator.id);
+    const matched = openOffers.find((o) => formatJobRef(o.rescueRequestId).endsWith(jobRef));
+    if (!matched) return null;
+
+    return this.reply(
+      `Got it — ${this.describeOffer(matched)}.\n\nNow send the reference *and* your price together, e.g. "${this.bareRef(matched.rescueRequestId)} 25000".\nTo turn this job down, reply "${this.bareRef(matched.rescueRequestId)} NO".`,
+    );
   }
 
   private async handleOperatorArrived(

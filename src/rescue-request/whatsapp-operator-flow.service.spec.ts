@@ -59,8 +59,14 @@ describe('WhatsAppOperatorFlowService', () => {
     };
     let dispatchService: { processQuoteOrDecline: jest.Mock };
 
-    const offerA = { id: 'offer-a', rescueRequestId: 'req-aaaaaaAAAAAA', expiresAt: new Date() };
-    const offerB = { id: 'offer-b', rescueRequestId: 'req-bbbbbbBBBBBB', expiresAt: new Date() };
+    const offerA = {
+      id: 'offer-a', rescueRequestId: 'req-aaaaaaAAAAAA', expiresAt: new Date(),
+      rescueRequest: { vehicleType: 'SEDAN', destination: 'Ikeja under bridge' },
+    };
+    const offerB = {
+      id: 'offer-b', rescueRequestId: 'req-bbbbbbBBBBBB', expiresAt: new Date(),
+      rescueRequest: { vehicleType: 'SUV', destination: 'Lekki Phase 1' },
+    };
 
     beforeEach(async () => {
       prisma = {
@@ -102,6 +108,69 @@ describe('WhatsAppOperatorFlowService', () => {
       expect(dispatchService.processQuoteOrDecline).not.toHaveBeenCalled();
       expect(result).toContain('AAAAAA');
       expect(result).toContain('BBBBBB');
+    });
+
+    it('describes each open job by vehicle and destination — a bare ref means nothing to an operator', async () => {
+      prisma.dispatchOffer.findMany.mockResolvedValue([offerB, offerA]);
+
+      const result = await (quoteService as any).handleOperatorQuoteOrDecline('+2341', 'user-1', 2500000);
+
+      expect(result).toContain('Ikeja under bridge');
+      expect(result).toContain('Lekki Phase 1');
+      // Refs are printed bare, matching the "AAAAAA 25000" example the same
+      // message gives — printing "Job #AAAAAA" is what led operators to reply
+      // with the # still attached.
+      expect(result).not.toContain('Job #');
+    });
+
+    it('only filters to offers that have not already expired', async () => {
+      prisma.dispatchOffer.findMany.mockResolvedValue([offerA]);
+
+      await (quoteService as any).handleOperatorQuoteOrDecline('+2341', 'user-1', 2500000);
+
+      const where = prisma.dispatchOffer.findMany.mock.calls[0][0].where;
+      expect(where.status).toBe('PENDING');
+      expect(where.expiresAt.gt).toBeInstanceOf(Date);
+    });
+
+    it('answers a bare job ref with that job\'s details and asks for the price, rather than staying silent', async () => {
+      prisma.dispatchOffer.findMany.mockResolvedValue([offerB, offerA]);
+
+      const result = await quoteService.handleOperatorMessage(
+        '+2341', 'user-1', '#AAAAAA',
+        { state: WhatsAppFlowState.IDLE } as any,
+        { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341' },
+      );
+
+      expect(result).toContain('Ikeja under bridge');
+      expect(result).toContain('AAAAAA 25000');
+      expect(dispatchService.processQuoteOrDecline).not.toHaveBeenCalled();
+    });
+
+    it('accepts a job ref with the leading # the offer message itself displays', async () => {
+      prisma.dispatchOffer.findMany.mockResolvedValue([offerB, offerA]);
+
+      await quoteService.handleOperatorMessage(
+        '+2341', 'user-1', '#AAAAAA 25000',
+        { state: WhatsAppFlowState.IDLE } as any,
+        { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341' },
+      );
+
+      expect(dispatchService.processQuoteOrDecline).toHaveBeenCalledWith(offerA, 2500000);
+    });
+
+    it('does not mistake a six-letter command for a job reference', async () => {
+      prisma.dispatchOffer.findMany.mockResolvedValue([offerB, offerA]);
+
+      const result = await quoteService.handleOperatorMessage(
+        '+2341', 'user-1', 'onsite',
+        { state: WhatsAppFlowState.IDLE } as any,
+        { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341' },
+      );
+
+      // No open offer ends in "ONSITE", so it falls through to the ARRIVED
+      // branch, which correctly rejects it for lack of an active job.
+      expect(result).toContain("don't have an active job");
     });
 
     it('matches the correct offer when a job ref is given', async () => {
