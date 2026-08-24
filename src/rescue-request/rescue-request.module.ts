@@ -4,6 +4,7 @@ import { DisputeService } from './dispute.service';
 import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestAdminService } from './rescue-request-admin.service';
 import { DispatchService } from './dispatch.service';
+import { DispatchOfferSweeperService } from './dispatch-offer-sweeper.service';
 import { WhatsAppOperatorFlowService } from './whatsapp-operator-flow.service';
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 import { WhatsAppInboundService } from './whatsapp-inbound.service';
@@ -40,7 +41,7 @@ import { AuthGuard } from '../auth/auth.guard';
   controllers: [RescueRequestController],
   providers: [
     RescueRequestSharedService, DisputeService, PaymentEventsService, RescueRequestAdminService,
-    DispatchService, WhatsAppOperatorFlowService, WhatsAppCustomerFlowService, WhatsAppInboundService,
+    DispatchService, DispatchOfferSweeperService, WhatsAppOperatorFlowService, WhatsAppCustomerFlowService, WhatsAppInboundService,
     WhatsAppSessionStore, AuthGuard,
   ],
   exports: [PaymentEventsService, RescueRequestAdminService, DispatchService, WhatsAppInboundService],

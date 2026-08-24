@@ -113,8 +113,15 @@ export class WhatsAppOperatorFlowService {
     });
     if (!operator) return this.xmlOk();
 
+    // expiresAt is filtered here, not just relied on via status: an offer is
+    // only flipped to TIMED_OUT by resolveBatch or the sweeper, so between a
+    // restart and the next sweep there can be PENDING rows that are long
+    // dead. Without this filter they count toward "how many jobs are open",
+    // and the operator gets asked to disambiguate between jobs that ended
+    // days ago. The dashboard equivalent (listMyPendingOffers) already
+    // filters this way — this brings the WhatsApp path in line.
     const pendingOffers = await this.prisma.dispatchOffer.findMany({
-      where: { operatorId: operator.id, status: 'PENDING' },
+      where: { operatorId: operator.id, status: 'PENDING', expiresAt: { gt: new Date() } },
       orderBy: { offeredAt: 'desc' },
     });
     if (pendingOffers.length === 0) return this.xmlOk();
