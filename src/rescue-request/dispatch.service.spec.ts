@@ -343,6 +343,38 @@ describe('DispatchService', () => {
       }
     });
 
+    it('fires the close timer AT the deadline, not a full window after the countdown sends finish', async () => {
+      // The countdown notice is N Twilio round-trips and is awaited before the
+      // timer is scheduled. Scheduling `quoteCollectionMs` from that point
+      // fires at deadline + notify-latency — the persisted deadline stays
+      // correct but the motorist's shortlist goes out late.
+      jest.useFakeTimers();
+      try {
+        const t0 = Date.now();
+        prisma.dispatchOffer.findMany.mockResolvedValue([
+          { operatorId: 'op-2', operator: { phoneNumber: '+2349022222222' } },
+        ]);
+        // Two seconds of WhatsApp latency, on the clock the timer is scheduled against.
+        twilioService.sendWhatsAppMessage.mockImplementation(async () => {
+          jest.advanceTimersByTime(2000);
+        });
+        const closeSpy = jest.spyOn(service as any, 'sendQuoteShortlist').mockResolvedValue(undefined);
+
+        await service.processQuoteOrDecline(offer, 2_500_000);
+        expect(row.quoteCollectionDeadline).toEqual(new Date(t0 + 5 * 60 * 1000));
+
+        prisma.dispatchOffer.count.mockResolvedValue(2); // stragglers: only the timer can close this
+        await jest.advanceTimersByTimeAsync(5 * 60 * 1000 - 2000 - 1);
+        expect(closeSpy).not.toHaveBeenCalled();
+
+        await jest.advanceTimersByTimeAsync(1); // now exactly at the deadline
+        expect(Date.now()).toBe(row.quoteCollectionDeadline!.getTime());
+        expect(closeSpy).toHaveBeenCalledWith('req-1', 'cust-1');
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
     it('sends the countdown notice via the Content Template when the SID is set, freeform when it is not', async () => {
       jest.useFakeTimers();
       try {
@@ -443,6 +475,22 @@ describe('DispatchService', () => {
         id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
         quoteCollectionDeadline: new Date(Date.now() - 1),
       });
+      const startDispatchSpy = jest.spyOn(radiusService as any, 'startDispatch').mockResolvedValue(undefined);
+
+      await expect(radiusService.expandRadiusNow('req-1')).rejects.toThrow('Bidding has closed');
+      expect(startDispatchSpy).not.toHaveBeenCalled();
+    });
+
+    it('refuses after an EARLY close, while the deadline is still in the future', async () => {
+      // Everyone answered before the deadline, so the shortlist has already
+      // gone out even though quoteCollectionDeadline still reads "in future".
+      // Guarding on the deadline alone would let this Expand create a fresh
+      // PENDING offer for a job the motorist is already choosing from.
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+        quoteCollectionDeadline: new Date(Date.now() + 4 * 60 * 1000),
+      });
+      (radiusService as any).closedRequests.add('req-1');
       const startDispatchSpy = jest.spyOn(radiusService as any, 'startDispatch').mockResolvedValue(undefined);
 
       await expect(radiusService.expandRadiusNow('req-1')).rejects.toThrow('Bidding has closed');
@@ -574,6 +622,18 @@ describe('DispatchService', () => {
         vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
         quoteCollectionDeadline: new Date(Date.now() - 1000),
       });
+
+      await expect(manualService.manualOfferToOperator('req-1', 'op-1')).rejects.toThrow('Bidding has closed');
+      expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();
+    });
+
+    it('refuses after an EARLY close, while the deadline is still in the future', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+        vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+        quoteCollectionDeadline: new Date(Date.now() + 4 * 60 * 1000),
+      });
+      (manualService as any).closedRequests.add('req-1');
 
       await expect(manualService.manualOfferToOperator('req-1', 'op-1')).rejects.toThrow('Bidding has closed');
       expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();

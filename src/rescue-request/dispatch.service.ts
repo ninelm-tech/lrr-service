@@ -305,10 +305,15 @@ export class DispatchService {
 
     await this.notifyPendingOperatorsOfCountdown(rescueRequestId, deadline);
 
+    // Scheduled off the DEADLINE, not off `quoteCollectionMs`: the countdown
+    // notify above is N Twilio round-trips, and a full-window delay measured
+    // from after those sends fires at deadline + notify-latency, pushing the
+    // motorist's shortlist out by however long WhatsApp took. Same reason the
+    // batch timers are scheduled from their offers' expiresAt.
     const timer = setTimeout(() => {
       this.closeTimers.delete(rescueRequestId);
       void this.closeBidding(rescueRequestId);
-    }, quoteCollectionMs);
+    }, Math.max(0, deadline.getTime() - Date.now()));
     this.closeTimers.set(rescueRequestId, timer);
   }
 
@@ -848,12 +853,21 @@ export class DispatchService {
    * Admin-path guard. `RescueRequest.status` stays DISPATCHING after the
    * shortlist is sent — only the WhatsApp session moves to
    * WAITING_FOR_QUOTE_SELECTION — so the status check alone would happily let
-   * an admin offer a job whose bidding is already over. Checking the deadline
-   * directly is sufficient and avoids inventing a status the model doesn't
-   * otherwise need.
+   * an admin offer a job whose bidding is already over.
+   *
+   * "Closed" is BOTH ways bidding can end, not just the deadline passing: an
+   * early close (every offer answered before the deadline) sends the same
+   * shortlist, and afterwards the persisted deadline still reads "in future".
+   * Guarding on the deadline alone would let an Expand in that gap create a
+   * fresh PENDING offer with a future expiresAt, for a job the motorist has
+   * already been shown quotes for.
    */
-  private assertBiddingStillOpen(quoteCollectionDeadline: Date | null | undefined): void {
-    if (quoteCollectionDeadline && Date.now() >= quoteCollectionDeadline.getTime()) {
+  private assertBiddingStillOpen(
+    rescueRequestId: string,
+    quoteCollectionDeadline: Date | null | undefined,
+  ): void {
+    const deadlinePassed = !!quoteCollectionDeadline && Date.now() >= quoteCollectionDeadline.getTime();
+    if (deadlinePassed || this.closedRequests.has(rescueRequestId)) {
       throw new BadRequestException('Bidding has closed for this request');
     }
   }
@@ -865,7 +879,7 @@ export class DispatchService {
     if (!rescueRequest || rescueRequest.status !== RescueRequestStatus.DISPATCHING) {
       throw new BadRequestException('Request is not currently DISPATCHING');
     }
-    this.assertBiddingStillOpen(rescueRequest.quoteCollectionDeadline);
+    this.assertBiddingStillOpen(rescueRequestId, rescueRequest.quoteCollectionDeadline);
 
     // Deliberately does NOT touch existing offers — operators still inside
     // their window keep them. Expanding adds people; it never un-asks anyone.
@@ -890,7 +904,7 @@ export class DispatchService {
     if (!rescueRequest || rescueRequest.status !== RescueRequestStatus.DISPATCHING) {
       throw new BadRequestException('Request is not currently DISPATCHING');
     }
-    this.assertBiddingStillOpen(rescueRequest.quoteCollectionDeadline);
+    this.assertBiddingStillOpen(rescueRequestId, rescueRequest.quoteCollectionDeadline);
 
     const operator = await this.prisma.operator.findUnique({ where: { id: operatorId } });
     if (!operator || operator.status !== 'ACTIVE') {
