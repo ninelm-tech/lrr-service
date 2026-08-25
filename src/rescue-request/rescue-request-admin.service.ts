@@ -33,7 +33,7 @@ export class RescueRequestAdminService {
 
   async adminList(query: any) {
     const {
-      status, issueType, operatorId, depositPaid, balancePaid,
+      status, issueType, operatorId, depositPaid, balancePaid, refundEligible,
       from, to, search, page = 1, limit = 20,
     } = query;
 
@@ -43,6 +43,9 @@ export class RescueRequestAdminService {
     if (operatorId) where.assignedOperatorId = operatorId;
     if (depositPaid !== undefined) where.depositPaid = depositPaid === 'true' || depositPaid === true;
     if (balancePaid !== undefined) where.balancePaid = balancePaid === 'true' || balancePaid === true;
+    if (refundEligible === 'true' || refundEligible === true) {
+      where.depositRefundStatus = { in: ['ELIGIBLE', 'FAILED'] };
+    }
     if (from && to) where.createdAt = { gte: new Date(from), lte: new Date(to) };
     if (search) {
       where.OR = [
@@ -351,6 +354,7 @@ export class RescueRequestAdminService {
       longitude: item.longitude ? Number(item.longitude) : undefined,
       depositPaid: item.depositPaid,
       balancePaid: item.balancePaid,
+      depositRefundStatus: item.depositRefundStatus,
       customer: { id: item.customer.id, phoneNumber: item.customer.phoneNumber! },
       assignedOperator: item.assignedOperator
         ? { id: item.assignedOperator.id, businessName: item.assignedOperator.businessName }

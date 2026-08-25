@@ -127,6 +127,62 @@ describe('RescueRequestAdminService', () => {
     });
   });
 
+  describe('adminList', () => {
+    let service: RescueRequestAdminService;
+    let prisma: {
+      rescueRequest: { findMany: jest.Mock; count: jest.Mock };
+    };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: { findMany: jest.fn(), count: jest.fn() },
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestAdminService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<RescueRequestAdminService>(RescueRequestAdminService);
+    });
+
+    it('filters to refund-eligible requests when refundEligible=true is passed', async () => {
+      prisma.rescueRequest.findMany.mockResolvedValue([]);
+      prisma.rescueRequest.count.mockResolvedValue(0);
+
+      await service.adminList({ refundEligible: 'true' });
+
+      expect(prisma.rescueRequest.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ depositRefundStatus: { in: ['ELIGIBLE', 'FAILED'] } }),
+        }),
+      );
+    });
+
+    it('includes depositRefundStatus in each list item', async () => {
+      prisma.rescueRequest.findMany.mockResolvedValue([{
+        id: 'req-1', status: 'CANCELLED', vehicleType: null, destination: null,
+        latitude: null, longitude: null, depositPaid: true, balancePaid: false,
+        depositRefundStatus: 'ELIGIBLE',
+        customer: { id: 'cust-1', phoneNumber: '+2341' }, assignedOperator: null,
+        createdAt: new Date(), updatedAt: new Date(),
+      }]);
+      prisma.rescueRequest.count.mockResolvedValue(1);
+
+      const result = await service.adminList({});
+
+      expect(result.data[0].depositRefundStatus).toBe('ELIGIBLE');
+    });
+  });
+
   describe('assignOperator', () => {
     let assignService: RescueRequestAdminService;
     let prisma: {
