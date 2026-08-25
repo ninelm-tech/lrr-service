@@ -121,6 +121,22 @@ describe('DispatchService', () => {
       ]);
     });
 
+    it('surfaces quoteCollectionDeadline so the admin UI can gate Expand near bidding close', async () => {
+      const deadline = new Date('2026-08-12T10:05:00Z');
+      prisma.rescueRequest.findMany.mockResolvedValue([
+        {
+          id: 'req-1', status: 'DISPATCHING', vehicleType: null, destination: null,
+          createdAt: new Date(), customerId: 'cust-1', dispatchOffers: [],
+          quoteCollectionDeadline: deadline,
+        },
+      ]);
+      prisma.whatsAppSession.findMany.mockResolvedValue([]);
+
+      const result = await boardService.getDispatchBoard();
+
+      expect(result[0].quoteCollectionDeadline).toEqual(deadline);
+    });
+
     it('defaults round to 0 when no session is found for the customer', async () => {
       prisma.rescueRequest.findMany.mockResolvedValue([
         {
@@ -679,7 +695,8 @@ describe('DispatchService', () => {
         expect(created.expiresAt.getTime()).toBe(deadline.getTime());
         expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
           expect.any(String),
-          expect.stringContaining('You have 90 seconds to respond'),
+          // 90s rounds UP to 2 minutes — messages are minutes-only, no seconds.
+          expect.stringContaining('You have 2 minutes to respond'),
         );
         // The offer was clamped TO the deadline — it never moved it.
         expect(deadline.getTime()).toBe(Date.now() + 90 * 1000);

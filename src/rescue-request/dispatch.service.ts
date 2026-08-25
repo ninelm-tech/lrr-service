@@ -370,22 +370,22 @@ export class DispatchService {
   }
 
   /**
-   * Human-readable time left until `until`. Used both for the countdown
-   * notice and for the "You have N to respond" line on an offer — an offer
-   * created late in phase 2 has ninety seconds, and its message must say so
-   * rather than repeating the configured window.
+   * Human-readable time left until `until`, in whole minutes (rounded up).
+   * Used both for the countdown notice and for the "You have N to respond"
+   * line on an offer — an offer created late in phase 2 may have well under
+   * a minute, and its message must reflect that rather than repeating the
+   * configured window.
    */
   private formatRemaining(until: Date): string {
     const ms = Math.max(0, until.getTime() - Date.now());
-    // Minutes only from two minutes up. Below that, rounding to minutes is
-    // exactly the lie this method exists to prevent: 90 seconds would render
-    // as "2 minutes" and invite an operator to answer after the deadline.
-    if (ms >= 120_000) {
-      const minutes = Math.round(ms / 60_000);
-      return `${minutes} minute${minutes === 1 ? '' : 's'}`;
-    }
-    const seconds = Math.max(1, Math.round(ms / 1000));
-    return `${seconds} second${seconds === 1 ? '' : 's'}`;
+    // Minutes only — no seconds granularity in operator-facing messages.
+    // Always rounds UP, never down: a lie in the generous direction ("1
+    // minute" when 20 seconds remain) costs nothing, but rounding down
+    // would understate the true deadline and could read as inviting a
+    // reply after it's actually passed. Floors at 1 so this never renders
+    // "0 minutes".
+    const minutes = Math.max(1, Math.ceil(ms / 60_000));
+    return `${minutes} minute${minutes === 1 ? '' : 's'}`;
   }
 
   /**
@@ -1199,6 +1199,7 @@ export class DispatchService {
       destination: r.destination ?? undefined,
       round: roundByCustomerId.get(r.customerId) ?? 0,
       createdAt: r.createdAt,
+      quoteCollectionDeadline: r.quoteCollectionDeadline ?? undefined,
       offers: r.dispatchOffers.map((o) => ({
         operatorId: o.operatorId,
         businessName: o.operator.businessName,
