@@ -122,4 +122,24 @@ describe('PaystackService', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1); // cached, not re-fetched
     });
   });
+
+  describe('refundTransaction', () => {
+    it('POSTs to /refund with the transaction reference and amount, returns id and status', async () => {
+      const mockFetch = jest.fn().mockResolvedValue({
+        json: () => Promise.resolve({ status: true, data: { id: 12345, status: 'pending' } }),
+      });
+      global.fetch = mockFetch as any;
+
+      const result = await service.refundTransaction('DEP_ref_1', 500000);
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://api.paystack.co/refund',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ transaction: 'DEP_ref_1', amount: 500000 }),
+        }),
+      );
+      expect(result).toEqual({ id: 12345, status: 'pending' });
+    });
+  });
 });
