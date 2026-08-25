@@ -63,6 +63,14 @@ enum RescueRequestStatus {
   STALLED
 }
 
+enum RefundStatus {
+  NONE      // not a late-payment case
+  ELIGIBLE  // handleLateDeposit fired — admin can refund
+  PENDING   // refund initiated at Paystack, awaiting webhook confirmation
+  COMPLETED
+  FAILED
+}
+
 enum IssueType {
   BREAKDOWN
   ACCIDENT
@@ -195,6 +203,8 @@ model RescueRequest {
   depositAmount      Int?
   serviceFeeAmount    Int?
   depositReference   String?
+  depositRefundStatus RefundStatus       @default(NONE)
+  depositRefundId    Int?
   balancePaid        Boolean             @default(false)
   balanceAmount      Int?
   balanceReference   String?
