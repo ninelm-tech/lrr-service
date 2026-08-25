@@ -520,6 +520,24 @@ export class DispatchService {
     });
 
     if (candidates.length === 0) {
+      // Never auto-cancel a request that already has a usable quote sitting
+      // on it. resolveBatch's own tail into startDispatch already checks
+      // this (it only reaches here with zero quotes), but expandRadiusNow
+      // calls startDispatch directly and has no such check of its own — an
+      // admin expanding the radius on a request that already has quotes
+      // would otherwise run this exact "no candidates found" logic all the
+      // way to auto-cancel, discarding real quotes. Confirmed on staging
+      // (Sentry LRR-SERVICE-5): "Auto-cancelled: no operator after 4 rounds"
+      // fired from POST /rescue-requests/:id/expand-radius while the request
+      // had 2 valid QUOTED offers.
+      const quotedOffers = await this.prisma.dispatchOffer.findMany({
+        where: { rescueRequestId, status: 'QUOTED' },
+      });
+      if (quotedOffers.length > 0) {
+        await this.sendQuoteShortlist(rescueRequestId, customerId);
+        return;
+      }
+
       // Fast-fail: check if there are ANY active operators near this location
       // (ignoring isAvailable — counts operators who switched themselves off).
       // If zero, it's a geography/coverage gap — retrying with an expanded

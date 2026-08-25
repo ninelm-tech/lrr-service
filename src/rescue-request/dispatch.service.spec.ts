@@ -1060,6 +1060,32 @@ describe('DispatchService', () => {
 
       clearAllBatchTimers(batchService);
     });
+
+    it('sends the shortlist instead of auto-cancelling when candidates run out but a quote already exists — LRR-SERVICE-5', async () => {
+      // Confirmed on staging: an admin clicking Expand on a request that
+      // already had 2 valid QUOTED offers auto-cancelled it after 4 rounds,
+      // because expandRadiusNow calls startDispatch directly and the
+      // no-candidates branch had no idea a quote already existed —
+      // resolveBatch's equivalent guard only protects its own tail call,
+      // not this one.
+      operatorService.findAndRankCandidates.mockResolvedValue([]); // nobody left to offer
+      prisma.operator.count.mockResolvedValue(5); // operators exist nearby — not a coverage gap
+      (prisma as any).dispatchOffer.findMany = jest.fn().mockResolvedValue([
+        { id: 'offer-1', status: 'QUOTED' },
+      ]);
+      (prisma as any).rescueRequest.update = jest.fn();
+      sessionStore.getOrCreate.mockResolvedValue({ offeredOperatorIds: ['op-a', 'op-b'], dispatchRound: 3 });
+      const shortlistSpy = jest.spyOn(batchService, 'sendQuoteShortlist').mockResolvedValue(undefined);
+
+      await batchService.startDispatch('req-1', 'cust-1', 6);
+
+      expect(shortlistSpy).toHaveBeenCalledWith('req-1', 'cust-1');
+      expect((prisma as any).rescueRequest.update).not.toHaveBeenCalled();
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
+        expect.any(String),
+        expect.stringContaining('automatically cancelled'),
+      );
+    });
   });
 
   describe('resolveBatch — no-quotes continuation (Task 7)', () => {
