@@ -248,10 +248,17 @@ not as the correlation key.
 
 **Before implementation:** trigger one real refund against a Paystack test
 transaction and inspect the actual `refund.processed` webhook payload Paystack
-sends, to confirm the original-transaction field's exact name and shape. Do
-not guess a second time on this — the dispatch-offer template work in this
-same codebase already paid for one round of "verify against the live payload,
-not the docs summary" (`2026-08-19-dispatch-offer-template-design.md`).
+sends, to confirm the original-transaction field's exact name and shape —
+**and specifically check whether the webhook also carries the refund's own id
+(matching what `Create Refund`'s response returned).** Do not guess a second
+time on this — the dispatch-offer template work in this same codebase already
+paid for one round of "verify against the live payload, not the docs summary"
+(`2026-08-19-dispatch-offer-template-design.md`).
+
+If the webhook does carry a refund-specific id, Section 6's correlation must
+match on it **in addition to** `depositReference`, not `depositReference`
+alone — see Section 6 for why `depositReference` by itself is unsafe once
+retries exist.
 
 New endpoint on `RescueRequestAdminService`, same shape as
 `PayoutService.retryPayout` — atomic claim, then act:
@@ -341,13 +348,43 @@ original transaction (see the correlation note in Section 4 — confirm this
 against a real payload before writing the case bodies).
 
 `confirmRefundOutcome` is a conditional write exactly like
-`PayoutService.confirmTransferOutcome` — `updateMany` on
-`depositReference: originalReference, depositRefundStatus: 'PENDING'`, flip to
-`COMPLETED` or `FAILED`. Paystack redelivers webhooks; this must be
-idempotent the same way the payout webhook already is, for the same reason.
-`refund.needs-attention` deliberately leaves `depositRefundStatus` at
-`PENDING` — it's not success or failure, just stuck; the Sentry alert is the
-signal, not a status change.
+`PayoutService.confirmTransferOutcome`, but **`depositReference` alone is not
+a safe correlation key once retries exist** — it never changes across
+`refundDeposit` attempts on the same request, while `depositRefundId` does
+(overwritten on every attempt, Section 4). A refund attempt can be retried:
+`ELIGIBLE → PENDING → FAILED → (admin retries) → PENDING` again, with a new
+Paystack refund id each time. If a *delayed or redelivered* webhook from the
+first, already-failed attempt arrives while the second attempt is `PENDING`,
+matching on `depositReference` alone would let that stale webhook flip the
+*current* attempt's status — attributing attempt #2's outcome to attempt #1's
+webhook, or worse, marking a live attempt `FAILED` based on a stale one.
+
+The `WHERE` must therefore include whichever refund-specific id the live
+payload check (Section 4) confirms is available, matched against the stored
+`depositRefundId` — not `depositReference` in isolation:
+
+```ts
+await this.prisma.rescueRequest.updateMany({
+  where: { depositReference: originalReference, depositRefundId: refundIdFromWebhook, depositRefundStatus: 'PENDING' },
+  data:  { depositRefundStatus: outcome },
+});
+```
+
+Both conditions together: `depositReference` confirms it's the right request,
+`depositRefundId` confirms it's the right *attempt*. If the live-payload check
+finds no refund-specific id anywhere in the webhook, this design does not yet
+have a safe way to distinguish attempts and **must not silently fall back to
+`depositReference`-only matching** — flag that finding back to this spec
+rather than shipping the unsafe version; the likely fix would be disallowing
+retry until the previous attempt's webhook has definitively landed
+(`FAILED`/`COMPLETED`), trading retry-speed for safety.
+
+Paystack redelivers webhooks; this must be idempotent the same way the payout
+webhook already is, for the same reason — matching on `depositRefundStatus:
+'PENDING'` means a second delivery for an already-resolved attempt finds
+nothing to update. `refund.needs-attention` deliberately leaves
+`depositRefundStatus` at `PENDING` — it's not success or failure, just stuck;
+the Sentry alert is the signal, not a status change.
 
 No new dependency wiring needed: `PaymentModule` already imports
 `RescueRequestModule` via `forwardRef` (for `PaymentEventsService`), and
@@ -413,6 +450,11 @@ exercise both branches of every conditional write below:
   `ELIGIBLE`/`FAILED` are.
 - **Refund webhook redelivery** does not double-write; a second delivery for
   an already-`COMPLETED` refund matches zero rows and is a no-op.
+- **A stale webhook from a prior, already-failed attempt does not affect a
+  later retry:** simulate `depositRefundId` having changed (attempt #2's
+  retry overwrote it) and a webhook arriving with attempt #1's now-stale
+  refund id — the `WHERE` must not match, so attempt #2's `PENDING` status is
+  untouched.
 - **A `FAILED` refund remains eligible for retry** — the claim condition
   accepts `ELIGIBLE` and `FAILED`.
 - **`refund.needs-attention`** captures a Sentry warning and leaves
