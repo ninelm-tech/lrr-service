@@ -209,6 +209,8 @@ model RescueRequest {
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
 
+  quoteCollectionDeadline DateTime?
+
   dispatchOffers     DispatchOffer[]
   media              RequestMedia[]
   ratings            Rating[]
@@ -234,6 +236,8 @@ model PlatformConfig {
   // WhatsApp number staff disputes are alerted to. Optional — unset means
   // the staff alert step is skipped, not an error.
   disputeAlertPhoneNumber String?
+  quoteCollectionMinutes Int      @default(5)
+  dispatchBatchSize      Int      @default(3)
   updatedAt             DateTime @updatedAt
 }
 
@@ -270,9 +274,12 @@ model DispatchOffer {
   respondedAt      DateTime?
   expiresAt        DateTime
 
+  batchId          String
+
   @@index([rescueRequestId])
   @@index([operatorId])
   @@index([status])
+  @@index([rescueRequestId, batchId])
 }
 
 enum RatingDirection {
