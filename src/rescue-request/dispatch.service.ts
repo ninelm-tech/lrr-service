@@ -630,6 +630,17 @@ export class DispatchService {
     const expiresAt = await this.offerExpiryClampedToDeadline(rescueRequestId, windowMs);
     const batchId = crypto.randomUUID();
 
+    // Re-check right before the write. expandRadiusNow checks
+    // assertBiddingStillOpen up front but then fires this method off
+    // unawaited (`void this.startDispatch(...)`) — the real write happens
+    // after findAndRankCandidates, well after that guard ran. An early close
+    // (closeBidding, triggered by the last outstanding offer being answered)
+    // can land in that window, so guard again here, silently, the same way
+    // the other early-return branches above do — this is reached from
+    // several fire-and-forget call sites and must not throw an unhandled
+    // rejection.
+    if (this.closedRequests.has(rescueRequestId)) return;
+
     // Create all offers in one batch insert
     await this.prisma.dispatchOffer.createMany({
       data: batch.map((op) => ({
@@ -913,6 +924,16 @@ export class DispatchService {
     const MANUAL_OFFER_WINDOW_MS = 5 * 60 * 1000;
     const expiresAt = await this.offerExpiryClampedToDeadline(rescueRequestId, MANUAL_OFFER_WINDOW_MS);
     const batchId = crypto.randomUUID();
+
+    // Re-check right before the write, not just at the top of the method:
+    // offerExpiryClampedToDeadline only re-reads the deadline, it does not
+    // know about an early close (every offer answered, closeBidding fires,
+    // this request added to closedRequests) that can happen during the
+    // operator lookup / deadline re-read above. Without this, a stray
+    // PENDING offer gets created for a job whose shortlist was already sent.
+    if (this.closedRequests.has(rescueRequestId)) {
+      throw new BadRequestException('Bidding has closed for this request');
+    }
 
     await this.prisma.dispatchOffer.create({
       data: { rescueRequestId, operatorId, expiresAt, batchId },

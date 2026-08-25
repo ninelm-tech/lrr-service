@@ -639,6 +639,26 @@ describe('DispatchService', () => {
       expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();
     });
 
+    it('refuses when bidding closes DURING the method — after the top-of-method guard passes but before the create', async () => {
+      // Simulates the exact gap the review flagged: the initial
+      // assertBiddingStillOpen call (right after the first findUnique) sees
+      // bidding still open, but closeBidding fires (e.g. the last outstanding
+      // offer on this request gets answered) while the awaited operator
+      // lookup is in flight — before dispatchOffer.create runs.
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+        vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+        quoteCollectionDeadline: new Date(Date.now() + 4 * 60 * 1000),
+      });
+      prisma.operator.findUnique.mockImplementation(async () => {
+        (manualService as any).closedRequests.add('req-1');
+        return { id: 'op-1', status: 'ACTIVE', businessName: 'Swift Towing', phoneNumber: '+2349012345678' };
+      });
+
+      await expect(manualService.manualOfferToOperator('req-1', 'op-1')).rejects.toThrow('Bidding has closed');
+      expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();
+    });
+
     it('clamps a phase-2 offer to the deadline and tells the operator the TRUE remaining time', async () => {
       jest.useFakeTimers();
       try {
