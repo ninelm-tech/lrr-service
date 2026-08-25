@@ -101,6 +101,18 @@ export class RescueRequestController {
     return this.rescueRequestAdminService.assignOperator(id, dto);
   }
 
+  /**
+   * Admin-triggered refund for a deposit that arrived after its request was
+   * already cancelled. Always refunds the full deposit amount.
+   */
+  @Post(':id/refund-deposit')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async refundDeposit(@Param('id') id: string) {
+    await this.rescueRequestAdminService.refundDeposit(id);
+    return { message: 'Refund initiated' };
+  }
+
   /** Update request status (admin override). */
   @Patch(':id/status')
   @UseGuards(RolesGuard)

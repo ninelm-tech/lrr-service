@@ -329,4 +329,83 @@ describe('RescueRequestAdminService', () => {
       });
     });
   });
+
+  describe('refundDeposit', () => {
+    let service: RescueRequestAdminService;
+    let prisma: {
+      rescueRequest: {
+        updateMany: jest.Mock;
+        findUniqueOrThrow: jest.Mock;
+        update: jest.Mock;
+      };
+    };
+    let paystackService: { refundTransaction: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: {
+          updateMany: jest.fn(),
+          findUniqueOrThrow: jest.fn(),
+          update: jest.fn(),
+        },
+      };
+      paystackService = { refundTransaction: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestAdminService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaystackService, useValue: paystackService },
+          { provide: TwilioService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<RescueRequestAdminService>(RescueRequestAdminService);
+    });
+
+    it('claims ELIGIBLE → PENDING, calls Paystack, stores the refund id', async () => {
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1', depositReference: 'DEP_ref_1', depositAmount: 500000,
+      });
+      paystackService.refundTransaction.mockResolvedValue({ id: 999, status: 'pending' });
+      prisma.rescueRequest.update.mockResolvedValue({});
+
+      await service.refundDeposit('req-1');
+
+      expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith({
+        where: { id: 'req-1', status: 'CANCELLED', depositRefundStatus: { in: ['ELIGIBLE', 'FAILED'] } },
+        data: { depositRefundStatus: 'PENDING' },
+      });
+      expect(paystackService.refundTransaction).toHaveBeenCalledWith('DEP_ref_1', 500000);
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { depositRefundId: 999 },
+      });
+    });
+
+    it('rejects the claim (BadRequestException) when depositRefundStatus is NONE — not eligible', async () => {
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(service.refundDeposit('req-1')).rejects.toThrow('Not eligible for refund');
+    });
+
+    it('marks FAILED and rethrows when the Paystack call throws', async () => {
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1', depositReference: 'DEP_ref_1', depositAmount: 500000,
+      });
+      paystackService.refundTransaction.mockRejectedValue(new Error('Paystack down'));
+
+      await expect(service.refundDeposit('req-1')).rejects.toThrow('Paystack down');
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { depositRefundStatus: 'FAILED' },
+      });
+    });
+  });
 });

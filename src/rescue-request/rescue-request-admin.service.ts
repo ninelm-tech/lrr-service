@@ -161,6 +161,39 @@ export class RescueRequestAdminService {
     return { data: this.mapToDetailDto(updated) };
   }
 
+  /**
+   * Admin-triggered refund for a deposit that arrived after its request was
+   * already CANCELLED (see PaymentEventsService.handleLateDeposit). Always
+   * refunds the full deposit amount — no partial-amount input.
+   *
+   * ELIGIBLE and FAILED are both claimable (a FAILED attempt must stay
+   * retryable, same shape as PayoutService.retryPayout). NONE is deliberately
+   * not claimable — a request that was never marked ELIGIBLE is not this
+   * feature's concern, even if it's CANCELLED with a paid deposit for some
+   * other reason.
+   */
+  async refundDeposit(id: string): Promise<void> {
+    const claimed = await this.prisma.rescueRequest.updateMany({
+      where: { id, status: RescueRequestStatus.CANCELLED, depositRefundStatus: { in: ['ELIGIBLE', 'FAILED'] } },
+      data: { depositRefundStatus: 'PENDING' },
+    });
+    if (claimed.count === 0) {
+      throw new BadRequestException('Not eligible for refund — already refunded/in progress, or not a late-payment case.');
+    }
+
+    const request = await this.prisma.rescueRequest.findUniqueOrThrow({ where: { id } });
+    try {
+      const refund = await this.paystackService.refundTransaction(request.depositReference!, request.depositAmount!);
+      await this.prisma.rescueRequest.update({
+        where: { id },
+        data: { depositRefundId: refund.id },
+      });
+    } catch (err) {
+      await this.prisma.rescueRequest.update({ where: { id }, data: { depositRefundStatus: 'FAILED' } });
+      throw err;
+    }
+  }
+
   async updateStatus(id: string, dto: { status: string }) {
     const status = dto.status as RescueRequestStatus;
     if (!Object.values(RescueRequestStatus).includes(status)) {
