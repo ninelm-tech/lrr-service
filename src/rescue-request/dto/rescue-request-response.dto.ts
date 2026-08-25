@@ -55,6 +55,8 @@ export class DispatchBoardRowDto {
   destination?: string;
   round: number;
   createdAt: Date;
+  /** Set once the first quote arrives; null while still SEARCHING (phase 1). */
+  quoteCollectionDeadline?: Date;
   offers: DispatchOfferAdminDto[];
 }
 
