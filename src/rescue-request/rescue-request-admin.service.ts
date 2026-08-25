@@ -181,9 +181,12 @@ export class RescueRequestAdminService {
       throw new BadRequestException('Not eligible for refund — already refunded/in progress, or not a late-payment case.');
     }
 
-    const request = await this.prisma.rescueRequest.findUniqueOrThrow({ where: { id } });
     try {
-      const refund = await this.paystackService.refundTransaction(request.depositReference!, request.depositAmount!);
+      const request = await this.prisma.rescueRequest.findUniqueOrThrow({ where: { id } });
+      if (!request.depositReference || !request.depositAmount) {
+        throw new Error(`Cannot refund request ${id}: missing depositReference or depositAmount`);
+      }
+      const refund = await this.paystackService.refundTransaction(request.depositReference, request.depositAmount);
       await this.prisma.rescueRequest.update({
         where: { id },
         data: { depositRefundId: refund.id },
