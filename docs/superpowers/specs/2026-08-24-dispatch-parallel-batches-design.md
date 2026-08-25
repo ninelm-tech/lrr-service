@@ -352,10 +352,27 @@ if (claimed.count === 0) {
 case, but `processQuoteOrDecline` — the one place both channels funnel through —
 is where the guarantee actually has to live.
 
-### 6. Bidding closes at the deadline
+### 6. Bidding closes at the deadline — or earlier, if nothing is left pending
 
-At `quoteCollectionDeadline`: mark all still-`PENDING` offers `TIMED_OUT`, rank
-every `QUOTED` offer for the request, and send the shortlist.
+**The deadline is a ceiling, not a mandatory wait.** If every offer on the
+request has been answered (quoted or declined) before the deadline arrives,
+send the shortlist immediately — don't make the motorist sit out the rest of
+the window when there's nothing left to wait for. This is `maybeResolveBatchEarly`'s
+existing behaviour and it must survive the redesign: today, three operators
+responding in the first 40 seconds of a 5-minute window resolve the batch in
+40 seconds, not 5 minutes. An earlier version of this spec regressed that by
+having bidding close *only* on the fixed timer — fixed here.
+
+Concretely: `maybeResolveBatchEarly` becomes request-scoped once phase 2
+starts (checking all `PENDING` offers for the request, not one batch by
+`batchId`), and fires the same close-and-send logic below whenever it finds
+none pending. The `quoteCollectionDeadline` timer is the fallback for
+"still-pending offers that never answer" — it does not gate the case where
+everyone already has.
+
+At whichever happens first — the deadline, or every offer answered — mark any
+still-`PENDING` offers `TIMED_OUT`, rank every `QUOTED` offer for the request,
+and send the shortlist.
 
 A quote arriving after that point is marked `NOT_SELECTED` and the operator told
 the job has moved to selection.
@@ -396,24 +413,35 @@ Defaults preserve today's behaviour exactly. The admin config screen in
 `RADIUS_EXPANSION_KM` stay as env/constants — not because they shouldn't be
 configurable eventually, but because nothing in this work needs them to be.
 
-### 8. Remove the extra retry delay from automatic expansion
+### 8. Delete the retry delay from automatic expansion — not just default it to 0
 
 **Behaviour change, called out explicitly because it's a business rule, not a
-bug fix.** The stated rule is: 10 minutes with no quote → expand immediately,
-new operators get a fresh full window. Today that isn't what happens when the
-local candidate pool is exhausted. `resolveBatch`'s tail call into
-`startDispatch` is immediate, but if `startDispatch` finds zero candidates at
-the current radius, it doesn't expand on the spot — it schedules the retry
-timer for `DISPATCH_RETRY_MINUTES` (default 5) and expands only when *that*
-fires. A motorist can wait up to 15 minutes before the radius actually grows,
-not 10.
+bug fix.** The rule: 10 minutes with no quote → expand immediately, new
+operators get a fresh full window. Today that isn't what happens when the local
+candidate pool is exhausted. `resolveBatch`'s tail call into `startDispatch` is
+immediate, but if `startDispatch` finds zero candidates at the current radius,
+it doesn't expand on the spot — it schedules the retry timer for
+`DISPATCH_RETRY_MINUTES` (default 5) and expands only when *that* fires. A
+motorist can wait up to 15 minutes before the radius actually grows, not 10.
+During those 5 minutes nobody is being given a chance to respond — it is pure
+dead time added to a stranded motorist's wait for no benefit to anyone.
 
-`DISPATCH_RETRY_MINUTES` becomes `0` for this path: when a round resolves with
-no quotes and no more untried candidates at the current radius, expand
-immediately rather than scheduling a delay. `retryTimers` and the
-`DISPATCH_RETRY_MINUTES` constant can stay in the code (harmless at 0, and a
-fallback if a future need for backoff reappears), but the default changes so
-staging behaviour actually matches the rule.
+**Delete `retryTimers`, the `setTimeout`, and `DISPATCH_RETRY_MINUTES`
+entirely — do not default the constant to `0`.** A knob that defaults to the
+right value is still a knob: leaving it configurable invites someone to set it
+back to `5` later — a plausible-looking "make dispatch less aggressive" change
+that would silently reintroduce exactly this dead time, with no test failing
+and no comment stopping them, because the config path would still work exactly
+as designed. Removing the mechanism removes that failure mode. The rule becomes
+unconditional and can't be dialed back to the wrong behaviour:
+
+> A round resolving with no quotes and no untried operators at the current
+> radius expands the radius and dispatches the next batch in the same tick.
+
+Note for the implementer: `retryTimers` and `DISPATCH_RETRY_MINUTES` already
+exist in code as of the earlier standalone fix (per-batch timer keys,
+`offeredOperatorIds` reset removal) that shipped ahead of this spec. That fix
+did not touch the delay itself — this change is what removes it.
 
 ### 9. Expand with almost no time left
 
@@ -466,6 +494,11 @@ so they target observable decisions:
   radius it stops at the round cap, alerts, and cancels.
 - **Bidding closes:** a quote arriving after the deadline is `NOT_SELECTED`, the
   operator is told, and the motorist's list is unchanged.
+- **Early resolution still works in phase 2:** with a 5-minute deadline set,
+  every outstanding offer answered at t=40s sends the shortlist at t=40s, not
+  at the deadline. **This is the regression an earlier draft introduced and
+  must not reappear** — the deadline is a ceiling on stragglers, not a floor
+  on how fast the motorist can be told.
 - **Config:** batch size and both windows are read from `PlatformConfig`; the
   defaults reproduce today's 10 / 5 / 3 behaviour.
 - **Batch identity survives the `expiresAt` rewrite:** after phase 2 shortens a
@@ -490,6 +523,7 @@ so they target observable decisions:
 - **Expand/manual-assign refused after bidding closes:** once
   `now >= quoteCollectionDeadline`, both throw — even though
   `RescueRequest.status` is still `DISPATCHING`.
-- **No extra retry delay:** a round resolving with no quotes and no remaining
-  candidates at the current radius expands on the same tick, not after
-  `DISPATCH_RETRY_MINUTES`.
+- **No retry delay:** a round resolving with no quotes and no remaining
+  candidates at the current radius expands and dispatches on the same tick —
+  no timer involved. `DISPATCH_RETRY_MINUTES` and `retryTimers` no longer
+  exist in the code to regress back to.
