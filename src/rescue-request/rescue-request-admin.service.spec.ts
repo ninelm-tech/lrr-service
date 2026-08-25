@@ -6,6 +6,7 @@ import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { PaymentEventsService } from './payment-events.service';
+import { RescueRequestSharedService } from './rescue-request-shared.service';
 
 describe('RescueRequestAdminService', () => {
   describe('detailForUser — quote-compliance data', () => {
@@ -32,6 +33,7 @@ describe('RescueRequestAdminService', () => {
           { provide: PlatformConfigService, useValue: platformConfigService },
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
         ],
       }).compile();
 
@@ -136,6 +138,7 @@ describe('RescueRequestAdminService', () => {
     let twilioService: { sendWhatsAppMessage: jest.Mock };
     let platformConfigService: { getConfig: jest.Mock };
     let dispatchService: { startDispatch: jest.Mock };
+    let sharedService: { scheduleDepositWindow: jest.Mock };
 
     const operator = { id: 'op-1', status: 'ACTIVE', businessName: 'Acme Towing', phoneNumber: '+2348011111111' };
     const request = {
@@ -170,6 +173,7 @@ describe('RescueRequestAdminService', () => {
         getConfig: jest.fn().mockResolvedValue({ serviceFeePercent: 10, depositPercent: 20 }),
       };
       dispatchService = { startDispatch: jest.fn().mockResolvedValue(undefined) };
+      sharedService = { scheduleDepositWindow: jest.fn() };
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
@@ -180,6 +184,7 @@ describe('RescueRequestAdminService', () => {
           { provide: PlatformConfigService, useValue: platformConfigService },
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: dispatchService },
+          { provide: RescueRequestSharedService, useValue: sharedService },
         ],
       }).compile();
 
@@ -187,43 +192,36 @@ describe('RescueRequestAdminService', () => {
     });
 
     it('splits the price into service fee, deposit, and balance, and creates a payment link', async () => {
-      // Fake timers so the 5-minute deposit-window setTimeout this schedules
-      // never becomes a real leaked OS timer.
-      jest.useFakeTimers();
-      try {
-        // price 100_000 kobo, 10% fee -> total 110_000, 20% deposit -> 22_000 deposit, 88_000 balance
-        const result = await assignService.assignOperator('req-1', { operatorId: 'op-1', priceKobo: 100_000 });
+      // price 100_000 kobo, 10% fee -> total 110_000, 20% deposit -> 22_000 deposit, 88_000 balance
+      const result = await assignService.assignOperator('req-1', { operatorId: 'op-1', priceKobo: 100_000 });
 
-        expect(prisma.dispatchOffer.create).toHaveBeenCalledWith({
+      expect(prisma.dispatchOffer.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          rescueRequestId: 'req-1',
+          operatorId: 'op-1',
+          status: 'SELECTED_PENDING_PAYMENT',
+          quotedPrice: 100_000,
+        }),
+      });
+      expect(paystackService.initializePayment).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 22_000 }),
+      );
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
           data: expect.objectContaining({
-            rescueRequestId: 'req-1',
-            operatorId: 'op-1',
-            status: 'SELECTED_PENDING_PAYMENT',
-            quotedPrice: 100_000,
+            assignedOperatorId: 'op-1',
+            status: 'WAITING_FOR_DEPOSIT',
+            serviceFeeAmount: 10_000,
+            depositAmount: 22_000,
+            balanceAmount: 88_000,
           }),
-        });
-        expect(paystackService.initializePayment).toHaveBeenCalledWith(
-          expect.objectContaining({ amount: 22_000 }),
-        );
-        expect(prisma.rescueRequest.update).toHaveBeenCalledWith(
-          expect.objectContaining({
-            data: expect.objectContaining({
-              assignedOperatorId: 'op-1',
-              status: 'WAITING_FOR_DEPOSIT',
-              serviceFeeAmount: 10_000,
-              depositAmount: 22_000,
-              balanceAmount: 88_000,
-            }),
-          }),
-        );
-        expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
-          expect.any(String),
-          expect.stringContaining('https://paystack.test/pay/xyz'),
-        );
-        expect(result.data).toBeDefined();
-      } finally {
-        jest.useRealTimers();
-      }
+        }),
+      );
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.stringContaining('https://paystack.test/pay/xyz'),
+      );
+      expect(result.data).toBeDefined();
     });
 
     it('rejects a non-active operator', async () => {
@@ -264,29 +262,15 @@ describe('RescueRequestAdminService', () => {
       expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
     });
 
-    it('releases the operator and reopens dispatch if the deposit window expires unpaid', async () => {
-      jest.useFakeTimers();
-      try {
-        prisma.rescueRequest.findUnique
-          .mockResolvedValueOnce(request) // initial lookup inside assignOperator
-          .mockResolvedValueOnce({ status: 'WAITING_FOR_DEPOSIT' }); // still-unpaid check in the timeout
+    it('schedules the deposit window via the shared service', async () => {
+      await assignService.assignOperator('req-1', { operatorId: 'op-1', priceKobo: 100_000 });
 
-        await assignService.assignOperator('req-1', { operatorId: 'op-1', priceKobo: 100_000 });
-
-        await jest.advanceTimersByTimeAsync(5 * 60 * 1000);
-
-        expect(prisma.dispatchOffer.update).toHaveBeenCalledWith({
-          where: { id: 'offer-1' },
-          data: expect.objectContaining({ status: 'TIMED_OUT' }),
-        });
-        expect(prisma.rescueRequest.update).toHaveBeenLastCalledWith({
-          where: { id: 'req-1' },
-          data: { assignedOperatorId: null, status: 'DISPATCHING' },
-        });
-        expect(dispatchService.startDispatch).toHaveBeenCalledWith('req-1', 'cust-1');
-      } finally {
-        jest.useRealTimers();
-      }
+      expect(sharedService.scheduleDepositWindow).toHaveBeenCalledWith({
+        rescueRequestId: 'req-1',
+        customerPhone: expect.any(String),
+        operatorPhone: expect.any(String),
+        paymentUrl: 'https://paystack.test/pay/xyz',
+      });
     });
   });
 });

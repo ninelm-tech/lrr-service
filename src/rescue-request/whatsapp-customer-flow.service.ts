@@ -354,7 +354,7 @@ export class WhatsAppCustomerFlowService {
     // ── Step 3: Operator found — waiting for customer to pay ──────────────
     if (session.state === WhatsAppFlowState.OPERATOR_FOUND_WAITING_PAYMENT) {
       return this.reply(
-        `🚗 Please pay using the link we sent you to confirm your operator.\n\nYou have 5 minutes before the request is cancelled.\n\nReply CANCEL to cancel (you will not be charged).`,
+        `🚗 Please pay using the link we sent you to confirm your operator.\n\nYou have 30 minutes before the request is cancelled.\n\nReply CANCEL to cancel (you will not be charged).`,
       );
     }
 
@@ -513,7 +513,7 @@ export class WhatsAppCustomerFlowService {
       : `💰 *One-time fee: ₦50,000* (paid in full now)\n`;
 
     return this.reply(
-      `Issue: ${formatIssueType(issueType)}${note}\n\n${costBreakdown}\n⚠️ *ACTION NEEDED* — tap the link below to pay ${isStandardDeposit ? '₦5,000 deposit' : '₦50,000'} and confirm your rescue:\n\n👉 ${paymentResponse.data.authorization_url}\n\n⏱ Pay within 5 minutes or the request is cancelled.`,
+      `Issue: ${formatIssueType(issueType)}${note}\n\n${costBreakdown}\n⚠️ *ACTION NEEDED* — tap the link below to pay ${isStandardDeposit ? '₦5,000 deposit' : '₦50,000'} and confirm your rescue:\n\n👉 ${paymentResponse.data.authorization_url}\n\n⏱ Pay within 30 minutes or the request is cancelled.`,
     );
   }
 
@@ -686,40 +686,15 @@ export class WhatsAppCustomerFlowService {
 
     void this.twilioService.sendWhatsAppMessage(
       phoneNumber,
-      `🚗 *Operator selected!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *5 minutes*:\n\n👉 ${paymentResponse.data.authorization_url}\n\nYour operator is confirmed once you pay. Reply CANCEL to cancel (no charge).`,
+      `🚗 *Operator selected!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *30 minutes*:\n\n👉 ${paymentResponse.data.authorization_url}\n\nYour operator is confirmed once you pay. Reply CANCEL to cancel (no charge).`,
     );
 
-    const DEPOSIT_WINDOW_MS = 5 * 60 * 1000;
-    setTimeout(async () => {
-      const fresh = await this.prisma.rescueRequest.findUnique({
-        where: { id: rescueRequestId },
-        select: { status: true },
-      });
-      if (fresh?.status !== RescueRequestStatus.WAITING_FOR_DEPOSIT) return;
-
-      await this.prisma.dispatchOffer.update({
-        where: { id: selectedOffer.id },
-        data: { status: 'TIMED_OUT', respondedAt: new Date() },
-      });
-      await this.prisma.rescueRequest.update({
-        where: { id: rescueRequestId },
-        data: { assignedOperatorId: null, status: RescueRequestStatus.DISPATCHING },
-      });
-      const freshSession = await this.sessionStore.getOrCreate(rescueRequest.customerId);
-      await this.sessionStore.update(rescueRequest.customerId, {
-        state: WhatsAppFlowState.REQUEST_CONFIRMED,
-        offeredOperatorIds: [...(freshSession.offeredOperatorIds ?? []), operator.id],
-      });
-      await this.twilioService.sendWhatsAppMessage(
-        phoneNumber,
-        `⏰ Payment window expired. Looking for the next available operator...`,
-      );
-      void this.dispatchService.startDispatch(rescueRequestId, rescueRequest.customerId);
-      await this.twilioService.sendWhatsAppMessage(
-        toWhatsAppAddress(operator.phoneNumber),
-        `⏰ ${formatJobRef(rescueRequestId)} is no longer available — the customer did not pay within 5 minutes. Watch for new offers!`,
-      );
-    }, DEPOSIT_WINDOW_MS);
+    this.sharedService.scheduleDepositWindow({
+      rescueRequestId,
+      customerPhone: phoneNumber,
+      operatorPhone: toWhatsAppAddress(operator.phoneNumber),
+      paymentUrl: paymentResponse.data.authorization_url,
+    });
 
     return this.xmlOk();
   }

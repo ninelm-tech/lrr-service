@@ -15,8 +15,8 @@ import {
   DispatchOfferAdminDto,
   PaginationMetaDto,
 } from './dto/rescue-request-response.dto';
-import { formatJobRef } from './domain/rescue-request-formatting';
 import { DispatchService } from './dispatch.service';
+import { RescueRequestSharedService } from './rescue-request-shared.service';
 
 @Injectable()
 export class RescueRequestAdminService {
@@ -28,6 +28,7 @@ export class RescueRequestAdminService {
     private readonly paymentEventsService: PaymentEventsService,
     @Inject(forwardRef(() => DispatchService))
     private readonly dispatchService: DispatchService,
+    private readonly sharedService: RescueRequestSharedService,
   ) {}
 
   async adminList(query: any) {
@@ -87,7 +88,7 @@ export class RescueRequestAdminService {
     const depositAmount = Math.round((total * config.depositPercent) / 100);
     const balanceAmount = total - depositAmount;
 
-    const MANUAL_ASSIGN_WINDOW_MS = 5 * 60 * 1000;
+    const MANUAL_ASSIGN_WINDOW_MS = 30 * 60 * 1000;
     const batchId = crypto.randomUUID();
     const offer = await this.prisma.dispatchOffer.create({
       data: {
@@ -140,35 +141,19 @@ export class RescueRequestAdminService {
 
     void this.twilioService.sendWhatsAppMessage(
       customerPhone,
-      `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *5 minutes*:\n\n👉 ${paymentResponse.data.authorization_url}\n\nReply CANCEL to cancel (no charge).`,
+      `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *30 minutes*:\n\n👉 ${paymentResponse.data.authorization_url}\n\nReply CANCEL to cancel (no charge).`,
     );
     void this.twilioService.sendWhatsAppMessage(
       operatorPhone,
       `🚗 You've been assigned a job (₦${(dto.priceKobo / 100).toLocaleString()}). Waiting for the customer to confirm payment.`,
     );
 
-    setTimeout(async () => {
-      const fresh = await this.prisma.rescueRequest.findUnique({ where: { id }, select: { status: true } });
-      if (fresh?.status !== RescueRequestStatus.WAITING_FOR_DEPOSIT) return;
-
-      await this.prisma.dispatchOffer.update({
-        where: { id: offer.id },
-        data:  { status: 'TIMED_OUT', respondedAt: new Date() },
-      });
-      await this.prisma.rescueRequest.update({
-        where: { id },
-        data:  { assignedOperatorId: null, status: RescueRequestStatus.DISPATCHING },
-      });
-      void this.twilioService.sendWhatsAppMessage(
-        customerPhone,
-        `⏰ Payment window expired. We're still looking for an operator for you.`,
-      );
-      void this.twilioService.sendWhatsAppMessage(
-        operatorPhone,
-        `⏰ ${formatJobRef(id)} is no longer available — the customer did not pay within 5 minutes.`,
-      );
-      void this.dispatchService.startDispatch(id, request.customerId);
-    }, MANUAL_ASSIGN_WINDOW_MS);
+    this.sharedService.scheduleDepositWindow({
+      rescueRequestId: id,
+      customerPhone,
+      operatorPhone,
+      paymentUrl: paymentResponse.data.authorization_url,
+    });
 
     return { data: this.mapToDetailDto(updated) };
   }
