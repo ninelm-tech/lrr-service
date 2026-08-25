@@ -175,17 +175,244 @@ describe('DispatchService', () => {
     });
   });
 
+  describe('processQuoteOrDecline — phase 2 (quote collection)', () => {
+    let service: DispatchService;
+    let prisma: any;
+    let twilioService: { sendWhatsAppMessage: jest.Mock; sendWhatsAppTemplateMessage: jest.Mock };
+    /** Stand-in for the persisted RescueRequest row, mutated by updateMany. */
+    let row: { id: string; status: string; customerId: string; quoteCollectionDeadline: Date | null };
+    const originalCountdownSid = process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID;
+
+    const offer = { id: 'offer-1', rescueRequestId: 'req-1', expiresAt: new Date(Date.now() + 600000), batchId: 'batch-1' };
+
+    afterEach(() => {
+      clearAllBatchTimers(service);
+      const closeTimers = (service as any).closeTimers as Map<string, NodeJS.Timeout>;
+      closeTimers.forEach((t) => clearTimeout(t));
+      closeTimers.clear();
+      if (originalCountdownSid === undefined) delete process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID;
+      else process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID = originalCountdownSid;
+    });
+
+    beforeEach(async () => {
+      delete process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID;
+      row = { id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1', quoteCollectionDeadline: null };
+
+      prisma = {
+        rescueRequest: {
+          findUnique: jest.fn(async () => ({ ...row })),
+          // Models the atomic once-only set: the `quoteCollectionDeadline: null`
+          // condition is what stops a second quote moving the deadline.
+          updateMany: jest.fn(async ({ where, data }: any) => {
+            if (where.quoteCollectionDeadline === null && row.quoteCollectionDeadline !== null) {
+              return { count: 0 };
+            }
+            row.quoteCollectionDeadline = data.quoteCollectionDeadline;
+            return { count: 1 };
+          }),
+        },
+        dispatchOffer: {
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+          findMany: jest.fn().mockResolvedValue([]),
+          count: jest.fn().mockResolvedValue(1), // a straggler is still pending by default
+        },
+      };
+      twilioService = { sendWhatsAppMessage: jest.fn(), sendWhatsAppTemplateMessage: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          DispatchService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: OperatorService, useValue: {} },
+          { provide: PlatformConfigService, useValue: { getConfig: jest.fn().mockResolvedValue({ quoteCollectionMinutes: 5 }) } },
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<DispatchService>(DispatchService);
+    });
+
+    it('the first quote sets quoteCollectionDeadline and shortens every pending offer expiring later than it', async () => {
+      jest.useFakeTimers();
+      try {
+        const result = await service.processQuoteOrDecline(offer, 2_500_000);
+
+        expect(result.quoted).toBe(true);
+        expect(row.quoteCollectionDeadline).toEqual(new Date(Date.now() + 5 * 60 * 1000));
+        expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith({
+          where: { id: 'req-1', quoteCollectionDeadline: null },
+          data: { quoteCollectionDeadline: row.quoteCollectionDeadline },
+        });
+        expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith({
+          where: { rescueRequestId: 'req-1', status: 'PENDING', expiresAt: { gt: row.quoteCollectionDeadline } },
+          data: { expiresAt: row.quoteCollectionDeadline },
+        });
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('a second quote does not move the deadline — nothing is rewritten, no new close timer', async () => {
+      jest.useFakeTimers();
+      try {
+        await service.processQuoteOrDecline(offer, 2_500_000);
+        const deadlineAfterFirst = row.quoteCollectionDeadline!;
+        prisma.dispatchOffer.updateMany.mockClear();
+        prisma.dispatchOffer.findMany.mockClear();
+
+        jest.advanceTimersByTime(60 * 1000); // a minute later — a later deadline would be visibly different
+        const second = await service.processQuoteOrDecline(
+          { ...offer, id: 'offer-2', batchId: 'batch-1' }, 2_600_000,
+        );
+
+        expect(second.quoted).toBe(true);
+        // THE invariant.
+        expect(row.quoteCollectionDeadline).toBe(deadlineAfterFirst);
+        // Only the atomic claim on the offer itself — no expiresAt rewrite,
+        // no second countdown notice.
+        expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledTimes(1);
+        expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({ where: expect.objectContaining({ id: 'offer-2' }) }),
+        );
+        expect(prisma.dispatchOffer.findMany).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('rejects an offer that is still PENDING but already past its expiresAt (the sweep-gap case)', async () => {
+      prisma.dispatchOffer.updateMany.mockResolvedValue({ count: 0 });
+
+      const result = await service.processQuoteOrDecline(offer, 2_500_000);
+
+      expect(result).toEqual({ quoted: false, message: 'Sorry, that offer has expired.' });
+      // No phase-2 transition, no shortlist logic — a late quote must not be
+      // what starts quote collection.
+      expect(prisma.rescueRequest.updateMany).not.toHaveBeenCalled();
+      expect(row.quoteCollectionDeadline).toBeNull();
+    });
+
+    it('marks a quote arriving after bidding closed as NOT_SELECTED and says so', async () => {
+      row.quoteCollectionDeadline = new Date(Date.now() - 1000); // deadline already passed
+      const deadlineBefore = row.quoteCollectionDeadline;
+
+      const result = await service.processQuoteOrDecline(offer, 2_500_000);
+
+      expect(result.quoted).toBe(false);
+      expect(result.message).toContain('Bidding has already closed');
+      expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith({
+        where: { id: 'offer-1', status: 'PENDING' },
+        data: { status: 'NOT_SELECTED', quotedPrice: 2_500_000, respondedAt: expect.any(Date) },
+      });
+      expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledTimes(1); // never claimed as QUOTED
+      expect(row.quoteCollectionDeadline).toBe(deadlineBefore);
+    });
+
+    it('closes bidding EARLY when nothing is left pending — at t=40s, not at the 5-minute deadline', async () => {
+      // The regression an earlier draft of the spec introduced. The deadline
+      // is a ceiling on stragglers, never a floor on how fast the motorist
+      // can be shown a shortlist.
+      jest.useFakeTimers();
+      try {
+        const closeSpy = jest.spyOn(service as any, 'sendQuoteShortlist').mockResolvedValue(undefined);
+
+        await service.processQuoteOrDecline(offer, 2_500_000); // t=0, deadline = t+5min
+        expect(closeSpy).not.toHaveBeenCalled(); // one straggler still pending
+
+        jest.advanceTimersByTime(40 * 1000);
+        prisma.dispatchOffer.count.mockResolvedValue(0); // last outstanding offer just answered
+        await service.processQuoteOrDecline({ ...offer, id: 'offer-3' }, 2_400_000);
+
+        // t=40s: shortlist already out, without advancing to the deadline.
+        expect(closeSpy).toHaveBeenCalledWith('req-1', 'cust-1');
+        expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith({
+          where: { rescueRequestId: 'req-1', status: 'PENDING' },
+          data: { status: 'TIMED_OUT', respondedAt: expect.any(Date) },
+        });
+        // ...and the close timer was cancelled rather than left to fire a
+        // second shortlist at the deadline.
+        expect((service as any).closeTimers.size).toBe(0);
+        closeSpy.mockClear();
+        jest.advanceTimersByTime(10 * 60 * 1000);
+        await Promise.resolve();
+        expect(closeSpy).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('sends the countdown notice via the Content Template when the SID is set, freeform when it is not', async () => {
+      jest.useFakeTimers();
+      try {
+        prisma.dispatchOffer.findMany.mockResolvedValue([
+          { operatorId: 'op-2', operator: { phoneNumber: '+2349022222222' } },
+        ]);
+
+        process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID = 'HXcountdown1';
+        await service.processQuoteOrDecline(offer, 2_500_000);
+
+        expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+          expect.stringContaining('+2349022222222'),
+          'HXcountdown1',
+          { '1': expect.any(String), '2': '5 minutes' },
+        );
+        expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+
+        const vars = twilioService.sendWhatsAppTemplateMessage.mock.calls[0][2];
+        for (const value of Object.values(vars) as string[]) {
+          expect(value).not.toMatch(/[\r\n\t]/);
+          expect(value).not.toMatch(/ {4,}/);
+          expect(value.length).toBeGreaterThan(0);
+        }
+
+        // Now the unset case, on a fresh request.
+        delete process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID;
+        row.quoteCollectionDeadline = null;
+        twilioService.sendWhatsAppTemplateMessage.mockClear();
+        await service.processQuoteOrDecline({ ...offer, id: 'offer-4' }, 2_500_000);
+
+        expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+          expect.stringContaining('+2349022222222'),
+          expect.stringContaining('Countdown started'),
+        );
+        expect(twilioService.sendWhatsAppTemplateMessage).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('a decline in phase 2 is claimed atomically and does not touch the deadline', async () => {
+      jest.useFakeTimers();
+      try {
+        await service.processQuoteOrDecline(offer, 2_500_000);
+        const deadline = row.quoteCollectionDeadline!;
+        prisma.rescueRequest.updateMany.mockClear();
+
+        const result = await service.processQuoteOrDecline({ ...offer, id: 'offer-5' }, undefined);
+
+        expect(result.quoted).toBe(false);
+        expect(result.message).toContain('declined');
+        expect(prisma.rescueRequest.updateMany).not.toHaveBeenCalled();
+        expect(row.quoteCollectionDeadline).toBe(deadline);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+  });
+
   describe('expandRadiusNow', () => {
     let radiusService: DispatchService;
     let prisma: {
-      rescueRequest: { findUnique: jest.Mock };
+      rescueRequest: { findUnique: jest.Mock; updateMany: jest.Mock };
       dispatchOffer: { updateMany: jest.Mock };
     };
     let sessionStore: { getOrCreate: jest.Mock };
 
     beforeEach(async () => {
       prisma = {
-        rescueRequest: { findUnique: jest.fn() },
+        rescueRequest: { findUnique: jest.fn(), updateMany: jest.fn() },
         dispatchOffer: { updateMany: jest.fn() },
       };
       sessionStore = { getOrCreate: jest.fn() };
@@ -209,6 +436,34 @@ describe('DispatchService', () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({ id: 'req-1', status: 'OPERATOR_ASSIGNED' });
 
       await expect(radiusService.expandRadiusNow('req-1')).rejects.toThrow('not currently DISPATCHING');
+    });
+
+    it('refuses once bidding has closed, even though the request is still DISPATCHING', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+        quoteCollectionDeadline: new Date(Date.now() - 1),
+      });
+      const startDispatchSpy = jest.spyOn(radiusService as any, 'startDispatch').mockResolvedValue(undefined);
+
+      await expect(radiusService.expandRadiusNow('req-1')).rejects.toThrow('Bidding has closed');
+      expect(startDispatchSpy).not.toHaveBeenCalled();
+    });
+
+    it('still works while bidding is open, and does not move the deadline', async () => {
+      const deadline = new Date(Date.now() + 3 * 60 * 1000);
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+        quoteCollectionDeadline: deadline,
+      });
+      sessionStore.getOrCreate.mockResolvedValue({ dispatchRound: 1 });
+      const startDispatchSpy = jest.spyOn(radiusService as any, 'startDispatch').mockResolvedValue(undefined);
+
+      await radiusService.expandRadiusNow('req-1');
+
+      expect(startDispatchSpy).toHaveBeenCalledWith('req-1', 'cust-1', 4);
+      // The invariant: an admin adding operators never pushes the motorist's
+      // deadline out. Nothing wrote to the request at all.
+      expect(prisma.rescueRequest.updateMany).not.toHaveBeenCalled();
     });
 
     it('starts a new round with an expanded radius', async () => {
@@ -308,6 +563,81 @@ describe('DispatchService', () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({ id: 'req-1', status: 'OPERATOR_ASSIGNED' });
 
       await expect(manualService.manualOfferToOperator('req-1', 'op-1')).rejects.toThrow('not currently DISPATCHING');
+    });
+
+    it('refuses once bidding has closed, even though the request is still DISPATCHING', async () => {
+      // RescueRequest.status stays DISPATCHING after the shortlist goes out —
+      // only the WhatsApp session moves on — so the deadline is what has to be
+      // checked here.
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+        vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+        quoteCollectionDeadline: new Date(Date.now() - 1000),
+      });
+
+      await expect(manualService.manualOfferToOperator('req-1', 'op-1')).rejects.toThrow('Bidding has closed');
+      expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();
+    });
+
+    it('clamps a phase-2 offer to the deadline and tells the operator the TRUE remaining time', async () => {
+      jest.useFakeTimers();
+      try {
+        const deadline = new Date(Date.now() + 90 * 1000); // 90s left, not the 5-minute window
+        prisma.rescueRequest.findUnique.mockResolvedValue({
+          id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+          vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+          quoteCollectionDeadline: deadline,
+        });
+        prisma.operator.findUnique.mockResolvedValue({
+          id: 'op-1', status: 'ACTIVE', businessName: 'Swift Towing', phoneNumber: '+2349012345678',
+        });
+        prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
+
+        await manualService.manualOfferToOperator('req-1', 'op-1');
+
+        const created = prisma.dispatchOffer.create.mock.calls[0][0].data;
+        expect(created.expiresAt.getTime()).toBe(deadline.getTime());
+        expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.stringContaining('You have 90 seconds to respond'),
+        );
+        // The offer was clamped TO the deadline — it never moved it.
+        expect(deadline.getTime()).toBe(Date.now() + 90 * 1000);
+
+        clearAllBatchTimers(manualService);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('clamps even when the deadline is set AFTER the request was first read (the expand-vs-first-quote race)', async () => {
+      jest.useFakeTimers();
+      try {
+        const deadline = new Date(Date.now() + 60 * 1000);
+        // First read (the status guard) sees phase 1; by the time the offer is
+        // written a quote has landed and phase 2 has begun.
+        prisma.rescueRequest.findUnique
+          .mockResolvedValueOnce({
+            id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+            vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+            quoteCollectionDeadline: null,
+          })
+          .mockResolvedValue({ quoteCollectionDeadline: deadline });
+        prisma.operator.findUnique.mockResolvedValue({
+          id: 'op-1', status: 'ACTIVE', businessName: 'Swift Towing', phoneNumber: '+2349012345678',
+        });
+        prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
+
+        await manualService.manualOfferToOperator('req-1', 'op-1');
+
+        const created = prisma.dispatchOffer.create.mock.calls[0][0].data;
+        expect(created.expiresAt.getTime()).toBe(deadline.getTime());
+        expect(created.expiresAt.getTime()).toBeLessThan(Date.now() + 5 * 60 * 1000);
+
+        clearAllBatchTimers(manualService);
+      } finally {
+        jest.useRealTimers();
+      }
     });
 
     it('rejects a missing or inactive operator', async () => {

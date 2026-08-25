@@ -32,6 +32,7 @@ describe('PlatformConfigService', () => {
         depositPercent: { toNumber: () => 10 },
         dispatchWindowMinutes: 10,
         dispatchBatchSize: 3,
+        quoteCollectionMinutes: 5,
         disputeAlertPhoneNumber: null,
       });
 
@@ -42,8 +43,23 @@ describe('PlatformConfigService', () => {
         depositPercent: 10,
         dispatchWindowMinutes: 10,
         dispatchBatchSize: 3,
+        quoteCollectionMinutes: 5,
         disputeAlertPhoneNumber: null,
       });
+    });
+
+    it('exposes quoteCollectionMinutes — the phase-2 window dispatch reads on the first quote', async () => {
+      prisma.platformConfig.findFirst.mockResolvedValue({
+        id: 'default',
+        serviceFeePercent: { toNumber: () => 10 },
+        depositPercent: { toNumber: () => 10 },
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        quoteCollectionMinutes: 7,
+        disputeAlertPhoneNumber: null,
+      });
+
+      expect((await service.getConfig()).quoteCollectionMinutes).toBe(7);
     });
 
     it('includes disputeAlertPhoneNumber, null when unset', async () => {
@@ -79,6 +95,32 @@ describe('PlatformConfigService', () => {
     it('rejects a dispatchBatchSize outside 1-20', async () => {
       await expect(service.updateConfig({ dispatchBatchSize: 0 })).rejects.toThrow(BadRequestException);
       await expect(service.updateConfig({ dispatchBatchSize: 21 })).rejects.toThrow(BadRequestException);
+    });
+
+    it('rejects a quoteCollectionMinutes outside 1-60', async () => {
+      await expect(service.updateConfig({ quoteCollectionMinutes: 0 })).rejects.toThrow(BadRequestException);
+      await expect(service.updateConfig({ quoteCollectionMinutes: 61 })).rejects.toThrow(BadRequestException);
+    });
+
+    it('persists a new quoteCollectionMinutes', async () => {
+      prisma.platformConfig.findFirst.mockResolvedValue({ id: 'default' });
+      prisma.platformConfig.update.mockResolvedValue({
+        id: 'default',
+        serviceFeePercent: { toNumber: () => 10 },
+        depositPercent: { toNumber: () => 10 },
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        quoteCollectionMinutes: 8,
+        disputeAlertPhoneNumber: null,
+      });
+
+      const result = await service.updateConfig({ quoteCollectionMinutes: 8 });
+
+      expect(prisma.platformConfig.update).toHaveBeenCalledWith({
+        where: { id: 'default' },
+        data: { quoteCollectionMinutes: 8 },
+      });
+      expect(result.quoteCollectionMinutes).toBe(8);
     });
 
     it('updates the singleton row when values are valid', async () => {

@@ -159,15 +159,30 @@ export class DispatchService {
   private readonly retryTimers = new Map<string, NodeJS.Timeout>();
 
   /**
-   * In-memory map from rescueRequestId to a short grace-period timer, started
-   * the moment the FIRST quote in a batch arrives. If the rest of the batch
-   * stays silent, we don't make the motorist wait out the full window for a
-   * shortlist that already has a usable quote — resolveBatch fires early with
-   * whatever quotes exist. Guarded by the same batchTimers mutex inside
-   * resolveBatch/supersedeActiveRound.
+   * Phase 2 close timers, one per request, started when the FIRST quote sets
+   * `quoteCollectionDeadline`. Replaces the old `graceTimers`/`QUOTE_GRACE_MS`
+   * pair: that was a batch-scoped grace period that competed with batch
+   * expiry, this is the single request-level ceiling.
+   *
+   * The timer is a CEILING on stragglers, not a mandatory wait —
+   * `maybeResolveBatchEarly` still closes bidding the moment nothing is
+   * pending, and `closeBidding` clears this entry when it does.
    */
-  private readonly graceTimers = new Map<string, NodeJS.Timeout>();
-  private readonly QUOTE_GRACE_MS = 5 * 60 * 1000;
+  private readonly closeTimers = new Map<string, NodeJS.Timeout>();
+
+  /**
+   * Requests whose bidding has already closed (shortlist sent). In-process
+   * only, like every other timer/mutex in this service — durability across
+   * restarts is explicitly out of scope for this spec.
+   *
+   * Needed on top of the `quoteCollectionDeadline` check because bidding can
+   * close EARLY (everyone answered before the deadline). Between an early
+   * close and the deadline the persisted deadline still reads "in future", so
+   * without this a quote on an admin-added offer in that gap would be recorded
+   * as QUOTED and never appear on the shortlist the motorist already has.
+   */
+  private readonly closedRequests = new Set<string>();
+
   private readonly QUOTE_SELECTION_WINDOW_MS = 5 * 60 * 1000;
 
   /**
@@ -181,23 +196,59 @@ export class DispatchService {
     offer: { id: string; rescueRequestId: string; expiresAt: Date; batchId: string },
     quotedPriceKobo: number | undefined,
   ): Promise<{ quoted: boolean; message: string }> {
-    if (quotedPriceKobo === undefined) {
-      await this.prisma.dispatchOffer.update({
-        where: { id: offer.id },
-        data: { status: 'DECLINED', respondedAt: new Date() },
+    const isDecline = quotedPriceKobo === undefined;
+
+    // Bidding already closed: the shortlist is with the motorist, so this
+    // price can never be ranked into it. Record it as NOT_SELECTED (never
+    // QUOTED — that would silently add it to a list already shown) and tell
+    // the operator what actually happened rather than "quote submitted".
+    // Checked BEFORE the atomic claim below, because after a deadline close
+    // the offer's expiresAt has also passed and the claim would otherwise
+    // return the generic "expired" message.
+    if (!isDecline && (await this.isBiddingClosed(offer.rescueRequestId))) {
+      await this.prisma.dispatchOffer.updateMany({
+        where: { id: offer.id, status: 'PENDING' },
+        data: { status: 'NOT_SELECTED', quotedPrice: quotedPriceKobo, respondedAt: new Date() },
       });
+      logger.info('dispatch: quote arrived after bidding closed', {
+        rescueRequestId: offer.rescueRequestId, offerId: offer.id, quotedPriceKobo,
+      });
+      return {
+        quoted: false,
+        message: `⌛ Bidding has already closed for ${formatJobRef(offer.rescueRequestId)} — the customer is choosing from the quotes received. Thanks for responding; watch for new offers!`,
+      };
+    }
+
+    // Atomic claim. Status-check-then-update left a real gap between an
+    // offer's expiresAt passing and something marking it TIMED_OUT (batch
+    // timer, phase-2 close, or the sweeper), and a quote accepted inside that
+    // gap is exactly what starts phase 2 or reorders a shortlist. The
+    // conditional write is where the guarantee has to live, because both the
+    // WhatsApp and dashboard channels funnel through here.
+    const claimed = await this.prisma.dispatchOffer.updateMany({
+      where: { id: offer.id, status: 'PENDING', expiresAt: { gt: new Date() } },
+      data: {
+        status: isDecline ? 'DECLINED' : 'QUOTED',
+        quotedPrice: quotedPriceKobo,
+        respondedAt: new Date(),
+      },
+    });
+    if (claimed.count === 0) {
+      return { quoted: false, message: `Sorry, that offer has expired.` };
+    }
+
+    if (isDecline) {
       logger.info('dispatch: offer declined', { rescueRequestId: offer.rescueRequestId, offerId: offer.id });
       await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.batchId);
       return { quoted: false, message: `Understood — ${formatJobRef(offer.rescueRequestId)} declined. We'll offer this job to another operator.` };
     }
 
-    await this.prisma.dispatchOffer.update({
-      where: { id: offer.id },
-      data: { status: 'QUOTED', quotedPrice: quotedPriceKobo, respondedAt: new Date() },
-    });
     logger.info('dispatch: offer quoted', { rescueRequestId: offer.rescueRequestId, offerId: offer.id, quotedPriceKobo });
+    // Order matters: phase 2 must have started (deadline persisted) before
+    // maybeResolveBatchEarly runs, or the early check would still be
+    // batch-scoped and could resolve one batch while others are pending.
+    await this.beginQuoteCollectionIfFirst(offer.rescueRequestId);
     await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.batchId);
-    this.scheduleGraceResolve(offer.rescueRequestId, offer.batchId);
 
     return {
       quoted: true,
@@ -205,60 +256,219 @@ export class DispatchService {
     };
   }
 
-  /**
-   * Starts (once per batch) the QUOTE_GRACE_MS countdown after a batch's
-   * first quote arrives. If nothing else has resolved the batch by then,
-   * forces resolution with whatever quotes exist rather than making the
-   * motorist wait out the rest of the full window for silent operators.
-   */
-  private scheduleGraceResolve(rescueRequestId: string, batchId: string) {
-    if (this.graceTimers.has(rescueRequestId)) return; // already scheduled for this batch
-
-    void this.notifyPendingOperatorsOfCountdown(rescueRequestId, batchId);
-
-    const timer = setTimeout(async () => {
-      this.graceTimers.delete(rescueRequestId);
-      const batchOffers = await this.prisma.dispatchOffer.findMany({
-        where: { rescueRequestId, batchId },
-        select: { operatorId: true },
-      });
-      const rescueRequest = await this.prisma.rescueRequest.findUnique({
-        where: { id: rescueRequestId },
-        select: { customerId: true },
-      });
-      if (!rescueRequest) return;
-
-      // extraRadiusKm is 0 here for the same reason maybeResolveBatchEarly uses
-      // 0 — a grace-forced resolve already has at least one quote, so it never
-      // needs a radius expansion to find candidates.
-      void this.resolveBatch(rescueRequestId, batchOffers.map((o) => o.operatorId), rescueRequest.customerId, 0, batchId);
-    }, this.QUOTE_GRACE_MS);
-
-    this.graceTimers.set(rescueRequestId, timer);
+  /** True once the shortlist has gone out, or once the deadline has passed. */
+  private async isBiddingClosed(rescueRequestId: string): Promise<boolean> {
+    if (this.closedRequests.has(rescueRequestId)) return true;
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      select: { quoteCollectionDeadline: true },
+    });
+    const deadline = rescueRequest?.quoteCollectionDeadline;
+    return !!deadline && Date.now() >= deadline.getTime();
   }
 
   /**
-   * Tells the rest of the batch a countdown has started, so a silent
-   * operator knows why the job might close sooner than the original
-   * response-window estimate — without this they'd have no signal that
-   * someone else already bid.
+   * Phase 1 → phase 2. Called on every accepted quote; only the FIRST one
+   * does anything.
+   *
+   * The set is an atomic `updateMany` conditioned on
+   * `quoteCollectionDeadline: null`, deliberately NOT read-then-write: two
+   * operators quoting simultaneously would each compute their own deadline
+   * and the later write would win, silently pushing the stranded motorist's
+   * wait further out. That is the one invariant this whole phase exists to
+   * protect — once set, nothing (a second quote, an admin Expand, a new
+   * batch) may ever move this deadline later.
    */
-  private async notifyPendingOperatorsOfCountdown(rescueRequestId: string, batchId: string) {
+  private async beginQuoteCollectionIfFirst(rescueRequestId: string): Promise<void> {
+    const config = await this.platformConfigService.getConfig();
+    const quoteCollectionMs = config.quoteCollectionMinutes * 60 * 1000;
+    const deadline = new Date(Date.now() + quoteCollectionMs);
+
+    const started = await this.prisma.rescueRequest.updateMany({
+      where: { id: rescueRequestId, quoteCollectionDeadline: null },
+      data: { quoteCollectionDeadline: deadline },
+    });
+    if (started.count === 0) return; // phase 2 already running — leave it alone
+
+    logger.info('dispatch: quote collection started', { rescueRequestId, deadline });
+
+    // Every still-pending offer now ends at the deadline instead of its own
+    // batch window. Rewriting expiresAt (rather than deriving a min() at each
+    // read) keeps expiresAt the single authority — the operator flow lookup,
+    // listMyPendingOffers and the sweeper all consult it and would each need
+    // the clamp otherwise. `gt: deadline` so a shorter window is never
+    // lengthened.
+    await this.prisma.dispatchOffer.updateMany({
+      where: { rescueRequestId, status: 'PENDING', expiresAt: { gt: deadline } },
+      data: { expiresAt: deadline },
+    });
+
+    await this.notifyPendingOperatorsOfCountdown(rescueRequestId, deadline);
+
+    const timer = setTimeout(() => {
+      this.closeTimers.delete(rescueRequestId);
+      void this.closeBidding(rescueRequestId);
+    }, quoteCollectionMs);
+    this.closeTimers.set(rescueRequestId, timer);
+  }
+
+  /**
+   * Tells everyone still pending on the request that the countdown has
+   * started, so a silent operator knows why the job may close sooner than
+   * the response window they were originally quoted.
+   *
+   * Request-scoped, not batch-scoped: phase 2 shortened EVERY pending offer,
+   * including ones from other batches, so every one of those operators needs
+   * telling.
+   *
+   * Sent via a Content Template when TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID is
+   * configured — same env-gated fallback as sendDispatchOfferMessage. This is
+   * not optional politeness in production: the recipients are by definition
+   * the operators who have NOT replied, i.e. exactly the ones least likely to
+   * have an open 24-hour session, so a freeform body hits Twilio 63016 for
+   * precisely its intended audience.
+   */
+  private async notifyPendingOperatorsOfCountdown(rescueRequestId: string, deadline: Date) {
     const stillPending = await this.prisma.dispatchOffer.findMany({
-      where: { rescueRequestId, batchId, status: 'PENDING' },
+      where: { rescueRequestId, status: 'PENDING' },
       include: { operator: true },
     });
     if (stillPending.length === 0) return;
 
-    const graceMinutes = Math.round(this.QUOTE_GRACE_MS / 60000);
-    await Promise.all(
-      stillPending.map((offer) =>
-        this.twilioService.sendWhatsAppMessage(
-          toWhatsAppAddress(offer.operator.phoneNumber),
-          `⏱ *Countdown started* — ${formatJobRef(rescueRequestId)}\n\nAnother operator just placed a bid. You have *${graceMinutes} minute${graceMinutes === 1 ? '' : 's'}* left to submit your price if you still want this job.`,
-        ),
-      ),
+    const remaining = this.formatRemaining(deadline);
+    const templateSid = process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID;
+    const jobRef = formatJobRef(rescueRequestId).replace('Job #', '');
+
+    // One send failing (no open session, bad number) must not stop the rest
+    // of the pending operators being told — same reason startDispatch uses
+    // allSettled for the batch offer.
+    const results = await Promise.allSettled(
+      stillPending.map((offer) => {
+        const to = toWhatsAppAddress(offer.operator.phoneNumber);
+        if (templateSid) {
+          // Two declared variables. Values are sanitized and given non-empty
+          // fallbacks for the same reason the dispatch-offer template does:
+          // an empty value, a newline, a tab or 4+ consecutive spaces inside
+          // a variable fails the entire send with Twilio 21656. The template
+          // body must wrap both — it may never start or end with a variable.
+          const variables: Record<string, string> = {
+            '1': sanitizeTemplateVariable(jobRef) || '—',
+            '2': sanitizeTemplateVariable(remaining) || '—',
+          };
+          return this.twilioService.sendWhatsAppTemplateMessage(to, templateSid, variables);
+        }
+        return this.twilioService.sendWhatsAppMessage(
+          to,
+          `⏱ *Countdown started* — ${formatJobRef(rescueRequestId)}\n\nAnother operator just placed a bid. You have *${remaining}* left to submit your price if you still want this job.`,
+        );
+      }),
     );
+    results.forEach((result, i) => {
+      if (result.status === 'rejected') {
+        console.error(`Failed to send countdown notice to operator ${stillPending[i].operatorId}:`, result.reason);
+        Sentry.captureException(result.reason, {
+          extra: { rescueRequestId, operatorId: stillPending[i].operatorId },
+        });
+      }
+    });
+  }
+
+  /**
+   * Human-readable time left until `until`. Used both for the countdown
+   * notice and for the "You have N to respond" line on an offer — an offer
+   * created late in phase 2 has ninety seconds, and its message must say so
+   * rather than repeating the configured window.
+   */
+  private formatRemaining(until: Date): string {
+    const ms = Math.max(0, until.getTime() - Date.now());
+    // Minutes only from two minutes up. Below that, rounding to minutes is
+    // exactly the lie this method exists to prevent: 90 seconds would render
+    // as "2 minutes" and invite an operator to answer after the deadline.
+    if (ms >= 120_000) {
+      const minutes = Math.round(ms / 60_000);
+      return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+    }
+    const seconds = Math.max(1, Math.round(ms / 1000));
+    return `${seconds} second${seconds === 1 ? '' : 's'}`;
+  }
+
+  /**
+   * An offer's expiry, never later than the request's quote-collection
+   * deadline.
+   *
+   * The deadline is re-read HERE, immediately before the write, and never
+   * taken from a value the caller read earlier: finding candidates takes real
+   * time, and a first quote can land — starting phase 2 — in that gap. An
+   * offer created after that point with a full window would escape the
+   * expiresAt rewrite entirely and outlive the deadline it should have been
+   * clamped to.
+   */
+  private async offerExpiryClampedToDeadline(rescueRequestId: string, windowMs: number): Promise<Date> {
+    const fresh = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      select: { quoteCollectionDeadline: true },
+    });
+    const deadline = fresh?.quoteCollectionDeadline ?? null;
+    const now = Date.now();
+    return deadline
+      ? new Date(Math.min(now + windowMs, deadline.getTime()))
+      : new Date(now + windowMs);
+  }
+
+  /**
+   * Bidding is over: no further quote can join the shortlist. Marks whatever
+   * is still PENDING as TIMED_OUT, then sends the ranked shortlist.
+   *
+   * The single place both close triggers funnel through — the
+   * quoteCollectionDeadline timer, and maybeResolveBatchEarly when nothing is
+   * left pending. Idempotent: whichever gets here first wins and the other
+   * returns immediately.
+   *
+   * This is the one request-wide PENDING → TIMED_OUT sweep the design allows
+   * (see the supersedeActiveRound note below). It is legitimate precisely
+   * because bidding has ended for everyone at once; it is NOT a licence to
+   * add other request-scoped sweeps.
+   */
+  private async closeBidding(rescueRequestId: string): Promise<void> {
+    const closeTimer = this.closeTimers.get(rescueRequestId);
+    if (closeTimer) {
+      clearTimeout(closeTimer);
+      this.closeTimers.delete(rescueRequestId);
+    }
+    if (this.closedRequests.has(rescueRequestId)) return;
+
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      select: { status: true, customerId: true },
+    });
+    if (
+      !rescueRequest ||
+      rescueRequest.status === RescueRequestStatus.OPERATOR_ASSIGNED ||
+      rescueRequest.status === RescueRequestStatus.WAITING_FOR_DEPOSIT ||
+      rescueRequest.status === RescueRequestStatus.COMPLETED ||
+      rescueRequest.status === RescueRequestStatus.CANCELLED
+    ) return;
+
+    this.closedRequests.add(rescueRequestId);
+
+    // Any batch timer still outstanding for this request belongs to a batch
+    // whose offers have just been closed. Left alone it would later fire
+    // resolveBatch, find QUOTED offers and send the motorist a SECOND
+    // shortlist. Drain them here.
+    for (const [key, timer] of this.batchTimers) {
+      if (key.startsWith(`${rescueRequestId}:`)) {
+        clearTimeout(timer);
+        this.batchTimers.delete(key);
+      }
+    }
+
+    await this.prisma.dispatchOffer.updateMany({
+      where: { rescueRequestId, status: 'PENDING' },
+      data: { status: 'TIMED_OUT', respondedAt: new Date() },
+    });
+
+    logger.info('dispatch: bidding closed', { rescueRequestId });
+    await this.sendQuoteShortlist(rescueRequestId, rescueRequest.customerId);
   }
 
   // ══════════════════════════════════════════════════════
@@ -425,8 +635,10 @@ export class DispatchService {
       offered: batch.map((op) => ({ operatorId: op.id, businessName: op.businessName, distanceKm: Number(op.distance.toFixed(1)) })),
     });
 
-    const windowSeconds = config.dispatchWindowMinutes * 60;
-    const expiresAt = new Date(Date.now() + windowSeconds * 1000);
+    // Clamped against a deadline read right now — a first quote may have
+    // landed while findAndRankCandidates was running.
+    const windowMs = config.dispatchWindowMinutes * 60 * 1000;
+    const expiresAt = await this.offerExpiryClampedToDeadline(rescueRequestId, windowMs);
     const batchId = crypto.randomUUID();
 
     // Create all offers in one batch insert
@@ -478,7 +690,10 @@ export class DispatchService {
           location: locationSection,
           mediaSection,
           etaLine: `Est. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.\n`,
-          window: `${config.dispatchWindowMinutes} minute${config.dispatchWindowMinutes === 1 ? '' : 's'}`,
+          // From the offer's ACTUAL expiry, not the configured window: an
+          // offer created inside phase 2 may only have ninety seconds, and
+          // the message must not claim otherwise.
+          window: this.formatRemaining(expiresAt),
         }),
       ),
     );
@@ -491,10 +706,12 @@ export class DispatchService {
     });
 
     // Single timeout covers the entire batch — stored so an early-resolved
-    // batch (Step below) can prevent this from firing a second time.
+    // batch (Step below) can prevent this from firing a second time. Fires
+    // when the offers actually expire, which is earlier than the full window
+    // if they were clamped to the quote-collection deadline.
     const timer = setTimeout(
       () => void this.resolveBatch(rescueRequestId, batchOperatorIds, customerId, extraRadiusKm, batchId),
-      windowSeconds * 1000,
+      Math.max(0, expiresAt.getTime() - Date.now()),
     );
     this.batchTimers.set(this.batchKey(rescueRequestId, batchId), timer);
   }
@@ -515,12 +732,9 @@ export class DispatchService {
     clearTimeout(timer);
     this.batchTimers.delete(key);
 
-    // This batch is resolving now — no need for a pending grace timer to fire later.
-    const graceTimer = this.graceTimers.get(rescueRequestId);
-    if (graceTimer) {
-      clearTimeout(graceTimer);
-      this.graceTimers.delete(rescueRequestId);
-    }
+    // Bidding already closed for the whole request — the shortlist has gone
+    // out. Resolving a batch now would send the motorist a second one.
+    if (this.closedRequests.has(rescueRequestId)) return;
 
     // Race condition guard — skip if the request moved on for any other reason
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
@@ -560,23 +774,42 @@ export class DispatchService {
   }
 
   /**
-   * Called after each operator quote/decline. If every operator in the
-   * current batch has now responded, resolves the batch immediately instead
-   * of waiting out the rest of the window.
+   * Called after each operator quote/decline.
+   *
+   * Phase 1 (no deadline yet): if every operator in THIS batch has responded,
+   * resolve the batch now instead of waiting out the rest of its window.
+   *
+   * Phase 2 (deadline set): scope widens to the whole request — batches no
+   * longer have independent lives, they all end at the one deadline — and
+   * bidding closes as soon as nothing anywhere on the request is pending.
+   *
+   * That early close is load bearing. The deadline is a CEILING on operators
+   * who never answer, never a mandatory wait: three operators answering in
+   * the first 40 seconds of a 5-minute collection window must get the
+   * motorist a shortlist at 40 seconds, not at 5 minutes.
    */
   private async maybeResolveBatchEarly(rescueRequestId: string, batchId: string) {
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      select: { customerId: true, quoteCollectionDeadline: true },
+    });
+    if (!rescueRequest) return;
+
+    if (rescueRequest.quoteCollectionDeadline) {
+      const pendingAnywhere = await this.prisma.dispatchOffer.count({
+        where: { rescueRequestId, status: 'PENDING' },
+      });
+      if (pendingAnywhere > 0) return; // stragglers — let the deadline handle them
+      await this.closeBidding(rescueRequestId);
+      return;
+    }
+
     const batchOffers = await this.prisma.dispatchOffer.findMany({
       where: { rescueRequestId, batchId },
       select: { operatorId: true, status: true },
     });
     const stillPending = batchOffers.some((o) => o.status === 'PENDING');
     if (stillPending) return;
-
-    const rescueRequest = await this.prisma.rescueRequest.findUnique({
-      where: { id: rescueRequestId },
-      select: { customerId: true },
-    });
-    if (!rescueRequest) return;
 
     const batchOperatorIds = batchOffers.map((o) => o.operatorId);
     // extraRadiusKm isn't tracked per-batch outside the session; 0 is correct
@@ -611,6 +844,20 @@ export class DispatchService {
    * approximated from the session's dispatchRound — the same
    * approximation the automatic retry path already effectively produces.
    */
+  /**
+   * Admin-path guard. `RescueRequest.status` stays DISPATCHING after the
+   * shortlist is sent — only the WhatsApp session moves to
+   * WAITING_FOR_QUOTE_SELECTION — so the status check alone would happily let
+   * an admin offer a job whose bidding is already over. Checking the deadline
+   * directly is sufficient and avoids inventing a status the model doesn't
+   * otherwise need.
+   */
+  private assertBiddingStillOpen(quoteCollectionDeadline: Date | null | undefined): void {
+    if (quoteCollectionDeadline && Date.now() >= quoteCollectionDeadline.getTime()) {
+      throw new BadRequestException('Bidding has closed for this request');
+    }
+  }
+
   async expandRadiusNow(rescueRequestId: string): Promise<void> {
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
       where: { id: rescueRequestId },
@@ -618,6 +865,7 @@ export class DispatchService {
     if (!rescueRequest || rescueRequest.status !== RescueRequestStatus.DISPATCHING) {
       throw new BadRequestException('Request is not currently DISPATCHING');
     }
+    this.assertBiddingStillOpen(rescueRequest.quoteCollectionDeadline);
 
     // Deliberately does NOT touch existing offers — operators still inside
     // their window keep them. Expanding adds people; it never un-asks anyone.
@@ -642,6 +890,7 @@ export class DispatchService {
     if (!rescueRequest || rescueRequest.status !== RescueRequestStatus.DISPATCHING) {
       throw new BadRequestException('Request is not currently DISPATCHING');
     }
+    this.assertBiddingStillOpen(rescueRequest.quoteCollectionDeadline);
 
     const operator = await this.prisma.operator.findUnique({ where: { id: operatorId } });
     if (!operator || operator.status !== 'ACTIVE') {
@@ -650,8 +899,11 @@ export class DispatchService {
 
     // As with expandRadiusNow: existing offers are left alone. This adds one
     // more operator to the request, it does not replace the current round.
+    // Deadline re-read immediately before the create, not taken from the
+    // rescueRequest read at the top of this method: a first quote can land in
+    // between and this offer must still be clamped.
     const MANUAL_OFFER_WINDOW_MS = 5 * 60 * 1000;
-    const expiresAt = new Date(Date.now() + MANUAL_OFFER_WINDOW_MS);
+    const expiresAt = await this.offerExpiryClampedToDeadline(rescueRequestId, MANUAL_OFFER_WINDOW_MS);
     const batchId = crypto.randomUUID();
 
     await this.prisma.dispatchOffer.create({
@@ -695,7 +947,7 @@ export class DispatchService {
         location: locationSection,
         mediaSection,
         etaLine: '', // not computed for a manual single-operator offer
-        window: '5 minutes',
+        window: this.formatRemaining(expiresAt), // true remaining time, clamped or not
       });
     } catch (error) {
       // Unlike the batch path (allSettled — a failed send must not block
@@ -710,7 +962,7 @@ export class DispatchService {
     const currentRadius = (session.dispatchRound ?? 0) * RADIUS_EXPANSION_KM;
     const timer = setTimeout(
       () => void this.resolveBatch(rescueRequestId, [operatorId], rescueRequest.customerId, currentRadius, batchId),
-      MANUAL_OFFER_WINDOW_MS,
+      Math.max(0, expiresAt.getTime() - Date.now()),
     );
     this.batchTimers.set(this.batchKey(rescueRequestId, batchId), timer);
   }
