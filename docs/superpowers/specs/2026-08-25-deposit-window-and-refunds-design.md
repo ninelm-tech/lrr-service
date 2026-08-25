@@ -123,15 +123,62 @@ const claimed = await this.prisma.rescueRequest.updateMany({
   data:  { depositPaid: true, status: RescueRequestStatus.OPERATOR_ASSIGNED },
 });
 if (claimed.count === 0) {
-  await this.handleLateDeposit(rescueRequest, reference);
+  await this.handleUnclaimedDeposit(rescueRequest.id, reference);
   return;
 }
 // existing flow, unchanged, below
 ```
 
-This closes the gap regardless of *why* the request left `WAITING_FOR_DEPOSIT`
-— the 30-minute timeout, an explicit customer `CANCEL`, or anything else. No
-special-casing per cause; the guard is on the state, not the history.
+**`claimed.count === 0` is ambiguous by itself, and treating it as "always
+late payment" is wrong.** Paystack redelivers webhooks. A perfectly normal,
+already-successful payment looks like this:
+
+1. Webhook #1 arrives: `WAITING_FOR_DEPOSIT` → claim succeeds → `depositPaid:
+   true`, `OPERATOR_ASSIGNED`, operator dispatched.
+2. Paystack redelivers the same webhook (their documented at-least-once
+   behaviour).
+3. Webhook #2 arrives: status is now `OPERATOR_ASSIGNED`, so the claim's
+   `WHERE` no longer matches → `count === 0`.
+
+Naively treating that as `handleLateDeposit` would tell a customer with a
+perfectly valid, already-processed deposit that a refund is coming. The
+`count === 0` branch must distinguish "already handled, this is a redelivery"
+from "actually arrived too late":
+
+```ts
+private async handleUnclaimedDeposit(rescueRequestId: string, reference: string) {
+  const fresh = await this.prisma.rescueRequest.findUniqueOrThrow({ where: { id: rescueRequestId } });
+
+  if (fresh.depositPaid) {
+    // Redelivery of a webhook we already successfully processed. No-op.
+    logger.info('deposit: duplicate confirmation ignored', { rescueRequestId, reference });
+    return;
+  }
+
+  if (fresh.status === RescueRequestStatus.CANCELLED) {
+    // The only state this feature is actually about: money arrived after
+    // the request moved on with nothing paid yet.
+    await this.handleLateDeposit(fresh, reference);
+    return;
+  }
+
+  // Anything else (e.g. some other status, or a state this design didn't
+  // anticipate) is NOT auto-refund-eligible. depositPaid is false and the
+  // request isn't CANCELLED — assigning an operator now would be wrong (the
+  // window already closed or the state is unexpected), but so is silently
+  // marking ELIGIBLE for a case this design didn't reason about. Alert and
+  // stop; a human decides.
+  console.error(`Deposit confirmed for request ${rescueRequestId} in unexpected status ${fresh.status}`, { reference });
+  Sentry.captureMessage('Deposit confirmed in unexpected (non-CANCELLED) status', {
+    level: 'error', extra: { rescueRequestId, reference, status: fresh.status },
+  });
+}
+```
+
+This also protects against a future status being added later and silently
+becoming refund-eligible just because it happens not to be
+`WAITING_FOR_DEPOSIT` — the `CANCELLED` check is exact, not "anything but the
+happy path."
 
 ### 3. The late-payment path
 
@@ -332,10 +379,20 @@ Mocked-Prisma tests in this codebase cannot observe real `NULL`/conditional
 these assert call shape and manually simulate `count: 0`/`count: 1` returns to
 exercise both branches of every conditional write below:
 
-- **Confirmed-payment guard:** claim succeeds (`WAITING_FOR_DEPOSIT`) → normal
-  flow, operator assigned, "on the way" message sent. Claim fails (any other
-  status) → `handleLateDeposit` runs instead; operator is NOT assigned; the
-  "on the way" message is NOT sent.
+- **Confirmed-payment guard, all three outcomes of a failed claim:**
+  - Claim succeeds (`WAITING_FOR_DEPOSIT`) → normal flow, operator assigned,
+    "on the way" message sent.
+  - Claim fails, `depositPaid` already `true` → webhook-redelivery no-op.
+    **This is the third regression that matters most** — an earlier draft
+    routed every failed claim straight to `handleLateDeposit`, which would
+    have told a customer with an already-successful payment that a refund was
+    coming, on every Paystack webhook redelivery of a normal payment.
+  - Claim fails, `depositPaid` still `false`, `status: CANCELLED` →
+    `handleLateDeposit` runs; operator is NOT assigned; the "on the way"
+    message is NOT sent.
+  - Claim fails, `depositPaid` still `false`, status is neither
+    `WAITING_FOR_DEPOSIT` nor `CANCELLED` → neither `handleLateDeposit` nor
+    the normal flow runs; a Sentry error fires; nothing is marked `ELIGIBLE`.
 - **30-minute timeout:** cancels the request (`status: CANCELLED`), does NOT
   call `startDispatch`, does NOT reset to `DISPATCHING`. **This is the
   regression that matters most** — it's the exact bug being removed.
