@@ -1024,4 +1024,81 @@ describe('DispatchService', () => {
       clearAllBatchTimers(batchService);
     });
   });
+
+  describe('resolveBatch — no-quotes continuation (Task 7)', () => {
+    // Task 7: the DISPATCH_RETRY_MINUTES delayed retry is gone. A batch that
+    // resolves with zero quotes must move to the next batch on the SAME
+    // TICK (no setTimeout) — unless phase 2 has already started
+    // (quoteCollectionDeadline set on the request), in which case this
+    // automatic continuation must no-op and leave phase 2's own
+    // closeBidding/deadline timer (Tasks 4-6) to own what happens next.
+    let service: DispatchService;
+    let prisma: {
+      rescueRequest: { findUnique: jest.Mock };
+      dispatchOffer: { updateMany: jest.Mock; findMany: jest.Mock };
+    };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: { findUnique: jest.fn() },
+        dispatchOffer: {
+          updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+          findMany: jest.fn().mockResolvedValue([]), // no QUOTED offers — the no-quotes path
+        },
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          DispatchService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<DispatchService>(DispatchService);
+    });
+
+    function seedBatchTimer(requestId: string, batchId: string) {
+      const key = (service as any).batchKey(requestId, batchId);
+      const timer = setTimeout(() => {}, 1_000_000); // never fires in the test
+      (service as any).batchTimers.set(key, timer);
+      return key;
+    }
+
+    it('phase 1 (no deadline set): calls startDispatch again immediately, with no setTimeout scheduled', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        status: 'DISPATCHING',
+        quoteCollectionDeadline: null,
+      });
+      const startDispatchSpy = jest.spyOn(service, 'startDispatch').mockResolvedValue(undefined);
+      seedBatchTimer('req-1', 'batch-1'); // pre-existing decoy timer, seeded BEFORE the spy below
+
+      const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
+      await (service as any).resolveBatch('req-1', ['op-1'], 'cust-1', 2, 'batch-1');
+
+      expect(startDispatchSpy).toHaveBeenCalledWith('req-1', 'cust-1', 2);
+      // resolveBatch itself must not schedule any new timer for a retry —
+      // the old DISPATCH_RETRY_MINUTES setTimeout is gone; continuation
+      // happens synchronously via the startDispatch call above.
+      expect(setTimeoutSpy).not.toHaveBeenCalled();
+      setTimeoutSpy.mockRestore();
+    });
+
+    it('phase 2 already active (quoteCollectionDeadline set): does NOT call startDispatch again', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        status: 'DISPATCHING',
+        quoteCollectionDeadline: new Date(Date.now() + 5 * 60 * 1000),
+      });
+      const startDispatchSpy = jest.spyOn(service, 'startDispatch').mockResolvedValue(undefined);
+
+      seedBatchTimer('req-1', 'batch-1');
+      await (service as any).resolveBatch('req-1', ['op-1'], 'cust-1', 2, 'batch-1');
+
+      expect(startDispatchSpy).not.toHaveBeenCalled();
+    });
+  });
 });

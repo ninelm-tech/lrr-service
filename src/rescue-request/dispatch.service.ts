@@ -17,7 +17,6 @@ import { DispatchBoardRowDto } from './dto/rescue-request-response.dto';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 
 // ── Dispatch config ────────────────────────────────────────────────────────────
-const DISPATCH_RETRY_MINUTES         = Number(process.env.DISPATCH_RETRY_MINUTES  ?? 5);   // set to 1 in dev
 const MAX_FAILED_ROUNDS_BEFORE_ALERT = Number(process.env.DISPATCH_MAX_ALERT_ROUND ?? 2);
 const MAX_ROUNDS_BEFORE_AUTO_CANCEL  = Number(process.env.DISPATCH_MAX_ROUNDS     ?? 4);   // ~RETRY*MAX min total
 const RADIUS_EXPANSION_KM = 2;
@@ -149,14 +148,6 @@ export class DispatchService {
   private batchKey(rescueRequestId: string, batchId: string): string {
     return `${rescueRequestId}:${batchId}`;
   }
-
-  /**
-   * Pending "try another round after DISPATCH_RETRY_MINUTES" timers, one per
-   * request. Separate from batchTimers because a retry belongs to no batch —
-   * it exists precisely because the last round produced no candidates. Cleared
-   * before being replaced so a request can't accumulate retries.
-   */
-  private readonly retryTimers = new Map<string, NodeJS.Timeout>();
 
   /**
    * Phase 2 close timers, one per request, started when the FIRST quote sets
@@ -615,19 +606,12 @@ export class DispatchService {
         );
       }
 
+      // No timer: expand the radius and try the next batch immediately, in
+      // the same tick. The old DISPATCH_RETRY_MINUTES delay just made a
+      // stranded motorist wait longer for no benefit — untried candidates
+      // (or a wider radius) are either there now or they aren't.
       const expandedRadius = extraRadiusKm + RADIUS_EXPANSION_KM;
-      const retryTimer = setTimeout(
-        () => {
-          this.retryTimers.delete(rescueRequestId);
-          void this.startDispatch(rescueRequestId, customerId, expandedRadius);
-        },
-        DISPATCH_RETRY_MINUTES * 60 * 1000,
-      );
-      // Clear before replacing — the previous code stored this in batchTimers
-      // with a plain set(), so an overwritten retry timer still fired.
-      const priorRetry = this.retryTimers.get(rescueRequestId);
-      if (priorRetry) clearTimeout(priorRetry);
-      this.retryTimers.set(rescueRequestId, retryTimer);
+      void this.startDispatch(rescueRequestId, customerId, expandedRadius);
       return;
     }
 
@@ -744,7 +728,7 @@ export class DispatchService {
     // Race condition guard — skip if the request moved on for any other reason
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
       where: { id: rescueRequestId },
-      select: { status: true },
+      select: { status: true, quoteCollectionDeadline: true },
     });
     if (
       !rescueRequest ||
@@ -773,8 +757,17 @@ export class DispatchService {
       return;
     }
 
-    // No quotes at all this round — move to next batch (same radius; untried
-    // operators may still be available), exactly as before.
+    // No quotes at all this round. This is phase 1's automatic continuation
+    // path — it must go quiet the moment phase 2 starts (quoteCollectionDeadline
+    // set), even though bidding itself stays open through the end of phase 2.
+    // Once phase 2 has started, closeBidding/the deadline timer from Tasks
+    // 4-6 already owns what happens next; admin-initiated continuation
+    // (expandRadiusNow, manualOfferToOperator) is unaffected by this check —
+    // it keeps working via assertBiddingStillOpen, not this guard.
+    if (rescueRequest.quoteCollectionDeadline) return;
+
+    // Move to next batch (same radius; untried operators may still be
+    // available), exactly as before.
     void this.startDispatch(rescueRequestId, customerId, extraRadiusKm);
   }
 
@@ -843,11 +836,12 @@ export class DispatchService {
 
   /**
    * Admin action: immediately start a new dispatch round with an expanded
-   * radius, instead of waiting for the automatic DISPATCH_RETRY_MINUTES
-   * timer. extraRadiusKm isn't persisted between rounds (see the comment
-   * on maybeResolveBatchEarly's callers), so the current radius is
-   * approximated from the session's dispatchRound — the same
-   * approximation the automatic retry path already effectively produces.
+   * radius, rather than waiting on the automatic no-candidates continuation
+   * inside startDispatch. extraRadiusKm isn't persisted between rounds (see
+   * the comment on maybeResolveBatchEarly's callers), so the current radius
+   * is approximated from the session's dispatchRound — the same
+   * approximation the automatic continuation path already effectively
+   * produces.
    */
   /**
    * Admin-path guard. `RescueRequest.status` stays DISPATCHING after the
