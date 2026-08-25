@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { GeocodingService } from '../integrations/geocoding/geocoding.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
-import { RescueRequestStatus, UserRole } from '@prisma/client';
+import { DispatchOfferStatus, RescueRequestStatus, UserRole } from '@prisma/client';
 
 /**
  * Small shared helpers with no WhatsApp-flow state of their own, used by
@@ -86,8 +86,8 @@ export class RescueRequestSharedService {
       if (claimed.count === 0) return; // the payment webhook won the race — nothing to do
 
       await this.prisma.dispatchOffer.updateMany({
-        where: { rescueRequestId, status: 'SELECTED_PENDING_PAYMENT' },
-        data: { status: 'TIMED_OUT', respondedAt: new Date() },
+        where: { rescueRequestId, status: DispatchOfferStatus.SELECTED_PENDING_PAYMENT },
+        data: { status: DispatchOfferStatus.TIMED_OUT, respondedAt: new Date() },
       });
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
