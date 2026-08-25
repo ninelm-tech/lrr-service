@@ -31,12 +31,19 @@ describe('PlatformConfigService', () => {
         serviceFeePercent: { toNumber: () => 10 },
         depositPercent: { toNumber: () => 10 },
         dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
         disputeAlertPhoneNumber: null,
       });
 
       const result = await service.getConfig();
 
-      expect(result).toEqual({ serviceFeePercent: 10, depositPercent: 10, dispatchWindowMinutes: 10, disputeAlertPhoneNumber: null });
+      expect(result).toEqual({
+        serviceFeePercent: 10,
+        depositPercent: 10,
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        disputeAlertPhoneNumber: null,
+      });
     });
 
     it('includes disputeAlertPhoneNumber, null when unset', async () => {
@@ -45,6 +52,7 @@ describe('PlatformConfigService', () => {
         serviceFeePercent: { toNumber: () => 10 },
         depositPercent: { toNumber: () => 10 },
         dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
         disputeAlertPhoneNumber: null,
       });
 
@@ -68,6 +76,11 @@ describe('PlatformConfigService', () => {
       await expect(service.updateConfig({ dispatchWindowMinutes: 61 })).rejects.toThrow(BadRequestException);
     });
 
+    it('rejects a dispatchBatchSize outside 1-20', async () => {
+      await expect(service.updateConfig({ dispatchBatchSize: 0 })).rejects.toThrow(BadRequestException);
+      await expect(service.updateConfig({ dispatchBatchSize: 21 })).rejects.toThrow(BadRequestException);
+    });
+
     it('updates the singleton row when values are valid', async () => {
       prisma.platformConfig.findFirst.mockResolvedValue({ id: 'default' });
       prisma.platformConfig.update.mockResolvedValue({
@@ -75,6 +88,7 @@ describe('PlatformConfigService', () => {
         serviceFeePercent: { toNumber: () => 15 },
         depositPercent: { toNumber: () => 10 },
         dispatchWindowMinutes: 15,
+        dispatchBatchSize: 3,
         disputeAlertPhoneNumber: null,
       });
 
@@ -84,7 +98,33 @@ describe('PlatformConfigService', () => {
         where: { id: 'default' },
         data: { serviceFeePercent: 15, dispatchWindowMinutes: 15 },
       });
-      expect(result).toEqual({ serviceFeePercent: 15, depositPercent: 10, dispatchWindowMinutes: 15, disputeAlertPhoneNumber: null });
+      expect(result).toEqual({
+        serviceFeePercent: 15,
+        depositPercent: 10,
+        dispatchWindowMinutes: 15,
+        dispatchBatchSize: 3,
+        disputeAlertPhoneNumber: null,
+      });
+    });
+
+    it('persists a new dispatchBatchSize', async () => {
+      prisma.platformConfig.findFirst.mockResolvedValue({ id: 'default' });
+      prisma.platformConfig.update.mockResolvedValue({
+        id: 'default',
+        serviceFeePercent: { toNumber: () => 10 },
+        depositPercent: { toNumber: () => 10 },
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 5,
+        disputeAlertPhoneNumber: null,
+      });
+
+      const result = await service.updateConfig({ dispatchBatchSize: 5 });
+
+      expect(prisma.platformConfig.update).toHaveBeenCalledWith({
+        where: { id: 'default' },
+        data: { dispatchBatchSize: 5 },
+      });
+      expect(result.dispatchBatchSize).toBe(5);
     });
 
     it('persists a new disputeAlertPhoneNumber', async () => {
@@ -94,6 +134,7 @@ describe('PlatformConfigService', () => {
         serviceFeePercent: { toNumber: () => 10 },
         depositPercent: { toNumber: () => 10 },
         dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
         disputeAlertPhoneNumber: '+2348012345678',
       });
 

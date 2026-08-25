@@ -6,6 +6,7 @@ export interface PlatformConfigValues {
   serviceFeePercent: number;
   depositPercent: number;
   dispatchWindowMinutes: number;
+  dispatchBatchSize: number;
   disputeAlertPhoneNumber: string | null;
 }
 
@@ -19,6 +20,7 @@ export class PlatformConfigService {
       serviceFeePercent: row!.serviceFeePercent.toNumber(),
       depositPercent: row!.depositPercent.toNumber(),
       dispatchWindowMinutes: row!.dispatchWindowMinutes,
+      dispatchBatchSize: row!.dispatchBatchSize,
       disputeAlertPhoneNumber: row!.disputeAlertPhoneNumber,
     };
   }
@@ -33,6 +35,9 @@ export class PlatformConfigService {
     if (dto.dispatchWindowMinutes !== undefined && (dto.dispatchWindowMinutes < 1 || dto.dispatchWindowMinutes > 60)) {
       throw new BadRequestException('dispatchWindowMinutes must be between 1 and 60');
     }
+    if (dto.dispatchBatchSize !== undefined && (dto.dispatchBatchSize < 1 || dto.dispatchBatchSize > 20)) {
+      throw new BadRequestException('dispatchBatchSize must be between 1 and 20');
+    }
 
     const existing = await this.prisma.platformConfig.findFirst();
 
@@ -40,6 +45,7 @@ export class PlatformConfigService {
     if (dto.serviceFeePercent !== undefined) data.serviceFeePercent = dto.serviceFeePercent;
     if (dto.depositPercent !== undefined) data.depositPercent = dto.depositPercent;
     if (dto.dispatchWindowMinutes !== undefined) data.dispatchWindowMinutes = dto.dispatchWindowMinutes;
+    if (dto.dispatchBatchSize !== undefined) data.dispatchBatchSize = dto.dispatchBatchSize;
     if (dto.disputeAlertPhoneNumber !== undefined) data.disputeAlertPhoneNumber = dto.disputeAlertPhoneNumber;
 
     const updated = await this.prisma.platformConfig.update({
@@ -51,6 +57,7 @@ export class PlatformConfigService {
       serviceFeePercent: updated.serviceFeePercent.toNumber(),
       depositPercent: updated.depositPercent.toNumber(),
       dispatchWindowMinutes: updated.dispatchWindowMinutes,
+      dispatchBatchSize: updated.dispatchBatchSize,
       disputeAlertPhoneNumber: updated.disputeAlertPhoneNumber,
     };
   }

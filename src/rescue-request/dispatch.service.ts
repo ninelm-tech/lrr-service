@@ -17,7 +17,6 @@ import { DispatchBoardRowDto } from './dto/rescue-request-response.dto';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 
 // ── Dispatch config ────────────────────────────────────────────────────────────
-const BATCH_SIZE = 3;                  // operators offered per round simultaneously
 const DISPATCH_RETRY_MINUTES         = Number(process.env.DISPATCH_RETRY_MINUTES  ?? 5);   // set to 1 in dev
 const MAX_FAILED_ROUNDS_BEFORE_ALERT = Number(process.env.DISPATCH_MAX_ALERT_ROUND ?? 2);
 const MAX_ROUNDS_BEFORE_AUTO_CANCEL  = Number(process.env.DISPATCH_MAX_ROUNDS     ?? 4);   // ~RETRY*MAX min total
@@ -289,6 +288,8 @@ export class DispatchService {
     });
     const customerPhone = customerRecord?.phoneNumber ?? null;
 
+    const config = await this.platformConfigService.getConfig();
+
     const session = await this.sessionStore.getOrCreate(customerId);
     const alreadyOffered: string[] = session.offeredOperatorIds ?? [];
     const round = session.dispatchRound ?? 0;
@@ -416,7 +417,7 @@ export class DispatchService {
     }
 
     // Take the next batch of top-ranked candidates
-    const batch = candidates.slice(0, BATCH_SIZE);
+    const batch = candidates.slice(0, config.dispatchBatchSize);
     const batchOperatorIds = batch.map((op) => op.id);
 
     logger.info('dispatch: batch offered', {
@@ -424,7 +425,6 @@ export class DispatchService {
       offered: batch.map((op) => ({ operatorId: op.id, businessName: op.businessName, distanceKm: Number(op.distance.toFixed(1)) })),
     });
 
-    const config = await this.platformConfigService.getConfig();
     const windowSeconds = config.dispatchWindowMinutes * 60;
     const expiresAt = new Date(Date.now() + windowSeconds * 1000);
     const batchId = crypto.randomUUID();

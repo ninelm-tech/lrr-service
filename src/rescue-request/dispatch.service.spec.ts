@@ -515,7 +515,7 @@ describe('DispatchService', () => {
         update: jest.fn(),
       };
       operatorService = { findAndRankCandidates: jest.fn().mockResolvedValue([candidateA, candidateB]) };
-      platformConfigService = { getConfig: jest.fn().mockResolvedValue({ dispatchWindowMinutes: 10 }) };
+      platformConfigService = { getConfig: jest.fn().mockResolvedValue({ dispatchWindowMinutes: 10, dispatchBatchSize: 3 }) };
       twilioService = { sendWhatsAppMessage: jest.fn(), sendWhatsAppTemplateMessage: jest.fn() };
       sharedService = { formatLocationSection: jest.fn().mockResolvedValue('https://maps.google.com/?q=6.5,3.4') };
 
@@ -532,6 +532,18 @@ describe('DispatchService', () => {
       }).compile();
 
       batchService = module.get<DispatchService>(DispatchService);
+    });
+
+    it('sizes the offered batch from PlatformConfig.dispatchBatchSize, not a hardcoded constant', async () => {
+      platformConfigService.getConfig.mockResolvedValue({ dispatchWindowMinutes: 10, dispatchBatchSize: 1 });
+
+      await batchService.startDispatch('req-1', 'cust-1');
+
+      expect(prisma.dispatchOffer.createMany).toHaveBeenCalledWith({
+        data: [expect.objectContaining({ operatorId: 'op-a' })],
+      });
+
+      clearAllBatchTimers(batchService);
     });
 
     it('sends via the Content Template, with per-operator distance+ETA combined into {{4}} (the template has no separate ETA slot), when TWILIO_DISPATCH_OFFER_TEMPLATE_SID is set', async () => {

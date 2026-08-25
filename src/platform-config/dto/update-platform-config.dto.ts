@@ -19,6 +19,12 @@ export class UpdatePlatformConfigDto {
   @IsOptional()
   dispatchWindowMinutes?: number;
 
+  @IsInt()
+  @Min(1)
+  @Max(20)
+  @IsOptional()
+  dispatchBatchSize?: number;
+
   @IsString()
   @IsOptional()
   disputeAlertPhoneNumber?: string;
