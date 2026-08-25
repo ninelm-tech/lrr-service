@@ -10,7 +10,7 @@ import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { ConfigModule } from '@nestjs/config';
 
 /**
- * Batch timers are keyed `requestId:expiresAt`, so a test can't clear one by
+ * Batch timers are keyed `requestId:batchId`, so a test can't clear one by
  * request id alone. Tests that schedule real timers drain the whole map.
  */
 function clearAllBatchTimers(service: DispatchService) {
@@ -136,6 +136,45 @@ describe('DispatchService', () => {
     });
   });
 
+  describe('batch identity survives the expiresAt rewrite', () => {
+    it('resolveBatch (via maybeResolveBatchEarly) still finds offers sharing a batchId even when one has a rewritten, shorter expiresAt', async () => {
+      // Simulates Task 5's transition: an offer's expiresAt can be shortened
+      // independently of the rest of its batch. Lookups must key off batchId,
+      // never expiresAt, or a rewritten offer silently drops out of its batch.
+      const prisma = {
+        rescueRequest: { findUnique: jest.fn().mockResolvedValue({ customerId: 'cust-1' }) },
+        dispatchOffer: {
+          findMany: jest.fn().mockResolvedValue([
+            { operatorId: 'op-1', status: 'QUOTED', expiresAt: new Date(Date.now() + 10 * 60 * 1000) },
+            { operatorId: 'op-2', status: 'DECLINED', expiresAt: new Date(Date.now() + 60 * 1000) }, // rewritten shorter
+          ]),
+        },
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          DispatchService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+      const service = module.get<DispatchService>(DispatchService);
+
+      const resolveBatchSpy = jest.spyOn(service as any, 'resolveBatch').mockResolvedValue(undefined);
+
+      await (service as any).maybeResolveBatchEarly('req-1', 'batch-shared');
+
+      expect(prisma.dispatchOffer.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { rescueRequestId: 'req-1', batchId: 'batch-shared' } }),
+      );
+      expect(resolveBatchSpy).toHaveBeenCalledWith('req-1', ['op-1', 'op-2'], 'cust-1', 0, 'batch-shared');
+    });
+  });
+
   describe('expandRadiusNow', () => {
     let radiusService: DispatchService;
     let prisma: {
@@ -200,7 +239,7 @@ describe('DispatchService', () => {
       jest.spyOn(radiusService as any, 'startDispatch').mockResolvedValue(undefined);
 
       const liveBatchTimer = setTimeout(() => {}, 100000);
-      const key = (radiusService as any).batchKey('req-1', new Date(Date.now() + 100000));
+      const key = (radiusService as any).batchKey('req-1', 'batch-live');
       (radiusService as any).batchTimers.set(key, liveBatchTimer);
 
       await radiusService.expandRadiusNow('req-1');
@@ -311,7 +350,7 @@ describe('DispatchService', () => {
       // One timer, keyed to this batch rather than to the request.
       const keys = [...(manualService as any).batchTimers.keys()] as string[];
       expect(keys).toHaveLength(1);
-      expect(keys[0]).toMatch(/^req-1:\d+$/);
+      expect(keys[0]).toMatch(/^req-1:[0-9a-f-]+$/);
 
       // Clean up the real timer this test scheduled
       clearTimeout((manualService as any).batchTimers.get(keys[0]));
@@ -333,7 +372,7 @@ describe('DispatchService', () => {
       prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
 
       const priorTimer = setTimeout(() => {}, 100000);
-      const priorKey = (manualService as any).batchKey('req-1', new Date(Date.now() + 100000));
+      const priorKey = (manualService as any).batchKey('req-1', 'batch-prior');
       (manualService as any).batchTimers.set(priorKey, priorTimer);
 
       await manualService.manualOfferToOperator('req-1', 'op-1');
@@ -378,7 +417,7 @@ describe('DispatchService', () => {
 
         jest.advanceTimersByTime(5 * 60 * 1000);
 
-        expect(resolveBatchSpy).toHaveBeenCalledWith('req-1', ['op-1'], 'cust-1', 2, expect.any(Date));
+        expect(resolveBatchSpy).toHaveBeenCalledWith('req-1', ['op-1'], 'cust-1', 2, expect.any(String));
       } finally {
         jest.useRealTimers();
         process.env.API_BASE_URL = prevApiBaseUrl;

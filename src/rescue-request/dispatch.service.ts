@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import * as crypto from 'crypto';
 import * as Sentry from '@sentry/node';
 import { logger } from '@sentry/node';
 import { toWhatsAppAddress } from '../common/phone.util';
@@ -145,9 +146,9 @@ export class DispatchService {
    */
   private readonly batchTimers = new Map<string, NodeJS.Timeout>();
 
-  /** `requestId:expiresAt` — see batchTimers. */
-  private batchKey(rescueRequestId: string, batchExpiresAt: Date): string {
-    return `${rescueRequestId}:${batchExpiresAt.getTime()}`;
+  /** `requestId:batchId` — see batchTimers. */
+  private batchKey(rescueRequestId: string, batchId: string): string {
+    return `${rescueRequestId}:${batchId}`;
   }
 
   /**
@@ -178,7 +179,7 @@ export class DispatchService {
    * caller resolves `offer` in the first place.
    */
   async processQuoteOrDecline(
-    offer: { id: string; rescueRequestId: string; expiresAt: Date },
+    offer: { id: string; rescueRequestId: string; expiresAt: Date; batchId: string },
     quotedPriceKobo: number | undefined,
   ): Promise<{ quoted: boolean; message: string }> {
     if (quotedPriceKobo === undefined) {
@@ -187,7 +188,7 @@ export class DispatchService {
         data: { status: 'DECLINED', respondedAt: new Date() },
       });
       logger.info('dispatch: offer declined', { rescueRequestId: offer.rescueRequestId, offerId: offer.id });
-      await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.expiresAt);
+      await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.batchId);
       return { quoted: false, message: `Understood — ${formatJobRef(offer.rescueRequestId)} declined. We'll offer this job to another operator.` };
     }
 
@@ -196,8 +197,8 @@ export class DispatchService {
       data: { status: 'QUOTED', quotedPrice: quotedPriceKobo, respondedAt: new Date() },
     });
     logger.info('dispatch: offer quoted', { rescueRequestId: offer.rescueRequestId, offerId: offer.id, quotedPriceKobo });
-    await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.expiresAt);
-    this.scheduleGraceResolve(offer.rescueRequestId, offer.expiresAt);
+    await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.batchId);
+    this.scheduleGraceResolve(offer.rescueRequestId, offer.batchId);
 
     return {
       quoted: true,
@@ -211,15 +212,15 @@ export class DispatchService {
    * forces resolution with whatever quotes exist rather than making the
    * motorist wait out the rest of the full window for silent operators.
    */
-  private scheduleGraceResolve(rescueRequestId: string, batchExpiresAt: Date) {
+  private scheduleGraceResolve(rescueRequestId: string, batchId: string) {
     if (this.graceTimers.has(rescueRequestId)) return; // already scheduled for this batch
 
-    void this.notifyPendingOperatorsOfCountdown(rescueRequestId, batchExpiresAt);
+    void this.notifyPendingOperatorsOfCountdown(rescueRequestId, batchId);
 
     const timer = setTimeout(async () => {
       this.graceTimers.delete(rescueRequestId);
       const batchOffers = await this.prisma.dispatchOffer.findMany({
-        where: { rescueRequestId, expiresAt: batchExpiresAt },
+        where: { rescueRequestId, batchId },
         select: { operatorId: true },
       });
       const rescueRequest = await this.prisma.rescueRequest.findUnique({
@@ -231,7 +232,7 @@ export class DispatchService {
       // extraRadiusKm is 0 here for the same reason maybeResolveBatchEarly uses
       // 0 — a grace-forced resolve already has at least one quote, so it never
       // needs a radius expansion to find candidates.
-      void this.resolveBatch(rescueRequestId, batchOffers.map((o) => o.operatorId), rescueRequest.customerId, 0, batchExpiresAt);
+      void this.resolveBatch(rescueRequestId, batchOffers.map((o) => o.operatorId), rescueRequest.customerId, 0, batchId);
     }, this.QUOTE_GRACE_MS);
 
     this.graceTimers.set(rescueRequestId, timer);
@@ -243,9 +244,9 @@ export class DispatchService {
    * response-window estimate — without this they'd have no signal that
    * someone else already bid.
    */
-  private async notifyPendingOperatorsOfCountdown(rescueRequestId: string, batchExpiresAt: Date) {
+  private async notifyPendingOperatorsOfCountdown(rescueRequestId: string, batchId: string) {
     const stillPending = await this.prisma.dispatchOffer.findMany({
-      where: { rescueRequestId, expiresAt: batchExpiresAt, status: 'PENDING' },
+      where: { rescueRequestId, batchId, status: 'PENDING' },
       include: { operator: true },
     });
     if (stillPending.length === 0) return;
@@ -426,6 +427,7 @@ export class DispatchService {
     const config = await this.platformConfigService.getConfig();
     const windowSeconds = config.dispatchWindowMinutes * 60;
     const expiresAt = new Date(Date.now() + windowSeconds * 1000);
+    const batchId = crypto.randomUUID();
 
     // Create all offers in one batch insert
     await this.prisma.dispatchOffer.createMany({
@@ -433,6 +435,7 @@ export class DispatchService {
         rescueRequestId,
         operatorId: op.id,
         expiresAt,
+        batchId,
       })),
     });
 
@@ -490,10 +493,10 @@ export class DispatchService {
     // Single timeout covers the entire batch — stored so an early-resolved
     // batch (Step below) can prevent this from firing a second time.
     const timer = setTimeout(
-      () => void this.resolveBatch(rescueRequestId, batchOperatorIds, customerId, extraRadiusKm, expiresAt),
+      () => void this.resolveBatch(rescueRequestId, batchOperatorIds, customerId, extraRadiusKm, batchId),
       windowSeconds * 1000,
     );
-    this.batchTimers.set(this.batchKey(rescueRequestId, expiresAt), timer);
+    this.batchTimers.set(this.batchKey(rescueRequestId, batchId), timer);
   }
 
   private async resolveBatch(
@@ -501,12 +504,12 @@ export class DispatchService {
     batchOperatorIds: string[],
     customerId: string,
     extraRadiusKm: number,
-    batchExpiresAt: Date,
+    batchId: string,
   ) {
     // Mutex: only the caller that finds (and removes) the timer entry proceeds.
     // Scoped to THIS batch — another batch of the same request resolving must
     // not consume this one's entry.
-    const key = this.batchKey(rescueRequestId, batchExpiresAt);
+    const key = this.batchKey(rescueRequestId, batchId);
     const timer = this.batchTimers.get(key);
     if (!timer) return; // already resolved by the other path
     clearTimeout(timer);
@@ -561,9 +564,9 @@ export class DispatchService {
    * current batch has now responded, resolves the batch immediately instead
    * of waiting out the rest of the window.
    */
-  private async maybeResolveBatchEarly(rescueRequestId: string, batchExpiresAt: Date) {
+  private async maybeResolveBatchEarly(rescueRequestId: string, batchId: string) {
     const batchOffers = await this.prisma.dispatchOffer.findMany({
-      where: { rescueRequestId, expiresAt: batchExpiresAt },
+      where: { rescueRequestId, batchId },
       select: { operatorId: true, status: true },
     });
     const stillPending = batchOffers.some((o) => o.status === 'PENDING');
@@ -580,7 +583,7 @@ export class DispatchService {
     // here because an early-resolved batch (all responded) never needed a
     // radius expansion to find candidates — expansion only happens when
     // zero candidates exist at all, a separate path in startDispatch.
-    void this.resolveBatch(rescueRequestId, batchOperatorIds, rescueRequest.customerId, 0, batchExpiresAt);
+    void this.resolveBatch(rescueRequestId, batchOperatorIds, rescueRequest.customerId, 0, batchId);
   }
 
   //
@@ -649,9 +652,10 @@ export class DispatchService {
     // more operator to the request, it does not replace the current round.
     const MANUAL_OFFER_WINDOW_MS = 5 * 60 * 1000;
     const expiresAt = new Date(Date.now() + MANUAL_OFFER_WINDOW_MS);
+    const batchId = crypto.randomUUID();
 
     await this.prisma.dispatchOffer.create({
-      data: { rescueRequestId, operatorId, expiresAt },
+      data: { rescueRequestId, operatorId, expiresAt, batchId },
     });
 
     // Append, never replace — every other call site that touches
@@ -705,10 +709,10 @@ export class DispatchService {
 
     const currentRadius = (session.dispatchRound ?? 0) * RADIUS_EXPANSION_KM;
     const timer = setTimeout(
-      () => void this.resolveBatch(rescueRequestId, [operatorId], rescueRequest.customerId, currentRadius, expiresAt),
+      () => void this.resolveBatch(rescueRequestId, [operatorId], rescueRequest.customerId, currentRadius, batchId),
       MANUAL_OFFER_WINDOW_MS,
     );
-    this.batchTimers.set(this.batchKey(rescueRequestId, expiresAt), timer);
+    this.batchTimers.set(this.batchKey(rescueRequestId, batchId), timer);
   }
 
   async sendQuoteShortlist(rescueRequestId: string, customerId: string) {

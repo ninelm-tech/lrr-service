@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException, UnauthorizedException, forwardRef, Inject } from '@nestjs/common';
+import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
@@ -87,6 +88,7 @@ export class RescueRequestAdminService {
     const balanceAmount = total - depositAmount;
 
     const MANUAL_ASSIGN_WINDOW_MS = 5 * 60 * 1000;
+    const batchId = crypto.randomUUID();
     const offer = await this.prisma.dispatchOffer.create({
       data: {
         rescueRequestId: id,
@@ -95,6 +97,7 @@ export class RescueRequestAdminService {
         quotedPrice:     dto.priceKobo,
         respondedAt:     new Date(),
         expiresAt:       new Date(Date.now() + MANUAL_ASSIGN_WINDOW_MS),
+        batchId,
       },
     });
 
