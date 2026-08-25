@@ -2,6 +2,8 @@ import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { GeocodingService } from '../integrations/geocoding/geocoding.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
+import { WhatsAppSessionStore } from './state/whatsapp-session.store';
+import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { DispatchOfferStatus, RescueRequestStatus, UserRole } from '@prisma/client';
 
 /**
@@ -19,6 +21,7 @@ export class RescueRequestSharedService {
     private readonly prisma: PrismaService,
     private readonly geocodingService: GeocodingService,
     private readonly twilioService: TwilioService,
+    private readonly sessionStore: WhatsAppSessionStore,
   ) {}
 
   async findOrCreateCustomer(phoneNumber: string) {
@@ -55,11 +58,12 @@ export class RescueRequestSharedService {
    */
   scheduleDepositWindow(params: {
     rescueRequestId: string;
+    customerId: string;
     customerPhone: string;
     operatorPhone: string;
     paymentUrl: string;
   }): void {
-    const { rescueRequestId, customerPhone, operatorPhone, paymentUrl } = params;
+    const { rescueRequestId, customerId, customerPhone, operatorPhone, paymentUrl } = params;
 
     for (const markMs of this.DEPOSIT_REMINDER_MARKS_MS) {
       const isFinalWarning = markMs === this.DEPOSIT_REMINDER_MARKS_MS[this.DEPOSIT_REMINDER_MARKS_MS.length - 1];
@@ -84,6 +88,12 @@ export class RescueRequestSharedService {
         data: { status: RescueRequestStatus.CANCELLED },
       });
       if (claimed.count === 0) return; // the payment webhook won the race — nothing to do
+
+      // The customer's session was set to OPERATOR_FOUND_WAITING_PAYMENT when
+      // the deposit flow started. Reset it now so a follow-up WhatsApp
+      // message doesn't hit stale state and get told to pay a request that
+      // was just cancelled.
+      await this.sessionStore.update(customerId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
 
       await this.prisma.dispatchOffer.updateMany({
         where: { rescueRequestId, status: DispatchOfferStatus.SELECTED_PENDING_PAYMENT },

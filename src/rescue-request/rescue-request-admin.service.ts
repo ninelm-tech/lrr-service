@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException, UnauthorizedException, forwardRef, Inject } from '@nestjs/common';
+import * as Sentry from '@sentry/node';
 import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
@@ -44,6 +45,7 @@ export class RescueRequestAdminService {
     if (depositPaid !== undefined) where.depositPaid = depositPaid === 'true' || depositPaid === true;
     if (balancePaid !== undefined) where.balancePaid = balancePaid === 'true' || balancePaid === true;
     if (refundEligible === 'true' || refundEligible === true) {
+      where.status = RescueRequestStatus.CANCELLED;
       where.depositRefundStatus = { in: ['ELIGIBLE', 'FAILED'] };
     }
     if (from && to) where.createdAt = { gte: new Date(from), lte: new Date(to) };
@@ -153,6 +155,7 @@ export class RescueRequestAdminService {
 
     this.sharedService.scheduleDepositWindow({
       rescueRequestId: id,
+      customerId: request.customerId,
       customerPhone,
       operatorPhone,
       paymentUrl: paymentResponse.data.authorization_url,
@@ -181,19 +184,34 @@ export class RescueRequestAdminService {
       throw new BadRequestException('Not eligible for refund — already refunded/in progress, or not a late-payment case.');
     }
 
+    let refund: { id: number; status: string };
     try {
       const request = await this.prisma.rescueRequest.findUniqueOrThrow({ where: { id } });
       if (!request.depositReference || !request.depositAmount) {
         throw new Error(`Cannot refund request ${id}: missing depositReference or depositAmount`);
       }
-      const refund = await this.paystackService.refundTransaction(request.depositReference, request.depositAmount);
+      refund = await this.paystackService.refundTransaction(request.depositReference, request.depositAmount);
+    } catch (err) {
+      // The Paystack call itself never went through (or never confirmed) —
+      // safe to mark FAILED so an admin can retry via the same claim.
+      await this.prisma.rescueRequest.update({ where: { id }, data: { depositRefundStatus: 'FAILED' } });
+      throw err;
+    }
+
+    try {
       await this.prisma.rescueRequest.update({
         where: { id },
         data: { depositRefundId: refund.id },
       });
     } catch (err) {
-      await this.prisma.rescueRequest.update({ where: { id }, data: { depositRefundStatus: 'FAILED' } });
-      throw err;
+      // Paystack already confirmed the refund — the money has moved. Do NOT
+      // mark FAILED here: FAILED is retryable and a retry would trigger a
+      // second, real refund against an already-refunded transaction. Leave
+      // depositRefundStatus at PENDING (not retryable) and alert a human to
+      // reconcile the missing depositRefundId manually.
+      Sentry.captureException(err, {
+        extra: { rescueRequestId: id, refundId: refund.id, reason: 'deposit refund succeeded at Paystack but failed to persist depositRefundId' },
+      });
     }
   }
 

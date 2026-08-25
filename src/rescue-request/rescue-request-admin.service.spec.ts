@@ -7,6 +7,9 @@ import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
+import * as Sentry from '@sentry/node';
+
+jest.mock('@sentry/node', () => ({ captureException: jest.fn() }));
 
 describe('RescueRequestAdminService', () => {
   describe('detailForUser — quote-compliance data', () => {
@@ -154,7 +157,7 @@ describe('RescueRequestAdminService', () => {
       service = module.get<RescueRequestAdminService>(RescueRequestAdminService);
     });
 
-    it('filters to refund-eligible requests when refundEligible=true is passed', async () => {
+    it('filters to refund-eligible requests when refundEligible=true is passed, matching refundDeposit\'s own claim condition (status CANCELLED + depositRefundStatus)', async () => {
       prisma.rescueRequest.findMany.mockResolvedValue([]);
       prisma.rescueRequest.count.mockResolvedValue(0);
 
@@ -162,7 +165,10 @@ describe('RescueRequestAdminService', () => {
 
       expect(prisma.rescueRequest.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: expect.objectContaining({ depositRefundStatus: { in: ['ELIGIBLE', 'FAILED'] } }),
+          where: expect.objectContaining({
+            status: 'CANCELLED',
+            depositRefundStatus: { in: ['ELIGIBLE', 'FAILED'] },
+          }),
         }),
       );
     });
@@ -323,6 +329,7 @@ describe('RescueRequestAdminService', () => {
 
       expect(sharedService.scheduleDepositWindow).toHaveBeenCalledWith({
         rescueRequestId: 'req-1',
+        customerId: 'cust-1',
         customerPhone: expect.any(String),
         operatorPhone: expect.any(String),
         paymentUrl: 'https://paystack.test/pay/xyz',
@@ -365,6 +372,7 @@ describe('RescueRequestAdminService', () => {
       }).compile();
 
       service = module.get<RescueRequestAdminService>(RescueRequestAdminService);
+      (Sentry.captureException as jest.Mock).mockClear();
     });
 
     it('claims ELIGIBLE → PENDING, calls Paystack, stores the refund id', async () => {
@@ -406,6 +414,33 @@ describe('RescueRequestAdminService', () => {
         where: { id: 'req-1' },
         data: { depositRefundStatus: 'FAILED' },
       });
+    });
+
+    it('leaves depositRefundStatus at PENDING (not FAILED) and alerts Sentry when Paystack succeeds but the depositRefundId write throws — a retry here would double-refund', async () => {
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1', depositReference: 'DEP_ref_1', depositAmount: 500000,
+      });
+      paystackService.refundTransaction.mockResolvedValue({ id: 999, status: 'success' });
+      prisma.rescueRequest.update.mockRejectedValue(new Error('DB write failed'));
+
+      await expect(service.refundDeposit('req-1')).resolves.toBeUndefined();
+
+      // Only the initial PENDING claim write happened — no FAILED write.
+      expect(prisma.rescueRequest.update).toHaveBeenCalledTimes(1);
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { depositRefundId: 999 },
+      });
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: { depositRefundStatus: 'FAILED' } }),
+      );
+      expect(Sentry.captureException).toHaveBeenCalledWith(
+        expect.any(Error),
+        expect.objectContaining({
+          extra: expect.objectContaining({ rescueRequestId: 'req-1', refundId: 999 }),
+        }),
+      );
     });
   });
 });

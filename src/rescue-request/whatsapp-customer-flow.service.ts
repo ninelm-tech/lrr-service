@@ -691,6 +691,7 @@ export class WhatsAppCustomerFlowService {
 
     this.sharedService.scheduleDepositWindow({
       rescueRequestId,
+      customerId: userId,
       customerPhone: phoneNumber,
       operatorPhone: toWhatsAppAddress(operator.phoneNumber),
       paymentUrl: paymentResponse.data.authorization_url,

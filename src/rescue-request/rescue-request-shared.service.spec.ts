@@ -3,6 +3,7 @@ import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { GeocodingService } from '../integrations/geocoding/geocoding.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
+import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 
 describe('RescueRequestSharedService', () => {
   let service: RescueRequestSharedService;
@@ -19,6 +20,7 @@ describe('RescueRequestSharedService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: GeocodingService, useValue: geocodingService },
         { provide: TwilioService, useValue: { sendWhatsAppMessage: jest.fn() } },
+        { provide: WhatsAppSessionStore, useValue: { update: jest.fn() } },
       ],
     }).compile();
 
@@ -62,6 +64,7 @@ describe('RescueRequestSharedService', () => {
       user: { upsert: jest.Mock };
     };
     let twilioService: { sendWhatsAppMessage: jest.Mock };
+    let sessionStore: { update: jest.Mock };
 
     beforeEach(async () => {
       fullPrisma = {
@@ -70,6 +73,7 @@ describe('RescueRequestSharedService', () => {
         user: { upsert: jest.fn() },
       };
       twilioService = { sendWhatsAppMessage: jest.fn() };
+      sessionStore = { update: jest.fn() };
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
@@ -77,6 +81,7 @@ describe('RescueRequestSharedService', () => {
           { provide: PrismaService, useValue: fullPrisma },
           { provide: GeocodingService, useValue: {} },
           { provide: TwilioService, useValue: twilioService },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
         ],
       }).compile();
 
@@ -93,7 +98,7 @@ describe('RescueRequestSharedService', () => {
       fullPrisma.dispatchOffer.updateMany.mockResolvedValue({ count: 1 });
 
       service.scheduleDepositWindow({
-        rescueRequestId: 'req-1', customerPhone: '+2341', operatorPhone: '+2342',
+        rescueRequestId: 'req-1', customerId: 'user-1', customerPhone: '+2341', operatorPhone: '+2342',
         paymentUrl: 'https://paystack.com/pay/abc',
       });
 
@@ -115,6 +120,10 @@ describe('RescueRequestSharedService', () => {
         '+2342',
         expect.stringContaining('no longer available'),
       );
+      expect(sessionStore.update).toHaveBeenCalledWith('user-1', {
+        state: 'IDLE',
+        rescueRequestId: undefined,
+      });
     });
 
     it('does nothing if the payment webhook already claimed the row (race at t=30)', async () => {
@@ -123,7 +132,7 @@ describe('RescueRequestSharedService', () => {
       fullPrisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 }); // payment webhook won
 
       service.scheduleDepositWindow({
-        rescueRequestId: 'req-1', customerPhone: '+2341', operatorPhone: '+2342',
+        rescueRequestId: 'req-1', customerId: 'user-1', customerPhone: '+2341', operatorPhone: '+2342',
         paymentUrl: 'https://paystack.com/pay/abc',
       });
 
@@ -142,6 +151,9 @@ describe('RescueRequestSharedService', () => {
         '+2342',
         expect.stringContaining('no longer available'),
       );
+      // The payment webhook won the race — its own flow is about to set the
+      // session for a different state; the timeout must not stomp on it.
+      expect(sessionStore.update).not.toHaveBeenCalled();
     });
 
     it('skips a reminder if the request is no longer WAITING_FOR_DEPOSIT by the time it fires', async () => {
@@ -150,7 +162,7 @@ describe('RescueRequestSharedService', () => {
       fullPrisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 });
 
       service.scheduleDepositWindow({
-        rescueRequestId: 'req-1', customerPhone: '+2341', operatorPhone: '+2342',
+        rescueRequestId: 'req-1', customerId: 'user-1', customerPhone: '+2341', operatorPhone: '+2342',
         paymentUrl: 'https://paystack.com/pay/abc',
       });
 
