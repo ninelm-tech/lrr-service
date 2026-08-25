@@ -32,6 +32,7 @@ export class RescueRequestListItemDto {
   longitude?: number;
   depositPaid: boolean;
   balancePaid: boolean;
+  depositRefundStatus: 'NONE' | 'ELIGIBLE' | 'PENDING' | 'COMPLETED' | 'FAILED';
   customer: CustomerSummaryDto;
   assignedOperator?: OperatorSummaryDto;
   createdAt: Date;

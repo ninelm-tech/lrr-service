@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException, UnauthorizedException, forwardRef, Inject } from '@nestjs/common';
+import * as Sentry from '@sentry/node';
 import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
@@ -15,8 +16,8 @@ import {
   DispatchOfferAdminDto,
   PaginationMetaDto,
 } from './dto/rescue-request-response.dto';
-import { formatJobRef } from './domain/rescue-request-formatting';
 import { DispatchService } from './dispatch.service';
+import { RescueRequestSharedService } from './rescue-request-shared.service';
 
 @Injectable()
 export class RescueRequestAdminService {
@@ -28,11 +29,12 @@ export class RescueRequestAdminService {
     private readonly paymentEventsService: PaymentEventsService,
     @Inject(forwardRef(() => DispatchService))
     private readonly dispatchService: DispatchService,
+    private readonly sharedService: RescueRequestSharedService,
   ) {}
 
   async adminList(query: any) {
     const {
-      status, issueType, operatorId, depositPaid, balancePaid,
+      status, issueType, operatorId, depositPaid, balancePaid, refundEligible,
       from, to, search, page = 1, limit = 20,
     } = query;
 
@@ -42,6 +44,10 @@ export class RescueRequestAdminService {
     if (operatorId) where.assignedOperatorId = operatorId;
     if (depositPaid !== undefined) where.depositPaid = depositPaid === 'true' || depositPaid === true;
     if (balancePaid !== undefined) where.balancePaid = balancePaid === 'true' || balancePaid === true;
+    if (refundEligible === 'true' || refundEligible === true) {
+      where.status = RescueRequestStatus.CANCELLED;
+      where.depositRefundStatus = { in: ['ELIGIBLE', 'FAILED'] };
+    }
     if (from && to) where.createdAt = { gte: new Date(from), lte: new Date(to) };
     if (search) {
       where.OR = [
@@ -87,7 +93,7 @@ export class RescueRequestAdminService {
     const depositAmount = Math.round((total * config.depositPercent) / 100);
     const balanceAmount = total - depositAmount;
 
-    const MANUAL_ASSIGN_WINDOW_MS = 5 * 60 * 1000;
+    const MANUAL_ASSIGN_WINDOW_MS = 30 * 60 * 1000;
     const batchId = crypto.randomUUID();
     const offer = await this.prisma.dispatchOffer.create({
       data: {
@@ -140,37 +146,73 @@ export class RescueRequestAdminService {
 
     void this.twilioService.sendWhatsAppMessage(
       customerPhone,
-      `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *5 minutes*:\n\n👉 ${paymentResponse.data.authorization_url}\n\nReply CANCEL to cancel (no charge).`,
+      `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *30 minutes*:\n\n👉 ${paymentResponse.data.authorization_url}\n\nReply CANCEL to cancel (no charge).`,
     );
     void this.twilioService.sendWhatsAppMessage(
       operatorPhone,
       `🚗 You've been assigned a job (₦${(dto.priceKobo / 100).toLocaleString()}). Waiting for the customer to confirm payment.`,
     );
 
-    setTimeout(async () => {
-      const fresh = await this.prisma.rescueRequest.findUnique({ where: { id }, select: { status: true } });
-      if (fresh?.status !== RescueRequestStatus.WAITING_FOR_DEPOSIT) return;
-
-      await this.prisma.dispatchOffer.update({
-        where: { id: offer.id },
-        data:  { status: 'TIMED_OUT', respondedAt: new Date() },
-      });
-      await this.prisma.rescueRequest.update({
-        where: { id },
-        data:  { assignedOperatorId: null, status: RescueRequestStatus.DISPATCHING },
-      });
-      void this.twilioService.sendWhatsAppMessage(
-        customerPhone,
-        `⏰ Payment window expired. We're still looking for an operator for you.`,
-      );
-      void this.twilioService.sendWhatsAppMessage(
-        operatorPhone,
-        `⏰ ${formatJobRef(id)} is no longer available — the customer did not pay within 5 minutes.`,
-      );
-      void this.dispatchService.startDispatch(id, request.customerId);
-    }, MANUAL_ASSIGN_WINDOW_MS);
+    this.sharedService.scheduleDepositWindow({
+      rescueRequestId: id,
+      customerId: request.customerId,
+      customerPhone,
+      operatorPhone,
+      paymentUrl: paymentResponse.data.authorization_url,
+    });
 
     return { data: this.mapToDetailDto(updated) };
+  }
+
+  /**
+   * Admin-triggered refund for a deposit that arrived after its request was
+   * already CANCELLED (see PaymentEventsService.handleLateDeposit). Always
+   * refunds the full deposit amount — no partial-amount input.
+   *
+   * ELIGIBLE and FAILED are both claimable (a FAILED attempt must stay
+   * retryable, same shape as PayoutService.retryPayout). NONE is deliberately
+   * not claimable — a request that was never marked ELIGIBLE is not this
+   * feature's concern, even if it's CANCELLED with a paid deposit for some
+   * other reason.
+   */
+  async refundDeposit(id: string): Promise<void> {
+    const claimed = await this.prisma.rescueRequest.updateMany({
+      where: { id, status: RescueRequestStatus.CANCELLED, depositRefundStatus: { in: ['ELIGIBLE', 'FAILED'] } },
+      data: { depositRefundStatus: 'PENDING' },
+    });
+    if (claimed.count === 0) {
+      throw new BadRequestException('Not eligible for refund — already refunded/in progress, or not a late-payment case.');
+    }
+
+    let refund: { id: number; status: string };
+    try {
+      const request = await this.prisma.rescueRequest.findUniqueOrThrow({ where: { id } });
+      if (!request.depositReference || !request.depositAmount) {
+        throw new Error(`Cannot refund request ${id}: missing depositReference or depositAmount`);
+      }
+      refund = await this.paystackService.refundTransaction(request.depositReference, request.depositAmount);
+    } catch (err) {
+      // The Paystack call itself never went through (or never confirmed) —
+      // safe to mark FAILED so an admin can retry via the same claim.
+      await this.prisma.rescueRequest.update({ where: { id }, data: { depositRefundStatus: 'FAILED' } });
+      throw err;
+    }
+
+    try {
+      await this.prisma.rescueRequest.update({
+        where: { id },
+        data: { depositRefundId: refund.id },
+      });
+    } catch (err) {
+      // Paystack already confirmed the refund — the money has moved. Do NOT
+      // mark FAILED here: FAILED is retryable and a retry would trigger a
+      // second, real refund against an already-refunded transaction. Leave
+      // depositRefundStatus at PENDING (not retryable) and alert a human to
+      // reconcile the missing depositRefundId manually.
+      Sentry.captureException(err, {
+        extra: { rescueRequestId: id, refundId: refund.id, reason: 'deposit refund succeeded at Paystack but failed to persist depositRefundId' },
+      });
+    }
   }
 
   async updateStatus(id: string, dto: { status: string }) {
@@ -366,6 +408,7 @@ export class RescueRequestAdminService {
       longitude: item.longitude ? Number(item.longitude) : undefined,
       depositPaid: item.depositPaid,
       balancePaid: item.balancePaid,
+      depositRefundStatus: item.depositRefundStatus,
       customer: { id: item.customer.id, phoneNumber: item.customer.phoneNumber! },
       assignedOperator: item.assignedOperator
         ? { id: item.assignedOperator.id, businessName: item.assignedOperator.businessName }

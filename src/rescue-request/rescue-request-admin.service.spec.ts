@@ -6,6 +6,10 @@ import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { PaymentEventsService } from './payment-events.service';
+import { RescueRequestSharedService } from './rescue-request-shared.service';
+import * as Sentry from '@sentry/node';
+
+jest.mock('@sentry/node', () => ({ captureException: jest.fn() }));
 
 describe('RescueRequestAdminService', () => {
   describe('detailForUser — quote-compliance data', () => {
@@ -32,6 +36,7 @@ describe('RescueRequestAdminService', () => {
           { provide: PlatformConfigService, useValue: platformConfigService },
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
         ],
       }).compile();
 
@@ -125,6 +130,65 @@ describe('RescueRequestAdminService', () => {
     });
   });
 
+  describe('adminList', () => {
+    let service: RescueRequestAdminService;
+    let prisma: {
+      rescueRequest: { findMany: jest.Mock; count: jest.Mock };
+    };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: { findMany: jest.fn(), count: jest.fn() },
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestAdminService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<RescueRequestAdminService>(RescueRequestAdminService);
+    });
+
+    it('filters to refund-eligible requests when refundEligible=true is passed, matching refundDeposit\'s own claim condition (status CANCELLED + depositRefundStatus)', async () => {
+      prisma.rescueRequest.findMany.mockResolvedValue([]);
+      prisma.rescueRequest.count.mockResolvedValue(0);
+
+      await service.adminList({ refundEligible: 'true' });
+
+      expect(prisma.rescueRequest.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: 'CANCELLED',
+            depositRefundStatus: { in: ['ELIGIBLE', 'FAILED'] },
+          }),
+        }),
+      );
+    });
+
+    it('includes depositRefundStatus in each list item', async () => {
+      prisma.rescueRequest.findMany.mockResolvedValue([{
+        id: 'req-1', status: 'CANCELLED', vehicleType: null, destination: null,
+        latitude: null, longitude: null, depositPaid: true, balancePaid: false,
+        depositRefundStatus: 'ELIGIBLE',
+        customer: { id: 'cust-1', phoneNumber: '+2341' }, assignedOperator: null,
+        createdAt: new Date(), updatedAt: new Date(),
+      }]);
+      prisma.rescueRequest.count.mockResolvedValue(1);
+
+      const result = await service.adminList({});
+
+      expect(result.data[0].depositRefundStatus).toBe('ELIGIBLE');
+    });
+  });
+
   describe('assignOperator', () => {
     let assignService: RescueRequestAdminService;
     let prisma: {
@@ -136,6 +200,7 @@ describe('RescueRequestAdminService', () => {
     let twilioService: { sendWhatsAppMessage: jest.Mock };
     let platformConfigService: { getConfig: jest.Mock };
     let dispatchService: { startDispatch: jest.Mock };
+    let sharedService: { scheduleDepositWindow: jest.Mock };
 
     const operator = { id: 'op-1', status: 'ACTIVE', businessName: 'Acme Towing', phoneNumber: '+2348011111111' };
     const request = {
@@ -170,6 +235,7 @@ describe('RescueRequestAdminService', () => {
         getConfig: jest.fn().mockResolvedValue({ serviceFeePercent: 10, depositPercent: 20 }),
       };
       dispatchService = { startDispatch: jest.fn().mockResolvedValue(undefined) };
+      sharedService = { scheduleDepositWindow: jest.fn() };
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
@@ -180,6 +246,7 @@ describe('RescueRequestAdminService', () => {
           { provide: PlatformConfigService, useValue: platformConfigService },
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: dispatchService },
+          { provide: RescueRequestSharedService, useValue: sharedService },
         ],
       }).compile();
 
@@ -187,43 +254,36 @@ describe('RescueRequestAdminService', () => {
     });
 
     it('splits the price into service fee, deposit, and balance, and creates a payment link', async () => {
-      // Fake timers so the 5-minute deposit-window setTimeout this schedules
-      // never becomes a real leaked OS timer.
-      jest.useFakeTimers();
-      try {
-        // price 100_000 kobo, 10% fee -> total 110_000, 20% deposit -> 22_000 deposit, 88_000 balance
-        const result = await assignService.assignOperator('req-1', { operatorId: 'op-1', priceKobo: 100_000 });
+      // price 100_000 kobo, 10% fee -> total 110_000, 20% deposit -> 22_000 deposit, 88_000 balance
+      const result = await assignService.assignOperator('req-1', { operatorId: 'op-1', priceKobo: 100_000 });
 
-        expect(prisma.dispatchOffer.create).toHaveBeenCalledWith({
+      expect(prisma.dispatchOffer.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          rescueRequestId: 'req-1',
+          operatorId: 'op-1',
+          status: 'SELECTED_PENDING_PAYMENT',
+          quotedPrice: 100_000,
+        }),
+      });
+      expect(paystackService.initializePayment).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 22_000 }),
+      );
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
           data: expect.objectContaining({
-            rescueRequestId: 'req-1',
-            operatorId: 'op-1',
-            status: 'SELECTED_PENDING_PAYMENT',
-            quotedPrice: 100_000,
+            assignedOperatorId: 'op-1',
+            status: 'WAITING_FOR_DEPOSIT',
+            serviceFeeAmount: 10_000,
+            depositAmount: 22_000,
+            balanceAmount: 88_000,
           }),
-        });
-        expect(paystackService.initializePayment).toHaveBeenCalledWith(
-          expect.objectContaining({ amount: 22_000 }),
-        );
-        expect(prisma.rescueRequest.update).toHaveBeenCalledWith(
-          expect.objectContaining({
-            data: expect.objectContaining({
-              assignedOperatorId: 'op-1',
-              status: 'WAITING_FOR_DEPOSIT',
-              serviceFeeAmount: 10_000,
-              depositAmount: 22_000,
-              balanceAmount: 88_000,
-            }),
-          }),
-        );
-        expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
-          expect.any(String),
-          expect.stringContaining('https://paystack.test/pay/xyz'),
-        );
-        expect(result.data).toBeDefined();
-      } finally {
-        jest.useRealTimers();
-      }
+        }),
+      );
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.stringContaining('https://paystack.test/pay/xyz'),
+      );
+      expect(result.data).toBeDefined();
     });
 
     it('rejects a non-active operator', async () => {
@@ -264,29 +324,123 @@ describe('RescueRequestAdminService', () => {
       expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
     });
 
-    it('releases the operator and reopens dispatch if the deposit window expires unpaid', async () => {
-      jest.useFakeTimers();
-      try {
-        prisma.rescueRequest.findUnique
-          .mockResolvedValueOnce(request) // initial lookup inside assignOperator
-          .mockResolvedValueOnce({ status: 'WAITING_FOR_DEPOSIT' }); // still-unpaid check in the timeout
+    it('schedules the deposit window via the shared service', async () => {
+      await assignService.assignOperator('req-1', { operatorId: 'op-1', priceKobo: 100_000 });
 
-        await assignService.assignOperator('req-1', { operatorId: 'op-1', priceKobo: 100_000 });
+      expect(sharedService.scheduleDepositWindow).toHaveBeenCalledWith({
+        rescueRequestId: 'req-1',
+        customerId: 'cust-1',
+        customerPhone: expect.any(String),
+        operatorPhone: expect.any(String),
+        paymentUrl: 'https://paystack.test/pay/xyz',
+      });
+    });
+  });
 
-        await jest.advanceTimersByTimeAsync(5 * 60 * 1000);
+  describe('refundDeposit', () => {
+    let service: RescueRequestAdminService;
+    let prisma: {
+      rescueRequest: {
+        updateMany: jest.Mock;
+        findUniqueOrThrow: jest.Mock;
+        update: jest.Mock;
+      };
+    };
+    let paystackService: { refundTransaction: jest.Mock };
 
-        expect(prisma.dispatchOffer.update).toHaveBeenCalledWith({
-          where: { id: 'offer-1' },
-          data: expect.objectContaining({ status: 'TIMED_OUT' }),
-        });
-        expect(prisma.rescueRequest.update).toHaveBeenLastCalledWith({
-          where: { id: 'req-1' },
-          data: { assignedOperatorId: null, status: 'DISPATCHING' },
-        });
-        expect(dispatchService.startDispatch).toHaveBeenCalledWith('req-1', 'cust-1');
-      } finally {
-        jest.useRealTimers();
-      }
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: {
+          updateMany: jest.fn(),
+          findUniqueOrThrow: jest.fn(),
+          update: jest.fn(),
+        },
+      };
+      paystackService = { refundTransaction: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestAdminService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaystackService, useValue: paystackService },
+          { provide: TwilioService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<RescueRequestAdminService>(RescueRequestAdminService);
+      (Sentry.captureException as jest.Mock).mockClear();
+    });
+
+    it('claims ELIGIBLE → PENDING, calls Paystack, stores the refund id', async () => {
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1', depositReference: 'DEP_ref_1', depositAmount: 500000,
+      });
+      paystackService.refundTransaction.mockResolvedValue({ id: 999, status: 'pending' });
+      prisma.rescueRequest.update.mockResolvedValue({});
+
+      await service.refundDeposit('req-1');
+
+      expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith({
+        where: { id: 'req-1', status: 'CANCELLED', depositRefundStatus: { in: ['ELIGIBLE', 'FAILED'] } },
+        data: { depositRefundStatus: 'PENDING' },
+      });
+      expect(paystackService.refundTransaction).toHaveBeenCalledWith('DEP_ref_1', 500000);
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { depositRefundId: 999 },
+      });
+    });
+
+    it('rejects the claim (BadRequestException) when depositRefundStatus is NONE — not eligible', async () => {
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(service.refundDeposit('req-1')).rejects.toThrow('Not eligible for refund');
+    });
+
+    it('marks FAILED and rethrows when the Paystack call throws', async () => {
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1', depositReference: 'DEP_ref_1', depositAmount: 500000,
+      });
+      paystackService.refundTransaction.mockRejectedValue(new Error('Paystack down'));
+
+      await expect(service.refundDeposit('req-1')).rejects.toThrow('Paystack down');
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { depositRefundStatus: 'FAILED' },
+      });
+    });
+
+    it('leaves depositRefundStatus at PENDING (not FAILED) and alerts Sentry when Paystack succeeds but the depositRefundId write throws — a retry here would double-refund', async () => {
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1', depositReference: 'DEP_ref_1', depositAmount: 500000,
+      });
+      paystackService.refundTransaction.mockResolvedValue({ id: 999, status: 'success' });
+      prisma.rescueRequest.update.mockRejectedValue(new Error('DB write failed'));
+
+      await expect(service.refundDeposit('req-1')).resolves.toBeUndefined();
+
+      // Only the initial PENDING claim write happened — no FAILED write.
+      expect(prisma.rescueRequest.update).toHaveBeenCalledTimes(1);
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { depositRefundId: 999 },
+      });
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: { depositRefundStatus: 'FAILED' } }),
+      );
+      expect(Sentry.captureException).toHaveBeenCalledWith(
+        expect.any(Error),
+        expect.objectContaining({
+          extra: expect.objectContaining({ rescueRequestId: 'req-1', refundId: 999 }),
+        }),
+      );
     });
   });
 });

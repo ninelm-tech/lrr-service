@@ -340,4 +340,28 @@ export class PaystackService {
     console.log('Paystack initiate transfer:', data);
     return { transferCode: data.data.transfer_code, status: data.data.status };
   }
+
+  // ── Paystack Refunds ─────────────────────────────────────────────────────
+
+  /**
+   * Initiates a refund via Paystack's Create Refund API. `transaction` is
+   * Paystack's own parameter name — the original transaction's id or
+   * reference (our depositReference) — not a generic "reference". This only
+   * INITIATES the refund; Paystack settles it asynchronously and confirms via
+   * the refund.processed/refund.failed webhook (see PaymentService).
+   */
+  async refundTransaction(transaction: string, amount: number): Promise<{ id: number; status: string }> {
+    const response = await fetch(`${this.baseUrl}/refund`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.secretKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ transaction, amount }),
+    });
+
+    const data = await response.json();
+    console.log('Paystack refund response:', data);
+    return data.data as { id: number; status: string };
+  }
 }
