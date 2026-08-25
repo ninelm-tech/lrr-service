@@ -1,5 +1,6 @@
 import { Injectable, forwardRef, Inject } from '@nestjs/common';
 import * as Sentry from '@sentry/node';
+import { logger } from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
@@ -46,11 +47,18 @@ export class PaymentEventsService {
     const customerId    = rescueRequest.customerId;
     const customerPhone = rescueRequest.customer.phoneNumber;
 
-    // Mark deposit paid and fully confirm the operator assignment
-    await this.prisma.rescueRequest.update({
-      where: { id: rescueRequest.id },
+    // Mark deposit paid and fully confirm the operator assignment — atomic
+    // claim, not an unconditional write. count === 0 means the WHERE didn't
+    // match; see handleUnclaimedDeposit for why that's ambiguous and must
+    // not be treated as "always late payment."
+    const claimed = await this.prisma.rescueRequest.updateMany({
+      where: { id: rescueRequest.id, status: RescueRequestStatus.WAITING_FOR_DEPOSIT },
       data:  { depositPaid: true, status: RescueRequestStatus.OPERATOR_ASSIGNED },
     });
+    if (claimed.count === 0) {
+      await this.handleUnclaimedDeposit(rescueRequest.id, reference);
+      return;
+    }
 
     // The offer is only actually awarded now that payment is confirmed —
     // selection alone (Task 8) only reached SELECTED_PENDING_PAYMENT.
@@ -98,6 +106,57 @@ export class PaymentEventsService {
       // Edge case: no operator was pre-assigned (e.g. admin manually sent a payment link)
       void this.dispatchService.startDispatch(rescueRequest.id, customerId);
     }
+  }
+
+  /**
+   * claimed.count === 0 on the confirmed-payment claim is ambiguous — it means
+   * EITHER a Paystack webhook redelivery of a payment we already successfully
+   * processed, OR a genuinely late payment arriving after the request moved
+   * on. These must not be conflated: see
+   * docs/superpowers/specs/2026-08-25-deposit-window-and-refunds-design.md
+   * Section 2.
+   */
+  private async handleUnclaimedDeposit(rescueRequestId: string, reference: string): Promise<void> {
+    const fresh = await this.prisma.rescueRequest.findUniqueOrThrow({
+      where:   { id: rescueRequestId },
+      include: { customer: true },
+    });
+
+    if (fresh.depositPaid) {
+      logger.info('deposit: duplicate confirmation ignored', { rescueRequestId, reference });
+      return;
+    }
+
+    if (fresh.status === RescueRequestStatus.CANCELLED) {
+      await this.handleLateDeposit(fresh, reference);
+      return;
+    }
+
+    console.error(`Deposit confirmed for request ${rescueRequestId} in unexpected status ${fresh.status}`, { reference });
+    Sentry.captureMessage('Deposit confirmed in unexpected (non-CANCELLED) status', {
+      level: 'error',
+      extra: { rescueRequestId, reference, status: fresh.status },
+    });
+  }
+
+  /**
+   * The only place in the codebase that writes RefundStatus.ELIGIBLE — this
+   * is deliberate. It means "a deposit arrived for a request that has already
+   * moved on with nothing paid yet," which is exactly and only what this
+   * feature's refund path is for. Do not write ELIGIBLE anywhere else.
+   */
+  private async handleLateDeposit(rescueRequest: { id: string; customer: { phoneNumber: string | null } }, reference: string): Promise<void> {
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequest.id },
+      data:  { depositPaid: true, depositRefundStatus: 'ELIGIBLE' },
+    });
+    if (rescueRequest.customer.phoneNumber) {
+      await this.twilioService.sendWhatsAppMessage(
+        rescueRequest.customer.phoneNumber,
+        `Your payment for a cancelled request has come through. We're processing a refund — you'll be notified once it's complete.`,
+      );
+    }
+    logger.info('deposit: late payment on a non-WAITING_FOR_DEPOSIT request', { rescueRequestId: rescueRequest.id, reference });
   }
 
   async handleBalancePaymentConfirmed(reference: string) {
