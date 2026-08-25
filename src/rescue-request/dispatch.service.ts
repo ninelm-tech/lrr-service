@@ -121,14 +121,42 @@ export class DispatchService {
   }
 
   /**
-   * In-memory map from rescueRequestId to the pending batch-window timer.
+   * In-memory map from BATCH to that batch's pending window timer.
    * Doubles as a simple single-process mutex: whichever code path (the
    * timer firing, or an operator's response completing the batch early)
    * finds and deletes the entry first is the one that resolves the batch;
    * the other finds it already gone and returns immediately. Fine for a
    * single-instance pilot deployment — not a distributed lock.
+   *
+   * Keyed per batch (`requestId:expiresAt`), NOT per request. This is load
+   * bearing: a request can have several batches in flight at once, because
+   * expanding the radius adds operators without cancelling the offers other
+   * operators are still holding. With a per-request key the second batch
+   * overwrote the first's entry, the orphaned timer later fired, and
+   * resolveBatch ran with the OLD batch's operator list against the NEW
+   * batch's state.
+   *
+   * supersedeActiveRound used to avoid that collision by cancelling every
+   * pending offer so only one batch was ever live — i.e. by destroying the
+   * work of operators who simply hadn't answered yet. It was deleted along
+   * with this change; the two go together. If a stale-timer symptom ever
+   * reappears, fix it here in the key, never by cancelling offers.
+   * See docs/superpowers/specs/2026-08-24-dispatch-parallel-batches-design.md
    */
   private readonly batchTimers = new Map<string, NodeJS.Timeout>();
+
+  /** `requestId:expiresAt` — see batchTimers. */
+  private batchKey(rescueRequestId: string, batchExpiresAt: Date): string {
+    return `${rescueRequestId}:${batchExpiresAt.getTime()}`;
+  }
+
+  /**
+   * Pending "try another round after DISPATCH_RETRY_MINUTES" timers, one per
+   * request. Separate from batchTimers because a retry belongs to no batch —
+   * it exists precisely because the last round produced no candidates. Cleared
+   * before being replaced so a request can't accumulate retries.
+   */
+  private readonly retryTimers = new Map<string, NodeJS.Timeout>();
 
   /**
    * In-memory map from rescueRequestId to a short grace-period timer, started
@@ -203,7 +231,7 @@ export class DispatchService {
       // extraRadiusKm is 0 here for the same reason maybeResolveBatchEarly uses
       // 0 — a grace-forced resolve already has at least one quote, so it never
       // needs a radius expansion to find candidates.
-      void this.resolveBatch(rescueRequestId, batchOffers.map((o) => o.operatorId), rescueRequest.customerId, 0);
+      void this.resolveBatch(rescueRequestId, batchOffers.map((o) => o.operatorId), rescueRequest.customerId, 0, batchExpiresAt);
     }, this.QUOTE_GRACE_MS);
 
     this.graceTimers.set(rescueRequestId, timer);
@@ -321,12 +349,18 @@ export class DispatchService {
       // Operators exist in the area but are currently busy or offline —
       // proceed with the normal retry + radius-expansion cycle.
       const newRound = round + 1;
-      // Reset offeredOperatorIds so timed-out operators can be re-offered
-      // after the retry delay — they may have missed the first notification
-      await this.sessionStore.update(customerId, {
-        dispatchRound: newRound,
-        offeredOperatorIds: [],
-      });
+      // offeredOperatorIds is deliberately NOT reset here. It used to be, so
+      // that timed-out operators could be re-offered after the retry delay —
+      // but combined with resolveBatch's tail call into startDispatch that
+      // formed a loop: no candidates (everyone already offered) → reset →
+      // the same operators become eligible → the same job is offered to them
+      // again, round after round, until MAX_ROUNDS_BEFORE_AUTO_CANCEL.
+      // Observed on staging 2026-08-24: an operator received one job
+      // repeatedly and could still quote on it after it had apparently ended.
+      //
+      // Once an operator has been asked, they have been asked. The radius
+      // expansion below is what finds new people.
+      await this.sessionStore.update(customerId, { dispatchRound: newRound });
 
       if (newRound >= MAX_ROUNDS_BEFORE_AUTO_CANCEL) {
         // Tried long enough — auto-cancel the request and notify everyone
@@ -366,10 +400,17 @@ export class DispatchService {
 
       const expandedRadius = extraRadiusKm + RADIUS_EXPANSION_KM;
       const retryTimer = setTimeout(
-        () => void this.startDispatch(rescueRequestId, customerId, expandedRadius),
+        () => {
+          this.retryTimers.delete(rescueRequestId);
+          void this.startDispatch(rescueRequestId, customerId, expandedRadius);
+        },
         DISPATCH_RETRY_MINUTES * 60 * 1000,
       );
-      this.batchTimers.set(rescueRequestId, retryTimer);
+      // Clear before replacing — the previous code stored this in batchTimers
+      // with a plain set(), so an overwritten retry timer still fired.
+      const priorRetry = this.retryTimers.get(rescueRequestId);
+      if (priorRetry) clearTimeout(priorRetry);
+      this.retryTimers.set(rescueRequestId, retryTimer);
       return;
     }
 
@@ -449,10 +490,10 @@ export class DispatchService {
     // Single timeout covers the entire batch — stored so an early-resolved
     // batch (Step below) can prevent this from firing a second time.
     const timer = setTimeout(
-      () => void this.resolveBatch(rescueRequestId, batchOperatorIds, customerId, extraRadiusKm),
+      () => void this.resolveBatch(rescueRequestId, batchOperatorIds, customerId, extraRadiusKm, expiresAt),
       windowSeconds * 1000,
     );
-    this.batchTimers.set(rescueRequestId, timer);
+    this.batchTimers.set(this.batchKey(rescueRequestId, expiresAt), timer);
   }
 
   private async resolveBatch(
@@ -460,12 +501,16 @@ export class DispatchService {
     batchOperatorIds: string[],
     customerId: string,
     extraRadiusKm: number,
+    batchExpiresAt: Date,
   ) {
     // Mutex: only the caller that finds (and removes) the timer entry proceeds.
-    const timer = this.batchTimers.get(rescueRequestId);
+    // Scoped to THIS batch — another batch of the same request resolving must
+    // not consume this one's entry.
+    const key = this.batchKey(rescueRequestId, batchExpiresAt);
+    const timer = this.batchTimers.get(key);
     if (!timer) return; // already resolved by the other path
     clearTimeout(timer);
-    this.batchTimers.delete(rescueRequestId);
+    this.batchTimers.delete(key);
 
     // This batch is resolving now — no need for a pending grace timer to fire later.
     const graceTimer = this.graceTimers.get(rescueRequestId);
@@ -535,36 +580,25 @@ export class DispatchService {
     // here because an early-resolved batch (all responded) never needed a
     // radius expansion to find candidates — expansion only happens when
     // zero candidates exist at all, a separate path in startDispatch.
-    void this.resolveBatch(rescueRequestId, batchOperatorIds, rescueRequest.customerId, 0);
+    void this.resolveBatch(rescueRequestId, batchOperatorIds, rescueRequest.customerId, 0, batchExpiresAt);
   }
 
-  /**
-   * Tears down whatever automatic dispatch round is currently active for a
-   * request, so an admin-initiated round (expand-radius or a manual offer)
-   * can safely take over the round slot. Without this, a stale timer from
-   * the superseded round could later fire, grab the *new* round's
-   * batchTimers entry via the shared map key, and resolve using the *old*
-   * round's stale operator list — see Global Constraints for the full
-   * mechanism this guards against.
-   */
-  private async supersedeActiveRound(rescueRequestId: string): Promise<void> {
-    const batchTimer = this.batchTimers.get(rescueRequestId);
-    if (batchTimer) {
-      clearTimeout(batchTimer);
-      this.batchTimers.delete(rescueRequestId);
-    }
-
-    const graceTimer = this.graceTimers.get(rescueRequestId);
-    if (graceTimer) {
-      clearTimeout(graceTimer);
-      this.graceTimers.delete(rescueRequestId);
-    }
-
-    await this.prisma.dispatchOffer.updateMany({
-      where: { rescueRequestId, status: 'PENDING' },
-      data: { status: 'TIMED_OUT', respondedAt: new Date() },
-    });
-  }
+  //
+  // supersedeActiveRound used to live here. It cancelled every PENDING offer
+  // on a request so an admin-initiated round could take over "the round slot",
+  // because batchTimers was keyed per request and a second batch would
+  // otherwise clobber the first's entry.
+  //
+  // It bought that safety by destroying other operators' work: an operator two
+  // minutes into a ten-minute window lost the offer because an admin clicked
+  // Expand — asked a question and never allowed to answer. Expanding the
+  // radius means "also ask these people", never "un-ask those people".
+  //
+  // Per-batch timer keys (see batchTimers) remove the collision it existed to
+  // prevent, so it is gone. Do not restore it, and do not add any other
+  // blanket PENDING → TIMED_OUT sweep scoped to a whole request. An offer ends
+  // when the operator answers it or when its own expiresAt passes.
+  //
 
   /**
    * Admin action: immediately start a new dispatch round with an expanded
@@ -582,8 +616,8 @@ export class DispatchService {
       throw new BadRequestException('Request is not currently DISPATCHING');
     }
 
-    await this.supersedeActiveRound(rescueRequestId);
-
+    // Deliberately does NOT touch existing offers — operators still inside
+    // their window keep them. Expanding adds people; it never un-asks anyone.
     const session = await this.sessionStore.getOrCreate(rescueRequest.customerId);
     const currentRadius = (session.dispatchRound ?? 0) * RADIUS_EXPANSION_KM;
     const expandedRadius = currentRadius + RADIUS_EXPANSION_KM;
@@ -611,8 +645,8 @@ export class DispatchService {
       throw new BadRequestException('Target is not an active operator');
     }
 
-    await this.supersedeActiveRound(rescueRequestId);
-
+    // As with expandRadiusNow: existing offers are left alone. This adds one
+    // more operator to the request, it does not replace the current round.
     const MANUAL_OFFER_WINDOW_MS = 5 * 60 * 1000;
     const expiresAt = new Date(Date.now() + MANUAL_OFFER_WINDOW_MS);
 
@@ -671,10 +705,10 @@ export class DispatchService {
 
     const currentRadius = (session.dispatchRound ?? 0) * RADIUS_EXPANSION_KM;
     const timer = setTimeout(
-      () => void this.resolveBatch(rescueRequestId, [operatorId], rescueRequest.customerId, currentRadius),
+      () => void this.resolveBatch(rescueRequestId, [operatorId], rescueRequest.customerId, currentRadius, expiresAt),
       MANUAL_OFFER_WINDOW_MS,
     );
-    this.batchTimers.set(rescueRequestId, timer);
+    this.batchTimers.set(this.batchKey(rescueRequestId, expiresAt), timer);
   }
 
   async sendQuoteShortlist(rescueRequestId: string, customerId: string) {
