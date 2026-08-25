@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { logger } from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppOperatorFlowService } from './whatsapp-operator-flow.service';
@@ -32,7 +33,11 @@ export class WhatsAppInboundService {
     // formatted address/place name — absent for a bare "current location" pin.
     const sharedAddress = body.Address ? String(body.Address).trim() : undefined;
 
-    console.log('Incoming WhatsApp message:', { phoneNumber, message, latitude, longitude });
+    // Structured, not console.log — plain console.log on this path was never
+    // shipped to Sentry (confirmed 2026-08-25 while investigating an
+    // "operator stuck after ARRIVED" report with zero trace of the inbound
+    // message anywhere), so this route had no diagnosability at all.
+    logger.info('whatsapp: inbound message', { phoneNumber, message, latitude, longitude });
 
     // Always resolve (or create) a User for this phone number.
     // Operators and customers both have a User record — this is our session key.
@@ -47,6 +52,9 @@ export class WhatsAppInboundService {
     });
 
     if (operatorRecord) {
+      logger.info('whatsapp: routed to operator flow', {
+        phoneNumber, userId, message, sessionState: session.state, rescueRequestId: session.rescueRequestId,
+      });
       return this.operatorFlow.handleOperatorMessage(phoneNumber, userId, message, session, operatorRecord);
     }
 

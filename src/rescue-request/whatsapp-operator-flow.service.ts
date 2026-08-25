@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { logger } from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { RescueRequestStatus, RatingDirection, VehicleType } from '@prisma/client';
@@ -81,21 +82,32 @@ export class WhatsAppOperatorFlowService {
     // ── ARRIVED at customer location ───────────────────────────────────────
     if (message === 'arrived' || message === 'on site' || message === 'onsite') {
       if (session.state !== WhatsAppFlowState.OPERATOR_ON_JOB || !session.rescueRequestId) {
+        logger.info('whatsapp: ARRIVED rejected — wrong session state', {
+          operatorId: operator.id, sessionState: session.state, rescueRequestId: session.rescueRequestId,
+        });
         return this.reply(`You don't have an active job. Wait for a dispatch offer.`);
       }
+      logger.info('whatsapp: ARRIVED accepted', { operatorId: operator.id, rescueRequestId: session.rescueRequestId });
       return this.handleOperatorArrived(phoneNumber, userId, session.rescueRequestId, operator);
     }
 
     // ── Job DONE — prompt customer to confirm ──────────────────────────────
     if (message === 'done' || message === 'complete' || message === 'finished') {
       if (session.state !== WhatsAppFlowState.OPERATOR_AT_LOCATION || !session.rescueRequestId) {
+        logger.info('whatsapp: DONE rejected — wrong session state', {
+          operatorId: operator.id, sessionState: session.state, rescueRequestId: session.rescueRequestId,
+        });
         return this.reply(`Please send ARRIVED first when you reach the customer location.`);
       }
+      logger.info('whatsapp: DONE accepted', { operatorId: operator.id, rescueRequestId: session.rescueRequestId });
       return this.handleOperatorJobDone(phoneNumber, userId, session.rescueRequestId, operator);
     }
 
     // ── Contextual help ───────────────────────────────────────────────────
     if (session.state === WhatsAppFlowState.OPERATOR_ON_JOB) {
+      logger.info('whatsapp: unrecognized message while ON_JOB — sent ARRIVED reminder', {
+        operatorId: operator.id, message, rescueRequestId: session.rescueRequestId,
+      });
       return this.reply(
         `📍 Send *ARRIVED* when you reach the customer location so we can notify them.`,
       );
@@ -106,6 +118,12 @@ export class WhatsAppOperatorFlowService {
       );
     }
 
+    // Nothing matched — the operator's message went entirely unhandled and
+    // got silent empty TwiML back. This used to be invisible; log it so an
+    // operator saying "nothing happened" is traceable to what they actually sent.
+    logger.info('whatsapp: operator message unhandled — no branch matched', {
+      operatorId: operator.id, message, sessionState: session.state, rescueRequestId: session.rescueRequestId,
+    });
     return this.xmlOk();
   }
 
@@ -240,6 +258,9 @@ export class WhatsAppOperatorFlowService {
       include: { customer: true },
     });
     if (!rescueRequest || rescueRequest.status === RescueRequestStatus.CANCELLED || rescueRequest.status === RescueRequestStatus.COMPLETED) {
+      logger.info('whatsapp: ARRIVED rejected — request already ended', {
+        operatorId: operator.id, rescueRequestId, status: rescueRequest?.status ?? 'NOT_FOUND',
+      });
       await this.sessionStore.clear(operatorUserId);
       return this.reply(`This job has already ended. Watch out for new dispatch offers.`);
     }
