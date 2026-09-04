@@ -1,0 +1,81 @@
+name: Deploy → Production
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**'
+      - '!.github/workflows/**'
+      - '.github/workflows/deploy-production.yml'
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: lrr/service
+  ECS_CLUSTER: lrr-prod
+  ECS_SERVICE: lrr-service-prod
+  IMAGE_TAG: prod
+
+jobs:
+  deploy:
+    name: Build & Deploy to Production
+    runs-on: ubuntu-latest
+    # Requires manual approval: configure a "production" environment under
+    # repo Settings → Environments with required reviewers before this runs.
+    environment: production
+
+    # Required for OIDC token exchange with AWS
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── AWS credentials (OIDC — no long-lived keys needed) ────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::808236751302:role/github-actions-lrr
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Login to ECR ──────────────────────────────────────────────
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Build & push image ────────────────────────────────────────
+      - name: Build, tag, and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "Building $IMAGE_URI"
+          docker build \
+            --cache-from $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $IMAGE_URI \
+            .
+          docker push $IMAGE_URI
+          echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      # ── Force new ECS deployment ──────────────────────────────────
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --force-new-deployment \
+            --region $AWS_REGION
+
+      # ── Wait for service to stabilise ─────────────────────────────
+      - name: Wait for deployment to complete
+        run: |
+          echo "Waiting for ECS service to stabilise..."
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --region $AWS_REGION
+          echo "✅ Deployment complete"
