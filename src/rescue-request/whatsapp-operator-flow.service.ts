@@ -33,6 +33,10 @@ export class WhatsAppOperatorFlowService {
     session: Awaited<ReturnType<WhatsAppSessionStore['getOrCreate']>>,
     operator: { id: string; businessName: string; phoneNumber: string },
   ) {
+    // Strip thousands separators so "100,000" parses the same as "100000" —
+    // no valid operator command otherwise contains a comma.
+    message = message.replace(/,/g, '');
+
     // ── Waiting for post-job rating (operator rates motorist) ─────────────
     // MUST come before the quote-parsing check below, which treats any bare
     // digit as a dispatch-offer price quote — without this ordering, a

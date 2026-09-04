@@ -35,7 +35,7 @@ describe('PayoutController', () => {
 
       expect(prisma.payout.findMany).toHaveBeenCalledWith({
         where: { status: 'FAILED' },
-        include: { operator: { select: { businessName: true } }, rescueRequest: { select: { id: true } } },
+        include: { operator: { select: { businessName: true } }, rescueRequest: { select: { id: true, disputed: true, disputeResolvedAt: true } } },
         orderBy: { createdAt: 'desc' },
       });
       expect(result.data).toHaveLength(1);

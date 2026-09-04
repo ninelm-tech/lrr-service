@@ -21,7 +21,7 @@ export class PayoutController {
       where: status ? { status: status as PayoutStatus } : {},
       include: {
         operator: { select: { businessName: true } },
-        rescueRequest: { select: { id: true } },
+        rescueRequest: { select: { id: true, disputed: true, disputeResolvedAt: true } },
       },
       orderBy: { createdAt: 'desc' },
     });
