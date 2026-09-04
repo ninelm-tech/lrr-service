@@ -302,6 +302,9 @@ export class PaystackService {
     });
     const data = await res.json() as any;
     console.log('Paystack create transfer recipient:', data);
+    if (!data.status || !data.data) {
+      throw new Error(data.message || 'Paystack transfer recipient creation failed');
+    }
     return { recipientCode: data.data.recipient_code };
   }
 
@@ -338,6 +341,9 @@ export class PaystackService {
     });
     const data = await res.json() as any;
     console.log('Paystack initiate transfer:', data);
+    if (!data.status || !data.data) {
+      throw new Error(data.message || 'Paystack transfer initiation failed');
+    }
     return { transferCode: data.data.transfer_code, status: data.data.status };
   }
 
