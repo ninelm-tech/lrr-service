@@ -185,7 +185,7 @@ export class PaymentEventsService {
     if (customerPhone) {
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
-        `✅ Payment of ₦${balanceNaira} confirmed! Thank you for using Lagos Roadside Rescue 🙏`,
+        `✅ Payment of ₦${balanceNaira} confirmed! Thank you for using Local Roadside Rescue 🙏`,
       );
       const operatorName = operator?.businessName ?? 'your operator';
       const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
@@ -286,7 +286,7 @@ export class PaymentEventsService {
     const balanceNaira = (balanceAmount / 100).toLocaleString();
     await this.twilioService.sendWhatsAppMessage(
       customerPhone,
-      `✅ Your tow is complete!\n\n⚠️ *ACTION NEEDED* — tap the link below to pay the ₦${balanceNaira} balance:\n\n👉 ${paymentResponse.data.authorization_url}\n\nThank you for using Lagos Roadside Rescue 🚗`,
+      `✅ Your tow is complete!\n\n⚠️ *ACTION NEEDED* — tap the link below to pay the ₦${balanceNaira} balance:\n\n👉 ${paymentResponse.data.authorization_url}\n\nThank you for using Local Roadside Rescue 🚗`,
     );
   }
 }

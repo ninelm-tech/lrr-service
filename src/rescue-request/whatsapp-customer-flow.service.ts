@@ -373,7 +373,7 @@ export class WhatsAppCustomerFlowService {
     }
 
     return this.reply(
-      `👋 Welcome to Lagos Roadside Rescue.\n\nSend HELP or SOS if you need roadside assistance.`,
+      `👋 Welcome to Local Roadside Rescue.\n\nSend HELP or SOS if you need roadside assistance.`,
     );
   }
 
