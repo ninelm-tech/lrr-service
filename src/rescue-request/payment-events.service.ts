@@ -1,4 +1,4 @@
-import { Injectable, forwardRef, Inject } from '@nestjs/common';
+import { BadRequestException, Injectable, forwardRef, Inject } from '@nestjs/common';
 import * as Sentry from '@sentry/node';
 import { logger } from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
@@ -236,6 +236,16 @@ export class PaymentEventsService {
       include: { customer: true },
     });
     if (!rescueRequest) throw new Error('Rescue request not found');
+
+    // A request under active dispute must not proceed to the balance
+    // payment / payout stage — staff have to resolve it first (see
+    // DisputeService.resolveDispute). Without this guard, the admin
+    // "mark completed" shortcut (and a customer replying CONFIRM after
+    // DISPUTE, since the session state doesn't change on dispute) both
+    // bypass the WhatsApp CONFIRM/DISPUTE fork entirely.
+    if (rescueRequest.disputed && !rescueRequest.disputeResolvedAt) {
+      throw new BadRequestException('This request has an unresolved dispute — resolve it before marking the job completed.');
+    }
 
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequestId },

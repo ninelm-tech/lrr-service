@@ -1,4 +1,4 @@
-import { Injectable, forwardRef, Inject } from '@nestjs/common';
+import { BadRequestException, Injectable, forwardRef, Inject } from '@nestjs/common';
 import * as Sentry from '@sentry/node';
 import { logger } from '@sentry/node';
 import * as crypto from 'crypto';
@@ -86,8 +86,19 @@ export class WhatsAppCustomerFlowService {
     if (session.state === WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM) {
       if (message === 'confirm') {
         if (session.rescueRequestId) {
-          await this.paymentEventsService.markJobCompleted(session.rescueRequestId);
-          await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
+          try {
+            await this.paymentEventsService.markJobCompleted(session.rescueRequestId);
+            await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
+          } catch (err) {
+            // Typically: a DISPUTE was raised on this same request just
+            // before this CONFIRM — session state doesn't change on
+            // dispute, so both replies reach here. Session stays put so a
+            // later CONFIRM (after staff resolve it) can still go through.
+            if (err instanceof BadRequestException) {
+              return this.reply(`This request is still under dispute review — our team will follow up before you can confirm completion.`);
+            }
+            throw err;
+          }
         }
         return this.xmlOk();
       }
