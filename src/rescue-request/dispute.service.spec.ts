@@ -85,6 +85,27 @@ describe('DisputeService', () => {
       );
     });
 
+    it('first raise: warns the operator (not the customer) to withhold the vehicle', async () => {
+      const operatorPhone = '+2348011112222';
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: rescueRequestId, disputed: false, disputeResolvedAt: null,
+        status: 'ARRIVED', assignedOperator: { businessName: 'Swift Towing', phoneNumber: operatorPhone },
+        balanceAmount: 22500, depositAmount: 2500, customer: { phoneNumber: customerPhone },
+      });
+      platformConfigService.getConfig.mockResolvedValue({ disputeAlertPhoneNumber: null });
+
+      await service.raiseDispute(rescueRequestId, customerPhone);
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining(operatorPhone),
+        expect.stringContaining('Do NOT release the vehicle'),
+      );
+      const customerCall = twilioService.sendWhatsAppMessage.mock.calls.find(
+        ([to]) => to.includes(customerPhone),
+      );
+      expect(customerCall?.[1]).not.toContain('vehicle');
+    });
+
     it('skips the staff alert cleanly when disputeAlertPhoneNumber is unset', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
         id: rescueRequestId, disputed: false, disputeResolvedAt: null,

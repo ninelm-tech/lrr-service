@@ -47,9 +47,25 @@ export class DisputeService {
     await this.twilioService.sendWhatsAppMessage(
       toWhatsAppAddress(customerPhoneNumber),
       isReopen
-        ? `⚠️ Your dispute has been reopened. Our team is on it.\n\nDo NOT release the vehicle until you hear from us.`
-        : `⚠️ Your dispute has been logged. Our team will contact you within 30 minutes.\n\nDo NOT release the vehicle until you hear from us.`,
+        ? `⚠️ Your dispute has been reopened. Our team is on it and will contact you shortly.`
+        : `⚠️ Your dispute has been logged. Our team will contact you within 30 minutes.`,
     );
+
+    // The operator is the one physically holding the vehicle — they're the
+    // one who needs to hear "don't release it," not the customer. Best-effort:
+    // a failed operator notification shouldn't block the dispute itself.
+    if (rescueRequest.assignedOperator?.phoneNumber) {
+      try {
+        await this.twilioService.sendWhatsAppMessage(
+          toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
+          isReopen
+            ? `⚠️ The customer's dispute on ${formatJobRef(rescueRequestId)} has been reopened.\n\nDo NOT release the vehicle until you hear from us.`
+            : `⚠️ The customer has disputed ${formatJobRef(rescueRequestId)}. Our team will review shortly.\n\nDo NOT release the vehicle until you hear from us.`,
+        );
+      } catch (error) {
+        console.error('Failed to notify operator of raised dispute:', error);
+      }
+    }
 
     await this.sendStaffDisputeAlert(rescueRequest);
   }
