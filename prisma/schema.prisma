@@ -58,6 +58,7 @@ enum RescueRequestStatus {
   OPERATOR_ASSIGNED
   IN_PROGRESS
   ARRIVED
+  IN_DISPUTE
   COMPLETED
   CANCELLED
   STALLED
@@ -212,6 +213,16 @@ model RescueRequest {
   disputed           Boolean             @default(false)
   disputeRaisedAt    DateTime?
   disputeResolvedAt  DateTime?
+  // Free-text statement each side sends when asked "what happened?" after a
+  // dispute is raised. Each is captured once — not an open-ended thread.
+  customerDisputeStatement String?
+  operatorDisputeStatement String?
+  // Staff's note on what was found/decided, entered alongside the settlement.
+  disputeResolutionNote    String?
+  // Snapshot of balanceAmount taken at resolution time, before any
+  // adjustment — balanceAmount itself becomes the settled figure, so this
+  // is the only place "what was originally owed" survives.
+  disputeOriginalBalanceAmount Int?
 
   assignedOperatorId String?
   assignedOperator   Operator?           @relation(fields: [assignedOperatorId], references: [id])

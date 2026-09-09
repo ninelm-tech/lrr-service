@@ -25,6 +25,14 @@ export enum WhatsAppFlowState {
   // Set on customer's session after operator marks job DONE;
   // customer must reply CONFIRM to release car + trigger balance payment
   AWAITING_COMPLETION_CONFIRM = 'AWAITING_COMPLETION_CONFIRM',
+
+  // ── Dispute intake states ─────────────────────────────────
+  // Set on the customer's session right after they reply DISPUTE; their
+  // next message is captured as customerDisputeStatement.
+  AWAITING_DISPUTE_REASON = 'AWAITING_DISPUTE_REASON',
+  // Set on the operator's session when a dispute is raised on their job;
+  // their next message is captured as operatorDisputeStatement.
+  AWAITING_DISPUTE_RESPONSE = 'AWAITING_DISPUTE_RESPONSE',
 }
 
 export type IssueType = 'BREAKDOWN' | 'ACCIDENT' | 'FLAT_TYRE' | 'FUEL';
