@@ -1,7 +1,11 @@
-import { BadRequestException, Body, Controller, Get, NotFoundException, Param, Patch } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, NotFoundException, Param, Patch, UseGuards } from '@nestjs/common';
+import { UserRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { RatingService } from './rating.service';
 import { RatingDetailDto, SubmitRatingCommentDto } from './dto/rating.dto';
+import { AuthGuard } from '../auth/auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
 
 @Controller('ratings')
 export class RatingController {
@@ -40,5 +44,13 @@ export class RatingController {
     }
     const updated = await this.ratingService.setComment(id, body.comment);
     return { data: { comment: updated.comment } };
+  }
+
+  /** Mark a flagged low rating reviewed. Idempotent — safe to call more than once. */
+  @Patch(':id/resolve-flag')
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async resolveFlag(@Param('id') id: string) {
+    return this.ratingService.resolveFlag(id);
   }
 }

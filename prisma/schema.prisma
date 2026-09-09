@@ -328,6 +328,12 @@ model Rating {
   score            Int
   comment          String?
 
+  // Set when score is 1-2 — durable record so a low rating survives past
+  // the one-time staff WhatsApp alert, and is visible/filterable later.
+  flagged          Boolean         @default(false)
+  flaggedAt        DateTime?
+  flaggedResolvedAt DateTime?
+
   createdAt        DateTime        @default(now())
 
   @@unique([rescueRequestId, direction])
