@@ -42,6 +42,10 @@ export class WhatsAppCustomerFlowService {
     private readonly platformConfigService: PlatformConfigService,
     private readonly operatorService: OperatorService,
     private readonly dispatchService: DispatchService,
+    // DisputeService now depends on PaymentEventsService (which already
+    // forwardRef's back to this class), so this edge closes a 3-hop cycle
+    // and needs forwardRef too, same as the PaymentEventsService edge below.
+    @Inject(forwardRef(() => DisputeService))
     private readonly disputeService: DisputeService,
     @Inject(forwardRef(() => PaymentEventsService))
     private readonly paymentEventsService: PaymentEventsService,
@@ -82,6 +86,21 @@ export class WhatsAppCustomerFlowService {
     session: Awaited<ReturnType<WhatsAppSessionStore['getOrCreate']>>,
     body: Record<string, any>,
   ) {
+    // ── Waiting for dispute statement (customer's side of the story) ──────
+    // MUST come before every other branch below, same reasoning as the
+    // operator-side equivalent: whatever the customer sends next while in
+    // this state is their statement, not a command.
+    if (session.state === WhatsAppFlowState.AWAITING_DISPUTE_REASON) {
+      if (session.rescueRequestId) {
+        await this.prisma.rescueRequest.update({
+          where: { id: session.rescueRequestId },
+          data: { customerDisputeStatement: rawMessage },
+        });
+      }
+      await this.sessionStore.update(userId, { state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM });
+      return this.reply(`Thanks — we've recorded that. Our team will be in touch.`);
+    }
+
     // ── CONFIRM / DISPUTE job completion (customer side) ──────────────────
     if (session.state === WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM) {
       if (message === 'confirm') {
@@ -104,7 +123,7 @@ export class WhatsAppCustomerFlowService {
       }
       if (message === 'dispute') {
         if (session.rescueRequestId) {
-          await this.disputeService.raiseDispute(session.rescueRequestId, phoneNumber);
+          await this.disputeService.raiseDispute(session.rescueRequestId, phoneNumber, userId);
         }
         return this.xmlOk();
       }

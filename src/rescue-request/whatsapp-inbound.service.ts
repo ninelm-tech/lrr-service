@@ -55,7 +55,7 @@ export class WhatsAppInboundService {
       logger.info('whatsapp: routed to operator flow', {
         phoneNumber, userId, message, sessionState: session.state, rescueRequestId: session.rescueRequestId,
       });
-      return this.operatorFlow.handleOperatorMessage(phoneNumber, userId, message, session, operatorRecord);
+      return this.operatorFlow.handleOperatorMessage(phoneNumber, userId, message, rawMessage, session, operatorRecord);
     }
 
     return this.customerFlow.handleCustomerMessage(

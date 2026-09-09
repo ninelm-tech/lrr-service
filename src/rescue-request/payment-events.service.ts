@@ -257,7 +257,7 @@ export class PaymentEventsService {
     }
   }
 
-  private async sendBalancePaymentLink(rescueRequest: any) {
+  async sendBalancePaymentLink(rescueRequest: any) {
     const customerPhone = rescueRequest.customer.phoneNumber;
     if (!customerPhone) return;
 

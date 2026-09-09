@@ -37,7 +37,7 @@ describe('WhatsAppOperatorFlowService', () => {
       const session = { state: WhatsAppFlowState.WAITING_FOR_RATING, rescueRequestId: 'req-1' } as any;
       const operator = { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341111111111' };
 
-      const result = await orderingService.handleOperatorMessage('+2341111111111', 'op-user-1', '4', session, operator);
+      const result = await orderingService.handleOperatorMessage('+2341111111111', 'op-user-1', '4', '4', session, operator);
 
       // handleOperatorQuoteOrDecline's quote path always starts with an
       // operator.findUnique lookup — asserting it was never called proves
@@ -137,7 +137,7 @@ describe('WhatsAppOperatorFlowService', () => {
       prisma.dispatchOffer.findMany.mockResolvedValue([offerB, offerA]);
 
       const result = await quoteService.handleOperatorMessage(
-        '+2341', 'user-1', '#AAAAAA',
+        '+2341', 'user-1', '#AAAAAA', '#AAAAAA',
         { state: WhatsAppFlowState.IDLE } as any,
         { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341' },
       );
@@ -151,7 +151,7 @@ describe('WhatsAppOperatorFlowService', () => {
       prisma.dispatchOffer.findMany.mockResolvedValue([offerB, offerA]);
 
       await quoteService.handleOperatorMessage(
-        '+2341', 'user-1', '#AAAAAA 25000',
+        '+2341', 'user-1', '#AAAAAA 25000', '#AAAAAA 25000',
         { state: WhatsAppFlowState.IDLE } as any,
         { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341' },
       );
@@ -163,7 +163,7 @@ describe('WhatsAppOperatorFlowService', () => {
       prisma.dispatchOffer.findMany.mockResolvedValue([offerB, offerA]);
 
       const result = await quoteService.handleOperatorMessage(
-        '+2341', 'user-1', 'onsite',
+        '+2341', 'user-1', 'onsite', 'onsite',
         { state: WhatsAppFlowState.IDLE } as any,
         { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341' },
       );
@@ -188,6 +188,47 @@ describe('WhatsAppOperatorFlowService', () => {
 
       expect(dispatchService.processQuoteOrDecline).not.toHaveBeenCalled();
       expect(result).toContain("doesn't match");
+    });
+  });
+
+  describe('AWAITING_DISPUTE_RESPONSE', () => {
+    let service: WhatsAppOperatorFlowService;
+    let prisma: { rescueRequest: { update: jest.Mock } };
+    let sessionStore: { update: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = { rescueRequest: { update: jest.fn() } };
+      sessionStore = { update: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppOperatorFlowService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppCustomerFlowService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppOperatorFlowService>(WhatsAppOperatorFlowService);
+    });
+
+    it('captures the operator\'s raw statement, reverts session state, and acknowledges', async () => {
+      const session = { state: WhatsAppFlowState.AWAITING_DISPUTE_RESPONSE, rescueRequestId: 'req-1' } as any;
+
+      await service.handleOperatorMessage(
+        '+2348011112222', 'op-user-1', 'the customer wasnt there when i arrived',
+        'The customer wasn\'t there when I arrived.', session,
+        { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2348011112222' },
+      );
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { operatorDisputeStatement: 'The customer wasn\'t there when I arrived.' },
+      });
+      expect(sessionStore.update).toHaveBeenCalledWith('op-user-1', { state: WhatsAppFlowState.OPERATOR_AT_LOCATION });
     });
   });
 });

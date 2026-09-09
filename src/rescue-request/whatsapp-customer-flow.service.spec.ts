@@ -187,4 +187,53 @@ describe('WhatsAppCustomerFlowService', () => {
       expect(result).toContain('type where you');
     });
   });
+
+  describe('AWAITING_DISPUTE_REASON', () => {
+    let service: WhatsAppCustomerFlowService;
+    let prisma: { rescueRequest: { update: jest.Mock } };
+    let sessionStore: { update: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = { rescueRequest: { update: jest.fn() } };
+      sessionStore = { update: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppCustomerFlowService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: { sendWhatsAppMessage: jest.fn() } },
+          { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PaystackService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppCustomerFlowService>(WhatsAppCustomerFlowService);
+    });
+
+    it('captures the customer\'s raw statement, reverts to AWAITING_COMPLETION_CONFIRM, and acknowledges', async () => {
+      const session = { state: WhatsAppFlowState.AWAITING_DISPUTE_REASON, rescueRequestId: 'req-1' } as any;
+
+      const result = await service.handleCustomerMessage(
+        '+2348012345678', 'cust-1', 'the tow took 3 hours',
+        'The tow took 3 hours, way longer than promised.',
+        undefined, undefined, undefined, session, {},
+      );
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { customerDisputeStatement: 'The tow took 3 hours, way longer than promised.' },
+      });
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', { state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM });
+      expect(result).toContain('recorded');
+    });
+  });
 });

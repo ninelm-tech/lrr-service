@@ -30,12 +30,29 @@ export class WhatsAppOperatorFlowService {
     phoneNumber: string,
     userId: string,
     message: string,
+    rawMessage: string,
     session: Awaited<ReturnType<WhatsAppSessionStore['getOrCreate']>>,
     operator: { id: string; businessName: string; phoneNumber: string },
   ) {
     // Strip thousands separators so "100,000" parses the same as "100000" —
     // no valid operator command otherwise contains a comma.
     message = message.replace(/,/g, '');
+
+    // ── Waiting for dispute statement (operator's side of the story) ──────
+    // MUST come before every other branch below — none of them apply once
+    // we've asked the operator for a free-text statement, and a numeric or
+    // keyword-shaped reply here must not be mistaken for a price quote or
+    // command.
+    if (session.state === WhatsAppFlowState.AWAITING_DISPUTE_RESPONSE) {
+      if (session.rescueRequestId) {
+        await this.prisma.rescueRequest.update({
+          where: { id: session.rescueRequestId },
+          data: { operatorDisputeStatement: rawMessage },
+        });
+      }
+      await this.sessionStore.update(userId, { state: WhatsAppFlowState.OPERATOR_AT_LOCATION });
+      return this.reply(`Thanks — we've recorded that. Our team will be in touch.`);
+    }
 
     // ── Waiting for post-job rating (operator rates motorist) ─────────────
     // MUST come before the quote-parsing check below, which treats any bare

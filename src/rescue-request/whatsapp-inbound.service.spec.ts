@@ -43,7 +43,7 @@ describe('WhatsAppInboundService', () => {
 
     expect(sharedService.findOrCreateCustomer).toHaveBeenCalledWith(phoneNumber);
     expect(operatorFlowService.handleOperatorMessage).toHaveBeenCalledWith(
-      phoneNumber, 'user-1', 'hi', { state: 'IDLE' }, { id: 'op-1', businessName: 'Swift Towing', phoneNumber },
+      phoneNumber, 'user-1', 'hi', 'hi', { state: 'IDLE' }, { id: 'op-1', businessName: 'Swift Towing', phoneNumber },
     );
     expect(customerFlowService.handleCustomerMessage).not.toHaveBeenCalled();
     expect(result).toBe('operator-reply');
