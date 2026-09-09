@@ -7,6 +7,7 @@ import { DispatchService } from './dispatch.service';
 import type { Request } from 'express';
 import { AdminRescueRequestQueryDto } from './dto/admin-rescue-request.dto';
 import { AssignOperatorDto } from './dto/assign-operator.dto';
+import { ResolveDisputeDto } from './dto/resolve-dispute.dto';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -139,7 +140,7 @@ export class RescueRequestController {
   @Patch(':id/resolve-dispute')
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
-  async resolveDispute(@Param('id') id: string) {
-    return this.disputeService.resolveDispute(id);
+  async resolveDispute(@Param('id') id: string, @Body() dto: ResolveDisputeDto) {
+    return this.disputeService.resolveDispute(id, dto.resolutionNote, dto.balanceAdjustmentPercent);
   }
 }
