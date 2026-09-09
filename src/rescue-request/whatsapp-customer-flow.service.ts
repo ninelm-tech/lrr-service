@@ -602,6 +602,27 @@ export class WhatsAppCustomerFlowService {
       rescueRequestId: undefined,
     });
 
+    // Low rating (either direction) — alert staff so someone actually looks
+    // at what went wrong, rather than the score just sitting in the DB
+    // unnoticed. Best-effort: a failed alert never blocks the reviewer's
+    // own reply.
+    if (score <= 2) {
+      try {
+        const config = await this.platformConfigService.getConfig();
+        if (config.disputeAlertPhoneNumber) {
+          const who = direction === RatingDirection.MOTORIST_TO_OPERATOR
+            ? 'Customer rated the operator'
+            : 'Operator rated the customer';
+          await this.twilioService.sendWhatsAppMessage(
+            toWhatsAppAddress(config.disputeAlertPhoneNumber),
+            `⚠️ Low rating (${score}/5) on ${formatJobRef(rescueRequestId)} — ${who} low. Please review.`,
+          );
+        }
+      } catch (error) {
+        console.error('Failed to send low-rating staff alert:', error);
+      }
+    }
+
     const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
     return this.reply(
       `Thanks for rating us ${score}/5! 🙏\n\nWant to add more detail? Tell us more here: ${frontendUrl}/feedback/${rating.id}`,

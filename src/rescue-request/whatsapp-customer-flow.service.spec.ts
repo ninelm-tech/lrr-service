@@ -86,6 +86,76 @@ describe('WhatsAppCustomerFlowService', () => {
     });
   });
 
+  describe('handleRatingReply — low rating staff alert', () => {
+    let service: WhatsAppCustomerFlowService;
+    let prisma: { rescueRequest: { findUnique: jest.Mock } };
+    let sessionStore: { update: jest.Mock };
+    let ratingServiceMock: { create: jest.Mock };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
+    let platformConfigService: { getConfig: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = { rescueRequest: { findUnique: jest.fn().mockResolvedValue({ customerId: 'cust-1', assignedOperatorId: 'op-1' }) } };
+      sessionStore = { update: jest.fn() };
+      ratingServiceMock = { create: jest.fn().mockResolvedValue({ id: 'rating-1' }) };
+      twilioService = { sendWhatsAppMessage: jest.fn() };
+      platformConfigService = { getConfig: jest.fn().mockResolvedValue({ disputeAlertPhoneNumber: '+2348099999999' }) };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppCustomerFlowService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: {} },
+          { provide: RatingService, useValue: ratingServiceMock },
+          { provide: PaystackService, useValue: {} },
+          { provide: PlatformConfigService, useValue: platformConfigService },
+          { provide: OperatorService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppCustomerFlowService>(WhatsAppCustomerFlowService);
+    });
+
+    it('alerts staff on a 1-2 star rating from the customer', async () => {
+      await service.handleRatingReply('cust-1', '2', 'req-1', 'MOTORIST_TO_OPERATOR' as any);
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348099999999'),
+        expect.stringContaining('Customer rated the operator'),
+      );
+    });
+
+    it('alerts staff on a 1-2 star rating from the operator', async () => {
+      await service.handleRatingReply('op-user-1', '1', 'req-1', 'OPERATOR_TO_MOTORIST' as any);
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348099999999'),
+        expect.stringContaining('Operator rated the customer'),
+      );
+    });
+
+    it('does not alert staff on a 3+ star rating', async () => {
+      await service.handleRatingReply('cust-1', '3', 'req-1', 'MOTORIST_TO_OPERATOR' as any);
+
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+
+    it('skips the alert cleanly when disputeAlertPhoneNumber is unset', async () => {
+      platformConfigService.getConfig.mockResolvedValue({ disputeAlertPhoneNumber: null });
+
+      await service.handleRatingReply('cust-1', '1', 'req-1', 'MOTORIST_TO_OPERATOR' as any);
+
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+  });
+
   describe('WAITING_FOR_DESTINATION', () => {
     let destService: WhatsAppCustomerFlowService;
     let prisma: {
