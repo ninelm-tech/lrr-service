@@ -109,12 +109,21 @@ export class WhatsAppCustomerFlowService {
             await this.paymentEventsService.markJobCompleted(session.rescueRequestId);
             await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
           } catch (err) {
-            // Typically: a DISPUTE was raised on this same request just
-            // before this CONFIRM — session state doesn't change on
-            // dispute, so both replies reach here. Session stays put so a
-            // later CONFIRM (after staff resolve it) can still go through.
+            // Typically: this request was disputed. Fetch current dispute
+            // state to phrase the reply correctly — "still under review" if
+            // unresolved, or "check the payment link we already sent" if
+            // staff have already resolved it (resolveDispute sends its own
+            // settlement link; this CONFIRM must not send a second one).
             if (err instanceof BadRequestException) {
-              return this.reply(`This request is still under dispute review — our team will follow up before you can confirm completion.`);
+              const current = await this.prisma.rescueRequest.findUnique({
+                where: { id: session.rescueRequestId! },
+                select: { disputeResolvedAt: true },
+              });
+              return this.reply(
+                current?.disputeResolvedAt
+                  ? `Your dispute has been resolved — please use the payment link we already sent to complete payment.`
+                  : `This request is still under dispute review — our team will follow up before you can confirm completion.`,
+              );
             }
             throw err;
           }

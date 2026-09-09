@@ -341,12 +341,21 @@ export class WhatsAppOperatorFlowService {
       );
     }
 
-    // Auto-complete after 30 minutes if customer doesn't respond
+    // Auto-complete after 30 minutes if customer doesn't respond. Skips
+    // disputed requests entirely — markJobCompleted now throws for any
+    // disputed request (PaymentEventsService's guard), and this callback
+    // has no caller to catch that: an unguarded call would surface as an
+    // unhandled promise rejection instead of the clear error it is
+    // everywhere else.
     setTimeout(async () => {
       const fresh = await this.prisma.rescueRequest.findUnique({
         where: { id: rescueRequestId },
-        select: { status: true },
+        select: { status: true, disputed: true },
       });
+      if (fresh && fresh.disputed) {
+        console.log(`⏱ Skipping auto-complete for ${rescueRequestId} — request is disputed`);
+        return;
+      }
       if (fresh && fresh.status !== RescueRequestStatus.COMPLETED && fresh.status !== RescueRequestStatus.CANCELLED) {
         console.log(`⏱ Auto-completing request ${rescueRequestId} — customer did not confirm in 30 min`);
         await this.paymentEventsService.markJobCompleted(rescueRequestId);

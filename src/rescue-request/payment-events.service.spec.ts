@@ -20,6 +20,7 @@ describe('PaymentEventsService', () => {
   let prisma: {
     rescueRequest: {
       findFirst: jest.Mock;
+      findUnique: jest.Mock;
       update: jest.Mock;
       updateMany: jest.Mock;
       findUniqueOrThrow: jest.Mock;
@@ -49,6 +50,7 @@ describe('PaymentEventsService', () => {
           customer: { phoneNumber: '+2348012345678' },
           assignedOperator: { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2349012345678' },
         }),
+        findUnique: jest.fn(),
         update: jest.fn(),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         findUniqueOrThrow: jest.fn(),
@@ -195,6 +197,36 @@ describe('PaymentEventsService', () => {
         '+2348012345678',
         expect.stringContaining('/login'),
       );
+    });
+  });
+
+  describe('markJobCompleted', () => {
+    it('blocks a request that was ever disputed, resolved or not', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', disputed: true, disputeResolvedAt: new Date('2026-01-01'),
+        balancePaid: false, customer: { phoneNumber: '+2348012345678' },
+      });
+
+      await expect(service.markJobCompleted('req-1')).rejects.toThrow('unresolved dispute');
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+    });
+
+    it('proceeds normally for a request that was never disputed', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', disputed: false, disputeResolvedAt: null,
+        balancePaid: false, balanceAmount: 45000, customerId: 'cust-1',
+        customer: { phoneNumber: '+2348012345678', email: null },
+      });
+      prisma.rescueRequest.update.mockResolvedValue({});
+      const paystackService = { generateReference: jest.fn().mockReturnValue('BAL-1'), initializePayment: jest.fn().mockResolvedValue({ status: true, data: { authorization_url: 'https://pay.example/1' } }) };
+      (service as any).paystackService = paystackService;
+
+      await service.markJobCompleted('req-1');
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { status: 'COMPLETED' },
+      });
     });
   });
 });

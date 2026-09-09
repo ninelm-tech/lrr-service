@@ -237,13 +237,17 @@ export class PaymentEventsService {
     });
     if (!rescueRequest) throw new Error('Rescue request not found');
 
-    // A request under active dispute must not proceed to the balance
-    // payment / payout stage — staff have to resolve it first (see
-    // DisputeService.resolveDispute). Without this guard, the admin
-    // "mark completed" shortcut (and a customer replying CONFIRM after
-    // DISPUTE, since the session state doesn't change on dispute) both
-    // bypass the WhatsApp CONFIRM/DISPUTE fork entirely.
-    if (rescueRequest.disputed && !rescueRequest.disputeResolvedAt) {
+    // Once a request has ever been disputed, markJobCompleted is
+    // permanently the wrong path for it — DisputeService.resolveDispute
+    // sends its own (possibly adjusted) settlement payment link directly,
+    // and status only becomes COMPLETED once that's actually paid
+    // (handleBalancePaymentConfirmed). Blocking here regardless of
+    // disputeResolvedAt stops a customer's CONFIRM (still possible while
+    // their session sits in AWAITING_COMPLETION_CONFIRM) from sending a
+    // second, wrong-amount payment link or completing the job before
+    // payment — both the admin "mark completed" shortcut and a same-message
+    // CONFIRM/DISPUTE race were the two ways this used to be bypassed.
+    if (rescueRequest.disputed) {
       throw new BadRequestException('This request has an unresolved dispute — resolve it before marking the job completed.');
     }
 
