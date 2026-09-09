@@ -393,7 +393,7 @@ export class WhatsAppCustomerFlowService {
     // ── Step 3: Operator found — waiting for customer to pay ──────────────
     if (session.state === WhatsAppFlowState.OPERATOR_FOUND_WAITING_PAYMENT) {
       return this.reply(
-        `🚗 Please pay using the link we sent you to confirm your operator.\n\nYou have 30 minutes before the request is cancelled.\n\nReply CANCEL to cancel (you will not be charged).`,
+        `🚗 Please pay using the link we sent you to confirm your operator.\n\nYou have 5 minutes before the request is cancelled.\n\nReply CANCEL to cancel (you will not be charged).`,
       );
     }
 
@@ -725,7 +725,7 @@ export class WhatsAppCustomerFlowService {
 
     void this.twilioService.sendWhatsAppMessage(
       phoneNumber,
-      `🚗 *Operator selected!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *30 minutes*:\n\n👉 ${paymentResponse.data.authorization_url}\n\nYour operator is confirmed once you pay. Reply CANCEL to cancel (no charge).`,
+      `🚗 *Operator selected!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *5 minutes*:\n\n👉 ${paymentResponse.data.authorization_url}\n\nYour operator is confirmed once you pay. Reply CANCEL to cancel (no charge).`,
     );
 
     this.sharedService.scheduleDepositWindow({

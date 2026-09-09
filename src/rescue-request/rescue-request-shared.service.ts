@@ -66,6 +66,7 @@ export class RescueRequestSharedService {
     const { rescueRequestId, customerId, customerPhone, operatorPhone, paymentUrl } = params;
 
     for (const markMs of this.DEPOSIT_REMINDER_MARKS_MS) {
+      const isFirstReminder = markMs === this.DEPOSIT_REMINDER_MARKS_MS[0];
       const isFinalWarning = markMs === this.DEPOSIT_REMINDER_MARKS_MS[this.DEPOSIT_REMINDER_MARKS_MS.length - 1];
       setTimeout(async () => {
         const fresh = await this.prisma.rescueRequest.findUnique({
@@ -74,10 +75,17 @@ export class RescueRequestSharedService {
         });
         if (fresh?.status !== RescueRequestStatus.WAITING_FOR_DEPOSIT) return; // paid or cancelled already — no nag
 
+        // Only the first reminder restates a concrete "time left" claim — the
+        // customer was already told 5 minutes up front, so this is the one
+        // reminder that lines up with what they were promised. Later
+        // reminders (15/25 min marks) don't repeat a number, since the real
+        // window keeps running to 30 and any fixed figure at that point
+        // would just be wrong.
+        const timeNote = isFirstReminder ? '\n\nYou have 5 more minutes to complete payment.' : '';
         const warning = isFinalWarning ? '\n\n⚠️ Your request will be cancelled soon if we don\'t receive payment.' : '';
         await this.twilioService.sendWhatsAppMessage(
           customerPhone,
-          `⏰ Reminder — tap the link below to pay and confirm your rescue:\n\n👉 ${paymentUrl}${warning}`,
+          `⏰ Reminder — tap the link below to pay and confirm your rescue:\n\n👉 ${paymentUrl}${timeNote}${warning}`,
         );
       }, markMs);
     }
