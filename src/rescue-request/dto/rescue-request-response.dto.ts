@@ -35,6 +35,9 @@ export class RescueRequestListItemDto {
   depositRefundStatus: 'NONE' | 'ELIGIBLE' | 'PENDING' | 'COMPLETED' | 'FAILED';
   customer: CustomerSummaryDto;
   assignedOperator?: OperatorSummaryDto;
+  disputed: boolean;
+  disputeRaisedAt?: Date;
+  disputeResolvedAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -78,6 +81,13 @@ export class RescueRequestDetailDto {
   balanceReference?: string;
   customer: CustomerDetailDto;
   assignedOperator?: OperatorDetailDto;
+  disputed: boolean;
+  disputeRaisedAt?: Date;
+  disputeResolvedAt?: Date;
+  customerDisputeStatement?: string;
+  operatorDisputeStatement?: string;
+  disputeResolutionNote?: string;
+  disputeOriginalBalanceAmount?: number;
   createdAt: Date;
   updatedAt: Date;
   offers?: DispatchOfferAdminDto[];

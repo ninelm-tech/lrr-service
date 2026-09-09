@@ -413,6 +413,9 @@ export class RescueRequestAdminService {
       assignedOperator: item.assignedOperator
         ? { id: item.assignedOperator.id, businessName: item.assignedOperator.businessName }
         : undefined,
+      disputed: item.disputed,
+      disputeRaisedAt: item.disputeRaisedAt ?? undefined,
+      disputeResolvedAt: item.disputeResolvedAt ?? undefined,
       createdAt: item.createdAt,
       updatedAt: item.updatedAt,
     }));
@@ -456,6 +459,13 @@ export class RescueRequestAdminService {
             email:        raw.assignedOperator.email,
           }
         : undefined,
+      disputed: raw.disputed,
+      disputeRaisedAt: raw.disputeRaisedAt ?? undefined,
+      disputeResolvedAt: raw.disputeResolvedAt ?? undefined,
+      customerDisputeStatement: raw.customerDisputeStatement ?? undefined,
+      operatorDisputeStatement: raw.operatorDisputeStatement ?? undefined,
+      disputeResolutionNote: raw.disputeResolutionNote ?? undefined,
+      disputeOriginalBalanceAmount: raw.disputeOriginalBalanceAmount ?? undefined,
       createdAt: raw.createdAt,
       updatedAt: raw.updatedAt,
       offers,

@@ -443,4 +443,47 @@ describe('RescueRequestAdminService', () => {
       );
     });
   });
+
+  describe('adminList — dispute field mapping', () => {
+    let service: RescueRequestAdminService;
+    let prisma: { rescueRequest: { findMany: jest.Mock; count: jest.Mock } };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: { findMany: jest.fn(), count: jest.fn().mockResolvedValue(1) },
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestAdminService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<RescueRequestAdminService>(RescueRequestAdminService);
+    });
+
+    it('does not drop dispute fields from the list response', async () => {
+      prisma.rescueRequest.findMany.mockResolvedValue([{
+        id: 'req-1', status: 'IN_DISPUTE', issueType: null, latitude: null, longitude: null,
+        depositPaid: true, balancePaid: false, depositRefundStatus: 'NONE',
+        customer: { id: 'cust-1', phoneNumber: '+2348012345678' },
+        assignedOperator: null,
+        disputed: true, disputeRaisedAt: new Date('2026-01-01'), disputeResolvedAt: null,
+        createdAt: new Date(), updatedAt: new Date(),
+      }]);
+
+      const result = await service.adminList({});
+
+      expect(result.data[0].disputed).toBe(true);
+      expect(result.data[0].disputeRaisedAt).toEqual(new Date('2026-01-01'));
+      expect(result.data[0].disputeResolvedAt).toBeUndefined();
+    });
+  });
 });
