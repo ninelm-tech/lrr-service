@@ -11,6 +11,7 @@ import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { toWhatsAppAddress } from '../common/phone.util';
+import { PlatformConfigService } from '../platform-config/platform-config.service';
 
 @Injectable()
 export class WhatsAppOperatorFlowService {
@@ -21,6 +22,7 @@ export class WhatsAppOperatorFlowService {
     private readonly paymentEventsService: PaymentEventsService,
     private readonly customerFlowService: WhatsAppCustomerFlowService,
     private readonly sessionStore: WhatsAppSessionStore,
+    private readonly platformConfigService: PlatformConfigService,
   ) {}
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -341,25 +343,34 @@ export class WhatsAppOperatorFlowService {
       );
     }
 
-    // Auto-complete after 30 minutes if customer doesn't respond. Skips
-    // disputed requests entirely — markJobCompleted now throws for any
-    // disputed request (PaymentEventsService's guard), and this callback
-    // has no caller to catch that: an unguarded call would surface as an
-    // unhandled promise rejection instead of the clear error it is
-    // everywhere else.
+    // Alert staff after 30 minutes if the customer hasn't confirmed — never
+    // auto-complete on their behalf. By this point the vehicle has already
+    // moved and the operator is waiting to be paid, so forcing the job to
+    // COMPLETED and telling the operator to release the vehicle based on
+    // nothing but silence would move money and vehicle custody without any
+    // genuine confirmation the job actually went as reported. A quiet
+    // customer (dead phone, multi-hour tow, generally busy) looks
+    // identical to one deliberately avoiding payment — only a human
+    // following up can tell those apart. The job stays in
+    // AWAITING_COMPLETION_CONFIRM indefinitely until the customer responds
+    // or staff resolve it.
     setTimeout(async () => {
       const fresh = await this.prisma.rescueRequest.findUnique({
         where: { id: rescueRequestId },
         select: { status: true, disputed: true },
       });
-      if (fresh && fresh.disputed) {
-        console.log(`⏱ Skipping auto-complete for ${rescueRequestId} — request is disputed`);
+      if (!fresh || fresh.disputed || fresh.status === RescueRequestStatus.COMPLETED || fresh.status === RescueRequestStatus.CANCELLED) {
         return;
       }
-      if (fresh && fresh.status !== RescueRequestStatus.COMPLETED && fresh.status !== RescueRequestStatus.CANCELLED) {
-        console.log(`⏱ Auto-completing request ${rescueRequestId} — customer did not confirm in 30 min`);
-        await this.paymentEventsService.markJobCompleted(rescueRequestId);
-        await this.sessionStore.update(customerId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
+      try {
+        const config = await this.platformConfigService.getConfig();
+        if (!config.disputeAlertPhoneNumber) return;
+        await this.twilioService.sendWhatsAppMessage(
+          toWhatsAppAddress(config.disputeAlertPhoneNumber),
+          `⏱ ${formatJobRef(rescueRequestId)}: customer hasn't confirmed completion 30 minutes after the operator marked it DONE. Please check on them.`,
+        );
+      } catch (error) {
+        console.error('Failed to send stalled-confirmation staff alert:', error);
       }
     }, 30 * 60 * 1000);
 

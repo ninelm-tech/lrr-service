@@ -7,6 +7,7 @@ import { PaymentEventsService } from './payment-events.service';
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
+import { PlatformConfigService } from '../platform-config/platform-config.service';
 
 describe('WhatsAppOperatorFlowService', () => {
   describe('handleOperatorMessage — rating branch ordering', () => {
@@ -27,6 +28,7 @@ describe('WhatsAppOperatorFlowService', () => {
           { provide: PaymentEventsService, useValue: {} },
           { provide: WhatsAppCustomerFlowService, useValue: customerFlowService },
           { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
         ],
       }).compile();
 
@@ -86,6 +88,7 @@ describe('WhatsAppOperatorFlowService', () => {
           { provide: PaymentEventsService, useValue: {} },
           { provide: WhatsAppCustomerFlowService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
         ],
       }).compile();
 
@@ -209,6 +212,7 @@ describe('WhatsAppOperatorFlowService', () => {
           { provide: PaymentEventsService, useValue: {} },
           { provide: WhatsAppCustomerFlowService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: PlatformConfigService, useValue: {} },
         ],
       }).compile();
 
