@@ -342,6 +342,7 @@ export class RescueRequestAdminService {
           include: { operator: { select: { id: true, businessName: true } } },
           orderBy: { offeredAt: 'asc' },
         },
+        ratings: true,
       },
     });
     if (!raw) throw new UnauthorizedException('Rescue request not found');
@@ -469,6 +470,15 @@ export class RescueRequestAdminService {
       createdAt: raw.createdAt,
       updatedAt: raw.updatedAt,
       offers,
+      ratings: (raw.ratings ?? []).map((r: any) => ({
+        id: r.id,
+        direction: r.direction,
+        score: r.score,
+        comment: r.comment ?? undefined,
+        flagged: r.flagged,
+        flaggedAt: r.flaggedAt ?? undefined,
+        flaggedResolvedAt: r.flaggedResolvedAt ?? undefined,
+      })),
     };
   }
 }

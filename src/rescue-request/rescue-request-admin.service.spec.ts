@@ -93,6 +93,22 @@ describe('RescueRequestAdminService', () => {
       ]);
     });
 
+    it('includes ratings with their flagged/resolved state for ADMIN', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        ...baseRaw,
+        ratings: [
+          { id: 'rating-1', direction: 'MOTORIST_TO_OPERATOR', score: 1, comment: null, flagged: true, flaggedAt: new Date('2026-01-01'), flaggedResolvedAt: null },
+        ],
+      });
+      platformConfigService.getConfig.mockResolvedValue({ serviceFeePercent: 10, depositPercent: 10 });
+
+      const result = await detailService.detailForUser({ role: 'ADMIN', userId: 'admin-1' }, 'req-1');
+
+      expect(result.data.ratings).toEqual([
+        expect.objectContaining({ id: 'rating-1', score: 1, flagged: true, flaggedResolvedAt: undefined }),
+      ]);
+    });
+
     it('omits offers entirely for OPERATOR', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
         ...baseRaw,

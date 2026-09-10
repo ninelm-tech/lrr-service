@@ -1,4 +1,4 @@
-import { RescueRequestStatus, IssueType, VehicleType, DispatchOfferStatus } from '@prisma/client';
+import { RescueRequestStatus, IssueType, VehicleType, DispatchOfferStatus, RatingDirection } from '@prisma/client';
 
 export class CustomerSummaryDto {
   id: string;
@@ -64,6 +64,16 @@ export class DispatchBoardRowDto {
   offers: DispatchOfferAdminDto[];
 }
 
+export class RatingSummaryDto {
+  id: string;
+  direction: RatingDirection;
+  score: number;
+  comment?: string;
+  flagged: boolean;
+  flaggedAt?: Date;
+  flaggedResolvedAt?: Date;
+}
+
 export class RescueRequestDetailDto {
   id: string;
   status: RescueRequestStatus;
@@ -91,6 +101,7 @@ export class RescueRequestDetailDto {
   createdAt: Date;
   updatedAt: Date;
   offers?: DispatchOfferAdminDto[];
+  ratings: RatingSummaryDto[];
 }
 
 export class PaginationMetaDto {
