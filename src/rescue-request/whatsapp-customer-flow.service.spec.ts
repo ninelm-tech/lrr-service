@@ -306,4 +306,106 @@ describe('WhatsAppCustomerFlowService', () => {
       expect(result).toContain('recorded');
     });
   });
+
+  describe('masked chat relay', () => {
+    let service: WhatsAppCustomerFlowService;
+    let prisma: { rescueRequest: { findUnique: jest.Mock } };
+    let sessionStore: { update: jest.Mock };
+    let sharedService: { findOrCreateCustomer: jest.Mock };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
+
+    const operatorPhone = '+2348011112222';
+    const customerPhone = '+2348012345678';
+
+    beforeEach(async () => {
+      prisma = { rescueRequest: { findUnique: jest.fn() } };
+      sessionStore = { update: jest.fn() };
+      sharedService = { findOrCreateCustomer: jest.fn().mockResolvedValue({ id: 'op-user-1' }) };
+      twilioService = { sendWhatsAppMessage: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppCustomerFlowService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PaystackService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: RescueRequestSharedService, useValue: sharedService },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppCustomerFlowService>(WhatsAppCustomerFlowService);
+    });
+
+    it('CHAT DRIVER starts a relay on both sides when an operator is assigned', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', assignedOperator: { businessName: 'Swift Towing', phoneNumber: operatorPhone },
+      });
+      const session = { state: WhatsAppFlowState.IDLE, rescueRequestId: 'req-1' } as any;
+
+      const result = await service.handleCustomerMessage(
+        customerPhone, 'cust-1', 'chat driver', 'chat driver', undefined, undefined, undefined, session, {},
+      );
+
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', { relayTarget: 'OPERATOR' });
+      expect(sessionStore.update).toHaveBeenCalledWith('op-user-1', { relayTarget: 'CUSTOMER', rescueRequestId: 'req-1' });
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining(operatorPhone),
+        expect.stringContaining('connected'),
+      );
+      expect(result).toContain('connected');
+    });
+
+    it('CHAT DRIVER replies with a clear message when no operator is assigned yet', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({ id: 'req-1', assignedOperator: null });
+      const session = { state: WhatsAppFlowState.IDLE, rescueRequestId: 'req-1' } as any;
+
+      const result = await service.handleCustomerMessage(
+        customerPhone, 'cust-1', 'chat driver', 'chat driver', undefined, undefined, undefined, session, {},
+      );
+
+      expect(result).toContain('No operator is assigned');
+      expect(sessionStore.update).not.toHaveBeenCalled();
+    });
+
+    it('relays a plain message to the operator while relayTarget is set', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', assignedOperator: { businessName: 'Swift Towing', phoneNumber: operatorPhone },
+      });
+      const session = { state: WhatsAppFlowState.IDLE, rescueRequestId: 'req-1', relayTarget: 'OPERATOR' } as any;
+
+      await service.handleCustomerMessage(
+        customerPhone, 'cust-1', 'where are you', 'Where are you?', undefined, undefined, undefined, session, {},
+      );
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining(operatorPhone),
+        'Customer: Where are you?',
+      );
+    });
+
+    it('END CHAT clears relayTarget on both sides and notifies both', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1', assignedOperator: { businessName: 'Swift Towing', phoneNumber: operatorPhone },
+      });
+      const session = { state: WhatsAppFlowState.IDLE, rescueRequestId: 'req-1', relayTarget: 'OPERATOR' } as any;
+
+      await service.handleCustomerMessage(
+        customerPhone, 'cust-1', 'end chat', 'end chat', undefined, undefined, undefined, session, {},
+      );
+
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', { relayTarget: null });
+      expect(sessionStore.update).toHaveBeenCalledWith('op-user-1', { relayTarget: null });
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(expect.stringContaining(customerPhone), 'Chat ended.');
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(expect.stringContaining(operatorPhone), 'Chat ended.');
+    });
+  });
 });

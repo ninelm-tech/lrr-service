@@ -40,6 +40,29 @@ export class WhatsAppOperatorFlowService {
     // no valid operator command otherwise contains a comma.
     message = message.replace(/,/g, '');
 
+    // ── Masked chat relay ───────────────────────────────────────────────────
+    // Checked before everything else — see the matching customer-side
+    // comment for why (orthogonal to `state`, explicit-exit only).
+    if (session.relayTarget) {
+      if (message === 'end chat') {
+        await this.endChatRelay(userId, phoneNumber, session.rescueRequestId);
+        return this.xmlOk();
+      }
+      if (session.rescueRequestId) {
+        const rescueRequest = await this.prisma.rescueRequest.findUnique({
+          where: { id: session.rescueRequestId },
+          include: { customer: true },
+        });
+        if (rescueRequest?.customer?.phoneNumber) {
+          await this.twilioService.sendWhatsAppMessage(
+            toWhatsAppAddress(rescueRequest.customer.phoneNumber),
+            `Driver: ${rawMessage}`,
+          );
+        }
+      }
+      return this.xmlOk();
+    }
+
     // ── Waiting for dispute statement (operator's side of the story) ──────
     // MUST come before every other branch below — none of them apply once
     // we've asked the operator for a free-text statement, and a numeric or
@@ -379,6 +402,26 @@ export class WhatsAppOperatorFlowService {
     return this.reply(
       `✅ Job marked as done! Waiting for customer confirmation.\n\nIf they confirm, you'll receive a notification. Thank you 🙏`,
     );
+  }
+
+  /**
+   * Ends a masked chat relay for both sides at once — either party saying
+   * END CHAT closes it for both, since there's no reason for one side to
+   * keep relaying to someone who's already left.
+   */
+  private async endChatRelay(operatorUserId: string, operatorPhone: string, rescueRequestId: string | undefined): Promise<void> {
+    await this.sessionStore.update(operatorUserId, { relayTarget: null });
+    await this.twilioService.sendWhatsAppMessage(toWhatsAppAddress(operatorPhone), `Chat ended.`);
+
+    if (!rescueRequestId) return;
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      include: { customer: true },
+    });
+    if (!rescueRequest?.customer?.phoneNumber) return;
+
+    await this.sessionStore.update(rescueRequest.customerId, { relayTarget: null });
+    await this.twilioService.sendWhatsAppMessage(toWhatsAppAddress(rescueRequest.customer.phoneNumber), `Chat ended.`);
   }
 
   private reply(message: string): string {

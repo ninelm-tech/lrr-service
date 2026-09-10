@@ -51,5 +51,7 @@ export interface WhatsAppSession {
   // Dispatch tracking — used during operator offer loop
   dispatchRound?: number;
   offeredOperatorIds?: string[];
+  // Masked chat relay — see the field's comment on the Prisma model.
+  relayTarget?: 'OPERATOR' | 'CUSTOMER' | null;
   updatedAt: Date;
 }

@@ -48,6 +48,7 @@ export class WhatsAppSessionStore {
     if (updates.offeredOperatorIds !== undefined) {
       data.offeredOperatorIds = JSON.stringify(updates.offeredOperatorIds);
     }
+    if (updates.relayTarget !== undefined)      data.relayTarget = updates.relayTarget;
 
     const row = await this.prisma.whatsAppSession.update({
       where:  { userId },
@@ -76,6 +77,7 @@ export class WhatsAppSessionStore {
       offeredOperatorIds: row.offeredOperatorIds
         ? JSON.parse(row.offeredOperatorIds)
         : [],
+      relayTarget: row.relayTarget ?? undefined,
       updatedAt: row.updatedAt,
     };
   }

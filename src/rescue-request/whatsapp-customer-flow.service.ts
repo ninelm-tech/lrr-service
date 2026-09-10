@@ -86,6 +86,57 @@ export class WhatsAppCustomerFlowService {
     session: Awaited<ReturnType<WhatsAppSessionStore['getOrCreate']>>,
     body: Record<string, any>,
   ) {
+    // ── Masked chat relay ───────────────────────────────────────────────────
+    // Checked before anything else — orthogonal to `state`, which stays
+    // untouched throughout a relay so whatever flow the customer was in
+    // resumes correctly once they explicitly leave with END CHAT. No other
+    // command works while a relay is active; that's the whole point of the
+    // explicit-exit design — no ambiguity between a chat message and a command.
+    if (session.relayTarget) {
+      if (message === 'end chat') {
+        await this.endChatRelay(userId, phoneNumber, session.rescueRequestId);
+        return this.xmlOk();
+      }
+      if (session.rescueRequestId) {
+        const rescueRequest = await this.prisma.rescueRequest.findUnique({
+          where: { id: session.rescueRequestId },
+          include: { assignedOperator: true },
+        });
+        if (rescueRequest?.assignedOperator?.phoneNumber) {
+          await this.twilioService.sendWhatsAppMessage(
+            toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
+            `Customer: ${rawMessage}`,
+          );
+        }
+      }
+      return this.xmlOk();
+    }
+
+    // ── CHAT DRIVER — start a masked chat relay with the assigned operator ──
+    // Available any time an operator is assigned (from quote selection
+    // onward — see assignedOperatorId being set in handleQuoteSelected),
+    // not gated to a specific session state.
+    if (message === 'chat driver') {
+      if (!session.rescueRequestId) {
+        return this.reply(`You don't have an active request right now.`);
+      }
+      const rescueRequest = await this.prisma.rescueRequest.findUnique({
+        where: { id: session.rescueRequestId },
+        include: { assignedOperator: true },
+      });
+      if (!rescueRequest?.assignedOperator) {
+        return this.reply(`No operator is assigned to your request yet.`);
+      }
+      const opUser = await this.sharedService.findOrCreateCustomer(rescueRequest.assignedOperator.phoneNumber);
+      await this.sessionStore.update(userId, { relayTarget: 'OPERATOR' });
+      await this.sessionStore.update(opUser.id, { relayTarget: 'CUSTOMER', rescueRequestId: session.rescueRequestId });
+      await this.twilioService.sendWhatsAppMessage(
+        toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
+        `You're now connected with your customer. Messages will be relayed. Reply END CHAT anytime to stop.`,
+      );
+      return this.reply(`You're now connected with your driver. Messages will be relayed. Reply END CHAT anytime to stop.`);
+    }
+
     // ── Waiting for dispute statement (customer's side of the story) ──────
     // MUST come before every other branch below, same reasoning as the
     // operator-side equivalent: whatever the customer sends next while in
@@ -447,6 +498,30 @@ export class WhatsAppCustomerFlowService {
       Sentry.captureException(error);
       return false;
     }
+  }
+
+  /**
+   * Ends a masked chat relay for both sides at once — either party saying
+   * END CHAT closes it for both, since there's no reason for one side to
+   * keep relaying to someone who's already left.
+   */
+  private async endChatRelay(customerUserId: string, customerPhone: string, rescueRequestId: string | undefined): Promise<void> {
+    await this.sessionStore.update(customerUserId, { relayTarget: null });
+    await this.twilioService.sendWhatsAppMessage(toWhatsAppAddress(customerPhone), `Chat ended.`);
+
+    if (!rescueRequestId) return;
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      include: { assignedOperator: true },
+    });
+    if (!rescueRequest?.assignedOperator?.phoneNumber) return;
+
+    const opUser = await this.sharedService.findOrCreateCustomer(rescueRequest.assignedOperator.phoneNumber);
+    await this.sessionStore.update(opUser.id, { relayTarget: null });
+    await this.twilioService.sendWhatsAppMessage(
+      toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
+      `Chat ended.`,
+    );
   }
 
   // ──────────────────────────────────────────────────────────────────────────
