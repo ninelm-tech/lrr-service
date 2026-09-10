@@ -156,20 +156,28 @@ export class WhatsAppCustomerFlowService {
     if (session.state === WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM) {
       if (message === 'confirm') {
         if (session.rescueRequestId) {
+          // Defense in depth: a session can end up stale (pointed at a
+          // request that's already CANCELLED/COMPLETED) for reasons other
+          // than the specific admin-cancel bug this used to hit — self-heal
+          // here rather than assuming every failure means "still disputed."
+          const current = await this.prisma.rescueRequest.findUnique({
+            where: { id: session.rescueRequestId },
+            select: { status: true, disputeResolvedAt: true },
+          });
+          if (current?.status === RescueRequestStatus.CANCELLED || current?.status === RescueRequestStatus.COMPLETED) {
+            await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
+            return this.reply(`This request has already ended. Send SOS if you need assistance again.`);
+          }
+
           try {
             await this.paymentEventsService.markJobCompleted(session.rescueRequestId);
             await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
           } catch (err) {
-            // Typically: this request was disputed. Fetch current dispute
-            // state to phrase the reply correctly — "still under review" if
+            // Typically: this request was disputed. "still under review" if
             // unresolved, or "check the payment link we already sent" if
             // staff have already resolved it (resolveDispute sends its own
             // settlement link; this CONFIRM must not send a second one).
             if (err instanceof BadRequestException) {
-              const current = await this.prisma.rescueRequest.findUnique({
-                where: { id: session.rescueRequestId! },
-                select: { disputeResolvedAt: true },
-              });
               return this.reply(
                 current?.disputeResolvedAt
                   ? `Your dispute has been resolved — please use the payment link we already sent to complete payment.`

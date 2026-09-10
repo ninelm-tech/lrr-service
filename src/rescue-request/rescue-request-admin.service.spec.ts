@@ -7,6 +7,7 @@ import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
+import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import * as Sentry from '@sentry/node';
 
 jest.mock('@sentry/node', () => ({ captureException: jest.fn() }));
@@ -37,6 +38,7 @@ describe('RescueRequestAdminService', () => {
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
         ],
       }).compile();
 
@@ -167,6 +169,7 @@ describe('RescueRequestAdminService', () => {
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
         ],
       }).compile();
 
@@ -263,6 +266,7 @@ describe('RescueRequestAdminService', () => {
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: dispatchService },
           { provide: RescueRequestSharedService, useValue: sharedService },
+          { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
         ],
       }).compile();
 
@@ -384,6 +388,7 @@ describe('RescueRequestAdminService', () => {
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
         ],
       }).compile();
 
@@ -479,6 +484,7 @@ describe('RescueRequestAdminService', () => {
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
         ],
       }).compile();
 
@@ -500,6 +506,51 @@ describe('RescueRequestAdminService', () => {
       expect(result.data[0].disputed).toBe(true);
       expect(result.data[0].disputeRaisedAt).toEqual(new Date('2026-01-01'));
       expect(result.data[0].disputeResolvedAt).toBeUndefined();
+    });
+  });
+
+  describe('cancel', () => {
+    let service: RescueRequestAdminService;
+    let prisma: { rescueRequest: { update: jest.Mock } };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
+    let sessionStore: { clear: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = { rescueRequest: { update: jest.fn() } };
+      twilioService = { sendWhatsAppMessage: jest.fn() };
+      sessionStore = { clear: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestAdminService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+        ],
+      }).compile();
+
+      service = module.get<RescueRequestAdminService>(RescueRequestAdminService);
+    });
+
+    it('clears the customer session so a stale mid-flow state cannot loop after cancellation', async () => {
+      prisma.rescueRequest.update.mockResolvedValue({
+        id: 'req-1', customerId: 'cust-1', status: 'CANCELLED',
+        customer: { id: 'cust-1', phoneNumber: '+2348012345678' },
+        media: [], dispatchOffers: [],
+      });
+
+      await service.cancel('req-1', {});
+
+      expect(sessionStore.clear).toHaveBeenCalledWith('cust-1');
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        '+2348012345678',
+        expect.stringContaining('cancelled'),
+      );
     });
   });
 });

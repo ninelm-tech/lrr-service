@@ -408,4 +408,75 @@ describe('WhatsAppCustomerFlowService', () => {
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(expect.stringContaining(operatorPhone), 'Chat ended.');
     });
   });
+
+  describe('CONFIRM on an already-terminal request', () => {
+    let service: WhatsAppCustomerFlowService;
+    let prisma: { rescueRequest: { findUnique: jest.Mock } };
+    let sessionStore: { update: jest.Mock };
+    let paymentEventsService: { markJobCompleted: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = { rescueRequest: { findUnique: jest.fn() } };
+      sessionStore = { update: jest.fn() };
+      paymentEventsService = { markJobCompleted: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppCustomerFlowService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: { sendWhatsAppMessage: jest.fn() } },
+          { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PaystackService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: paymentEventsService },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppCustomerFlowService>(WhatsAppCustomerFlowService);
+    });
+
+    it('self-heals a stale session pointed at a CANCELLED request instead of calling markJobCompleted', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({ status: 'CANCELLED', disputeResolvedAt: null });
+      const session = { state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM, rescueRequestId: 'req-1' } as any;
+
+      const result = await service.handleCustomerMessage(
+        '+2348012345678', 'cust-1', 'confirm', 'confirm', undefined, undefined, undefined, session, {},
+      );
+
+      expect(paymentEventsService.markJobCompleted).not.toHaveBeenCalled();
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
+      expect(result).toContain('already ended');
+    });
+
+    it('self-heals a stale session pointed at a COMPLETED request too', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({ status: 'COMPLETED', disputeResolvedAt: null });
+      const session = { state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM, rescueRequestId: 'req-1' } as any;
+
+      const result = await service.handleCustomerMessage(
+        '+2348012345678', 'cust-1', 'confirm', 'confirm', undefined, undefined, undefined, session, {},
+      );
+
+      expect(paymentEventsService.markJobCompleted).not.toHaveBeenCalled();
+      expect(result).toContain('already ended');
+    });
+
+    it('proceeds normally when the request is still active', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({ status: 'ARRIVED', disputeResolvedAt: null });
+      paymentEventsService.markJobCompleted.mockResolvedValue(undefined);
+      const session = { state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM, rescueRequestId: 'req-1' } as any;
+
+      await service.handleCustomerMessage(
+        '+2348012345678', 'cust-1', 'confirm', 'confirm', undefined, undefined, undefined, session, {},
+      );
+
+      expect(paymentEventsService.markJobCompleted).toHaveBeenCalledWith('req-1');
+    });
+  });
 });

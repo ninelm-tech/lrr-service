@@ -18,6 +18,7 @@ import {
 } from './dto/rescue-request-response.dto';
 import { DispatchService } from './dispatch.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
+import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 
 @Injectable()
 export class RescueRequestAdminService {
@@ -30,6 +31,7 @@ export class RescueRequestAdminService {
     @Inject(forwardRef(() => DispatchService))
     private readonly dispatchService: DispatchService,
     private readonly sharedService: RescueRequestSharedService,
+    private readonly sessionStore: WhatsAppSessionStore,
   ) {}
 
   async adminList(query: any) {
@@ -238,6 +240,14 @@ export class RescueRequestAdminService {
       data:  { status: RescueRequestStatus.CANCELLED },
       include: { customer: true },
     });
+
+    // The customer's WhatsApp session may still be mid-flow (e.g. sitting
+    // in AWAITING_COMPLETION_CONFIRM) and pointed at this now-dead request.
+    // Without clearing it, telling them "send SOS" below is actively
+    // misleading — SOS would hit the stale state first and just re-send
+    // whatever reminder that state was showing, forever. The customer's
+    // own CANCEL command already does this; the admin action was missing it.
+    await this.sessionStore.clear(updated.customerId);
 
     if (updated.customer.phoneNumber) {
       await this.twilioService.sendWhatsAppMessage(
