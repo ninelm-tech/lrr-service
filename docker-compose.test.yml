@@ -1,0 +1,20 @@
+# Throwaway Postgres for integration tests (`yarn test:integration`).
+# Not for development — it binds 5433 so it can never collide with a real
+# local Postgres, and its data lives in tmpfs, so the container starts clean
+# every time and nothing survives a restart.
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lrr
+      POSTGRES_PASSWORD: lrr
+      POSTGRES_DB: lrr_test
+    ports:
+      - '5433:5432'
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U lrr -d lrr_test']
+      interval: 2s
+      timeout: 2s
+      retries: 15
