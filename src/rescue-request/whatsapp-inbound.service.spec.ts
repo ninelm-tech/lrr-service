@@ -17,10 +17,18 @@ describe('WhatsAppInboundService', () => {
 
   beforeEach(async () => {
     prisma = { operator: { findUnique: jest.fn().mockResolvedValue(null) } };
-    sessionStore = { getOrCreate: jest.fn().mockResolvedValue({ state: 'IDLE' }) };
-    operatorFlowService = { handleOperatorMessage: jest.fn().mockResolvedValue('operator-reply') };
-    customerFlowService = { handleCustomerMessage: jest.fn().mockResolvedValue('customer-reply') };
-    sharedService = { findOrCreateCustomer: jest.fn().mockResolvedValue({ id: 'user-1' }) };
+    sessionStore = {
+      getOrCreate: jest.fn().mockResolvedValue({ state: 'IDLE' }),
+    };
+    operatorFlowService = {
+      handleOperatorMessage: jest.fn().mockResolvedValue('operator-reply'),
+    };
+    customerFlowService = {
+      handleCustomerMessage: jest.fn().mockResolvedValue('customer-reply'),
+    };
+    sharedService = {
+      findOrCreateCustomer: jest.fn().mockResolvedValue({ id: 'user-1' }),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -37,13 +45,27 @@ describe('WhatsAppInboundService', () => {
   });
 
   it('routes to WhatsAppOperatorFlowService when the sender is a known operator', async () => {
-    prisma.operator.findUnique.mockResolvedValue({ id: 'op-1', businessName: 'Swift Towing', phoneNumber });
+    prisma.operator.findUnique.mockResolvedValue({
+      id: 'op-1',
+      businessName: 'Swift Towing',
+      phoneNumber,
+    });
 
-    const result = await service.handleIncomingWhatsAppMessage({ From: `whatsapp:${phoneNumber}`, Body: 'hi' });
+    const result = await service.handleIncomingWhatsAppMessage({
+      From: `whatsapp:${phoneNumber}`,
+      Body: 'hi',
+    });
 
-    expect(sharedService.findOrCreateCustomer).toHaveBeenCalledWith(phoneNumber);
+    expect(sharedService.findOrCreateCustomer).toHaveBeenCalledWith(
+      phoneNumber,
+    );
     expect(operatorFlowService.handleOperatorMessage).toHaveBeenCalledWith(
-      phoneNumber, 'user-1', 'hi', 'hi', { state: 'IDLE' }, { id: 'op-1', businessName: 'Swift Towing', phoneNumber },
+      phoneNumber,
+      'user-1',
+      'hi',
+      'hi',
+      { state: 'IDLE' },
+      { id: 'op-1', businessName: 'Swift Towing', phoneNumber },
     );
     expect(customerFlowService.handleCustomerMessage).not.toHaveBeenCalled();
     expect(result).toBe('operator-reply');
@@ -55,7 +77,15 @@ describe('WhatsAppInboundService', () => {
     const result = await service.handleIncomingWhatsAppMessage(body);
 
     expect(customerFlowService.handleCustomerMessage).toHaveBeenCalledWith(
-      phoneNumber, 'user-1', 'help', 'HELP', undefined, undefined, undefined, { state: 'IDLE' }, body,
+      phoneNumber,
+      'user-1',
+      'help',
+      'HELP',
+      undefined,
+      undefined,
+      undefined,
+      { state: 'IDLE' },
+      body,
     );
     expect(operatorFlowService.handleOperatorMessage).not.toHaveBeenCalled();
     expect(result).toBe('customer-reply');

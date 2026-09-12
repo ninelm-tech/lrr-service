@@ -15,6 +15,9 @@ export class OtpController {
 
   @Post('verify-code')
   async verifyCode(@Body() dto: VerifyCodeDto) {
-    return this.otpService.verifyCode(normalizePhone(dto.phoneNumber), dto.code);
+    return this.otpService.verifyCode(
+      normalizePhone(dto.phoneNumber),
+      dto.code,
+    );
   }
 }

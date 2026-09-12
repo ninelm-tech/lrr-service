@@ -1,4 +1,8 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import * as Sentry from '@sentry/node';
 import { PayoutStatus, PayoutBlockReason } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -22,7 +26,11 @@ export class PayoutService {
    * this is called from handleBalancePaymentConfirmed and must not disrupt
    * the customer/operator notification flow around it.
    */
-  async createAndProcessPayout(rescueRequestId: string, operatorId: string, amount: number): Promise<void> {
+  async createAndProcessPayout(
+    rescueRequestId: string,
+    operatorId: string,
+    amount: number,
+  ): Promise<void> {
     let payoutId: string;
     try {
       const payout = await this.prisma.payout.create({
@@ -65,13 +73,18 @@ export class PayoutService {
    * opposite of the truth.
    */
   async retryPayout(payoutId: string) {
-    const payout = await this.prisma.payout.findUnique({ where: { id: payoutId } });
+    const payout = await this.prisma.payout.findUnique({
+      where: { id: payoutId },
+    });
     if (!payout) {
       throw new NotFoundException('Payout not found');
     }
 
     const claimed = await this.prisma.payout.updateMany({
-      where: { id: payoutId, status: { in: [PayoutStatus.PENDING, PayoutStatus.FAILED] } },
+      where: {
+        id: payoutId,
+        status: { in: [PayoutStatus.PENDING, PayoutStatus.FAILED] },
+      },
       data: { status: PayoutStatus.PROCESSING },
     });
     if (claimed.count === 0) {
@@ -80,7 +93,12 @@ export class PayoutService {
       );
     }
 
-    await this.attemptPayout(payoutId, payout.operatorId, payout.amount, payout.rescueRequestId);
+    await this.attemptPayout(
+      payoutId,
+      payout.operatorId,
+      payout.amount,
+      payout.rescueRequestId,
+    );
     return this.prisma.payout.findUnique({ where: { id: payoutId } });
   }
 
@@ -90,9 +108,16 @@ export class PayoutService {
    * the full account number is ever available). This method only ever
    * consumes an already-existing paystackRecipientCode.
    */
-  private async attemptPayout(payoutId: string, operatorId: string, amount: number, rescueRequestId: string): Promise<void> {
+  private async attemptPayout(
+    payoutId: string,
+    operatorId: string,
+    amount: number,
+    rescueRequestId: string,
+  ): Promise<void> {
     try {
-      const operator = await this.prisma.operator.findUnique({ where: { id: operatorId } });
+      const operator = await this.prisma.operator.findUnique({
+        where: { id: operatorId },
+      });
       if (!operator?.paystackRecipientCode) {
         // Conditional write, not read-then-write: two concurrent attempts
         // must not both observe "not yet blocked" and both notify. Same
@@ -141,7 +166,11 @@ export class PayoutService {
         // integrity problem, not a missing-bank-details one) — the payout is
         // still correctly blocked above, there's just nobody to message.
         if (operator) {
-          await this.notifyOperatorBankDetailsNeeded(operator, amount, rescueRequestId);
+          await this.notifyOperatorBankDetailsNeeded(
+            operator,
+            amount,
+            rescueRequestId,
+          );
         }
         return;
       }
@@ -150,7 +179,11 @@ export class PayoutService {
       if (balance < amount) {
         await this.prisma.payout.update({
           where: { id: payoutId },
-          data: { status: 'PENDING', blockReason: 'INSUFFICIENT_BALANCE', failureReason: null },
+          data: {
+            status: 'PENDING',
+            blockReason: 'INSUFFICIENT_BALANCE',
+            failureReason: null,
+          },
         });
         return;
       }
@@ -165,29 +198,42 @@ export class PayoutService {
 
       await this.prisma.payout.update({
         where: { id: payoutId },
-        data: { status: 'PROCESSING', blockReason: null, paystackTransferCode: transfer.transferCode },
+        data: {
+          status: 'PROCESSING',
+          blockReason: null,
+          paystackTransferCode: transfer.transferCode,
+        },
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error';
       console.error('❌ Payout attempt failed:', message);
       Sentry.captureException(err);
-      await this.prisma.payout.update({
-        where: { id: payoutId },
-        data: { status: 'FAILED', blockReason: null, failureReason: message },
-      }).catch((updateErr) => {
-        console.error('❌ Failed to record payout failure:', updateErr);
-        Sentry.captureException(updateErr);
-      });
+      await this.prisma.payout
+        .update({
+          where: { id: payoutId },
+          data: { status: 'FAILED', blockReason: null, failureReason: message },
+        })
+        .catch((updateErr) => {
+          console.error('❌ Failed to record payout failure:', updateErr);
+          Sentry.captureException(updateErr);
+        });
     }
   }
 
   /** Called from the Paystack webhook handler when a transfer's final outcome arrives. */
-  async confirmTransferOutcome(transferCode: string, outcome: 'SUCCESS' | 'FAILED', failureReason?: string): Promise<void> {
+  async confirmTransferOutcome(
+    transferCode: string,
+    outcome: 'SUCCESS' | 'FAILED',
+    failureReason?: string,
+  ): Promise<void> {
     try {
       if (outcome === 'FAILED') {
         await this.prisma.payout.update({
           where: { paystackTransferCode: transferCode },
-          data: { status: PayoutStatus.FAILED, failureReason: failureReason ?? 'Transfer failed' },
+          data: {
+            status: PayoutStatus.FAILED,
+            failureReason: failureReason ?? 'Transfer failed',
+          },
         });
         return;
       }
@@ -199,7 +245,10 @@ export class PayoutService {
       // later redelivery matches 0 rows. Accepted for MVP — the operator was
       // paid, and the Payouts tab still shows it correctly.
       const changed = await this.prisma.payout.updateMany({
-        where: { paystackTransferCode: transferCode, status: { not: PayoutStatus.SUCCESS } },
+        where: {
+          paystackTransferCode: transferCode,
+          status: { not: PayoutStatus.SUCCESS },
+        },
         data: { status: PayoutStatus.SUCCESS, completedAt: new Date() },
       });
       if (changed.count === 0) return;
@@ -209,11 +258,21 @@ export class PayoutService {
         include: { operator: true },
       });
       if (payout?.operator) {
-        await this.notifyOperatorPaid(payout.operator, payout.amount, payout.rescueRequestId);
+        await this.notifyOperatorPaid(
+          payout.operator,
+          payout.amount,
+          payout.rescueRequestId,
+        );
       }
     } catch (err) {
-      console.error(`❌ No payout found for transfer code ${transferCode}:`, err);
-      Sentry.captureMessage(`Payout webhook: no payout found for transfer code ${transferCode}`, 'warning');
+      console.error(
+        `❌ No payout found for transfer code ${transferCode}:`,
+        err,
+      );
+      Sentry.captureMessage(
+        `Payout webhook: no payout found for transfer code ${transferCode}`,
+        'warning',
+      );
     }
   }
 
@@ -258,7 +317,9 @@ export class PayoutService {
       }
     } catch (err) {
       console.error('❌ Failed to notify operator of payout:', err);
-      Sentry.captureException(err, { extra: { rescueRequestId, notification: 'payout_sent' } });
+      Sentry.captureException(err, {
+        extra: { rescueRequestId, notification: 'payout_sent' },
+      });
     }
   }
 
@@ -288,8 +349,13 @@ export class PayoutService {
         );
       }
     } catch (err) {
-      console.error('❌ Failed to notify operator of missing bank details:', err);
-      Sentry.captureException(err, { extra: { rescueRequestId, notification: 'payout_bank_details_needed' } });
+      console.error(
+        '❌ Failed to notify operator of missing bank details:',
+        err,
+      );
+      Sentry.captureException(err, {
+        extra: { rescueRequestId, notification: 'payout_bank_details_needed' },
+      });
     }
   }
 }

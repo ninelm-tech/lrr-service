@@ -1,5 +1,14 @@
-
-import { Body, Controller, Get, Param, Patch, Post, Query, Req, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  Patch,
+  Post,
+  Query,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import { UserRole } from '@prisma/client';
 import { DisputeService } from './dispute.service';
 import { RescueRequestAdminService } from './rescue-request-admin.service';
@@ -47,7 +56,10 @@ export class RescueRequestController {
     @Param('offerId') offerId: string,
     @Body() body: { priceNaira?: number },
   ) {
-    const priceKobo = body.priceNaira !== undefined ? Math.round(body.priceNaira * 100) : undefined;
+    const priceKobo =
+      body.priceNaira !== undefined
+        ? Math.round(body.priceNaira * 100)
+        : undefined;
     return this.dispatchService.respondToOffer(
       (req.user as any).userId,
       offerId,
@@ -75,7 +87,10 @@ export class RescueRequestController {
   @Post(':id/offer-to/:operatorId')
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
-  async offerToOperator(@Param('id') id: string, @Param('operatorId') operatorId: string) {
+  async offerToOperator(
+    @Param('id') id: string,
+    @Param('operatorId') operatorId: string,
+  ) {
     await this.dispatchService.manualOfferToOperator(id, operatorId);
     return { message: 'Offer sent' };
   }
@@ -122,17 +137,16 @@ export class RescueRequestController {
     @Param('id') id: string,
     @Body() body: { status: string },
   ) {
-    return this.rescueRequestAdminService.updateStatus(id, { status: body.status });
+    return this.rescueRequestAdminService.updateStatus(id, {
+      status: body.status,
+    });
   }
 
   /** Cancel a request, optionally with a reason sent to the customer. */
   @Patch(':id/cancel')
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
-  async cancel(
-    @Param('id') id: string,
-    @Body() body: { reason?: string },
-  ) {
+  async cancel(@Param('id') id: string, @Body() body: { reason?: string }) {
     return this.rescueRequestAdminService.cancel(id, { reason: body.reason });
   }
 
@@ -140,7 +154,14 @@ export class RescueRequestController {
   @Patch(':id/resolve-dispute')
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
-  async resolveDispute(@Param('id') id: string, @Body() dto: ResolveDisputeDto) {
-    return this.disputeService.resolveDispute(id, dto.resolutionNote, dto.balanceAdjustmentPercent);
+  async resolveDispute(
+    @Param('id') id: string,
+    @Body() dto: ResolveDisputeDto,
+  ) {
+    return this.disputeService.resolveDispute(
+      id,
+      dto.resolutionNote,
+      dto.balanceAdjustmentPercent,
+    );
   }
 }

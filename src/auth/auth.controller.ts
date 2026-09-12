@@ -1,4 +1,14 @@
-import { Body, Controller, Get, Patch, Post, UseGuards, Request, Query, BadRequestException } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Patch,
+  Post,
+  UseGuards,
+  Request,
+  Query,
+  BadRequestException,
+} from '@nestjs/common';
 import { UserRole } from '@prisma/client';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
@@ -83,7 +93,10 @@ export class AuthController {
    */
   @Post('forgot-password')
   async forgotPassword(@Body() dto: ForgotPasswordDto) {
-    return this.authService.requestPasswordReset(dto.identifier, dto.newPassword);
+    return this.authService.requestPasswordReset(
+      dto.identifier,
+      dto.newPassword,
+    );
   }
 
   /**
@@ -91,7 +104,11 @@ export class AuthController {
    */
   @Post('reset-password')
   async resetPassword(@Body() dto: ResetPasswordDto) {
-    return this.authService.resetPasswordWithCode(dto.phoneNumber, dto.code, dto.newPassword);
+    return this.authService.resetPasswordWithCode(
+      dto.phoneNumber,
+      dto.code,
+      dto.newPassword,
+    );
   }
 
   /**
@@ -135,6 +152,11 @@ export class AuthController {
     @Query('page') page = '1',
     @Query('limit') limit = '25',
   ) {
-    return this.authService.listUsers({ role, search, page: +page, limit: +limit });
+    return this.authService.listUsers({
+      role,
+      search,
+      page: +page,
+      limit: +limit,
+    });
   }
 }

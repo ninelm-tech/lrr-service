@@ -36,8 +36,12 @@ export class OtpService {
     return hash(code);
   }
 
-  async sendCode(phoneNumber: string): Promise<{ required: boolean; available?: boolean }> {
-    const existingUser = await this.prisma.user.findUnique({ where: { phoneNumber } });
+  async sendCode(
+    phoneNumber: string,
+  ): Promise<{ required: boolean; available?: boolean }> {
+    const existingUser = await this.prisma.user.findUnique({
+      where: { phoneNumber },
+    });
 
     if (!existingUser) {
       return { required: false, available: true };
@@ -57,8 +61,12 @@ export class OtpService {
    * loosening sendCode's role check, since the two callers have genuinely
    * different eligibility rules.
    */
-  async sendPasswordResetCode(phoneNumber: string): Promise<{ required: boolean }> {
-    const existingUser = await this.prisma.user.findUnique({ where: { phoneNumber } });
+  async sendPasswordResetCode(
+    phoneNumber: string,
+  ): Promise<{ required: boolean }> {
+    const existingUser = await this.prisma.user.findUnique({
+      where: { phoneNumber },
+    });
     if (!existingUser || !existingUser.passwordHash) {
       return { required: false };
     }
@@ -67,16 +75,29 @@ export class OtpService {
     return { required: true };
   }
 
-  private async sendCodeToPhone(phoneNumber: string, label: string): Promise<void> {
+  private async sendCodeToPhone(
+    phoneNumber: string,
+    label: string,
+  ): Promise<void> {
     const recent = await this.prisma.phoneVerification.findMany({
-      where: { phoneNumber, createdAt: { gte: new Date(Date.now() - SEND_WINDOW_MS) } },
+      where: {
+        phoneNumber,
+        createdAt: { gte: new Date(Date.now() - SEND_WINDOW_MS) },
+      },
       orderBy: { createdAt: 'desc' },
     });
-    if (recent.length > 0 && Date.now() - recent[0].createdAt.getTime() < RESEND_COOLDOWN_MS) {
-      throw new BadRequestException('Please wait before requesting another code.');
+    if (
+      recent.length > 0 &&
+      Date.now() - recent[0].createdAt.getTime() < RESEND_COOLDOWN_MS
+    ) {
+      throw new BadRequestException(
+        'Please wait before requesting another code.',
+      );
     }
     if (recent.length >= MAX_SENDS_PER_WINDOW) {
-      throw new BadRequestException('Too many code requests — please try again later.');
+      throw new BadRequestException(
+        'Too many code requests — please try again later.',
+      );
     }
 
     const code = generateCode();
@@ -94,13 +115,18 @@ export class OtpService {
     );
   }
 
-  async verifyCode(phoneNumber: string, code: string): Promise<{ token: string }> {
+  async verifyCode(
+    phoneNumber: string,
+    code: string,
+  ): Promise<{ token: string }> {
     const row = await this.prisma.phoneVerification.findFirst({
       where: { phoneNumber, expiresAt: { gt: new Date() } },
       orderBy: { createdAt: 'desc' },
     });
     if (!row) {
-      throw new BadRequestException('Code expired or not found — request a new one.');
+      throw new BadRequestException(
+        'Code expired or not found — request a new one.',
+      );
     }
     if (row.attempts >= MAX_ATTEMPTS) {
       throw new BadRequestException('Too many attempts — request a new code.');

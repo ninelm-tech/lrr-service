@@ -22,22 +22,34 @@ export class WhatsAppInboundService {
     private readonly sharedService: RescueRequestSharedService,
   ) {}
 
-  async handleIncomingWhatsAppMessage(body: Record<string, any>): Promise<string> {
+  async handleIncomingWhatsAppMessage(
+    body: Record<string, any>,
+  ): Promise<string> {
     // Twilio always delivers E.164 with country code — just strip the whatsapp: prefix
-    const phoneNumber: string = String(body.From || '').replace(/^whatsapp:/i, '');
+    const phoneNumber: string = String(body.From || '').replace(
+      /^whatsapp:/i,
+      '',
+    );
     const rawMessage = String(body.Body || '').trim();
     const message = rawMessage.toLowerCase();
-    const latitude  = body.Latitude  ? Number(body.Latitude)  : undefined;
+    const latitude = body.Latitude ? Number(body.Latitude) : undefined;
     const longitude = body.Longitude ? Number(body.Longitude) : undefined;
     // Present when a "search for a place" share includes WhatsApp's own
     // formatted address/place name — absent for a bare "current location" pin.
-    const sharedAddress = body.Address ? String(body.Address).trim() : undefined;
+    const sharedAddress = body.Address
+      ? String(body.Address).trim()
+      : undefined;
 
     // Structured, not console.log — plain console.log on this path was never
     // shipped to Sentry (confirmed 2026-08-25 while investigating an
     // "operator stuck after ARRIVED" report with zero trace of the inbound
     // message anywhere), so this route had no diagnosability at all.
-    logger.info('whatsapp: inbound message', { phoneNumber, message, latitude, longitude });
+    logger.info('whatsapp: inbound message', {
+      phoneNumber,
+      message,
+      latitude,
+      longitude,
+    });
 
     // Always resolve (or create) a User for this phone number.
     // Operators and customers both have a User record — this is our session key.
@@ -53,13 +65,32 @@ export class WhatsAppInboundService {
 
     if (operatorRecord) {
       logger.info('whatsapp: routed to operator flow', {
-        phoneNumber, userId, message, sessionState: session.state, rescueRequestId: session.rescueRequestId,
+        phoneNumber,
+        userId,
+        message,
+        sessionState: session.state,
+        rescueRequestId: session.rescueRequestId,
       });
-      return this.operatorFlow.handleOperatorMessage(phoneNumber, userId, message, rawMessage, session, operatorRecord);
+      return this.operatorFlow.handleOperatorMessage(
+        phoneNumber,
+        userId,
+        message,
+        rawMessage,
+        session,
+        operatorRecord,
+      );
     }
 
     return this.customerFlow.handleCustomerMessage(
-      phoneNumber, userId, message, rawMessage, latitude, longitude, sharedAddress, session, body,
+      phoneNumber,
+      userId,
+      message,
+      rawMessage,
+      latitude,
+      longitude,
+      sharedAddress,
+      session,
+      body,
     );
   }
 }

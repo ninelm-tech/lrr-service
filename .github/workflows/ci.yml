@@ -37,6 +37,16 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit
 
+      # eslint directly, never `yarn lint` — that script passes --fix, which
+      # would rewrite files in CI and hide the very problems it should report.
+      #
+      # Any error fails the build. Warnings are the no-unsafe-* debt on
+      # untyped Prisma results and webhook bodies; --max-warnings pins them at
+      # today's count so the debt cannot grow while it is paid down. This
+      # number is a ratchet: lower it as warnings are fixed, never raise it.
+      - name: Lint
+        run: npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 657
+
       - name: Test
         run: yarn test --ci
 

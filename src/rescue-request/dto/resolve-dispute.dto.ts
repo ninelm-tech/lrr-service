@@ -1,4 +1,11 @@
-import { IsInt, IsOptional, IsString, Max, Min, MinLength } from 'class-validator';
+import {
+  IsInt,
+  IsOptional,
+  IsString,
+  Max,
+  Min,
+  MinLength,
+} from 'class-validator';
 
 export class ResolveDisputeDto {
   /** Staff's record of what happened and why the settlement was decided. */

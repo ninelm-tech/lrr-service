@@ -41,9 +41,12 @@ describe('DispatchOfferSweeperService', () => {
   });
 
   it('also closes PENDING offers on requests that already ended, which the expiry sweep cannot see', async () => {
-    prisma.dispatchOffer.findMany.mockResolvedValue([{ id: 'offer-1' }, { id: 'offer-2' }]);
+    prisma.dispatchOffer.findMany.mockResolvedValue([
+      { id: 'offer-1' },
+      { id: 'offer-2' },
+    ]);
     prisma.dispatchOffer.updateMany
-      .mockResolvedValueOnce({ count: 0 })  // expiry sweep
+      .mockResolvedValueOnce({ count: 0 }) // expiry sweep
       .mockResolvedValueOnce({ count: 2 }); // orphans on ended requests
 
     await expect(service.sweep()).resolves.toBe(2);
@@ -52,7 +55,10 @@ describe('DispatchOfferSweeperService', () => {
     // offers are still inside their window, which is why they were missed.
     const findArg = prisma.dispatchOffer.findMany.mock.calls[0][0];
     expect(findArg.where.status).toBe('PENDING');
-    expect(findArg.where.rescueRequest.status.in).toEqual(['COMPLETED', 'CANCELLED']);
+    expect(findArg.where.rescueRequest.status.in).toEqual([
+      'COMPLETED',
+      'CANCELLED',
+    ]);
     expect(findArg.where.expiresAt).toBeUndefined();
 
     expect(prisma.dispatchOffer.updateMany).toHaveBeenLastCalledWith({
@@ -68,7 +74,9 @@ describe('DispatchOfferSweeperService', () => {
   });
 
   it('never throws when the database call fails — the interval must keep running', async () => {
-    prisma.dispatchOffer.updateMany.mockRejectedValue(new Error('connection lost'));
+    prisma.dispatchOffer.updateMany.mockRejectedValue(
+      new Error('connection lost'),
+    );
     await expect(service.sweep()).resolves.toBe(0);
   });
 

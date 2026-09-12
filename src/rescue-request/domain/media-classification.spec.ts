@@ -1,5 +1,8 @@
 import { MediaType } from '@prisma/client';
-import { classifyMediaType, getExtensionFromContentType } from './media-classification';
+import {
+  classifyMediaType,
+  getExtensionFromContentType,
+} from './media-classification';
 
 describe('classifyMediaType', () => {
   it('classifies image/* as IMAGE', () => {

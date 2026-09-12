@@ -9,14 +9,18 @@ const isProd = process.env.NODE_ENV === 'production';
 // nodeProfilingIntegration requires a native binary tied to the exact Node.js
 // version. Load it lazily so a missing binary never crashes the process —
 // profiling is a nice-to-have, not a hard requirement.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+
 let profilingIntegrations: any[] = [];
+/* eslint-disable @typescript-eslint/no-require-imports -- must stay a require(): a static import cannot be wrapped in try/catch, and the whole point here is to fall back when the native binary is absent */
 try {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { nodeProfilingIntegration } = require('@sentry/profiling-node') as typeof import('@sentry/profiling-node');
+  const { nodeProfilingIntegration } =
+    require('@sentry/profiling-node') as typeof import('@sentry/profiling-node');
   profilingIntegrations = [nodeProfilingIntegration()];
+  /* eslint-enable @typescript-eslint/no-require-imports */
 } catch {
-  console.warn('[Sentry] nodeProfilingIntegration not available on this Node version — profiling disabled.');
+  console.warn(
+    '[Sentry] nodeProfilingIntegration not available on this Node version — profiling disabled.',
+  );
 }
 
 Sentry.init({
@@ -34,7 +38,8 @@ Sentry.init({
   tracesSampleRate: isProd ? 0.2 : 1.0,
 
   // Profiling sample rate (relative to tracesSampleRate)
-  profilesSampleRate: profilingIntegrations.length > 0 ? (isProd ? 0.5 : 1.0) : 0,
+  profilesSampleRate:
+    profilingIntegrations.length > 0 ? (isProd ? 0.5 : 1.0) : 0,
 
   integrations: profilingIntegrations,
 

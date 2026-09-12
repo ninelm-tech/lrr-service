@@ -61,7 +61,9 @@ describe('GeocodingService', () => {
 
   it('returns null instead of throwing when the request fails', async () => {
     configService.get.mockReturnValue('test-key');
-    global.fetch = jest.fn().mockRejectedValue(new Error('network down')) as any;
+    global.fetch = jest
+      .fn()
+      .mockRejectedValue(new Error('network down')) as any;
 
     const result = await service.reverseGeocode(6.5, 3.4);
 

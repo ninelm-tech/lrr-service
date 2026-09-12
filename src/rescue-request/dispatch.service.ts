@@ -1,4 +1,8 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import * as crypto from 'crypto';
 import * as Sentry from '@sentry/node';
 import { logger } from '@sentry/node';
@@ -6,10 +10,17 @@ import { toWhatsAppAddress } from '../common/phone.util';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { PrismaService } from '../prisma/prisma.service';
-import { RescueRequestStatus, VehicleType } from '@prisma/client';
-import { getEligibleTruckClasses, formatVehicleType } from './domain/vehicle-truck-mapping';
+import { scheduleSafely } from '../common/safe-timer';
+import { RescueRequestStatus } from '@prisma/client';
+import {
+  getEligibleTruckClasses,
+  formatVehicleType,
+} from './domain/vehicle-truck-mapping';
 import { estimateEtaMinutes, rankQuotes } from './domain/quote-ranking';
-import { formatJobRef, buildMediaLinksSection } from './domain/rescue-request-formatting';
+import {
+  formatJobRef,
+  buildMediaLinksSection,
+} from './domain/rescue-request-formatting';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { OperatorService } from '../operator/operator.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
@@ -17,8 +28,12 @@ import { DispatchBoardRowDto } from './dto/rescue-request-response.dto';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 
 // ── Dispatch config ────────────────────────────────────────────────────────────
-const MAX_FAILED_ROUNDS_BEFORE_ALERT = Number(process.env.DISPATCH_MAX_ALERT_ROUND ?? 2);
-const MAX_ROUNDS_BEFORE_AUTO_CANCEL  = Number(process.env.DISPATCH_MAX_ROUNDS     ?? 4);   // ~RETRY*MAX min total
+const MAX_FAILED_ROUNDS_BEFORE_ALERT = Number(
+  process.env.DISPATCH_MAX_ALERT_ROUND ?? 2,
+);
+const MAX_ROUNDS_BEFORE_AUTO_CANCEL = Number(
+  process.env.DISPATCH_MAX_ROUNDS ?? 4,
+); // ~RETRY*MAX min total
 const RADIUS_EXPANSION_KM = 2;
 
 /**
@@ -32,9 +47,9 @@ const RADIUS_EXPANSION_KM = 2;
 function sanitizeTemplateVariable(value: string): string {
   return value
     .trim()
-    .replace(/[\t ]*[\r\n]+[\t ]*/g, ' · ')  // line breaks → visible separator
-    .replace(/\t+/g, ' ')                     // stray tabs
-    .replace(/ {2,}/g, ' ')                   // runs of spaces (4+ consecutive is rejected)
+    .replace(/[\t ]*[\r\n]+[\t ]*/g, ' · ') // line breaks → visible separator
+    .replace(/\t+/g, ' ') // stray tabs
+    .replace(/ {2,}/g, ' ') // runs of spaces (4+ consecutive is rejected)
     .trim();
 }
 
@@ -63,7 +78,9 @@ export class DispatchService {
   private async sendDispatchOfferMessage(
     operatorPhone: string,
     variables: {
-      jobRef: string; vehicle: string; destination: string;
+      jobRef: string;
+      vehicle: string;
+      destination: string;
       /** '' or 'Distance: X km\n' — trailing newline included, absent when there's nothing to show (manualOfferToOperator). */
       distanceLine: string;
       location: string;
@@ -91,22 +108,30 @@ export class DispatchService {
       // Every value also goes through sanitizeTemplateVariable: 21656 is
       // equally triggered by newlines/tabs inside a value, and by a value
       // that resolves to empty — hence the non-empty fallbacks below.
-      const distanceEta = [variables.distanceLine.trim(), variables.etaLine.trim()]
-        .filter(Boolean)
-        .join('\n') || 'Distance: N/A';
+      const distanceEta =
+        [variables.distanceLine.trim(), variables.etaLine.trim()]
+          .filter(Boolean)
+          .join('\n') || 'Distance: N/A';
       const templateVariables: Record<string, string> = {
         '1': variables.jobRef,
         '2': variables.vehicle,
         '3': variables.destination,
         '4': distanceEta,
         '5': variables.location,
-        '6': variables.mediaSection.trim() || 'No photos, video, or audio attached.',
+        '6':
+          variables.mediaSection.trim() ||
+          'No photos, video, or audio attached.',
         '7': variables.window,
       };
       for (const key of Object.keys(templateVariables)) {
-        templateVariables[key] = sanitizeTemplateVariable(templateVariables[key]) || '—';
+        templateVariables[key] =
+          sanitizeTemplateVariable(templateVariables[key]) || '—';
       }
-      await this.twilioService.sendWhatsAppTemplateMessage(to, templateSid, templateVariables);
+      await this.twilioService.sendWhatsAppTemplateMessage(
+        to,
+        templateSid,
+        templateVariables,
+      );
     } else {
       // Matches the original freeform layout exactly: Distance sits right
       // after Destination (before Location); ETA is its own line after the
@@ -184,7 +209,12 @@ export class DispatchService {
    * caller resolves `offer` in the first place.
    */
   async processQuoteOrDecline(
-    offer: { id: string; rescueRequestId: string; expiresAt: Date; batchId: string },
+    offer: {
+      id: string;
+      rescueRequestId: string;
+      expiresAt: Date;
+      batchId: string;
+    },
     quotedPriceKobo: number | undefined,
   ): Promise<{ quoted: boolean; message: string }> {
     const isDecline = quotedPriceKobo === undefined;
@@ -199,10 +229,16 @@ export class DispatchService {
     if (!isDecline && (await this.isBiddingClosed(offer.rescueRequestId))) {
       await this.prisma.dispatchOffer.updateMany({
         where: { id: offer.id, status: 'PENDING' },
-        data: { status: 'NOT_SELECTED', quotedPrice: quotedPriceKobo, respondedAt: new Date() },
+        data: {
+          status: 'NOT_SELECTED',
+          quotedPrice: quotedPriceKobo,
+          respondedAt: new Date(),
+        },
       });
       logger.info('dispatch: quote arrived after bidding closed', {
-        rescueRequestId: offer.rescueRequestId, offerId: offer.id, quotedPriceKobo,
+        rescueRequestId: offer.rescueRequestId,
+        offerId: offer.id,
+        quotedPriceKobo,
       });
       return {
         quoted: false,
@@ -229,12 +265,22 @@ export class DispatchService {
     }
 
     if (isDecline) {
-      logger.info('dispatch: offer declined', { rescueRequestId: offer.rescueRequestId, offerId: offer.id });
+      logger.info('dispatch: offer declined', {
+        rescueRequestId: offer.rescueRequestId,
+        offerId: offer.id,
+      });
       await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.batchId);
-      return { quoted: false, message: `Understood — ${formatJobRef(offer.rescueRequestId)} declined. We'll offer this job to another operator.` };
+      return {
+        quoted: false,
+        message: `Understood — ${formatJobRef(offer.rescueRequestId)} declined. We'll offer this job to another operator.`,
+      };
     }
 
-    logger.info('dispatch: offer quoted', { rescueRequestId: offer.rescueRequestId, offerId: offer.id, quotedPriceKobo });
+    logger.info('dispatch: offer quoted', {
+      rescueRequestId: offer.rescueRequestId,
+      offerId: offer.id,
+      quotedPriceKobo,
+    });
     // Order matters: phase 2 must have started (deadline persisted) before
     // maybeResolveBatchEarly runs, or the early check would still be
     // batch-scoped and could resolve one batch while others are pending.
@@ -270,7 +316,9 @@ export class DispatchService {
    * protect — once set, nothing (a second quote, an admin Expand, a new
    * batch) may ever move this deadline later.
    */
-  private async beginQuoteCollectionIfFirst(rescueRequestId: string): Promise<void> {
+  private async beginQuoteCollectionIfFirst(
+    rescueRequestId: string,
+  ): Promise<void> {
     const config = await this.platformConfigService.getConfig();
     const quoteCollectionMs = config.quoteCollectionMinutes * 60 * 1000;
     const deadline = new Date(Date.now() + quoteCollectionMs);
@@ -281,7 +329,10 @@ export class DispatchService {
     });
     if (started.count === 0) return; // phase 2 already running — leave it alone
 
-    logger.info('dispatch: quote collection started', { rescueRequestId, deadline });
+    logger.info('dispatch: quote collection started', {
+      rescueRequestId,
+      deadline,
+    });
 
     // Every still-pending offer now ends at the deadline instead of its own
     // batch window. Rewriting expiresAt (rather than deriving a min() at each
@@ -290,7 +341,11 @@ export class DispatchService {
     // the clamp otherwise. `gt: deadline` so a shorter window is never
     // lengthened.
     await this.prisma.dispatchOffer.updateMany({
-      where: { rescueRequestId, status: 'PENDING', expiresAt: { gt: deadline } },
+      where: {
+        rescueRequestId,
+        status: 'PENDING',
+        expiresAt: { gt: deadline },
+      },
       data: { expiresAt: deadline },
     });
 
@@ -301,10 +356,13 @@ export class DispatchService {
     // from after those sends fires at deadline + notify-latency, pushing the
     // motorist's shortlist out by however long WhatsApp took. Same reason the
     // batch timers are scheduled from their offers' expiresAt.
-    const timer = setTimeout(() => {
-      this.closeTimers.delete(rescueRequestId);
-      void this.closeBidding(rescueRequestId);
-    }, Math.max(0, deadline.getTime() - Date.now()));
+    const timer = setTimeout(
+      () => {
+        this.closeTimers.delete(rescueRequestId);
+        void this.closeBidding(rescueRequestId);
+      },
+      Math.max(0, deadline.getTime() - Date.now()),
+    );
     this.closeTimers.set(rescueRequestId, timer);
   }
 
@@ -324,7 +382,10 @@ export class DispatchService {
    * have an open 24-hour session, so a freeform body hits Twilio 63016 for
    * precisely its intended audience.
    */
-  private async notifyPendingOperatorsOfCountdown(rescueRequestId: string, deadline: Date) {
+  private async notifyPendingOperatorsOfCountdown(
+    rescueRequestId: string,
+    deadline: Date,
+  ) {
     const stillPending = await this.prisma.dispatchOffer.findMany({
       where: { rescueRequestId, status: 'PENDING' },
       include: { operator: true },
@@ -351,7 +412,11 @@ export class DispatchService {
             '1': sanitizeTemplateVariable(jobRef) || '—',
             '2': sanitizeTemplateVariable(remaining) || '—',
           };
-          return this.twilioService.sendWhatsAppTemplateMessage(to, templateSid, variables);
+          return this.twilioService.sendWhatsAppTemplateMessage(
+            to,
+            templateSid,
+            variables,
+          );
         }
         return this.twilioService.sendWhatsAppMessage(
           to,
@@ -361,7 +426,10 @@ export class DispatchService {
     );
     results.forEach((result, i) => {
       if (result.status === 'rejected') {
-        console.error(`Failed to send countdown notice to operator ${stillPending[i].operatorId}:`, result.reason);
+        console.error(
+          `Failed to send countdown notice to operator ${stillPending[i].operatorId}:`,
+          result.reason,
+        );
         Sentry.captureException(result.reason, {
           extra: { rescueRequestId, operatorId: stillPending[i].operatorId },
         });
@@ -399,7 +467,10 @@ export class DispatchService {
    * expiresAt rewrite entirely and outlive the deadline it should have been
    * clamped to.
    */
-  private async offerExpiryClampedToDeadline(rescueRequestId: string, windowMs: number): Promise<Date> {
+  private async offerExpiryClampedToDeadline(
+    rescueRequestId: string,
+    windowMs: number,
+  ): Promise<Date> {
     const fresh = await this.prisma.rescueRequest.findUnique({
       where: { id: rescueRequestId },
       select: { quoteCollectionDeadline: true },
@@ -443,7 +514,8 @@ export class DispatchService {
       rescueRequest.status === RescueRequestStatus.WAITING_FOR_DEPOSIT ||
       rescueRequest.status === RescueRequestStatus.COMPLETED ||
       rescueRequest.status === RescueRequestStatus.CANCELLED
-    ) return;
+    )
+      return;
 
     this.closedRequests.add(rescueRequestId);
 
@@ -484,8 +556,9 @@ export class DispatchService {
       rescueRequest.status === RescueRequestStatus.CANCELLED ||
       rescueRequest.status === RescueRequestStatus.COMPLETED ||
       rescueRequest.status === RescueRequestStatus.OPERATOR_ASSIGNED ||
-      rescueRequest.status === RescueRequestStatus.WAITING_FOR_DEPOSIT  // payment window active
-    ) return;
+      rescueRequest.status === RescueRequestStatus.WAITING_FOR_DEPOSIT // payment window active
+    )
+      return;
 
     // Resolve the customer's phone number for Twilio messages
     const customerRecord = await this.prisma.user.findUnique({
@@ -504,16 +577,23 @@ export class DispatchService {
     const lon = Number(rescueRequest.longitude);
 
     const eligibleTruckClasses = rescueRequest.vehicleType
-      ? getEligibleTruckClasses(rescueRequest.vehicleType as VehicleType)
+      ? getEligibleTruckClasses(rescueRequest.vehicleType)
       : undefined;
 
     // Get all ranked candidates (excluding already-offered operators)
     const candidates = await this.operatorService.findAndRankCandidates(
-      lat, lon, alreadyOffered, extraRadiusKm, undefined, eligibleTruckClasses,
+      lat,
+      lon,
+      alreadyOffered,
+      extraRadiusKm,
+      undefined,
+      eligibleTruckClasses,
     );
 
     logger.info('dispatch: candidate search', {
-      rescueRequestId, round, radiusExpansionKm: extraRadiusKm,
+      rescueRequestId,
+      round,
+      radiusExpansionKm: extraRadiusKm,
       alreadyOfferedOperatorIds: alreadyOffered,
       candidateCount: candidates.length,
       candidateIds: candidates.map((c) => c.id),
@@ -549,9 +629,15 @@ export class DispatchService {
       const COVERAGE_DELTA_DEG = 1.5;
       const nearbyOperatorCount = await this.prisma.operator.count({
         where: {
-          status: 'ACTIVE',           // isAvailable intentionally omitted (see findAndRankCandidates)
-          latitude:  { gte: lat - COVERAGE_DELTA_DEG, lte: lat + COVERAGE_DELTA_DEG },
-          longitude: { gte: lon - COVERAGE_DELTA_DEG, lte: lon + COVERAGE_DELTA_DEG },
+          status: 'ACTIVE', // isAvailable intentionally omitted (see findAndRankCandidates)
+          latitude: {
+            gte: lat - COVERAGE_DELTA_DEG,
+            lte: lat + COVERAGE_DELTA_DEG,
+          },
+          longitude: {
+            gte: lon - COVERAGE_DELTA_DEG,
+            lte: lon + COVERAGE_DELTA_DEG,
+          },
         },
       });
 
@@ -559,7 +645,7 @@ export class DispatchService {
         // No operator infrastructure in this area at all — cancel immediately
         await this.prisma.rescueRequest.update({
           where: { id: rescueRequestId },
-          data:  { status: RescueRequestStatus.CANCELLED },
+          data: { status: RescueRequestStatus.CANCELLED },
         });
         await this.sessionStore.clear(customerId);
         if (customerPhone) {
@@ -615,11 +701,20 @@ export class DispatchService {
         }
 
         await this.alertAdminNoOperator(rescueRequestId, lat, lon, newRound);
-        console.warn(`🚨 Auto-cancelled request ${rescueRequestId} after ${newRound} rounds with no operator found.`);
+        console.warn(
+          `🚨 Auto-cancelled request ${rescueRequestId} after ${newRound} rounds with no operator found.`,
+        );
         Sentry.withScope((scope) => {
           scope.setLevel('warning');
-          scope.setContext('dispatch', { rescueRequestId, lat, lon, rounds: newRound });
-          Sentry.captureMessage(`Auto-cancelled: no operator after ${newRound} rounds`);
+          scope.setContext('dispatch', {
+            rescueRequestId,
+            lat,
+            lon,
+            rounds: newRound,
+          });
+          Sentry.captureMessage(
+            `Auto-cancelled: no operator after ${newRound} rounds`,
+          );
         });
         return;
       }
@@ -649,14 +744,23 @@ export class DispatchService {
     const batchOperatorIds = batch.map((op) => op.id);
 
     logger.info('dispatch: batch offered', {
-      rescueRequestId, round, radiusExpansionKm: extraRadiusKm,
-      offered: batch.map((op) => ({ operatorId: op.id, businessName: op.businessName, distanceKm: Number(op.distance.toFixed(1)) })),
+      rescueRequestId,
+      round,
+      radiusExpansionKm: extraRadiusKm,
+      offered: batch.map((op) => ({
+        operatorId: op.id,
+        businessName: op.businessName,
+        distanceKm: Number(op.distance.toFixed(1)),
+      })),
     });
 
     // Clamped against a deadline read right now — a first quote may have
     // landed while findAndRankCandidates was running.
     const windowMs = config.dispatchWindowMinutes * 60 * 1000;
-    const expiresAt = await this.offerExpiryClampedToDeadline(rescueRequestId, windowMs);
+    const expiresAt = await this.offerExpiryClampedToDeadline(
+      rescueRequestId,
+      windowMs,
+    );
     const batchId = crypto.randomUUID();
 
     // Re-check right before the write. expandRadiusNow checks
@@ -687,7 +791,7 @@ export class DispatchService {
     });
 
     const vehicleLabel = rescueRequest.vehicleType
-      ? formatVehicleType(rescueRequest.vehicleType as VehicleType)
+      ? formatVehicleType(rescueRequest.vehicleType)
       : 'Unknown';
     const destinationLabel = rescueRequest.destination ?? 'Not specified';
 
@@ -701,7 +805,10 @@ export class DispatchService {
         return [];
       });
     const mediaSection = buildMediaLinksSection(mediaItems);
-    const locationSection = await this.sharedService.formatLocationSection(lat, lon);
+    const locationSection = await this.sharedService.formatLocationSection(
+      lat,
+      lon,
+    );
 
     // Notify all batch operators simultaneously. allSettled (not all) —
     // one operator's send failing (e.g. Twilio 63016, no open session with
@@ -729,8 +836,13 @@ export class DispatchService {
     sendResults.forEach((result, i) => {
       if (result.status === 'rejected') {
         const op = batch[i];
-        console.error(`Failed to send dispatch offer to operator ${op.id}:`, result.reason);
-        Sentry.captureException(result.reason, { extra: { rescueRequestId, operatorId: op.id } });
+        console.error(
+          `Failed to send dispatch offer to operator ${op.id}:`,
+          result.reason,
+        );
+        Sentry.captureException(result.reason, {
+          extra: { rescueRequestId, operatorId: op.id },
+        });
       }
     });
 
@@ -739,7 +851,14 @@ export class DispatchService {
     // when the offers actually expire, which is earlier than the full window
     // if they were clamped to the quote-collection deadline.
     const timer = setTimeout(
-      () => void this.resolveBatch(rescueRequestId, batchOperatorIds, customerId, extraRadiusKm, batchId),
+      () =>
+        void this.resolveBatch(
+          rescueRequestId,
+          batchOperatorIds,
+          customerId,
+          extraRadiusKm,
+          batchId,
+        ),
       Math.max(0, expiresAt.getTime() - Date.now()),
     );
     this.batchTimers.set(this.batchKey(rescueRequestId, batchId), timer);
@@ -776,7 +895,8 @@ export class DispatchService {
       rescueRequest.status === RescueRequestStatus.WAITING_FOR_DEPOSIT ||
       rescueRequest.status === RescueRequestStatus.COMPLETED ||
       rescueRequest.status === RescueRequestStatus.CANCELLED
-    ) return;
+    )
+      return;
 
     // Mark all still-pending offers in this batch as timed out
     await this.prisma.dispatchOffer.updateMany({
@@ -826,7 +946,10 @@ export class DispatchService {
    * the first 40 seconds of a 5-minute collection window must get the
    * motorist a shortlist at 40 seconds, not at 5 minutes.
    */
-  private async maybeResolveBatchEarly(rescueRequestId: string, batchId: string) {
+  private async maybeResolveBatchEarly(
+    rescueRequestId: string,
+    batchId: string,
+  ) {
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
       where: { id: rescueRequestId },
       select: { customerId: true, quoteCollectionDeadline: true },
@@ -854,7 +977,13 @@ export class DispatchService {
     // here because an early-resolved batch (all responded) never needed a
     // radius expansion to find candidates — expansion only happens when
     // zero candidates exist at all, a separate path in startDispatch.
-    void this.resolveBatch(rescueRequestId, batchOperatorIds, rescueRequest.customerId, 0, batchId);
+    void this.resolveBatch(
+      rescueRequestId,
+      batchOperatorIds,
+      rescueRequest.customerId,
+      0,
+      batchId,
+    );
   }
 
   //
@@ -900,7 +1029,9 @@ export class DispatchService {
     rescueRequestId: string,
     quoteCollectionDeadline: Date | null | undefined,
   ): void {
-    const deadlinePassed = !!quoteCollectionDeadline && Date.now() >= quoteCollectionDeadline.getTime();
+    const deadlinePassed =
+      !!quoteCollectionDeadline &&
+      Date.now() >= quoteCollectionDeadline.getTime();
     if (deadlinePassed || this.closedRequests.has(rescueRequestId)) {
       throw new BadRequestException('Bidding has closed for this request');
     }
@@ -910,18 +1041,30 @@ export class DispatchService {
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
       where: { id: rescueRequestId },
     });
-    if (!rescueRequest || rescueRequest.status !== RescueRequestStatus.DISPATCHING) {
+    if (
+      !rescueRequest ||
+      rescueRequest.status !== RescueRequestStatus.DISPATCHING
+    ) {
       throw new BadRequestException('Request is not currently DISPATCHING');
     }
-    this.assertBiddingStillOpen(rescueRequestId, rescueRequest.quoteCollectionDeadline);
+    this.assertBiddingStillOpen(
+      rescueRequestId,
+      rescueRequest.quoteCollectionDeadline,
+    );
 
     // Deliberately does NOT touch existing offers — operators still inside
     // their window keep them. Expanding adds people; it never un-asks anyone.
-    const session = await this.sessionStore.getOrCreate(rescueRequest.customerId);
+    const session = await this.sessionStore.getOrCreate(
+      rescueRequest.customerId,
+    );
     const currentRadius = (session.dispatchRound ?? 0) * RADIUS_EXPANSION_KM;
     const expandedRadius = currentRadius + RADIUS_EXPANSION_KM;
 
-    void this.startDispatch(rescueRequestId, rescueRequest.customerId, expandedRadius);
+    void this.startDispatch(
+      rescueRequestId,
+      rescueRequest.customerId,
+      expandedRadius,
+    );
   }
 
   /**
@@ -931,16 +1074,27 @@ export class DispatchService {
    * processQuoteOrDecline/maybeResolveBatchEarly machinery every other
    * round uses, so no bespoke quote-handling is needed here.
    */
-  async manualOfferToOperator(rescueRequestId: string, operatorId: string): Promise<void> {
+  async manualOfferToOperator(
+    rescueRequestId: string,
+    operatorId: string,
+  ): Promise<void> {
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
       where: { id: rescueRequestId },
     });
-    if (!rescueRequest || rescueRequest.status !== RescueRequestStatus.DISPATCHING) {
+    if (
+      !rescueRequest ||
+      rescueRequest.status !== RescueRequestStatus.DISPATCHING
+    ) {
       throw new BadRequestException('Request is not currently DISPATCHING');
     }
-    this.assertBiddingStillOpen(rescueRequestId, rescueRequest.quoteCollectionDeadline);
+    this.assertBiddingStillOpen(
+      rescueRequestId,
+      rescueRequest.quoteCollectionDeadline,
+    );
 
-    const operator = await this.prisma.operator.findUnique({ where: { id: operatorId } });
+    const operator = await this.prisma.operator.findUnique({
+      where: { id: operatorId },
+    });
     if (!operator || operator.status !== 'ACTIVE') {
       throw new BadRequestException('Target is not an active operator');
     }
@@ -951,7 +1105,10 @@ export class DispatchService {
     // rescueRequest read at the top of this method: a first quote can land in
     // between and this offer must still be clamped.
     const MANUAL_OFFER_WINDOW_MS = 5 * 60 * 1000;
-    const expiresAt = await this.offerExpiryClampedToDeadline(rescueRequestId, MANUAL_OFFER_WINDOW_MS);
+    const expiresAt = await this.offerExpiryClampedToDeadline(
+      rescueRequestId,
+      MANUAL_OFFER_WINDOW_MS,
+    );
     const batchId = crypto.randomUUID();
 
     // Re-check right before the write, not just at the top of the method:
@@ -972,7 +1129,9 @@ export class DispatchService {
     // offeredOperatorIds spreads the existing list first (see e.g.
     // startDispatch's batch-tracking update); replacing it here would let
     // operators from earlier rounds become eligible for re-offering again.
-    const session = await this.sessionStore.getOrCreate(rescueRequest.customerId);
+    const session = await this.sessionStore.getOrCreate(
+      rescueRequest.customerId,
+    );
     await this.sessionStore.update(rescueRequest.customerId, {
       offeredOperatorIds: [...(session.offeredOperatorIds ?? []), operatorId],
     });
@@ -980,7 +1139,7 @@ export class DispatchService {
     const lat = Number(rescueRequest.latitude);
     const lon = Number(rescueRequest.longitude);
     const vehicleLabel = rescueRequest.vehicleType
-      ? formatVehicleType(rescueRequest.vehicleType as VehicleType)
+      ? formatVehicleType(rescueRequest.vehicleType)
       : 'Unknown';
     const destinationLabel = rescueRequest.destination ?? 'Not specified';
 
@@ -994,7 +1153,10 @@ export class DispatchService {
         return [];
       });
     const mediaSection = buildMediaLinksSection(mediaItems);
-    const locationSection = await this.sharedService.formatLocationSection(lat, lon);
+    const locationSection = await this.sharedService.formatLocationSection(
+      lat,
+      lon,
+    );
 
     try {
       await this.sendDispatchOfferMessage(operator.phoneNumber, {
@@ -1012,14 +1174,26 @@ export class DispatchService {
       // the other operators in the round), this is a single admin-triggered
       // offer: the admin needs to see it failed, so re-throw after logging
       // for visibility — don't silently succeed.
-      console.error(`Failed to send manual dispatch offer to operator ${operatorId}:`, error);
-      Sentry.captureException(error, { extra: { rescueRequestId, operatorId } });
+      console.error(
+        `Failed to send manual dispatch offer to operator ${operatorId}:`,
+        error,
+      );
+      Sentry.captureException(error, {
+        extra: { rescueRequestId, operatorId },
+      });
       throw error;
     }
 
     const currentRadius = (session.dispatchRound ?? 0) * RADIUS_EXPANSION_KM;
     const timer = setTimeout(
-      () => void this.resolveBatch(rescueRequestId, [operatorId], rescueRequest.customerId, currentRadius, batchId),
+      () =>
+        void this.resolveBatch(
+          rescueRequestId,
+          [operatorId],
+          rescueRequest.customerId,
+          currentRadius,
+          batchId,
+        ),
       Math.max(0, expiresAt.getTime() - Date.now()),
     );
     this.batchTimers.set(this.batchKey(rescueRequestId, batchId), timer);
@@ -1043,7 +1217,10 @@ export class DispatchService {
 
     const forRanking = quotedOffers.map((offer) => {
       const distance = this.operatorService['calculateDistance'](
-        lat, lon, Number(offer.operator.latitude), Number(offer.operator.longitude),
+        lat,
+        lon,
+        Number(offer.operator.latitude),
+        Number(offer.operator.longitude),
       );
       return {
         offerId: offer.id,
@@ -1062,7 +1239,9 @@ export class DispatchService {
       // Motorist-facing amount is ALWAYS quotedPrice + service fee — never the raw quote.
       // This must exactly match what handleQuoteSelected later charges, so the
       // motorist never sees one number here and a different one at payment.
-      const displayTotal = q.quotedPrice + Math.round((q.quotedPrice * config.serviceFeePercent) / 100);
+      const displayTotal =
+        q.quotedPrice +
+        Math.round((q.quotedPrice * config.serviceFeePercent) / 100);
       const priceNaira = (displayTotal / 100).toLocaleString();
       return `${numberEmoji} ₦${priceNaira} · ETA ${q.etaMinutes} min · ${q.businessName}`;
     });
@@ -1079,36 +1258,41 @@ export class DispatchService {
       state: WhatsAppFlowState.WAITING_FOR_QUOTE_SELECTION,
     });
 
-    setTimeout(async () => {
-      const fresh = await this.sessionStore.getOrCreate(customerId);
-      if (fresh.state !== WhatsAppFlowState.WAITING_FOR_QUOTE_SELECTION) return; // already selected
+    scheduleSafely(
+      async () => {
+        const fresh = await this.sessionStore.getOrCreate(customerId);
+        if (fresh.state !== WhatsAppFlowState.WAITING_FOR_QUOTE_SELECTION)
+          return; // already selected
 
-      // Timed out — release every quoting operator and let the motorist retry.
-      await this.prisma.dispatchOffer.updateMany({
-        where: { rescueRequestId, status: 'QUOTED' },
-        data: { status: 'TIMED_OUT', respondedAt: new Date() },
-      });
-      await this.prisma.rescueRequest.update({
-        where: { id: rescueRequestId },
-        data: { status: RescueRequestStatus.CANCELLED },
-      });
-      await this.sessionStore.clear(customerId);
+        // Timed out — release every quoting operator and let the motorist retry.
+        await this.prisma.dispatchOffer.updateMany({
+          where: { rescueRequestId, status: 'QUOTED' },
+          data: { status: 'TIMED_OUT', respondedAt: new Date() },
+        });
+        await this.prisma.rescueRequest.update({
+          where: { id: rescueRequestId },
+          data: { status: RescueRequestStatus.CANCELLED },
+        });
+        await this.sessionStore.clear(customerId);
 
-      if (customerPhone) {
-        await this.twilioService.sendWhatsAppMessage(
-          customerPhone,
-          `⏰ You didn't choose a quote in time. Your request has been cancelled — send SOS to start again.`,
-        );
-      }
-      await Promise.all(
-        quotedOffers.map((offer) =>
-          this.twilioService.sendWhatsAppMessage(
-            toWhatsAppAddress(offer.operator.phoneNumber),
-            `⏰ ${formatJobRef(rescueRequestId)} is no longer available — the customer didn't choose a quote in time. Watch for new offers!`,
+        if (customerPhone) {
+          await this.twilioService.sendWhatsAppMessage(
+            customerPhone,
+            `⏰ You didn't choose a quote in time. Your request has been cancelled — send SOS to start again.`,
+          );
+        }
+        await Promise.all(
+          quotedOffers.map((offer) =>
+            this.twilioService.sendWhatsAppMessage(
+              toWhatsAppAddress(offer.operator.phoneNumber),
+              `⏰ ${formatJobRef(rescueRequestId)} is no longer available — the customer didn't choose a quote in time. Watch for new offers!`,
+            ),
           ),
-        ),
-      );
-    }, this.QUOTE_SELECTION_WINDOW_MS);
+        );
+      },
+      this.QUOTE_SELECTION_WINDOW_MS,
+      'quote-selection-timeout',
+    );
   }
 
   // ══════════════════════════════════════════════════════
@@ -1133,8 +1317,12 @@ export class DispatchService {
       include: {
         rescueRequest: {
           select: {
-            id: true, latitude: true, longitude: true, createdAt: true,
-            vehicleType: true, destination: true,
+            id: true,
+            latitude: true,
+            longitude: true,
+            createdAt: true,
+            vehicleType: true,
+            destination: true,
             media: { select: { id: true } },
           },
         },
@@ -1147,18 +1335,20 @@ export class DispatchService {
     // Note: customer contact details are deliberately NOT exposed before acceptance.
     return {
       data: offers.map((o) => ({
-        id:        o.id,
+        id: o.id,
         offeredAt: o.offeredAt,
         expiresAt: o.expiresAt,
         request: {
-          id:          o.rescueRequest.id,
+          id: o.rescueRequest.id,
           vehicleType: o.rescueRequest.vehicleType,
           destination: o.rescueRequest.destination,
-          latitude:    o.rescueRequest.latitude,
-          longitude:   o.rescueRequest.longitude,
-          createdAt:   o.rescueRequest.createdAt,
+          latitude: o.rescueRequest.latitude,
+          longitude: o.rescueRequest.longitude,
+          createdAt: o.rescueRequest.createdAt,
           mediaLinks: apiBaseUrl
-            ? o.rescueRequest.media.map((m) => `${apiBaseUrl}/api/v1/media/${m.id}`)
+            ? o.rescueRequest.media.map(
+                (m) => `${apiBaseUrl}/api/v1/media/${m.id}`,
+              )
             : [],
         },
       })),
@@ -1200,7 +1390,12 @@ export class DispatchService {
         OR: [
           { status: RescueRequestStatus.DISPATCHING },
           {
-            status: { in: [RescueRequestStatus.OPERATOR_ASSIGNED, RescueRequestStatus.CANCELLED] },
+            status: {
+              in: [
+                RescueRequestStatus.OPERATOR_ASSIGNED,
+                RescueRequestStatus.CANCELLED,
+              ],
+            },
             updatedAt: { gte: sixtyMinAgo },
           },
         ],
@@ -1219,7 +1414,9 @@ export class DispatchService {
       where: { userId: { in: customerIds } },
       select: { userId: true, dispatchRound: true },
     });
-    const roundByCustomerId = new Map(sessions.map((s) => [s.userId, s.dispatchRound]));
+    const roundByCustomerId = new Map(
+      sessions.map((s) => [s.userId, s.dispatchRound]),
+    );
 
     return requests.map((r) => ({
       id: r.id,

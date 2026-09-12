@@ -1,4 +1,9 @@
-import { BadRequestException, Injectable, forwardRef, Inject } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  forwardRef,
+  Inject,
+} from '@nestjs/common';
 import * as Sentry from '@sentry/node';
 import { logger } from '@sentry/node';
 import * as crypto from 'crypto';
@@ -6,11 +11,27 @@ import { toWhatsAppAddress } from '../common/phone.util';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { IssueType, WhatsAppFlowState } from './state/whatsapp-session.types';
 import { PrismaService } from '../prisma/prisma.service';
-import { RescueRequestStatus, UserRole, VehicleType, MediaType, RatingDirection } from '@prisma/client';
-import { mapVehicleTypeReply, formatVehicleType } from './domain/vehicle-truck-mapping';
+import { scheduleSafely } from '../common/safe-timer';
+import {
+  RescueRequestStatus,
+  VehicleType,
+  MediaType,
+  RatingDirection,
+} from '@prisma/client';
+import {
+  mapVehicleTypeReply,
+  formatVehicleType,
+} from './domain/vehicle-truck-mapping';
 import { estimateEtaMinutes, rankQuotes } from './domain/quote-ranking';
-import { formatIssueType, formatStatus, formatJobRef } from './domain/rescue-request-formatting';
-import { classifyMediaType, getExtensionFromContentType } from './domain/media-classification';
+import {
+  formatIssueType,
+  formatStatus,
+  formatJobRef,
+} from './domain/rescue-request-formatting';
+import {
+  classifyMediaType,
+  getExtensionFromContentType,
+} from './domain/media-classification';
 import { S3Service } from '../integrations/s3/s3.service';
 import { GeocodingService } from '../integrations/geocoding/geocoding.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
@@ -25,7 +46,7 @@ import { DisputeService } from './dispute.service';
 import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 
-const DEPOSIT_AMOUNT_KOBO = 500000;   // ₦5,000
+const DEPOSIT_AMOUNT_KOBO = 500000; // ₦5,000
 const MAX_MEDIA_ITEMS = 5;
 
 @Injectable()
@@ -62,12 +83,22 @@ export class WhatsAppCustomerFlowService {
    * started a fresh SOS).
    */
   scheduleRatingTimeout(userId: string, rescueRequestId: string) {
-    setTimeout(async () => {
-      const fresh = await this.sessionStore.getOrCreate(userId);
-      if (fresh.state === WhatsAppFlowState.WAITING_FOR_RATING && fresh.rescueRequestId === rescueRequestId) {
-        await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
-      }
-    }, this.RATING_TIMEOUT_MS);
+    scheduleSafely(
+      async () => {
+        const fresh = await this.sessionStore.getOrCreate(userId);
+        if (
+          fresh.state === WhatsAppFlowState.WAITING_FOR_RATING &&
+          fresh.rescueRequestId === rescueRequestId
+        ) {
+          await this.sessionStore.update(userId, {
+            state: WhatsAppFlowState.IDLE,
+            rescueRequestId: undefined,
+          });
+        }
+      },
+      this.RATING_TIMEOUT_MS,
+      'rating-timeout',
+    );
   }
 
   /**
@@ -127,14 +158,21 @@ export class WhatsAppCustomerFlowService {
       if (!rescueRequest?.assignedOperator) {
         return this.reply(`No operator is assigned to your request yet.`);
       }
-      const opUser = await this.sharedService.findOrCreateCustomer(rescueRequest.assignedOperator.phoneNumber);
+      const opUser = await this.sharedService.findOrCreateCustomer(
+        rescueRequest.assignedOperator.phoneNumber,
+      );
       await this.sessionStore.update(userId, { relayTarget: 'OPERATOR' });
-      await this.sessionStore.update(opUser.id, { relayTarget: 'CUSTOMER', rescueRequestId: session.rescueRequestId });
+      await this.sessionStore.update(opUser.id, {
+        relayTarget: 'CUSTOMER',
+        rescueRequestId: session.rescueRequestId,
+      });
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
         `You're now connected with your customer. Messages will be relayed. Reply END CHAT anytime to stop.`,
       );
-      return this.reply(`You're now connected with your driver. Messages will be relayed. Reply END CHAT anytime to stop.`);
+      return this.reply(
+        `You're now connected with your driver. Messages will be relayed. Reply END CHAT anytime to stop.`,
+      );
     }
 
     // ── Waiting for dispute statement (customer's side of the story) ──────
@@ -148,8 +186,12 @@ export class WhatsAppCustomerFlowService {
           data: { customerDisputeStatement: rawMessage },
         });
       }
-      await this.sessionStore.update(userId, { state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM });
-      return this.reply(`Thanks — we've recorded that. Our team will be in touch.`);
+      await this.sessionStore.update(userId, {
+        state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
+      });
+      return this.reply(
+        `Thanks — we've recorded that. Our team will be in touch.`,
+      );
     }
 
     // ── CONFIRM / DISPUTE job completion (customer side) ──────────────────
@@ -164,14 +206,27 @@ export class WhatsAppCustomerFlowService {
             where: { id: session.rescueRequestId },
             select: { status: true, disputeResolvedAt: true },
           });
-          if (current?.status === RescueRequestStatus.CANCELLED || current?.status === RescueRequestStatus.COMPLETED) {
-            await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
-            return this.reply(`This request has already ended. Send SOS if you need assistance again.`);
+          if (
+            current?.status === RescueRequestStatus.CANCELLED ||
+            current?.status === RescueRequestStatus.COMPLETED
+          ) {
+            await this.sessionStore.update(userId, {
+              state: WhatsAppFlowState.IDLE,
+              rescueRequestId: undefined,
+            });
+            return this.reply(
+              `This request has already ended. Send SOS if you need assistance again.`,
+            );
           }
 
           try {
-            await this.paymentEventsService.markJobCompleted(session.rescueRequestId);
-            await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
+            await this.paymentEventsService.markJobCompleted(
+              session.rescueRequestId,
+            );
+            await this.sessionStore.update(userId, {
+              state: WhatsAppFlowState.IDLE,
+              rescueRequestId: undefined,
+            });
           } catch (err) {
             // Typically: this request was disputed. "still under review" if
             // unresolved, or "check the payment link we already sent" if
@@ -191,7 +246,11 @@ export class WhatsAppCustomerFlowService {
       }
       if (message === 'dispute') {
         if (session.rescueRequestId) {
-          await this.disputeService.raiseDispute(session.rescueRequestId, phoneNumber, userId);
+          await this.disputeService.raiseDispute(
+            session.rescueRequestId,
+            phoneNumber,
+            userId,
+          );
         }
         return this.xmlOk();
       }
@@ -216,7 +275,10 @@ export class WhatsAppCustomerFlowService {
             },
           },
         });
-        if (openRequest && openRequest.status === RescueRequestStatus.WAITING_FOR_MEDIA) {
+        if (
+          openRequest &&
+          openRequest.status === RescueRequestStatus.WAITING_FOR_MEDIA
+        ) {
           // Stale request abandoned before any media was sent — nothing else expires it,
           // so auto-cancel it and let the new SOS proceed normally.
           await this.prisma.rescueRequest.update({
@@ -258,7 +320,10 @@ export class WhatsAppCustomerFlowService {
           where: {
             customerId: userId,
             status: {
-              notIn: [RescueRequestStatus.COMPLETED, RescueRequestStatus.CANCELLED] as RescueRequestStatus[],
+              notIn: [
+                RescueRequestStatus.COMPLETED,
+                RescueRequestStatus.CANCELLED,
+              ] as RescueRequestStatus[],
             },
           },
           orderBy: { createdAt: 'desc' },
@@ -301,11 +366,15 @@ export class WhatsAppCustomerFlowService {
           );
         }
 
-        return this.reply(`❌ Your rescue request has been cancelled. You were not charged.\n\nSend SOS or HELP if you need assistance again.`);
+        return this.reply(
+          `❌ Your rescue request has been cancelled. You were not charged.\n\nSend SOS or HELP if you need assistance again.`,
+        );
       }
 
       // Nothing to cancel
-      return this.reply(`You don't have an active rescue request to cancel.\n\nSend SOS or HELP if you need assistance.`);
+      return this.reply(
+        `You don't have an active rescue request to cancel.\n\nSend SOS or HELP if you need assistance.`,
+      );
     }
 
     // ── Step 1: Waiting for location ───────────────────────────────────────
@@ -329,7 +398,9 @@ export class WhatsAppCustomerFlowService {
     if (session.state === WhatsAppFlowState.WAITING_FOR_VEHICLE_TYPE) {
       const vehicleType = mapVehicleTypeReply(message);
       if (!vehicleType) {
-        return this.reply(`Please reply with a number 1-4 to select the vehicle type.`);
+        return this.reply(
+          `Please reply with a number 1-4 to select the vehicle type.`,
+        );
       }
       await this.sessionStore.update(userId, {
         vehicleType,
@@ -352,7 +423,10 @@ export class WhatsAppCustomerFlowService {
         if (sharedAddress) {
           destination = sharedAddress;
         } else {
-          const geocoded = await this.geocodingService.reverseGeocode(latitude, longitude);
+          const geocoded = await this.geocodingService.reverseGeocode(
+            latitude,
+            longitude,
+          );
           destination = geocoded ?? `${latitude}, ${longitude}`;
         }
       } else if (rawMessage) {
@@ -360,16 +434,19 @@ export class WhatsAppCustomerFlowService {
       }
 
       if (!destination) {
-        return this.reply(`Please type where you'd like the car towed to, or share a location pin.`);
+        return this.reply(
+          `Please type where you'd like the car towed to, or share a location pin.`,
+        );
       }
 
-      const customer = await this.sharedService.findOrCreateCustomer(phoneNumber);
+      const customer =
+        await this.sharedService.findOrCreateCustomer(phoneNumber);
       const rescueRequest = await this.prisma.rescueRequest.create({
         data: {
-          customerId:  customer.id,
-          status:      RescueRequestStatus.WAITING_FOR_MEDIA,
-          latitude:    session.latitude,
-          longitude:   session.longitude,
+          customerId: customer.id,
+          status: RescueRequestStatus.WAITING_FOR_MEDIA,
+          latitude: session.latitude,
+          longitude: session.longitude,
           vehicleType: session.vehicleType as VehicleType,
           destination,
         },
@@ -389,24 +466,38 @@ export class WhatsAppCustomerFlowService {
     if (session.state === WhatsAppFlowState.WAITING_FOR_MEDIA) {
       const rescueRequestId = session.rescueRequestId;
       if (!rescueRequestId) {
-        await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE });
-        return this.reply(`Sorry, we lost track of your request. Please send SOS to start again.`);
+        await this.sessionStore.update(userId, {
+          state: WhatsAppFlowState.IDLE,
+        });
+        return this.reply(
+          `Sorry, we lost track of your request. Please send SOS to start again.`,
+        );
       }
 
       if (message === '2') {
         const visualCount = await this.prisma.requestMedia.count({
-          where: { rescueRequestId, mediaType: { in: [MediaType.IMAGE, MediaType.VIDEO] } },
+          where: {
+            rescueRequestId,
+            mediaType: { in: [MediaType.IMAGE, MediaType.VIDEO] },
+          },
         });
         if (visualCount === 0) {
           return this.reply(
             `Please send at least one photo or video before continuing — a voice note alone isn't enough for the operator to assess the vehicle.`,
           );
         }
-        return this.handleMediaFinished(phoneNumber, userId, session, rescueRequestId);
+        return this.handleMediaFinished(
+          phoneNumber,
+          userId,
+          session,
+          rescueRequestId,
+        );
       }
 
       if (message === '1') {
-        return this.reply(`Go ahead — send your photo(s), video(s), or voice note(s).`);
+        return this.reply(
+          `Go ahead — send your photo(s), video(s), or voice note(s).`,
+        );
       }
 
       const numMedia = Number(body.NumMedia ?? 0);
@@ -416,7 +507,9 @@ export class WhatsAppCustomerFlowService {
         );
       }
 
-      const existingCount = await this.prisma.requestMedia.count({ where: { rescueRequestId } });
+      const existingCount = await this.prisma.requestMedia.count({
+        where: { rescueRequestId },
+      });
       let savedCount = existingCount;
       let failedCount = 0;
       let capReached = false;
@@ -431,7 +524,11 @@ export class WhatsAppCustomerFlowService {
         const contentType: string | undefined = body[`MediaContentType${i}`];
         if (!mediaUrl || !contentType) continue;
 
-        const saved = await this.captureMediaAttachment(rescueRequestId, mediaUrl, contentType);
+        const saved = await this.captureMediaAttachment(
+          rescueRequestId,
+          mediaUrl,
+          contentType,
+        );
         if (saved) {
           savedCount++;
         } else {
@@ -442,9 +539,10 @@ export class WhatsAppCustomerFlowService {
       const capNote = capReached
         ? `\n\n⚠️ You've reached the ${MAX_MEDIA_ITEMS}-item limit — further attachments won't be saved.`
         : '';
-      const failNote = failedCount > 0
-        ? `\n\n⚠️ ${failedCount} item(s) failed to upload — please resend if important.`
-        : '';
+      const failNote =
+        failedCount > 0
+          ? `\n\n⚠️ ${failedCount} item(s) failed to upload — please resend if important.`
+          : '';
 
       return this.reply(
         `📸 Received (${savedCount}/${MAX_MEDIA_ITEMS} items saved).${capNote}${failNote}\n\n1️⃣ Add more\n2️⃣ Continue to dispatch`,
@@ -455,7 +553,9 @@ export class WhatsAppCustomerFlowService {
     if (session.state === WhatsAppFlowState.WAITING_FOR_QUOTE_SELECTION) {
       const choice = Number(message);
       if (!Number.isInteger(choice) || choice < 1) {
-        return this.reply(`Please reply with the number of the quote you'd like to choose.`);
+        return this.reply(
+          `Please reply with the number of the quote you'd like to choose.`,
+        );
       }
       return this.handleQuoteSelected(phoneNumber, userId, choice);
     }
@@ -477,7 +577,10 @@ export class WhatsAppCustomerFlowService {
     // ── Step 5: Waiting for post-job rating (motorist rates operator) ─────
     if (session.state === WhatsAppFlowState.WAITING_FOR_RATING) {
       return this.handleRatingReply(
-        userId, rawMessage, session.rescueRequestId, RatingDirection.MOTORIST_TO_OPERATOR,
+        userId,
+        rawMessage,
+        session.rescueRequestId,
+        RatingDirection.MOTORIST_TO_OPERATOR,
       );
     }
 
@@ -510,7 +613,11 @@ export class WhatsAppCustomerFlowService {
         data: { rescueRequestId, mediaType, s3Key, contentType },
       });
 
-      logger.info('media: attachment saved', { rescueRequestId, mediaType, contentType });
+      logger.info('media: attachment saved', {
+        rescueRequestId,
+        mediaType,
+        contentType,
+      });
       return true;
     } catch (error) {
       console.error('Failed to capture media attachment:', error);
@@ -524,9 +631,16 @@ export class WhatsAppCustomerFlowService {
    * END CHAT closes it for both, since there's no reason for one side to
    * keep relaying to someone who's already left.
    */
-  private async endChatRelay(customerUserId: string, customerPhone: string, rescueRequestId: string | undefined): Promise<void> {
+  private async endChatRelay(
+    customerUserId: string,
+    customerPhone: string,
+    rescueRequestId: string | undefined,
+  ): Promise<void> {
     await this.sessionStore.update(customerUserId, { relayTarget: null });
-    await this.twilioService.sendWhatsAppMessage(toWhatsAppAddress(customerPhone), `Chat ended.`);
+    await this.twilioService.sendWhatsAppMessage(
+      toWhatsAppAddress(customerPhone),
+      `Chat ended.`,
+    );
 
     if (!rescueRequestId) return;
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
@@ -535,7 +649,9 @@ export class WhatsAppCustomerFlowService {
     });
     if (!rescueRequest?.assignedOperator?.phoneNumber) return;
 
-    const opUser = await this.sharedService.findOrCreateCustomer(rescueRequest.assignedOperator.phoneNumber);
+    const opUser = await this.sharedService.findOrCreateCustomer(
+      rescueRequest.assignedOperator.phoneNumber,
+    );
     await this.sessionStore.update(opUser.id, { relayTarget: null });
     await this.twilioService.sendWhatsAppMessage(
       toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
@@ -558,7 +674,9 @@ export class WhatsAppCustomerFlowService {
     ]);
     if (!customer || !rescueRequestRow) {
       await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE });
-      return this.reply(`Sorry, we lost track of your request. Please send SOS to start again.`);
+      return this.reply(
+        `Sorry, we lost track of your request. Please send SOS to start again.`,
+      );
     }
     const vehicleType = rescueRequestRow.vehicleType as VehicleType;
     const destination = rescueRequestRow.destination as string;
@@ -569,8 +687,8 @@ export class WhatsAppCustomerFlowService {
     });
 
     await this.sessionStore.update(userId, {
-      state:              WhatsAppFlowState.REQUEST_CONFIRMED,
-      dispatchRound:      0,
+      state: WhatsAppFlowState.REQUEST_CONFIRMED,
+      dispatchRound: 0,
       offeredOperatorIds: [],
     });
 
@@ -597,10 +715,10 @@ export class WhatsAppCustomerFlowService {
   ) {
     const rescueRequest = await this.prisma.rescueRequest.create({
       data: {
-        customerId:    customer.id,
-        status:        RescueRequestStatus.WAITING_FOR_DEPOSIT,
-        latitude:      session.latitude,
-        longitude:     session.longitude,
+        customerId: customer.id,
+        status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
+        latitude: session.latitude,
+        longitude: session.longitude,
         issueType,
         depositAmount: amountKobo,
       },
@@ -615,7 +733,7 @@ export class WhatsAppCustomerFlowService {
       reference,
       metadata: {
         rescueRequestId: rescueRequest.id,
-        customerId:      customer.id,
+        customerId: customer.id,
         phoneNumber,
         type: 'deposit',
       },
@@ -623,19 +741,21 @@ export class WhatsAppCustomerFlowService {
 
     if (!paymentResponse.status) {
       console.error('Failed to initialize Paystack payment:', paymentResponse);
-      return this.reply(`Sorry, we couldn't create a payment link. Please try again.`);
+      return this.reply(
+        `Sorry, we couldn't create a payment link. Please try again.`,
+      );
     }
 
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequest.id },
-      data:  { depositReference: reference },
+      data: { depositReference: reference },
     });
 
     await this.sessionStore.update(customer.id, {
       issueType,
-      rescueRequestId:  rescueRequest.id,
+      rescueRequestId: rescueRequest.id,
       depositReference: reference,
-      state:            WhatsAppFlowState.WAITING_FOR_DEPOSIT,
+      state: WhatsAppFlowState.WAITING_FOR_DEPOSIT,
     });
 
     const isStandardDeposit = amountKobo === DEPOSIT_AMOUNT_KOBO;
@@ -662,7 +782,9 @@ export class WhatsAppCustomerFlowService {
     }
 
     if (!rescueRequestId) {
-      await this.sessionStore.update(reviewerUserId, { state: WhatsAppFlowState.IDLE });
+      await this.sessionStore.update(reviewerUserId, {
+        state: WhatsAppFlowState.IDLE,
+      });
       return this.reply(`Thanks for your feedback!`);
     }
 
@@ -704,9 +826,10 @@ export class WhatsAppCustomerFlowService {
       try {
         const config = await this.platformConfigService.getConfig();
         if (config.disputeAlertPhoneNumber) {
-          const who = direction === RatingDirection.MOTORIST_TO_OPERATOR
-            ? 'Customer rated the operator'
-            : 'Operator rated the customer';
+          const who =
+            direction === RatingDirection.MOTORIST_TO_OPERATOR
+              ? 'Customer rated the operator'
+              : 'Operator rated the customer';
           await this.twilioService.sendWhatsAppMessage(
             toWhatsAppAddress(config.disputeAlertPhoneNumber),
             `⚠️ Low rating (${score}/5) on ${formatJobRef(rescueRequestId)} — ${who} low. Please review.`,
@@ -723,12 +846,18 @@ export class WhatsAppCustomerFlowService {
     );
   }
 
-  private async handleQuoteSelected(phoneNumber: string, userId: string, choice: number) {
+  private async handleQuoteSelected(
+    phoneNumber: string,
+    userId: string,
+    choice: number,
+  ) {
     const session = await this.sessionStore.getOrCreate(userId);
     const rescueRequestId = session.rescueRequestId;
     if (!rescueRequestId) {
       await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE });
-      return this.reply(`Sorry, we lost track of your request. Please send SOS to start again.`);
+      return this.reply(
+        `Sorry, we lost track of your request. Please send SOS to start again.`,
+      );
     }
 
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
@@ -736,7 +865,9 @@ export class WhatsAppCustomerFlowService {
       include: { customer: true },
     });
     if (!rescueRequest) {
-      return this.reply(`Sorry, we lost track of your request. Please send SOS to start again.`);
+      return this.reply(
+        `Sorry, we lost track of your request. Please send SOS to start again.`,
+      );
     }
 
     const quotedOffers = await this.prisma.dispatchOffer.findMany({
@@ -755,14 +886,21 @@ export class WhatsAppCustomerFlowService {
       businessName: offer.operator.businessName,
       quotedPrice: offer.quotedPrice!,
       etaMinutes: estimateEtaMinutes(
-        this.operatorService['calculateDistance'](lat, lon, Number(offer.operator.latitude), Number(offer.operator.longitude)),
+        this.operatorService['calculateDistance'](
+          lat,
+          lon,
+          Number(offer.operator.latitude),
+          Number(offer.operator.longitude),
+        ),
       ),
     }));
     const ranked = rankQuotes(forRanking);
 
     const selected = ranked[choice - 1];
     if (!selected) {
-      return this.reply(`That's not one of the options. Please reply with a valid number from the list.`);
+      return this.reply(
+        `That's not one of the options. Please reply with a valid number from the list.`,
+      );
     }
 
     // Atomic claim — only proceeds if the request is still DISPATCHING.
@@ -775,14 +913,21 @@ export class WhatsAppCustomerFlowService {
     }
 
     const config = await this.platformConfigService.getConfig();
-    const serviceFeeAmount = Math.round((selected.quotedPrice * config.serviceFeePercent) / 100);
+    const serviceFeeAmount = Math.round(
+      (selected.quotedPrice * config.serviceFeePercent) / 100,
+    );
     const total = selected.quotedPrice + serviceFeeAmount;
     const depositAmount = Math.round((total * config.depositPercent) / 100);
     const balanceAmount = total - depositAmount;
 
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequestId },
-      data: { serviceFeeAmount, depositAmount, balanceAmount, assignedOperatorId: selected.operatorId },
+      data: {
+        serviceFeeAmount,
+        depositAmount,
+        balanceAmount,
+        assignedOperatorId: selected.operatorId,
+      },
     });
 
     const selectedOffer = quotedOffers.find((o) => o.id === selected.offerId)!;
@@ -791,7 +936,11 @@ export class WhatsAppCustomerFlowService {
       data: { status: 'SELECTED_PENDING_PAYMENT', respondedAt: new Date() },
     });
     await this.prisma.dispatchOffer.updateMany({
-      where: { rescueRequestId, status: 'QUOTED', id: { not: selectedOffer.id } },
+      where: {
+        rescueRequestId,
+        status: 'QUOTED',
+        id: { not: selectedOffer.id },
+      },
       data: { status: 'NOT_SELECTED', respondedAt: new Date() },
     });
     // Operators who hadn't responded at all yet (never quoted, never
@@ -816,11 +965,15 @@ export class WhatsAppCustomerFlowService {
         ),
     );
 
-    await this.sessionStore.update(userId, { state: WhatsAppFlowState.OPERATOR_FOUND_WAITING_PAYMENT });
+    await this.sessionStore.update(userId, {
+      state: WhatsAppFlowState.OPERATOR_FOUND_WAITING_PAYMENT,
+    });
 
     const operator = selectedOffer.operator;
     const reference = this.paystackService.generateReference('DEP');
-    const email = rescueRequest.customer.email ?? `${phoneNumber.replace(/\D/g, '')}@lrr.ng`;
+    const email =
+      rescueRequest.customer.email ??
+      `${phoneNumber.replace(/\D/g, '')}@lrr.ng`;
 
     const paymentResponse = await this.paystackService.initializePayment({
       email,
@@ -836,7 +989,9 @@ export class WhatsAppCustomerFlowService {
 
     if (!paymentResponse.status) {
       console.error('Failed to create deposit payment link:', paymentResponse);
-      return this.reply(`⚠️ We couldn't generate a payment link. Our team has been alerted. Reply CANCEL to cancel.`);
+      return this.reply(
+        `⚠️ We couldn't generate a payment link. Our team has been alerted. Reply CANCEL to cancel.`,
+      );
     }
 
     await this.prisma.rescueRequest.update({
@@ -864,14 +1019,22 @@ export class WhatsAppCustomerFlowService {
   }
 
   private isSosMessage(message: string): boolean {
-    return ['help', 'sos', 'stuck', 'rescue', 'emergency'].some((w) => message.includes(w));
+    return ['help', 'sos', 'stuck', 'rescue', 'emergency'].some((w) =>
+      message.includes(w),
+    );
   }
 
   private mapIssueType(message: string): IssueType | undefined {
     const map: Record<string, IssueType> = {
-      '1': 'BREAKDOWN', '2': 'ACCIDENT', '3': 'FLAT_TYRE', '4': 'FUEL',
-      'breakdown': 'BREAKDOWN', 'accident': 'ACCIDENT',
-      'flat': 'FLAT_TYRE', 'tyre': 'FLAT_TYRE', 'fuel': 'FUEL',
+      '1': 'BREAKDOWN',
+      '2': 'ACCIDENT',
+      '3': 'FLAT_TYRE',
+      '4': 'FUEL',
+      breakdown: 'BREAKDOWN',
+      accident: 'ACCIDENT',
+      flat: 'FLAT_TYRE',
+      tyre: 'FLAT_TYRE',
+      fuel: 'FUEL',
     };
     return map[message];
   }

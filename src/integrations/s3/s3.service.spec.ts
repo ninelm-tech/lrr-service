@@ -11,7 +11,9 @@ jest.mock('@aws-sdk/client-s3', () => ({
 }));
 
 jest.mock('@aws-sdk/s3-request-presigner', () => ({
-  getSignedUrl: jest.fn().mockResolvedValue('https://signed-url.example.com/object'),
+  getSignedUrl: jest
+    .fn()
+    .mockResolvedValue('https://signed-url.example.com/object'),
 }));
 
 describe('S3Service', () => {
@@ -44,7 +46,11 @@ describe('S3Service', () => {
 
   it('uploads media with the correct bucket, key, body, and content type', async () => {
     const buffer = Buffer.from('fake-image-bytes');
-    await service.uploadMedia(buffer, 'image/jpeg', 'rescue-requests/req-1/abc.jpg');
+    await service.uploadMedia(
+      buffer,
+      'image/jpeg',
+      'rescue-requests/req-1/abc.jpg',
+    );
 
     expect(mockSend).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -59,7 +65,10 @@ describe('S3Service', () => {
   });
 
   it('returns a signed URL for a given key', async () => {
-    const url = await service.getSignedUrl('rescue-requests/req-1/abc.jpg', 3600);
+    const url = await service.getSignedUrl(
+      'rescue-requests/req-1/abc.jpg',
+      3600,
+    );
     expect(url).toBe('https://signed-url.example.com/object');
   });
 });

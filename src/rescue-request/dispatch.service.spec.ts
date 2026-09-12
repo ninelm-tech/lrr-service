@@ -24,7 +24,8 @@ describe('DispatchService', () => {
     const moduleRef = await Test.createTestingModule({
       imports: [ConfigModule.forRoot({ isGlobal: true }), RescueRequestModule],
     })
-      .overrideProvider(PrismaService).useValue({})
+      .overrideProvider(PrismaService)
+      .useValue({})
       .compile();
     const first = moduleRef.get(DispatchService);
     const second = moduleRef.get(DispatchService);
@@ -125,8 +126,13 @@ describe('DispatchService', () => {
       const deadline = new Date('2026-08-12T10:05:00Z');
       prisma.rescueRequest.findMany.mockResolvedValue([
         {
-          id: 'req-1', status: 'DISPATCHING', vehicleType: null, destination: null,
-          createdAt: new Date(), customerId: 'cust-1', dispatchOffers: [],
+          id: 'req-1',
+          status: 'DISPATCHING',
+          vehicleType: null,
+          destination: null,
+          createdAt: new Date(),
+          customerId: 'cust-1',
+          dispatchOffers: [],
           quoteCollectionDeadline: deadline,
         },
       ]);
@@ -140,8 +146,13 @@ describe('DispatchService', () => {
     it('defaults round to 0 when no session is found for the customer', async () => {
       prisma.rescueRequest.findMany.mockResolvedValue([
         {
-          id: 'req-1', status: 'DISPATCHING', vehicleType: null, destination: null,
-          createdAt: new Date(), customerId: 'cust-1', dispatchOffers: [],
+          id: 'req-1',
+          status: 'DISPATCHING',
+          vehicleType: null,
+          destination: null,
+          createdAt: new Date(),
+          customerId: 'cust-1',
+          dispatchOffers: [],
         },
       ]);
       prisma.whatsAppSession.findMany.mockResolvedValue([]);
@@ -158,11 +169,21 @@ describe('DispatchService', () => {
       // independently of the rest of its batch. Lookups must key off batchId,
       // never expiresAt, or a rewritten offer silently drops out of its batch.
       const prisma = {
-        rescueRequest: { findUnique: jest.fn().mockResolvedValue({ customerId: 'cust-1' }) },
+        rescueRequest: {
+          findUnique: jest.fn().mockResolvedValue({ customerId: 'cust-1' }),
+        },
         dispatchOffer: {
           findMany: jest.fn().mockResolvedValue([
-            { operatorId: 'op-1', status: 'QUOTED', expiresAt: new Date(Date.now() + 10 * 60 * 1000) },
-            { operatorId: 'op-2', status: 'DECLINED', expiresAt: new Date(Date.now() + 60 * 1000) }, // rewritten shorter
+            {
+              operatorId: 'op-1',
+              status: 'QUOTED',
+              expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+            },
+            {
+              operatorId: 'op-2',
+              status: 'DECLINED',
+              expiresAt: new Date(Date.now() + 60 * 1000),
+            }, // rewritten shorter
           ]),
         },
       };
@@ -180,39 +201,73 @@ describe('DispatchService', () => {
       }).compile();
       const service = module.get<DispatchService>(DispatchService);
 
-      const resolveBatchSpy = jest.spyOn(service as any, 'resolveBatch').mockResolvedValue(undefined);
+      const resolveBatchSpy = jest
+        .spyOn(service as any, 'resolveBatch')
+        .mockResolvedValue(undefined);
 
       await (service as any).maybeResolveBatchEarly('req-1', 'batch-shared');
 
       expect(prisma.dispatchOffer.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { rescueRequestId: 'req-1', batchId: 'batch-shared' } }),
+        expect.objectContaining({
+          where: { rescueRequestId: 'req-1', batchId: 'batch-shared' },
+        }),
       );
-      expect(resolveBatchSpy).toHaveBeenCalledWith('req-1', ['op-1', 'op-2'], 'cust-1', 0, 'batch-shared');
+      expect(resolveBatchSpy).toHaveBeenCalledWith(
+        'req-1',
+        ['op-1', 'op-2'],
+        'cust-1',
+        0,
+        'batch-shared',
+      );
     });
   });
 
   describe('processQuoteOrDecline — phase 2 (quote collection)', () => {
     let service: DispatchService;
     let prisma: any;
-    let twilioService: { sendWhatsAppMessage: jest.Mock; sendWhatsAppTemplateMessage: jest.Mock };
+    let twilioService: {
+      sendWhatsAppMessage: jest.Mock;
+      sendWhatsAppTemplateMessage: jest.Mock;
+    };
     /** Stand-in for the persisted RescueRequest row, mutated by updateMany. */
-    let row: { id: string; status: string; customerId: string; quoteCollectionDeadline: Date | null };
-    const originalCountdownSid = process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID;
+    let row: {
+      id: string;
+      status: string;
+      customerId: string;
+      quoteCollectionDeadline: Date | null;
+    };
+    const originalCountdownSid =
+      process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID;
 
-    const offer = { id: 'offer-1', rescueRequestId: 'req-1', expiresAt: new Date(Date.now() + 600000), batchId: 'batch-1' };
+    const offer = {
+      id: 'offer-1',
+      rescueRequestId: 'req-1',
+      expiresAt: new Date(Date.now() + 600000),
+      batchId: 'batch-1',
+    };
 
     afterEach(() => {
       clearAllBatchTimers(service);
-      const closeTimers = (service as any).closeTimers as Map<string, NodeJS.Timeout>;
+      const closeTimers = (service as any).closeTimers as Map<
+        string,
+        NodeJS.Timeout
+      >;
       closeTimers.forEach((t) => clearTimeout(t));
       closeTimers.clear();
-      if (originalCountdownSid === undefined) delete process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID;
-      else process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID = originalCountdownSid;
+      if (originalCountdownSid === undefined)
+        delete process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID;
+      else
+        process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID = originalCountdownSid;
     });
 
     beforeEach(async () => {
       delete process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID;
-      row = { id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1', quoteCollectionDeadline: null };
+      row = {
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
+        quoteCollectionDeadline: null,
+      };
 
       prisma = {
         rescueRequest: {
@@ -220,7 +275,10 @@ describe('DispatchService', () => {
           // Models the atomic once-only set: the `quoteCollectionDeadline: null`
           // condition is what stops a second quote moving the deadline.
           updateMany: jest.fn(async ({ where, data }: any) => {
-            if (where.quoteCollectionDeadline === null && row.quoteCollectionDeadline !== null) {
+            if (
+              where.quoteCollectionDeadline === null &&
+              row.quoteCollectionDeadline !== null
+            ) {
               return { count: 0 };
             }
             row.quoteCollectionDeadline = data.quoteCollectionDeadline;
@@ -233,7 +291,10 @@ describe('DispatchService', () => {
           count: jest.fn().mockResolvedValue(1), // a straggler is still pending by default
         },
       };
-      twilioService = { sendWhatsAppMessage: jest.fn(), sendWhatsAppTemplateMessage: jest.fn() };
+      twilioService = {
+        sendWhatsAppMessage: jest.fn(),
+        sendWhatsAppTemplateMessage: jest.fn(),
+      };
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
@@ -241,7 +302,14 @@ describe('DispatchService', () => {
           { provide: PrismaService, useValue: prisma },
           { provide: TwilioService, useValue: twilioService },
           { provide: OperatorService, useValue: {} },
-          { provide: PlatformConfigService, useValue: { getConfig: jest.fn().mockResolvedValue({ quoteCollectionMinutes: 5 }) } },
+          {
+            provide: PlatformConfigService,
+            useValue: {
+              getConfig: jest
+                .fn()
+                .mockResolvedValue({ quoteCollectionMinutes: 5 }),
+            },
+          },
           { provide: WhatsAppSessionStore, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
         ],
@@ -256,13 +324,19 @@ describe('DispatchService', () => {
         const result = await service.processQuoteOrDecline(offer, 2_500_000);
 
         expect(result.quoted).toBe(true);
-        expect(row.quoteCollectionDeadline).toEqual(new Date(Date.now() + 5 * 60 * 1000));
+        expect(row.quoteCollectionDeadline).toEqual(
+          new Date(Date.now() + 5 * 60 * 1000),
+        );
         expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith({
           where: { id: 'req-1', quoteCollectionDeadline: null },
           data: { quoteCollectionDeadline: row.quoteCollectionDeadline },
         });
         expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith({
-          where: { rescueRequestId: 'req-1', status: 'PENDING', expiresAt: { gt: row.quoteCollectionDeadline } },
+          where: {
+            rescueRequestId: 'req-1',
+            status: 'PENDING',
+            expiresAt: { gt: row.quoteCollectionDeadline },
+          },
           data: { expiresAt: row.quoteCollectionDeadline },
         });
       } finally {
@@ -280,7 +354,8 @@ describe('DispatchService', () => {
 
         jest.advanceTimersByTime(60 * 1000); // a minute later — a later deadline would be visibly different
         const second = await service.processQuoteOrDecline(
-          { ...offer, id: 'offer-2', batchId: 'batch-1' }, 2_600_000,
+          { ...offer, id: 'offer-2', batchId: 'batch-1' },
+          2_600_000,
         );
 
         expect(second.quoted).toBe(true);
@@ -290,7 +365,9 @@ describe('DispatchService', () => {
         // no second countdown notice.
         expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledTimes(1);
         expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith(
-          expect.objectContaining({ where: expect.objectContaining({ id: 'offer-2' }) }),
+          expect.objectContaining({
+            where: expect.objectContaining({ id: 'offer-2' }),
+          }),
         );
         expect(prisma.dispatchOffer.findMany).not.toHaveBeenCalled();
       } finally {
@@ -303,7 +380,10 @@ describe('DispatchService', () => {
 
       const result = await service.processQuoteOrDecline(offer, 2_500_000);
 
-      expect(result).toEqual({ quoted: false, message: 'Sorry, that offer has expired.' });
+      expect(result).toEqual({
+        quoted: false,
+        message: 'Sorry, that offer has expired.',
+      });
       // No phase-2 transition, no shortlist logic — a late quote must not be
       // what starts quote collection.
       expect(prisma.rescueRequest.updateMany).not.toHaveBeenCalled();
@@ -320,7 +400,11 @@ describe('DispatchService', () => {
       expect(result.message).toContain('Bidding has already closed');
       expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith({
         where: { id: 'offer-1', status: 'PENDING' },
-        data: { status: 'NOT_SELECTED', quotedPrice: 2_500_000, respondedAt: expect.any(Date) },
+        data: {
+          status: 'NOT_SELECTED',
+          quotedPrice: 2_500_000,
+          respondedAt: expect.any(Date),
+        },
       });
       expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledTimes(1); // never claimed as QUOTED
       expect(row.quoteCollectionDeadline).toBe(deadlineBefore);
@@ -332,14 +416,19 @@ describe('DispatchService', () => {
       // can be shown a shortlist.
       jest.useFakeTimers();
       try {
-        const closeSpy = jest.spyOn(service as any, 'sendQuoteShortlist').mockResolvedValue(undefined);
+        const closeSpy = jest
+          .spyOn(service as any, 'sendQuoteShortlist')
+          .mockResolvedValue(undefined);
 
         await service.processQuoteOrDecline(offer, 2_500_000); // t=0, deadline = t+5min
         expect(closeSpy).not.toHaveBeenCalled(); // one straggler still pending
 
         jest.advanceTimersByTime(40 * 1000);
         prisma.dispatchOffer.count.mockResolvedValue(0); // last outstanding offer just answered
-        await service.processQuoteOrDecline({ ...offer, id: 'offer-3' }, 2_400_000);
+        await service.processQuoteOrDecline(
+          { ...offer, id: 'offer-3' },
+          2_400_000,
+        );
 
         // t=40s: shortlist already out, without advancing to the deadline.
         expect(closeSpy).toHaveBeenCalledWith('req-1', 'cust-1');
@@ -374,10 +463,14 @@ describe('DispatchService', () => {
         twilioService.sendWhatsAppMessage.mockImplementation(async () => {
           jest.advanceTimersByTime(2000);
         });
-        const closeSpy = jest.spyOn(service as any, 'sendQuoteShortlist').mockResolvedValue(undefined);
+        const closeSpy = jest
+          .spyOn(service as any, 'sendQuoteShortlist')
+          .mockResolvedValue(undefined);
 
         await service.processQuoteOrDecline(offer, 2_500_000);
-        expect(row.quoteCollectionDeadline).toEqual(new Date(t0 + 5 * 60 * 1000));
+        expect(row.quoteCollectionDeadline).toEqual(
+          new Date(t0 + 5 * 60 * 1000),
+        );
 
         prisma.dispatchOffer.count.mockResolvedValue(2); // stragglers: only the timer can close this
         await jest.advanceTimersByTimeAsync(5 * 60 * 1000 - 2000 - 1);
@@ -409,6 +502,7 @@ describe('DispatchService', () => {
         expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
 
         const vars = twilioService.sendWhatsAppTemplateMessage.mock.calls[0][2];
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- not redundant: without it Object.values() yields unknown[] and .length fails to compile
         for (const value of Object.values(vars) as string[]) {
           expect(value).not.toMatch(/[\r\n\t]/);
           expect(value).not.toMatch(/ {4,}/);
@@ -419,13 +513,18 @@ describe('DispatchService', () => {
         delete process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID;
         row.quoteCollectionDeadline = null;
         twilioService.sendWhatsAppTemplateMessage.mockClear();
-        await service.processQuoteOrDecline({ ...offer, id: 'offer-4' }, 2_500_000);
+        await service.processQuoteOrDecline(
+          { ...offer, id: 'offer-4' },
+          2_500_000,
+        );
 
         expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
           expect.stringContaining('+2349022222222'),
           expect.stringContaining('Countdown started'),
         );
-        expect(twilioService.sendWhatsAppTemplateMessage).not.toHaveBeenCalled();
+        expect(
+          twilioService.sendWhatsAppTemplateMessage,
+        ).not.toHaveBeenCalled();
       } finally {
         jest.useRealTimers();
       }
@@ -438,7 +537,10 @@ describe('DispatchService', () => {
         const deadline = row.quoteCollectionDeadline!;
         prisma.rescueRequest.updateMany.mockClear();
 
-        const result = await service.processQuoteOrDecline({ ...offer, id: 'offer-5' }, undefined);
+        const result = await service.processQuoteOrDecline(
+          { ...offer, id: 'offer-5' },
+          undefined,
+        );
 
         expect(result.quoted).toBe(false);
         expect(result.message).toContain('declined');
@@ -481,19 +583,30 @@ describe('DispatchService', () => {
     });
 
     it('rejects a request that is not DISPATCHING', async () => {
-      prisma.rescueRequest.findUnique.mockResolvedValue({ id: 'req-1', status: 'OPERATOR_ASSIGNED' });
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'OPERATOR_ASSIGNED',
+      });
 
-      await expect(radiusService.expandRadiusNow('req-1')).rejects.toThrow('not currently DISPATCHING');
+      await expect(radiusService.expandRadiusNow('req-1')).rejects.toThrow(
+        'not currently DISPATCHING',
+      );
     });
 
     it('refuses once bidding has closed, even though the request is still DISPATCHING', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
         quoteCollectionDeadline: new Date(Date.now() - 1),
       });
-      const startDispatchSpy = jest.spyOn(radiusService as any, 'startDispatch').mockResolvedValue(undefined);
+      const startDispatchSpy = jest
+        .spyOn(radiusService as any, 'startDispatch')
+        .mockResolvedValue(undefined);
 
-      await expect(radiusService.expandRadiusNow('req-1')).rejects.toThrow('Bidding has closed');
+      await expect(radiusService.expandRadiusNow('req-1')).rejects.toThrow(
+        'Bidding has closed',
+      );
       expect(startDispatchSpy).not.toHaveBeenCalled();
     });
 
@@ -503,24 +616,34 @@ describe('DispatchService', () => {
       // Guarding on the deadline alone would let this Expand create a fresh
       // PENDING offer for a job the motorist is already choosing from.
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
         quoteCollectionDeadline: new Date(Date.now() + 4 * 60 * 1000),
       });
       (radiusService as any).closedRequests.add('req-1');
-      const startDispatchSpy = jest.spyOn(radiusService as any, 'startDispatch').mockResolvedValue(undefined);
+      const startDispatchSpy = jest
+        .spyOn(radiusService as any, 'startDispatch')
+        .mockResolvedValue(undefined);
 
-      await expect(radiusService.expandRadiusNow('req-1')).rejects.toThrow('Bidding has closed');
+      await expect(radiusService.expandRadiusNow('req-1')).rejects.toThrow(
+        'Bidding has closed',
+      );
       expect(startDispatchSpy).not.toHaveBeenCalled();
     });
 
     it('still works while bidding is open, and does not move the deadline', async () => {
       const deadline = new Date(Date.now() + 3 * 60 * 1000);
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
         quoteCollectionDeadline: deadline,
       });
       sessionStore.getOrCreate.mockResolvedValue({ dispatchRound: 1 });
-      const startDispatchSpy = jest.spyOn(radiusService as any, 'startDispatch').mockResolvedValue(undefined);
+      const startDispatchSpy = jest
+        .spyOn(radiusService as any, 'startDispatch')
+        .mockResolvedValue(undefined);
 
       await radiusService.expandRadiusNow('req-1');
 
@@ -532,11 +655,15 @@ describe('DispatchService', () => {
 
     it('starts a new round with an expanded radius', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
       });
       sessionStore.getOrCreate.mockResolvedValue({ dispatchRound: 1 });
 
-      const startDispatchSpy = jest.spyOn(radiusService as any, 'startDispatch').mockResolvedValue(undefined);
+      const startDispatchSpy = jest
+        .spyOn(radiusService as any, 'startDispatch')
+        .mockResolvedValue(undefined);
 
       await radiusService.expandRadiusNow('req-1');
 
@@ -552,10 +679,14 @@ describe('DispatchService', () => {
       // offer because an admin clicked Expand. Expanding adds people; it must
       // never un-ask anyone.
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
       });
       sessionStore.getOrCreate.mockResolvedValue({ dispatchRound: 1 });
-      jest.spyOn(radiusService as any, 'startDispatch').mockResolvedValue(undefined);
+      jest
+        .spyOn(radiusService as any, 'startDispatch')
+        .mockResolvedValue(undefined);
 
       const liveBatchTimer = setTimeout(() => {}, 100000);
       const key = (radiusService as any).batchKey('req-1', 'batch-live');
@@ -582,12 +713,16 @@ describe('DispatchService', () => {
       requestMedia: { findMany: jest.Mock };
     };
     let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
-    let twilioService: { sendWhatsAppMessage: jest.Mock; sendWhatsAppTemplateMessage: jest.Mock };
+    let twilioService: {
+      sendWhatsAppMessage: jest.Mock;
+      sendWhatsAppTemplateMessage: jest.Mock;
+    };
     let sharedService: { formatLocationSection: jest.Mock };
     const originalTemplateSid = process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
 
     afterEach(() => {
-      if (originalTemplateSid === undefined) delete process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
+      if (originalTemplateSid === undefined)
+        delete process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
       else process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID = originalTemplateSid;
     });
 
@@ -600,12 +735,20 @@ describe('DispatchService', () => {
         requestMedia: { findMany: jest.fn().mockResolvedValue([]) },
       };
       sessionStore = {
-        getOrCreate: jest.fn().mockResolvedValue({ offeredOperatorIds: ['op-already-tried'], dispatchRound: 1 }),
+        getOrCreate: jest.fn().mockResolvedValue({
+          offeredOperatorIds: ['op-already-tried'],
+          dispatchRound: 1,
+        }),
         update: jest.fn(),
       };
-      twilioService = { sendWhatsAppMessage: jest.fn(), sendWhatsAppTemplateMessage: jest.fn() };
+      twilioService = {
+        sendWhatsAppMessage: jest.fn(),
+        sendWhatsAppTemplateMessage: jest.fn(),
+      };
       sharedService = {
-        formatLocationSection: jest.fn().mockResolvedValue('https://maps.google.com/?q=6.5,3.4'),
+        formatLocationSection: jest
+          .fn()
+          .mockResolvedValue('https://maps.google.com/?q=6.5,3.4'),
       };
 
       const module: TestingModule = await Test.createTestingModule({
@@ -624,9 +767,14 @@ describe('DispatchService', () => {
     });
 
     it('rejects a request that is not DISPATCHING', async () => {
-      prisma.rescueRequest.findUnique.mockResolvedValue({ id: 'req-1', status: 'OPERATOR_ASSIGNED' });
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'OPERATOR_ASSIGNED',
+      });
 
-      await expect(manualService.manualOfferToOperator('req-1', 'op-1')).rejects.toThrow('not currently DISPATCHING');
+      await expect(
+        manualService.manualOfferToOperator('req-1', 'op-1'),
+      ).rejects.toThrow('not currently DISPATCHING');
     });
 
     it('refuses once bidding has closed, even though the request is still DISPATCHING', async () => {
@@ -634,24 +782,38 @@ describe('DispatchService', () => {
       // only the WhatsApp session moves on — so the deadline is what has to be
       // checked here.
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
-        vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
         quoteCollectionDeadline: new Date(Date.now() - 1000),
       });
 
-      await expect(manualService.manualOfferToOperator('req-1', 'op-1')).rejects.toThrow('Bidding has closed');
+      await expect(
+        manualService.manualOfferToOperator('req-1', 'op-1'),
+      ).rejects.toThrow('Bidding has closed');
       expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();
     });
 
     it('refuses after an EARLY close, while the deadline is still in the future', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
-        vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
         quoteCollectionDeadline: new Date(Date.now() + 4 * 60 * 1000),
       });
       (manualService as any).closedRequests.add('req-1');
 
-      await expect(manualService.manualOfferToOperator('req-1', 'op-1')).rejects.toThrow('Bidding has closed');
+      await expect(
+        manualService.manualOfferToOperator('req-1', 'op-1'),
+      ).rejects.toThrow('Bidding has closed');
       expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();
     });
 
@@ -662,16 +824,28 @@ describe('DispatchService', () => {
       // offer on this request gets answered) while the awaited operator
       // lookup is in flight — before dispatchOffer.create runs.
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
-        vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
         quoteCollectionDeadline: new Date(Date.now() + 4 * 60 * 1000),
       });
       prisma.operator.findUnique.mockImplementation(async () => {
         (manualService as any).closedRequests.add('req-1');
-        return { id: 'op-1', status: 'ACTIVE', businessName: 'Swift Towing', phoneNumber: '+2349012345678' };
+        return {
+          id: 'op-1',
+          status: 'ACTIVE',
+          businessName: 'Swift Towing',
+          phoneNumber: '+2349012345678',
+        };
       });
 
-      await expect(manualService.manualOfferToOperator('req-1', 'op-1')).rejects.toThrow('Bidding has closed');
+      await expect(
+        manualService.manualOfferToOperator('req-1', 'op-1'),
+      ).rejects.toThrow('Bidding has closed');
       expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();
     });
 
@@ -680,12 +854,20 @@ describe('DispatchService', () => {
       try {
         const deadline = new Date(Date.now() + 90 * 1000); // 90s left, not the 5-minute window
         prisma.rescueRequest.findUnique.mockResolvedValue({
-          id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
-          vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+          id: 'req-1',
+          status: 'DISPATCHING',
+          customerId: 'cust-1',
+          vehicleType: 'SEDAN',
+          destination: 'Lekki',
+          latitude: 6.5,
+          longitude: 3.4,
           quoteCollectionDeadline: deadline,
         });
         prisma.operator.findUnique.mockResolvedValue({
-          id: 'op-1', status: 'ACTIVE', businessName: 'Swift Towing', phoneNumber: '+2349012345678',
+          id: 'op-1',
+          status: 'ACTIVE',
+          businessName: 'Swift Towing',
+          phoneNumber: '+2349012345678',
         });
         prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
 
@@ -715,13 +897,21 @@ describe('DispatchService', () => {
         // written a quote has landed and phase 2 has begun.
         prisma.rescueRequest.findUnique
           .mockResolvedValueOnce({
-            id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
-            vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+            id: 'req-1',
+            status: 'DISPATCHING',
+            customerId: 'cust-1',
+            vehicleType: 'SEDAN',
+            destination: 'Lekki',
+            latitude: 6.5,
+            longitude: 3.4,
             quoteCollectionDeadline: null,
           })
           .mockResolvedValue({ quoteCollectionDeadline: deadline });
         prisma.operator.findUnique.mockResolvedValue({
-          id: 'op-1', status: 'ACTIVE', businessName: 'Swift Towing', phoneNumber: '+2349012345678',
+          id: 'op-1',
+          status: 'ACTIVE',
+          businessName: 'Swift Towing',
+          phoneNumber: '+2349012345678',
         });
         prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
 
@@ -729,7 +919,9 @@ describe('DispatchService', () => {
 
         const created = prisma.dispatchOffer.create.mock.calls[0][0].data;
         expect(created.expiresAt.getTime()).toBe(deadline.getTime());
-        expect(created.expiresAt.getTime()).toBeLessThan(Date.now() + 5 * 60 * 1000);
+        expect(created.expiresAt.getTime()).toBeLessThan(
+          Date.now() + 5 * 60 * 1000,
+        );
 
         clearAllBatchTimers(manualService);
       } finally {
@@ -739,21 +931,39 @@ describe('DispatchService', () => {
 
     it('rejects a missing or inactive operator', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
-        vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
       });
-      prisma.operator.findUnique.mockResolvedValue({ id: 'op-1', status: 'INACTIVE' });
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1',
+        status: 'INACTIVE',
+      });
 
-      await expect(manualService.manualOfferToOperator('req-1', 'op-1')).rejects.toThrow('not an active operator');
+      await expect(
+        manualService.manualOfferToOperator('req-1', 'op-1'),
+      ).rejects.toThrow('not an active operator');
     });
 
     it('creates a single-operator round: offer created, WhatsApp sent, session updated, timer scheduled', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
-        vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
       });
       prisma.operator.findUnique.mockResolvedValue({
-        id: 'op-1', status: 'ACTIVE', businessName: 'Swift Towing', phoneNumber: '+2349012345678',
+        id: 'op-1',
+        status: 'ACTIVE',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2349012345678',
       });
       prisma.dispatchOffer.updateMany.mockResolvedValue({ count: 0 });
       prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
@@ -790,11 +1000,19 @@ describe('DispatchService', () => {
       // own schedule — which is only safe because the timers are keyed per
       // batch rather than per request.
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
-        vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
       });
       prisma.operator.findUnique.mockResolvedValue({
-        id: 'op-1', status: 'ACTIVE', businessName: 'Swift Towing', phoneNumber: '+2349012345678',
+        id: 'op-1',
+        status: 'ACTIVE',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2349012345678',
       });
       prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
 
@@ -811,7 +1029,9 @@ describe('DispatchService', () => {
 
       const keys = [...(manualService as any).batchTimers.keys()] as string[];
       expect(keys).toHaveLength(2);
-      keys.forEach((k) => clearTimeout((manualService as any).batchTimers.get(k)));
+      keys.forEach((k) =>
+        clearTimeout((manualService as any).batchTimers.get(k)),
+      );
     });
 
     it('passes the current accumulated radius (not a hardcoded 0) to resolveBatch on timeout, and includes media links in the message', async () => {
@@ -820,23 +1040,38 @@ describe('DispatchService', () => {
       process.env.API_BASE_URL = 'https://api.example.com';
       try {
         prisma.rescueRequest.findUnique.mockResolvedValue({
-          id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
-          vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+          id: 'req-1',
+          status: 'DISPATCHING',
+          customerId: 'cust-1',
+          vehicleType: 'SEDAN',
+          destination: 'Lekki',
+          latitude: 6.5,
+          longitude: 3.4,
         });
         prisma.operator.findUnique.mockResolvedValue({
-          id: 'op-1', status: 'ACTIVE', businessName: 'Swift Towing', phoneNumber: '+2349012345678',
+          id: 'op-1',
+          status: 'ACTIVE',
+          businessName: 'Swift Towing',
+          phoneNumber: '+2349012345678',
         });
         prisma.dispatchOffer.updateMany.mockResolvedValue({ count: 0 });
         prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
         prisma.requestMedia.findMany.mockResolvedValue([{ id: 'media-1' }]);
         // session.dispatchRound is 1 → currentRadius should be 1 * RADIUS_EXPANSION_KM (2), not 0
-        sessionStore.getOrCreate.mockResolvedValue({ offeredOperatorIds: [], dispatchRound: 1 });
+        sessionStore.getOrCreate.mockResolvedValue({
+          offeredOperatorIds: [],
+          dispatchRound: 1,
+        });
 
-        const resolveBatchSpy = jest.spyOn(manualService as any, 'resolveBatch').mockResolvedValue(undefined);
+        const resolveBatchSpy = jest
+          .spyOn(manualService as any, 'resolveBatch')
+          .mockResolvedValue(undefined);
 
         await manualService.manualOfferToOperator('req-1', 'op-1');
 
-        expect(prisma.requestMedia.findMany).toHaveBeenCalledWith({ where: { rescueRequestId: 'req-1' } });
+        expect(prisma.requestMedia.findMany).toHaveBeenCalledWith({
+          where: { rescueRequestId: 'req-1' },
+        });
         expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
           expect.any(String),
           expect.stringContaining('media-1'),
@@ -844,7 +1079,13 @@ describe('DispatchService', () => {
 
         jest.advanceTimersByTime(5 * 60 * 1000);
 
-        expect(resolveBatchSpy).toHaveBeenCalledWith('req-1', ['op-1'], 'cust-1', 2, expect.any(String));
+        expect(resolveBatchSpy).toHaveBeenCalledWith(
+          'req-1',
+          ['op-1'],
+          'cust-1',
+          2,
+          expect.any(String),
+        );
       } finally {
         jest.useRealTimers();
         process.env.API_BASE_URL = prevApiBaseUrl;
@@ -854,11 +1095,19 @@ describe('DispatchService', () => {
     it('sends via the approved Content Template — matching its actual shape: no separate ETA slot, {{8}} repeats the job ref — when TWILIO_DISPATCH_OFFER_TEMPLATE_SID is set', async () => {
       process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID = 'HXtest456';
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
-        vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
       });
       prisma.operator.findUnique.mockResolvedValue({
-        id: 'op-1', status: 'ACTIVE', businessName: 'Swift Towing', phoneNumber: '+2349012345678',
+        id: 'op-1',
+        status: 'ACTIVE',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2349012345678',
       });
       prisma.dispatchOffer.updateMany.mockResolvedValue({ count: 0 });
       prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
@@ -888,17 +1137,29 @@ describe('DispatchService', () => {
 
     it('logs to Sentry and re-throws (does not silently succeed) when the send fails', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', status: 'DISPATCHING', customerId: 'cust-1',
-        vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
       });
       prisma.operator.findUnique.mockResolvedValue({
-        id: 'op-1', status: 'ACTIVE', businessName: 'Swift Towing', phoneNumber: '+2349012345678',
+        id: 'op-1',
+        status: 'ACTIVE',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2349012345678',
       });
       prisma.dispatchOffer.updateMany.mockResolvedValue({ count: 0 });
       prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
-      twilioService.sendWhatsAppMessage.mockRejectedValue(new Error('63016: outside messaging window'));
+      twilioService.sendWhatsAppMessage.mockRejectedValue(
+        new Error('63016: outside messaging window'),
+      );
 
-      await expect(manualService.manualOfferToOperator('req-1', 'op-1')).rejects.toThrow('63016');
+      await expect(
+        manualService.manualOfferToOperator('req-1', 'op-1'),
+      ).rejects.toThrow('63016');
     });
   });
 
@@ -914,37 +1175,80 @@ describe('DispatchService', () => {
     let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
     let operatorService: { findAndRankCandidates: jest.Mock };
     let platformConfigService: { getConfig: jest.Mock };
-    let twilioService: { sendWhatsAppMessage: jest.Mock; sendWhatsAppTemplateMessage: jest.Mock };
+    let twilioService: {
+      sendWhatsAppMessage: jest.Mock;
+      sendWhatsAppTemplateMessage: jest.Mock;
+    };
     let sharedService: { formatLocationSection: jest.Mock };
     const originalTemplateSid = process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
 
-    const candidateA = { id: 'op-a', businessName: 'A Towing', phoneNumber: '+2349011111111', distance: 5.2 };
-    const candidateB = { id: 'op-b', businessName: 'B Towing', phoneNumber: '+2349022222222', distance: 8.1 };
+    const candidateA = {
+      id: 'op-a',
+      businessName: 'A Towing',
+      phoneNumber: '+2349011111111',
+      distance: 5.2,
+    };
+    const candidateB = {
+      id: 'op-b',
+      businessName: 'B Towing',
+      phoneNumber: '+2349022222222',
+      distance: 8.1,
+    };
 
     afterEach(() => {
-      if (originalTemplateSid === undefined) delete process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
+      if (originalTemplateSid === undefined)
+        delete process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
       else process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID = originalTemplateSid;
     });
 
     beforeEach(async () => {
       delete process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
       prisma = {
-        rescueRequest: { findUnique: jest.fn().mockResolvedValue({
-          id: 'req-1', status: 'DISPATCHING', vehicleType: 'SEDAN', destination: 'Lekki', latitude: 6.5, longitude: 3.4,
-        }) },
-        user: { findUnique: jest.fn().mockResolvedValue({ phoneNumber: '+2348000000000' }) },
+        rescueRequest: {
+          findUnique: jest.fn().mockResolvedValue({
+            id: 'req-1',
+            status: 'DISPATCHING',
+            vehicleType: 'SEDAN',
+            destination: 'Lekki',
+            latitude: 6.5,
+            longitude: 3.4,
+          }),
+        },
+        user: {
+          findUnique: jest
+            .fn()
+            .mockResolvedValue({ phoneNumber: '+2348000000000' }),
+        },
         operator: { count: jest.fn() },
         dispatchOffer: { createMany: jest.fn() },
         requestMedia: { findMany: jest.fn().mockResolvedValue([]) },
       };
       sessionStore = {
-        getOrCreate: jest.fn().mockResolvedValue({ offeredOperatorIds: [], dispatchRound: 0 }),
+        getOrCreate: jest
+          .fn()
+          .mockResolvedValue({ offeredOperatorIds: [], dispatchRound: 0 }),
         update: jest.fn(),
       };
-      operatorService = { findAndRankCandidates: jest.fn().mockResolvedValue([candidateA, candidateB]) };
-      platformConfigService = { getConfig: jest.fn().mockResolvedValue({ dispatchWindowMinutes: 10, dispatchBatchSize: 3 }) };
-      twilioService = { sendWhatsAppMessage: jest.fn(), sendWhatsAppTemplateMessage: jest.fn() };
-      sharedService = { formatLocationSection: jest.fn().mockResolvedValue('https://maps.google.com/?q=6.5,3.4') };
+      operatorService = {
+        findAndRankCandidates: jest
+          .fn()
+          .mockResolvedValue([candidateA, candidateB]),
+      };
+      platformConfigService = {
+        getConfig: jest.fn().mockResolvedValue({
+          dispatchWindowMinutes: 10,
+          dispatchBatchSize: 3,
+        }),
+      };
+      twilioService = {
+        sendWhatsAppMessage: jest.fn(),
+        sendWhatsAppTemplateMessage: jest.fn(),
+      };
+      sharedService = {
+        formatLocationSection: jest
+          .fn()
+          .mockResolvedValue('https://maps.google.com/?q=6.5,3.4'),
+      };
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
@@ -962,7 +1266,10 @@ describe('DispatchService', () => {
     });
 
     it('sizes the offered batch from PlatformConfig.dispatchBatchSize, not a hardcoded constant', async () => {
-      platformConfigService.getConfig.mockResolvedValue({ dispatchWindowMinutes: 10, dispatchBatchSize: 1 });
+      platformConfigService.getConfig.mockResolvedValue({
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 1,
+      });
 
       await batchService.startDispatch('req-1', 'cust-1');
 
@@ -985,7 +1292,9 @@ describe('DispatchService', () => {
           '1': expect.any(String),
           '2': 'Sedan',
           '3': 'Lekki',
-          '4': expect.stringMatching(/^Distance: 5\.2 km · Est\. ETA: ~\d+ min based on your registered location\.$/),
+          '4': expect.stringMatching(
+            /^Distance: 5\.2 km · Est\. ETA: ~\d+ min based on your registered location\.$/,
+          ),
           '5': 'https://maps.google.com/?q=6.5,3.4',
           '6': expect.any(String),
           '7': '10 minutes',
@@ -994,7 +1303,9 @@ describe('DispatchService', () => {
       expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
         expect.stringContaining('+2349022222222'),
         'HXtest789',
-        expect.objectContaining({ '4': expect.stringContaining('Distance: 8.1 km') }),
+        expect.objectContaining({
+          '4': expect.stringContaining('Distance: 8.1 km'),
+        }),
       );
       expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
 
@@ -1007,7 +1318,15 @@ describe('DispatchService', () => {
       await batchService.startDispatch('req-1', 'cust-1');
 
       const vars = twilioService.sendWhatsAppTemplateMessage.mock.calls[0][2];
-      expect(Object.keys(vars).sort()).toEqual(['1', '2', '3', '4', '5', '6', '7']);
+      expect(Object.keys(vars).sort()).toEqual([
+        '1',
+        '2',
+        '3',
+        '4',
+        '5',
+        '6',
+        '7',
+      ]);
 
       clearAllBatchTimers(batchService);
     });
@@ -1022,7 +1341,10 @@ describe('DispatchService', () => {
         sharedService.formatLocationSection.mockResolvedValue(
           '4 Wilmot Point Rd, Victoria Island, Lagos\n📍 https://maps.google.com/?q=6.5,3.4',
         );
-        prisma.requestMedia.findMany.mockResolvedValue([{ id: 'media-1' }, { id: 'media-2' }]);
+        prisma.requestMedia.findMany.mockResolvedValue([
+          { id: 'media-1' },
+          { id: 'media-2' },
+        ]);
 
         await batchService.startDispatch('req-1', 'cust-1');
 
@@ -1046,11 +1368,14 @@ describe('DispatchService', () => {
 
     it('one operator send failing does not block the others in the batch, and is reported instead of thrown', async () => {
       twilioService.sendWhatsAppMessage.mockImplementation((to: string) => {
-        if (to.includes('+2349011111111')) return Promise.reject(new Error('63016: outside messaging window'));
+        if (to.includes('+2349011111111'))
+          return Promise.reject(new Error('63016: outside messaging window'));
         return Promise.resolve();
       });
 
-      await expect(batchService.startDispatch('req-1', 'cust-1')).resolves.toBeUndefined();
+      await expect(
+        batchService.startDispatch('req-1', 'cust-1'),
+      ).resolves.toBeUndefined();
 
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledTimes(2); // both attempted
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
@@ -1070,12 +1395,17 @@ describe('DispatchService', () => {
       // not this one.
       operatorService.findAndRankCandidates.mockResolvedValue([]); // nobody left to offer
       prisma.operator.count.mockResolvedValue(5); // operators exist nearby — not a coverage gap
-      (prisma as any).dispatchOffer.findMany = jest.fn().mockResolvedValue([
-        { id: 'offer-1', status: 'QUOTED' },
-      ]);
+      (prisma as any).dispatchOffer.findMany = jest
+        .fn()
+        .mockResolvedValue([{ id: 'offer-1', status: 'QUOTED' }]);
       (prisma as any).rescueRequest.update = jest.fn();
-      sessionStore.getOrCreate.mockResolvedValue({ offeredOperatorIds: ['op-a', 'op-b'], dispatchRound: 3 });
-      const shortlistSpy = jest.spyOn(batchService, 'sendQuoteShortlist').mockResolvedValue(undefined);
+      sessionStore.getOrCreate.mockResolvedValue({
+        offeredOperatorIds: ['op-a', 'op-b'],
+        dispatchRound: 3,
+      });
+      const shortlistSpy = jest
+        .spyOn(batchService, 'sendQuoteShortlist')
+        .mockResolvedValue(undefined);
 
       await batchService.startDispatch('req-1', 'cust-1', 6);
 
@@ -1137,11 +1467,19 @@ describe('DispatchService', () => {
         status: 'DISPATCHING',
         quoteCollectionDeadline: null,
       });
-      const startDispatchSpy = jest.spyOn(service, 'startDispatch').mockResolvedValue(undefined);
+      const startDispatchSpy = jest
+        .spyOn(service, 'startDispatch')
+        .mockResolvedValue(undefined);
       seedBatchTimer('req-1', 'batch-1'); // pre-existing decoy timer, seeded BEFORE the spy below
 
       const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
-      await (service as any).resolveBatch('req-1', ['op-1'], 'cust-1', 2, 'batch-1');
+      await (service as any).resolveBatch(
+        'req-1',
+        ['op-1'],
+        'cust-1',
+        2,
+        'batch-1',
+      );
 
       expect(startDispatchSpy).toHaveBeenCalledWith('req-1', 'cust-1', 2);
       // resolveBatch itself must not schedule any new timer for a retry —
@@ -1156,10 +1494,18 @@ describe('DispatchService', () => {
         status: 'DISPATCHING',
         quoteCollectionDeadline: new Date(Date.now() + 5 * 60 * 1000),
       });
-      const startDispatchSpy = jest.spyOn(service, 'startDispatch').mockResolvedValue(undefined);
+      const startDispatchSpy = jest
+        .spyOn(service, 'startDispatch')
+        .mockResolvedValue(undefined);
 
       seedBatchTimer('req-1', 'batch-1');
-      await (service as any).resolveBatch('req-1', ['op-1'], 'cust-1', 2, 'batch-1');
+      await (service as any).resolveBatch(
+        'req-1',
+        ['op-1'],
+        'cust-1',
+        2,
+        'batch-1',
+      );
 
       expect(startDispatchSpy).not.toHaveBeenCalled();
     });

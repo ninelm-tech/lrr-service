@@ -14,19 +14,23 @@ async function bootstrap() {
   const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
 
   app.enableCors({
-    origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
+    origin: (
+      origin: string | undefined,
+      callback: (err: Error | null, allow?: boolean) => void,
+    ) => {
       // Allow requests with no origin (mobile apps, curl, Postman)
       if (!origin) return callback(null, true);
 
       const allowed = [
-        frontendUrl,                          // staging.lrr.ninelm.com or lrr.ninelm.com
-        'http://localhost:3000',              // local web dev
-        'http://localhost:3001',              // local web dev (alt port)
+        frontendUrl, // staging.lrr.ninelm.com or lrr.ninelm.com
+        'http://localhost:3000', // local web dev
+        'http://localhost:3001', // local web dev (alt port)
       ];
 
       // Allow all Vercel preview deployments (*.vercel.app)
-      const isVercelPreview = /^https:\/\/[a-z0-9-]+-[a-z0-9]+-ninelm\.vercel\.app$/.test(origin)
-        || origin.endsWith('.vercel.app');
+      const isVercelPreview =
+        /^https:\/\/[a-z0-9-]+-[a-z0-9]+-ninelm\.vercel\.app$/.test(origin) ||
+        origin.endsWith('.vercel.app');
 
       if (allowed.includes(origin) || isVercelPreview) {
         callback(null, true);
