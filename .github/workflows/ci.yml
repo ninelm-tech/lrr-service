@@ -1,0 +1,85 @@
+name: CI
+
+# Runs on every PR, and on pushes to the long-lived branches so those always
+# carry a signal of their own. Deliberately separate from the deploy
+# workflows: those prove an image builds, not that the code is correct.
+on:
+  pull_request:
+  push:
+    branches:
+      - staging
+      - main
+
+jobs:
+  verify:
+    name: Typecheck & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      # @prisma/client's typed models are generated, not committed, so a fresh
+      # checkout has only the stub and every Prisma type fails to resolve.
+      # Needs the schema only — no database connection.
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: yarn test --ci
+
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+
+    # Mirrors docker-compose.test.yml, including the 5433 port, so the same
+    # default connection string works locally and here.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: lrr
+          POSTGRES_PASSWORD: lrr
+          POSTGRES_DB: lrr_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U lrr -d lrr_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      # globalSetup applies the real migrations, so a broken migration fails
+      # here rather than on deploy.
+      - name: Run integration tests
+        run: yarn test:integration
+        env:
+          DATABASE_URL: postgresql://lrr:lrr@localhost:5433/lrr_test
