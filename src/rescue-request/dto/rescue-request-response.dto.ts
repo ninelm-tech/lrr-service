@@ -1,4 +1,10 @@
-import { RescueRequestStatus, IssueType, VehicleType, DispatchOfferStatus, RatingDirection } from '@prisma/client';
+import {
+  RescueRequestStatus,
+  IssueType,
+  VehicleType,
+  DispatchOfferStatus,
+  RatingDirection,
+} from '@prisma/client';
 
 export class CustomerSummaryDto {
   id: string;

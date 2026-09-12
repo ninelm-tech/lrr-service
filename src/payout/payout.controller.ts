@@ -21,7 +21,9 @@ export class PayoutController {
       where: status ? { status: status as PayoutStatus } : {},
       include: {
         operator: { select: { businessName: true } },
-        rescueRequest: { select: { id: true, disputed: true, disputeResolvedAt: true } },
+        rescueRequest: {
+          select: { id: true, disputed: true, disputeResolvedAt: true },
+        },
       },
       orderBy: { createdAt: 'desc' },
     });
@@ -42,9 +44,14 @@ export class PayoutController {
  * reflects the payout's actual resulting state.
  */
 function describeRetryOutcome(
-  payout: { status: PayoutStatus; blockReason: PayoutBlockReason | null; failureReason: string | null } | null,
+  payout: {
+    status: PayoutStatus;
+    blockReason: PayoutBlockReason | null;
+    failureReason: string | null;
+  } | null,
 ): string {
-  if (!payout) return 'Payout retried, but its current state could not be read.';
+  if (!payout)
+    return 'Payout retried, but its current state could not be read.';
 
   switch (payout.status) {
     case PayoutStatus.PROCESSING:

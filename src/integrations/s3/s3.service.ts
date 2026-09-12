@@ -1,6 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import {
+  GetObjectCommand,
+  PutObjectCommand,
+  S3Client,
+} from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 @Injectable()
@@ -15,7 +19,11 @@ export class S3Service {
     this.client = new S3Client({ region });
   }
 
-  async uploadMedia(buffer: Buffer, contentType: string, key: string): Promise<void> {
+  async uploadMedia(
+    buffer: Buffer,
+    contentType: string,
+    key: string,
+  ): Promise<void> {
     await this.client.send(
       new PutObjectCommand({
         Bucket: this.bucket,

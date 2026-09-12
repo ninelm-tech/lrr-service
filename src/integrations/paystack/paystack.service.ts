@@ -41,13 +41,16 @@ export class PaystackService {
   private readonly secretKey: string;
 
   constructor(private readonly configService: ConfigService) {
-    this.secretKey = this.configService.get<string>('PAYSTACK_SECRET_KEY') || '';
+    this.secretKey =
+      this.configService.get<string>('PAYSTACK_SECRET_KEY') || '';
   }
 
   /**
    * Initialize a payment and get a payment link
    */
-  async initializePayment(params: InitializePaymentParams): Promise<PaystackInitializeResponse> {
+  async initializePayment(
+    params: InitializePaymentParams,
+  ): Promise<PaystackInitializeResponse> {
     const response = await fetch(`${this.baseUrl}/transaction/initialize`, {
       method: 'POST',
       headers: {
@@ -71,13 +74,16 @@ export class PaystackService {
    * Verify a payment by reference
    */
   async verifyPayment(reference: string): Promise<PaystackVerifyResponse> {
-    const response = await fetch(`${this.baseUrl}/transaction/verify/${reference}`, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${this.secretKey}`,
-        'Content-Type': 'application/json',
+    const response = await fetch(
+      `${this.baseUrl}/transaction/verify/${reference}`,
+      {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${this.secretKey}`,
+          'Content-Type': 'application/json',
+        },
       },
-    });
+    );
 
     const data = await response.json();
     console.log('Paystack verify response:', data);
@@ -107,10 +113,13 @@ export class PaystackService {
     const fetchRes = await fetch(`${this.baseUrl}/customer/${params.email}`, {
       headers: { Authorization: `Bearer ${this.secretKey}` },
     });
-    const fetchData = await fetchRes.json() as any;
+    const fetchData = await fetchRes.json();
 
     if (fetchData.status && fetchData.data?.customer_code) {
-      return { customer_code: fetchData.data.customer_code, id: fetchData.data.id };
+      return {
+        customer_code: fetchData.data.customer_code,
+        id: fetchData.data.id,
+      };
     }
 
     // Create new customer
@@ -122,9 +131,12 @@ export class PaystackService {
       },
       body: JSON.stringify(params),
     });
-    const createData = await createRes.json() as any;
+    const createData = await createRes.json();
     console.log('Paystack create customer:', createData);
-    return { customer_code: createData.data.customer_code, id: createData.data.id };
+    return {
+      customer_code: createData.data.customer_code,
+      id: createData.data.id,
+    };
   }
 
   // ── Paystack Plans ───────────────────────────────────────────────────────
@@ -135,7 +147,7 @@ export class PaystackService {
    */
   async createPlan(params: {
     name: string;
-    amount: number;       // in kobo
+    amount: number; // in kobo
     interval: 'monthly' | 'annually';
     description?: string;
   }): Promise<{ plan_code: string; id: number }> {
@@ -147,7 +159,7 @@ export class PaystackService {
       },
       body: JSON.stringify(params),
     });
-    const data = await res.json() as any;
+    const data = await res.json();
     console.log('Paystack create plan:', data);
     return { plan_code: data.data.plan_code, id: data.data.id };
   }
@@ -156,12 +168,15 @@ export class PaystackService {
    * Update an existing Paystack plan (e.g. price change).
    * Note: only affects NEW subscriptions — existing subscribers keep their old amount.
    */
-  async updatePlan(planCode: string, params: {
-    name?: string;
-    amount?: number;      // in kobo
-    interval?: 'monthly' | 'annually';
-    description?: string;
-  }): Promise<boolean> {
+  async updatePlan(
+    planCode: string,
+    params: {
+      name?: string;
+      amount?: number; // in kobo
+      interval?: 'monthly' | 'annually';
+      description?: string;
+    },
+  ): Promise<boolean> {
     const res = await fetch(`${this.baseUrl}/plan/${planCode}`, {
       method: 'PUT',
       headers: {
@@ -170,7 +185,7 @@ export class PaystackService {
       },
       body: JSON.stringify(params),
     });
-    const data = await res.json() as any;
+    const data = await res.json();
     console.log('Paystack update plan:', planCode, data?.status, data?.message);
     return Boolean(data?.status);
   }
@@ -178,11 +193,19 @@ export class PaystackService {
   /**
    * List plans — used to find existing plans by name at startup.
    */
-  async listPlans(): Promise<Array<{ id: number; plan_code: string; name: string; amount: number; interval: string }>> {
+  async listPlans(): Promise<
+    Array<{
+      id: number;
+      plan_code: string;
+      name: string;
+      amount: number;
+      interval: string;
+    }>
+  > {
     const res = await fetch(`${this.baseUrl}/plan?perPage=50`, {
       headers: { Authorization: `Bearer ${this.secretKey}` },
     });
-    const data = await res.json() as any;
+    const data = await res.json();
     return data.data ?? [];
   }
 
@@ -195,9 +218,9 @@ export class PaystackService {
   async initializeSubscriptionCheckout(params: {
     email: string;
     amount: number;
-    plan: string;            // plan_code
+    plan: string; // plan_code
     reference: string;
-    callback_url?: string;   // where Paystack redirects after payment
+    callback_url?: string; // where Paystack redirects after payment
     metadata?: Record<string, any>;
   }): Promise<PaystackInitializeResponse> {
     const res = await fetch(`${this.baseUrl}/transaction/initialize`, {
@@ -207,15 +230,15 @@ export class PaystackService {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        email:        params.email,
-        amount:       params.amount,
-        plan:         params.plan,
-        reference:    params.reference,
+        email: params.email,
+        amount: params.amount,
+        plan: params.plan,
+        reference: params.reference,
         callback_url: params.callback_url,
-        metadata:     params.metadata,
+        metadata: params.metadata,
       }),
     });
-    const data = await res.json() as any;
+    const data = await res.json();
     console.log('Paystack subscription checkout init:', data);
     return data as PaystackInitializeResponse;
   }
@@ -224,8 +247,8 @@ export class PaystackService {
    * Cancel a Paystack subscription.
    */
   async cancelSubscription(params: {
-    code: string;            // subscription_code
-    token: string;           // email_token from Paystack subscription object
+    code: string; // subscription_code
+    token: string; // email_token from Paystack subscription object
   }): Promise<{ status: boolean; message: string }> {
     const res = await fetch(`${this.baseUrl}/subscription/disable`, {
       method: 'POST',
@@ -235,7 +258,7 @@ export class PaystackService {
       },
       body: JSON.stringify(params),
     });
-    const data = await res.json() as any;
+    const data = await res.json();
     console.log('Paystack cancel subscription:', data);
     return data;
   }
@@ -244,10 +267,13 @@ export class PaystackService {
    * Fetch a Paystack subscription by code.
    */
   async fetchSubscription(subscriptionCode: string): Promise<any> {
-    const res = await fetch(`${this.baseUrl}/subscription/${subscriptionCode}`, {
-      headers: { Authorization: `Bearer ${this.secretKey}` },
-    });
-    return (await res.json() as any).data;
+    const res = await fetch(
+      `${this.baseUrl}/subscription/${subscriptionCode}`,
+      {
+        headers: { Authorization: `Bearer ${this.secretKey}` },
+      },
+    );
+    return (await res.json()).data;
   }
 
   private banksCache: Array<{ name: string; code: string }> | null = null;
@@ -255,15 +281,20 @@ export class PaystackService {
   // ── Transfers / Payouts ──────────────────────────────────────────────────
 
   /** Verify a bank account belongs to a real, named holder before saving it. */
-  async resolveAccountNumber(accountNumber: string, bankCode: string): Promise<{ accountName: string }> {
+  async resolveAccountNumber(
+    accountNumber: string,
+    bankCode: string,
+  ): Promise<{ accountName: string }> {
     const res = await fetch(
       `${this.baseUrl}/bank/resolve?account_number=${accountNumber}&bank_code=${bankCode}`,
       { headers: { Authorization: `Bearer ${this.secretKey}` } },
     );
-    const data = await res.json() as any;
+    const data = await res.json();
     console.log('Paystack resolve account:', data);
     if (!data.status || !data.data) {
-      throw new BadRequestException(data.message || 'Could not verify that account number');
+      throw new BadRequestException(
+        data.message || 'Could not verify that account number',
+      );
     }
     return { accountName: data.data.account_name };
   }
@@ -274,8 +305,11 @@ export class PaystackService {
     const res = await fetch(`${this.baseUrl}/bank?country=nigeria`, {
       headers: { Authorization: `Bearer ${this.secretKey}` },
     });
-    const data = await res.json() as any;
-    this.banksCache = (data.data ?? []).map((b: any) => ({ name: b.name, code: b.code }));
+    const data = await res.json();
+    this.banksCache = (data.data ?? []).map((b: any) => ({
+      name: b.name,
+      code: b.code,
+    }));
     return this.banksCache!;
   }
 
@@ -300,10 +334,12 @@ export class PaystackService {
         currency: 'NGN',
       }),
     });
-    const data = await res.json() as any;
+    const data = await res.json();
     console.log('Paystack create transfer recipient:', data);
     if (!data.status || !data.data) {
-      throw new Error(data.message || 'Paystack transfer recipient creation failed');
+      throw new Error(
+        data.message || 'Paystack transfer recipient creation failed',
+      );
     }
     return { recipientCode: data.data.recipient_code };
   }
@@ -313,7 +349,7 @@ export class PaystackService {
     const res = await fetch(`${this.baseUrl}/balance`, {
       headers: { Authorization: `Bearer ${this.secretKey}` },
     });
-    const data = await res.json() as any;
+    const data = await res.json();
     const ngn = (data.data ?? []).find((b: any) => b.currency === 'NGN');
     return ngn?.balance ?? 0;
   }
@@ -339,7 +375,7 @@ export class PaystackService {
         reason: params.reason,
       }),
     });
-    const data = await res.json() as any;
+    const data = await res.json();
     console.log('Paystack initiate transfer:', data);
     if (!data.status || !data.data) {
       throw new Error(data.message || 'Paystack transfer initiation failed');
@@ -356,7 +392,10 @@ export class PaystackService {
    * INITIATES the refund; Paystack settles it asynchronously and confirms via
    * the refund.processed/refund.failed webhook (see PaymentService).
    */
-  async refundTransaction(transaction: string, amount: number): Promise<{ id: number; status: string }> {
+  async refundTransaction(
+    transaction: string,
+    amount: number,
+  ): Promise<{ id: number; status: string }> {
     const response = await fetch(`${this.baseUrl}/refund`, {
       method: 'POST',
       headers: {

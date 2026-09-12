@@ -21,13 +21,22 @@ export async function truncateAll(prisma: PrismaService): Promise<void> {
   `);
 }
 
-export async function createCustomer(prisma: PrismaService, phoneNumber?: string) {
+export async function createCustomer(
+  prisma: PrismaService,
+  phoneNumber?: string,
+) {
   return prisma.user.create({
-    data: { phoneNumber: phoneNumber ?? `+234800${unique().slice(-7)}`, role: 'CUSTOMER' },
+    data: {
+      phoneNumber: phoneNumber ?? `+234800${unique().slice(-7)}`,
+      role: 'CUSTOMER',
+    },
   });
 }
 
-export async function createOperator(prisma: PrismaService, phoneNumber?: string) {
+export async function createOperator(
+  prisma: PrismaService,
+  phoneNumber?: string,
+) {
   return prisma.operator.create({
     data: {
       businessName: 'Swift Towing',

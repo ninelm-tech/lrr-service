@@ -40,10 +40,23 @@ import { AuthGuard } from '../auth/auth.guard';
   ],
   controllers: [RescueRequestController],
   providers: [
-    RescueRequestSharedService, DisputeService, PaymentEventsService, RescueRequestAdminService,
-    DispatchService, DispatchOfferSweeperService, WhatsAppOperatorFlowService, WhatsAppCustomerFlowService, WhatsAppInboundService,
-    WhatsAppSessionStore, AuthGuard,
+    RescueRequestSharedService,
+    DisputeService,
+    PaymentEventsService,
+    RescueRequestAdminService,
+    DispatchService,
+    DispatchOfferSweeperService,
+    WhatsAppOperatorFlowService,
+    WhatsAppCustomerFlowService,
+    WhatsAppInboundService,
+    WhatsAppSessionStore,
+    AuthGuard,
   ],
-  exports: [PaymentEventsService, RescueRequestAdminService, DispatchService, WhatsAppInboundService],
+  exports: [
+    PaymentEventsService,
+    RescueRequestAdminService,
+    DispatchService,
+    WhatsAppInboundService,
+  ],
 })
 export class RescueRequestModule {}

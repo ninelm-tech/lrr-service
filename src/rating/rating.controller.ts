@@ -1,4 +1,13 @@
-import { BadRequestException, Body, Controller, Get, NotFoundException, Param, Patch, UseGuards } from '@nestjs/common';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Get,
+  NotFoundException,
+  Param,
+  Patch,
+  UseGuards,
+} from '@nestjs/common';
 import { UserRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { RatingService } from './rating.service';
@@ -22,9 +31,10 @@ export class RatingController {
     });
     if (!rating) throw new NotFoundException('Rating not found');
 
-    const ratedName = rating.direction === 'MOTORIST_TO_OPERATOR'
-      ? rating.operator.businessName
-      : 'the motorist';
+    const ratedName =
+      rating.direction === 'MOTORIST_TO_OPERATOR'
+        ? rating.operator.businessName
+        : 'the motorist';
 
     return {
       data: { ratedName, score: rating.score, comment: rating.comment },

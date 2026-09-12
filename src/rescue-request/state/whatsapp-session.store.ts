@@ -1,9 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
-import {
-  WhatsAppFlowState,
-  WhatsAppSession,
-} from './whatsapp-session.types';
+import { WhatsAppFlowState, WhatsAppSession } from './whatsapp-session.types';
 
 /**
  * DB-backed WhatsApp session store, keyed by userId.
@@ -18,7 +15,7 @@ export class WhatsAppSessionStore {
 
   async getOrCreate(userId: string): Promise<WhatsAppSession> {
     const row = await this.prisma.whatsAppSession.upsert({
-      where:  { userId },
+      where: { userId },
       create: {
         userId,
         state: WhatsAppFlowState.IDLE,
@@ -36,22 +33,28 @@ export class WhatsAppSessionStore {
   ): Promise<WhatsAppSession> {
     const data: Record<string, any> = {};
 
-    if (updates.state !== undefined)            data.state = updates.state;
-    if (updates.latitude !== undefined)         data.latitude = updates.latitude;
-    if (updates.longitude !== undefined)        data.longitude = updates.longitude;
-    if (updates.issueType !== undefined)        data.issueType = updates.issueType;
-    if (updates.vehicleType !== undefined)      data.vehicleType = updates.vehicleType;
-    if (updates.destination !== undefined)      data.destination = updates.destination;
-    if (updates.rescueRequestId !== undefined)  data.rescueRequestId = updates.rescueRequestId;
-    if (updates.depositReference !== undefined) data.depositReference = updates.depositReference;
-    if (updates.dispatchRound !== undefined)    data.dispatchRound = updates.dispatchRound;
+    if (updates.state !== undefined) data.state = updates.state;
+    if (updates.latitude !== undefined) data.latitude = updates.latitude;
+    if (updates.longitude !== undefined) data.longitude = updates.longitude;
+    if (updates.issueType !== undefined) data.issueType = updates.issueType;
+    if (updates.vehicleType !== undefined)
+      data.vehicleType = updates.vehicleType;
+    if (updates.destination !== undefined)
+      data.destination = updates.destination;
+    if (updates.rescueRequestId !== undefined)
+      data.rescueRequestId = updates.rescueRequestId;
+    if (updates.depositReference !== undefined)
+      data.depositReference = updates.depositReference;
+    if (updates.dispatchRound !== undefined)
+      data.dispatchRound = updates.dispatchRound;
     if (updates.offeredOperatorIds !== undefined) {
       data.offeredOperatorIds = JSON.stringify(updates.offeredOperatorIds);
     }
-    if (updates.relayTarget !== undefined)      data.relayTarget = updates.relayTarget;
+    if (updates.relayTarget !== undefined)
+      data.relayTarget = updates.relayTarget;
 
     const row = await this.prisma.whatsAppSession.update({
-      where:  { userId },
+      where: { userId },
       data,
     });
 

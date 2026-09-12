@@ -25,7 +25,9 @@ import { PrismaService } from '../prisma/prisma.service';
  * several instances is harmless.
  */
 @Injectable()
-export class DispatchOfferSweeperService implements OnModuleInit, OnModuleDestroy {
+export class DispatchOfferSweeperService
+  implements OnModuleInit, OnModuleDestroy
+{
   private readonly SWEEP_INTERVAL_MS = 60 * 1000;
   private readonly MAX_ORPHANS_PER_SWEEP = 500;
   private timer?: NodeJS.Timeout;
@@ -62,7 +64,10 @@ export class DispatchOfferSweeperService implements OnModuleInit, OnModuleDestro
       // Only log when something was actually swept — a quiet system should
       // not write a line every minute.
       if (total > 0) {
-        logger.info('dispatch: swept offers', { expired: count, onEndedRequests: orphaned });
+        logger.info('dispatch: swept offers', {
+          expired: count,
+          onEndedRequests: orphaned,
+        });
       }
       return total;
     } catch (error) {
@@ -91,7 +96,9 @@ export class DispatchOfferSweeperService implements OnModuleInit, OnModuleDestro
       where: {
         status: 'PENDING',
         rescueRequest: {
-          status: { in: [RescueRequestStatus.COMPLETED, RescueRequestStatus.CANCELLED] },
+          status: {
+            in: [RescueRequestStatus.COMPLETED, RescueRequestStatus.CANCELLED],
+          },
         },
       },
       select: { id: true },

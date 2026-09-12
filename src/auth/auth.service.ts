@@ -1,4 +1,9 @@
-import { Injectable, UnauthorizedException, ConflictException, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  UnauthorizedException,
+  ConflictException,
+  BadRequestException,
+} from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
 import { logger } from '@sentry/node';
@@ -71,9 +76,15 @@ export class AuthService {
       throw new UnauthorizedException('Invalid email or password');
     }
 
-    const isPasswordValid = await this.verifyPassword(password, user.passwordHash);
+    const isPasswordValid = await this.verifyPassword(
+      password,
+      user.passwordHash,
+    );
     if (!isPasswordValid) {
-      logger.warn('login: wrong password', { userId: user.id, role: user.role });
+      logger.warn('login: wrong password', {
+        userId: user.id,
+        role: user.role,
+      });
       throw new UnauthorizedException('Invalid email or password');
     }
 
@@ -110,7 +121,12 @@ export class AuthService {
     name: string;
     role: UserRole;
     temporaryPassword: string;
-  }): Promise<{ id: string; email: string; name: string | null; role: UserRole }> {
+  }): Promise<{
+    id: string;
+    email: string;
+    name: string | null;
+    role: UserRole;
+  }> {
     const existingUser = await this.prisma.user.findUnique({
       where: { email: data.email },
     });
@@ -129,7 +145,12 @@ export class AuthService {
       },
     });
 
-    return { id: user.id, email: user.email!, name: user.name, role: user.role };
+    return {
+      id: user.id,
+      email: user.email!,
+      name: user.name,
+      role: user.role,
+    };
   }
 
   /**
@@ -154,64 +175,87 @@ export class AuthService {
       // just attach email/password and return a token.
       if (existingPhone.role === UserRole.CUSTOMER) {
         const updates: any = {};
-        if (dto.name)     updates.name = dto.name;
-        if (dto.email)    updates.email = dto.email;
-        if (dto.password) updates.passwordHash = await this.hashPassword(dto.password);
+        if (dto.name) updates.name = dto.name;
+        if (dto.email) updates.email = dto.email;
+        if (dto.password)
+          updates.passwordHash = await this.hashPassword(dto.password);
 
         const updated = await this.prisma.user.update({
           where: { id: existingPhone.id },
-          data:  updates,
+          data: updates,
         });
 
         const accessToken = this.generateToken({
-          id:    updated.id,
+          id: updated.id,
           email: updated.email ?? phoneNumber,
-          role:  updated.role,
+          role: updated.role,
         });
 
         return {
           accessToken,
-          user: { id: updated.id, email: updated.email!, name: updated.name, role: updated.role },
+          user: {
+            id: updated.id,
+            email: updated.email!,
+            name: updated.name,
+            role: updated.role,
+          },
         };
       }
 
-      logger.warn('registerCustomer: phone already registered to a non-customer account', {
-        phoneNumber, existingRole: existingPhone.role,
-      });
-      throw new ConflictException('Phone number already registered to a different account type.');
+      logger.warn(
+        'registerCustomer: phone already registered to a non-customer account',
+        {
+          phoneNumber,
+          existingRole: existingPhone.role,
+        },
+      );
+      throw new ConflictException(
+        'Phone number already registered to a different account type.',
+      );
     }
 
     // Check email uniqueness if provided
     if (dto.email) {
-      const existingEmail = await this.prisma.user.findUnique({ where: { email: dto.email } });
+      const existingEmail = await this.prisma.user.findUnique({
+        where: { email: dto.email },
+      });
       if (existingEmail) {
-        logger.warn('registerCustomer: email already registered', { email: dto.email });
+        logger.warn('registerCustomer: email already registered', {
+          email: dto.email,
+        });
         throw new ConflictException('Email already registered.');
       }
     }
 
-    const passwordHash = dto.password ? await this.hashPassword(dto.password) : null;
+    const passwordHash = dto.password
+      ? await this.hashPassword(dto.password)
+      : null;
 
     const user = await this.prisma.user.create({
       data: {
-        phoneNumber,         // normalised +234... form
-        email:        dto.email ?? null,
+        phoneNumber, // normalised +234... form
+        email: dto.email ?? null,
         passwordHash: passwordHash ?? undefined,
-        name:         dto.name ?? null,
-        role:         UserRole.CUSTOMER,
+        name: dto.name ?? null,
+        role: UserRole.CUSTOMER,
       },
     });
     logger.info('registerCustomer: account created', { userId: user.id });
 
     const accessToken = this.generateToken({
-      id:    user.id,
+      id: user.id,
       email: user.email ?? phoneNumber,
-      role:  user.role,
+      role: user.role,
     });
 
     return {
       accessToken,
-      user: { id: user.id, email: user.email!, name: user.name, role: user.role },
+      user: {
+        id: user.id,
+        email: user.email!,
+        name: user.name,
+        role: user.role,
+      },
     };
   }
 
@@ -241,17 +285,28 @@ export class AuthService {
    *   sent to the account's registered phone number instead, and the
    *   caller must follow up with resetPasswordWithCode to actually apply it.
    */
-  async requestPasswordReset(identifier: string, newPassword: string): Promise<{ message: string; otpRequired: boolean }> {
+  async requestPasswordReset(
+    identifier: string,
+    newPassword: string,
+  ): Promise<{ message: string; otpRequired: boolean }> {
     // ValidationPipe isn't wired up globally, so class-validator decorators
     // on ForgotPasswordDto alone don't run — enforce the length rule here
     // too (same pattern as e.g. rescue-request-admin.service.ts's manual
     // priceKobo check).
     if (newPassword.length < 8) {
-      throw new BadRequestException('newPassword must be at least 8 characters.');
+      throw new BadRequestException(
+        'newPassword must be at least 8 characters.',
+      );
     }
 
-    const byEmail = await this.prisma.user.findUnique({ where: { email: identifier } });
-    const user = byEmail ?? await this.prisma.user.findUnique({ where: { phoneNumber: identifier } });
+    const byEmail = await this.prisma.user.findUnique({
+      where: { email: identifier },
+    });
+    const user =
+      byEmail ??
+      (await this.prisma.user.findUnique({
+        where: { phoneNumber: identifier },
+      }));
 
     if (!this.otpPasswordResetEnabled) {
       if (user && user.passwordHash) {
@@ -259,12 +314,22 @@ export class AuthService {
           where: { id: user.id },
           data: { passwordHash: await this.hashPassword(newPassword) },
         });
-        logger.warn('requestPasswordReset: password reset with no OTP verification (otpPasswordResetEnabled=false)', { userId: user.id });
+        logger.warn(
+          'requestPasswordReset: password reset with no OTP verification (otpPasswordResetEnabled=false)',
+          { userId: user.id },
+        );
       }
-      return { message: 'Password updated. You can now log in.', otpRequired: false };
+      return {
+        message: 'Password updated. You can now log in.',
+        otpRequired: false,
+      };
     }
 
-    const genericMessage = { message: "If an account exists, we've sent a reset code to its registered phone number.", otpRequired: true };
+    const genericMessage = {
+      message:
+        "If an account exists, we've sent a reset code to its registered phone number.",
+      otpRequired: true,
+    };
     if (!user || !user.passwordHash || !user.phoneNumber) {
       return genericMessage;
     }
@@ -282,13 +347,22 @@ export class AuthService {
    * never sends a code while it's off, so verifyCode below always fails
    * "not found" for any code a caller might guess.
    */
-  async resetPasswordWithCode(phoneNumber: string, code: string, newPassword: string): Promise<{ message: string }> {
+  async resetPasswordWithCode(
+    phoneNumber: string,
+    code: string,
+    newPassword: string,
+  ): Promise<{ message: string }> {
     if (newPassword.length < 8) {
-      throw new BadRequestException('newPassword must be at least 8 characters.');
+      throw new BadRequestException(
+        'newPassword must be at least 8 characters.',
+      );
     }
 
     const { token } = await this.otpService.verifyCode(phoneNumber, code);
-    const tokenRow = await this.otpService.findValidTokenRow(phoneNumber, token);
+    const tokenRow = await this.otpService.findValidTokenRow(
+      phoneNumber,
+      token,
+    );
     if (!tokenRow) {
       throw new BadRequestException('Code expired — request a new one.');
     }
@@ -297,8 +371,15 @@ export class AuthService {
     await this.prisma.$transaction(async (tx) => {
       // Re-check inside the transaction — close the gap if the token was
       // consumed between the pre-check above and this write.
-      const freshTokenRow = await tx.phoneVerification.findUnique({ where: { id: tokenRow.id } });
-      if (!freshTokenRow || freshTokenRow.consumedAt || !freshTokenRow.tokenExpiresAt || freshTokenRow.tokenExpiresAt < new Date()) {
+      const freshTokenRow = await tx.phoneVerification.findUnique({
+        where: { id: tokenRow.id },
+      });
+      if (
+        !freshTokenRow ||
+        freshTokenRow.consumedAt ||
+        !freshTokenRow.tokenExpiresAt ||
+        freshTokenRow.tokenExpiresAt < new Date()
+      ) {
         throw new BadRequestException('Code expired — request a new one.');
       }
 
@@ -326,11 +407,15 @@ export class AuthService {
    * Email and phone are checked for uniqueness; phone is normalised to E.164
    * (it is the WhatsApp identity, so it must stay canonical).
    */
-  async updateProfile(userId: string, dto: { name?: string; email?: string; phoneNumber?: string }) {
+  async updateProfile(
+    userId: string,
+    dto: { name?: string; email?: string; phoneNumber?: string },
+  ) {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) throw new UnauthorizedException('User not found');
 
-    const data: { name?: string | null; email?: string; phoneNumber?: string } = {};
+    const data: { name?: string | null; email?: string; phoneNumber?: string } =
+      {};
 
     if (dto.name !== undefined) {
       data.name = dto.name.trim() || null;
@@ -342,8 +427,11 @@ export class AuthService {
         throw new BadRequestException('Invalid email address');
       }
       if (email !== user.email) {
-        const existing = await this.prisma.user.findUnique({ where: { email } });
-        if (existing && existing.id !== userId) throw new ConflictException('Email already in use');
+        const existing = await this.prisma.user.findUnique({
+          where: { email },
+        });
+        if (existing && existing.id !== userId)
+          throw new ConflictException('Email already in use');
         data.email = email;
       }
     }
@@ -351,8 +439,11 @@ export class AuthService {
     if (dto.phoneNumber !== undefined && dto.phoneNumber.trim()) {
       const phoneNumber = normalizePhone(dto.phoneNumber);
       if (phoneNumber !== user.phoneNumber) {
-        const existing = await this.prisma.user.findUnique({ where: { phoneNumber } });
-        if (existing && existing.id !== userId) throw new ConflictException('Phone number already in use');
+        const existing = await this.prisma.user.findUnique({
+          where: { phoneNumber },
+        });
+        if (existing && existing.id !== userId)
+          throw new ConflictException('Phone number already in use');
         data.phoneNumber = phoneNumber;
       }
     }
@@ -362,7 +453,14 @@ export class AuthService {
     return this.prisma.user.update({
       where: { id: userId },
       data,
-      select: { id: true, email: true, phoneNumber: true, name: true, role: true, createdAt: true },
+      select: {
+        id: true,
+        email: true,
+        phoneNumber: true,
+        name: true,
+        role: true,
+        createdAt: true,
+      },
     });
   }
 
@@ -371,17 +469,26 @@ export class AuthService {
    * Requires the current password when one exists. Customers created by the
    * WhatsApp bot have no password yet — they may set one directly.
    */
-  async changePassword(userId: string, dto: { currentPassword?: string; newPassword: string }) {
+  async changePassword(
+    userId: string,
+    dto: { currentPassword?: string; newPassword: string },
+  ) {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) throw new UnauthorizedException('User not found');
 
     if (!dto.newPassword || dto.newPassword.length < 6) {
-      throw new BadRequestException('New password must be at least 6 characters');
+      throw new BadRequestException(
+        'New password must be at least 6 characters',
+      );
     }
 
     if (user.passwordHash) {
-      if (!dto.currentPassword) throw new BadRequestException('Current password is required');
-      const ok = await this.verifyPassword(dto.currentPassword, user.passwordHash);
+      if (!dto.currentPassword)
+        throw new BadRequestException('Current password is required');
+      const ok = await this.verifyPassword(
+        dto.currentPassword,
+        user.passwordHash,
+      );
       if (!ok) throw new UnauthorizedException('Current password is incorrect');
     }
 
@@ -433,8 +540,8 @@ export class AuthService {
     if (opts.role) where.role = opts.role;
     if (opts.search) {
       where.OR = [
-        { name:        { contains: opts.search, mode: 'insensitive' } },
-        { email:       { contains: opts.search, mode: 'insensitive' } },
+        { name: { contains: opts.search, mode: 'insensitive' } },
+        { email: { contains: opts.search, mode: 'insensitive' } },
         { phoneNumber: { contains: opts.search } },
       ];
     }
@@ -446,8 +553,13 @@ export class AuthService {
         take: opts.limit,
         orderBy: { createdAt: 'desc' },
         select: {
-          id: true, email: true, phoneNumber: true, name: true,
-          role: true, createdAt: true, updatedAt: true,
+          id: true,
+          email: true,
+          phoneNumber: true,
+          name: true,
+          role: true,
+          createdAt: true,
+          updatedAt: true,
         },
       }),
       this.prisma.user.count({ where }),
@@ -455,7 +567,12 @@ export class AuthService {
 
     return {
       data,
-      meta: { page: opts.page, limit: opts.limit, total, pages: Math.ceil(total / opts.limit) },
+      meta: {
+        page: opts.page,
+        limit: opts.limit,
+        total,
+        pages: Math.ceil(total / opts.limit),
+      },
     };
   }
 

@@ -28,14 +28,24 @@ describe('PayoutController', () => {
   describe('list', () => {
     it('lists payouts joined with operator and rescue request info, optionally filtered by status', async () => {
       prisma.payout.findMany.mockResolvedValue([
-        { id: 'payout-1', status: 'FAILED', operator: { businessName: 'Swift Towing' }, rescueRequest: { id: 'req-1' } },
+        {
+          id: 'payout-1',
+          status: 'FAILED',
+          operator: { businessName: 'Swift Towing' },
+          rescueRequest: { id: 'req-1' },
+        },
       ]);
 
       const result = await controller.list('FAILED');
 
       expect(prisma.payout.findMany).toHaveBeenCalledWith({
         where: { status: 'FAILED' },
-        include: { operator: { select: { businessName: true } }, rescueRequest: { select: { id: true, disputed: true, disputeResolvedAt: true } } },
+        include: {
+          operator: { select: { businessName: true } },
+          rescueRequest: {
+            select: { id: true, disputed: true, disputeResolvedAt: true },
+          },
+        },
         orderBy: { createdAt: 'desc' },
       });
       expect(result.data).toHaveLength(1);
@@ -54,7 +64,11 @@ describe('PayoutController', () => {
 
   describe('retry', () => {
     it('delegates to PayoutService.retryPayout', async () => {
-      payoutService.retryPayout.mockResolvedValue({ status: 'PROCESSING', blockReason: null, failureReason: null });
+      payoutService.retryPayout.mockResolvedValue({
+        status: 'PROCESSING',
+        blockReason: null,
+        failureReason: null,
+      });
 
       await controller.retry('payout-1');
 
@@ -62,7 +76,11 @@ describe('PayoutController', () => {
     });
 
     it('reports a transfer actually being initiated', async () => {
-      payoutService.retryPayout.mockResolvedValue({ status: 'PROCESSING', blockReason: null, failureReason: null });
+      payoutService.retryPayout.mockResolvedValue({
+        status: 'PROCESSING',
+        blockReason: null,
+        failureReason: null,
+      });
 
       const result = await controller.retry('payout-1');
 
@@ -71,7 +89,9 @@ describe('PayoutController', () => {
 
     it('does NOT claim success when the retry immediately re-blocked on missing bank details', async () => {
       payoutService.retryPayout.mockResolvedValue({
-        status: 'PENDING', blockReason: 'NO_BANK_DETAILS', failureReason: null,
+        status: 'PENDING',
+        blockReason: 'NO_BANK_DETAILS',
+        failureReason: null,
       });
 
       const result = await controller.retry('payout-1');
@@ -82,7 +102,9 @@ describe('PayoutController', () => {
 
     it('reports a balance block distinctly from a bank-details block', async () => {
       payoutService.retryPayout.mockResolvedValue({
-        status: 'PENDING', blockReason: 'INSUFFICIENT_BALANCE', failureReason: null,
+        status: 'PENDING',
+        blockReason: 'INSUFFICIENT_BALANCE',
+        failureReason: null,
       });
 
       const result = await controller.retry('payout-1');
@@ -92,7 +114,9 @@ describe('PayoutController', () => {
 
     it('surfaces the failure reason when the transfer attempt failed outright', async () => {
       payoutService.retryPayout.mockResolvedValue({
-        status: 'FAILED', blockReason: null, failureReason: 'Recipient account invalid',
+        status: 'FAILED',
+        blockReason: null,
+        failureReason: 'Recipient account invalid',
       });
 
       const result = await controller.retry('payout-1');

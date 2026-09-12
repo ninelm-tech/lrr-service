@@ -1,4 +1,10 @@
-import { Controller, Get, NotFoundException, Param, Redirect } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  NotFoundException,
+  Param,
+  Redirect,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../integrations/s3/s3.service';
 
@@ -14,10 +20,15 @@ export class MediaController {
   @Get(':mediaId')
   @Redirect()
   async redirectToMedia(@Param('mediaId') mediaId: string) {
-    const media = await this.prisma.requestMedia.findUnique({ where: { id: mediaId } });
+    const media = await this.prisma.requestMedia.findUnique({
+      where: { id: mediaId },
+    });
     if (!media) throw new NotFoundException('Media not found');
 
-    const url = await this.s3Service.getSignedUrl(media.s3Key, SIGNED_URL_EXPIRY_SECONDS);
+    const url = await this.s3Service.getSignedUrl(
+      media.s3Key,
+      SIGNED_URL_EXPIRY_SECONDS,
+    );
     return { url, statusCode: 302 };
   }
 }

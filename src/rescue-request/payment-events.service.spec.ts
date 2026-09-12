@@ -49,7 +49,11 @@ describe('PaymentEventsService', () => {
           serviceFeeAmount: 25000,
           assignedOperatorId: 'op-1',
           customer: { phoneNumber: '+2348012345678' },
-          assignedOperator: { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2349012345678' },
+          assignedOperator: {
+            id: 'op-1',
+            businessName: 'Swift Towing',
+            phoneNumber: '+2349012345678',
+          },
         }),
         findUnique: jest.fn(),
         update: jest.fn(),
@@ -63,7 +67,9 @@ describe('PaymentEventsService', () => {
     twilioService = { sendWhatsAppMessage: jest.fn() };
     sharedService = {
       findOrCreateCustomer: jest.fn().mockResolvedValue({ id: 'op-user-1' }),
-      formatLocationSection: jest.fn().mockResolvedValue('https://maps.google.com/?q=6.5,3.4'),
+      formatLocationSection: jest
+        .fn()
+        .mockResolvedValue('https://maps.google.com/?q=6.5,3.4'),
       endRelayForEndedRequest: jest.fn(),
     };
     dispatchService = { startDispatch: jest.fn() };
@@ -89,8 +95,11 @@ describe('PaymentEventsService', () => {
   describe('handleDepositPaymentConfirmed', () => {
     it('assigns the operator and confirms when the claim succeeds', async () => {
       prisma.rescueRequest.findFirst.mockResolvedValue({
-        id: 'req-1', customerId: 'cust-1', assignedOperatorId: 'op-1',
-        customer: { phoneNumber: '+2341' }, assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
       });
       prisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
 
@@ -109,12 +118,17 @@ describe('PaymentEventsService', () => {
 
     it('is a silent no-op when the claim fails because the deposit was already paid (webhook redelivery)', async () => {
       prisma.rescueRequest.findFirst.mockResolvedValue({
-        id: 'req-1', customerId: 'cust-1', assignedOperatorId: 'op-1',
-        customer: { phoneNumber: '+2341' }, assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
       });
       prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 }); // claim failed
       prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
-        id: 'req-1', depositPaid: true, status: 'OPERATOR_ASSIGNED', // already processed
+        id: 'req-1',
+        depositPaid: true,
+        status: 'OPERATOR_ASSIGNED', // already processed
       });
 
       await service.handleDepositPaymentConfirmed('DEP_ref_1');
@@ -126,12 +140,17 @@ describe('PaymentEventsService', () => {
 
     it('routes to handleLateDeposit when the request is CANCELLED and not yet paid', async () => {
       prisma.rescueRequest.findFirst.mockResolvedValue({
-        id: 'req-1', customerId: 'cust-1',
-        customer: { phoneNumber: '+2341' }, assignedOperator: null,
+        id: 'req-1',
+        customerId: 'cust-1',
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: null,
       });
       prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 });
       prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
-        id: 'req-1', customer: { phoneNumber: '+2341' }, depositPaid: false, status: 'CANCELLED',
+        id: 'req-1',
+        customer: { phoneNumber: '+2341' },
+        depositPaid: false,
+        status: 'CANCELLED',
       });
       prisma.rescueRequest.update.mockResolvedValue({});
 
@@ -150,12 +169,16 @@ describe('PaymentEventsService', () => {
 
     it('alerts Sentry and does nothing automatic for an unexpected non-CANCELLED status', async () => {
       prisma.rescueRequest.findFirst.mockResolvedValue({
-        id: 'req-1', customerId: 'cust-1',
-        customer: { phoneNumber: '+2341' }, assignedOperator: null,
+        id: 'req-1',
+        customerId: 'cust-1',
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: null,
       });
       prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 });
       prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
-        id: 'req-1', depositPaid: false, status: 'ARRIVED', // some other status, neither WAITING_FOR_DEPOSIT nor CANCELLED
+        id: 'req-1',
+        depositPaid: false,
+        status: 'ARRIVED', // some other status, neither WAITING_FOR_DEPOSIT nor CANCELLED
       });
 
       await service.handleDepositPaymentConfirmed('DEP_ref_1');
@@ -173,7 +196,11 @@ describe('PaymentEventsService', () => {
     it('triggers a payout for depositAmount + balanceAmount - serviceFeeAmount', async () => {
       await service.handleBalancePaymentConfirmed('BAL_ref');
 
-      expect(payoutServiceMock.createAndProcessPayout).toHaveBeenCalledWith('req-1', 'op-1', 225000);
+      expect(payoutServiceMock.createAndProcessPayout).toHaveBeenCalledWith(
+        'req-1',
+        'op-1',
+        225000,
+      );
     });
 
     it('invites a phone-only customer to create a portal account', async () => {
@@ -188,7 +215,9 @@ describe('PaymentEventsService', () => {
     it('releases any open chat relay — otherwise it swallows the rating replies prompted just below', async () => {
       await service.handleBalancePaymentConfirmed('BAL_ref');
 
-      expect(sharedService.endRelayForEndedRequest).toHaveBeenCalledWith('req-1');
+      expect(sharedService.endRelayForEndedRequest).toHaveBeenCalledWith(
+        'req-1',
+      );
     });
 
     it('claims on balancePaid so the completion only ever runs once', async () => {
@@ -212,10 +241,22 @@ describe('PaymentEventsService', () => {
 
     it('tells a customer who already has portal credentials to log in instead', async () => {
       prisma.rescueRequest.findFirst.mockResolvedValue({
-        id: 'req-1', customerId: 'cust-1', balanceAmount: 200000, depositAmount: 50000, serviceFeeAmount: 25000,
+        id: 'req-1',
+        customerId: 'cust-1',
+        balanceAmount: 200000,
+        depositAmount: 50000,
+        serviceFeeAmount: 25000,
         assignedOperatorId: 'op-1',
-        customer: { phoneNumber: '+2348012345678', email: 'ada@example.com', passwordHash: 'hashed' },
-        assignedOperator: { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2349012345678' },
+        customer: {
+          phoneNumber: '+2348012345678',
+          email: 'ada@example.com',
+          passwordHash: 'hashed',
+        },
+        assignedOperator: {
+          id: 'op-1',
+          businessName: 'Swift Towing',
+          phoneNumber: '+2349012345678',
+        },
       });
 
       await service.handleBalancePaymentConfirmed('BAL_ref');
@@ -230,22 +271,37 @@ describe('PaymentEventsService', () => {
   describe('markJobCompleted', () => {
     it('blocks a request that was ever disputed, resolved or not', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', disputed: true, disputeResolvedAt: new Date('2026-01-01'),
-        balancePaid: false, customer: { phoneNumber: '+2348012345678' },
+        id: 'req-1',
+        disputed: true,
+        disputeResolvedAt: new Date('2026-01-01'),
+        balancePaid: false,
+        customer: { phoneNumber: '+2348012345678' },
       });
 
-      await expect(service.markJobCompleted('req-1')).rejects.toThrow('unresolved dispute');
+      await expect(service.markJobCompleted('req-1')).rejects.toThrow(
+        'unresolved dispute',
+      );
       expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
     });
 
     it('proceeds normally for a request that was never disputed', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', disputed: false, disputeResolvedAt: null,
-        balancePaid: false, balanceAmount: 45000, customerId: 'cust-1',
+        id: 'req-1',
+        disputed: false,
+        disputeResolvedAt: null,
+        balancePaid: false,
+        balanceAmount: 45000,
+        customerId: 'cust-1',
         customer: { phoneNumber: '+2348012345678', email: null },
       });
       prisma.rescueRequest.update.mockResolvedValue({});
-      const paystackService = { generateReference: jest.fn().mockReturnValue('BAL-1'), initializePayment: jest.fn().mockResolvedValue({ status: true, data: { authorization_url: 'https://pay.example/1' } }) };
+      const paystackService = {
+        generateReference: jest.fn().mockReturnValue('BAL-1'),
+        initializePayment: jest.fn().mockResolvedValue({
+          status: true,
+          data: { authorization_url: 'https://pay.example/1' },
+        }),
+      };
       (service as any).paystackService = paystackService;
 
       await service.markJobCompleted('req-1');

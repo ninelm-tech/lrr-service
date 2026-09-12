@@ -1,4 +1,10 @@
-import { BadRequestException, forwardRef, Inject, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  forwardRef,
+  Inject,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { RescueRequestStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
@@ -37,7 +43,11 @@ export class DisputeService {
    * session into AWAITING_DISPUTE_REASON — without it we can still raise
    * the dispute, we just can't prompt that customer for their statement.
    */
-  async raiseDispute(rescueRequestId: string, customerPhoneNumber: string, customerUserId?: string) {
+  async raiseDispute(
+    rescueRequestId: string,
+    customerPhoneNumber: string,
+    customerUserId?: string,
+  ) {
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
       where: { id: rescueRequestId },
       include: { customer: true, assignedOperator: true },
@@ -53,13 +63,23 @@ export class DisputeService {
       return;
     }
 
-    const isReopen = rescueRequest.disputed && !!rescueRequest.disputeResolvedAt;
+    const isReopen =
+      rescueRequest.disputed && !!rescueRequest.disputeResolvedAt;
 
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequestId },
       data: isReopen
-        ? { disputed: true, disputeRaisedAt: new Date(), disputeResolvedAt: null, status: RescueRequestStatus.IN_DISPUTE }
-        : { disputed: true, disputeRaisedAt: new Date(), status: RescueRequestStatus.IN_DISPUTE },
+        ? {
+            disputed: true,
+            disputeRaisedAt: new Date(),
+            disputeResolvedAt: null,
+            status: RescueRequestStatus.IN_DISPUTE,
+          }
+        : {
+            disputed: true,
+            disputeRaisedAt: new Date(),
+            status: RescueRequestStatus.IN_DISPUTE,
+          },
     });
 
     const config = await this.platformConfigService.getConfig();
@@ -71,8 +91,8 @@ export class DisputeService {
       toWhatsAppAddress(customerPhoneNumber),
       (isReopen
         ? `⚠️ Your dispute has been reopened. Our team is on it and will contact you shortly.`
-        : `⚠️ Your dispute has been logged. Our team will contact you within 30 minutes.`)
-        + `\n\nPlease reply with what happened, so we have your side of the story.${callLine}`,
+        : `⚠️ Your dispute has been logged. Our team will contact you within 30 minutes.`) +
+        `\n\nPlease reply with what happened, so we have your side of the story.${callLine}`,
     );
 
     if (customerUserId) {
@@ -87,7 +107,9 @@ export class DisputeService {
     // a failed operator notification shouldn't block the dispute itself.
     if (rescueRequest.assignedOperator?.phoneNumber) {
       try {
-        const opUser = await this.sharedService.findOrCreateCustomer(rescueRequest.assignedOperator.phoneNumber);
+        const opUser = await this.sharedService.findOrCreateCustomer(
+          rescueRequest.assignedOperator.phoneNumber,
+        );
         await this.sessionStore.update(opUser.id, {
           state: WhatsAppFlowState.AWAITING_DISPUTE_RESPONSE,
           rescueRequestId,
@@ -96,9 +118,9 @@ export class DisputeService {
           toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
           (isReopen
             ? `⚠️ The customer's dispute on ${formatJobRef(rescueRequestId)} has been reopened.`
-            : `⚠️ The customer has disputed ${formatJobRef(rescueRequestId)}. Our team will review shortly.`)
-            + `\n\nDo NOT release the vehicle until you hear from us.`
-            + `\n\nPlease reply with your side of what happened.${callLine}`,
+            : `⚠️ The customer has disputed ${formatJobRef(rescueRequestId)}. Our team will review shortly.`) +
+            `\n\nDo NOT release the vehicle until you hear from us.` +
+            `\n\nPlease reply with your side of what happened.${callLine}`,
         );
       } catch (error) {
         console.error('Failed to notify operator of raised dispute:', error);
@@ -166,8 +188,14 @@ export class DisputeService {
     resolutionNote: string,
     balanceAdjustmentPercent = 100,
   ): Promise<{ resolved: boolean }> {
-    if (!Number.isInteger(balanceAdjustmentPercent) || balanceAdjustmentPercent < 1 || balanceAdjustmentPercent > 100) {
-      throw new BadRequestException('balanceAdjustmentPercent must be an integer between 1 and 100.');
+    if (
+      !Number.isInteger(balanceAdjustmentPercent) ||
+      balanceAdjustmentPercent < 1 ||
+      balanceAdjustmentPercent > 100
+    ) {
+      throw new BadRequestException(
+        'balanceAdjustmentPercent must be an integer between 1 and 100.',
+      );
     }
 
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
@@ -186,7 +214,9 @@ export class DisputeService {
     }
 
     const originalBalance = rescueRequest.balanceAmount ?? 0;
-    const settledBalance = Math.round(originalBalance * balanceAdjustmentPercent / 100);
+    const settledBalance = Math.round(
+      (originalBalance * balanceAdjustmentPercent) / 100,
+    );
 
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequestId },
@@ -200,14 +230,20 @@ export class DisputeService {
 
     // Send the settlement payment link directly — resolving a dispute
     // replaces the customer's CONFIRM, it doesn't ask them to CONFIRM again.
-    await this.paymentEventsService.sendBalancePaymentLink({ ...rescueRequest, balanceAmount: settledBalance });
+    await this.paymentEventsService.sendBalancePaymentLink({
+      ...rescueRequest,
+      balanceAmount: settledBalance,
+    });
 
     const jobRef = formatJobRef(rescueRequestId);
     const operatorMessage = `The dispute on ${jobRef} has been resolved. A payment link for ₦${(settledBalance / 100).toLocaleString()} has been sent to the customer.`;
 
     try {
       if (rescueRequest.assignedOperator?.phoneNumber) {
-        await this.twilioService.sendWhatsAppMessage(toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber), operatorMessage);
+        await this.twilioService.sendWhatsAppMessage(
+          toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
+          operatorMessage,
+        );
       }
     } catch (error) {
       console.error('Failed to notify operator of dispute resolution:', error);

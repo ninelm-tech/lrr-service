@@ -1,11 +1,17 @@
 import { IssueType, RescueRequestStatus } from '@prisma/client';
 
 export function formatIssueType(issueType: IssueType): string {
-  return issueType.replace('_', ' ').toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+  return issueType
+    .replace('_', ' ')
+    .toLowerCase()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 export function formatStatus(status: RescueRequestStatus): string {
-  return status.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+  return status
+    .replace(/_/g, ' ')
+    .toLowerCase()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 /**
@@ -24,7 +30,9 @@ export function formatJobRef(rescueRequestId: string): string {
  * message. Best-effort: if API_BASE_URL isn't configured, the section is
  * simply omitted — this must never block the dispatch offer itself.
  */
-export function buildMediaLinksSection(mediaItems: Array<{ id: string }>): string {
+export function buildMediaLinksSection(
+  mediaItems: Array<{ id: string }>,
+): string {
   if (mediaItems.length === 0) return '';
 
   const apiBaseUrl = process.env.API_BASE_URL;
