@@ -1,4 +1,9 @@
-import { BadRequestException, Injectable, forwardRef, Inject } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  forwardRef,
+  Inject,
+} from '@nestjs/common';
 import * as Sentry from '@sentry/node';
 import { logger } from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
@@ -7,7 +12,7 @@ import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PayoutService } from '../payout/payout.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
-import { RescueRequestStatus, VehicleType } from '@prisma/client';
+import { RescueRequestStatus } from '@prisma/client';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { formatVehicleType } from './domain/vehicle-truck-mapping';
 import { formatJobRef } from './domain/rescue-request-formatting';
@@ -36,16 +41,19 @@ export class PaymentEventsService {
     console.log('🔍 Deposit confirmed, reference:', reference);
 
     const rescueRequest = await this.prisma.rescueRequest.findFirst({
-      where:   { depositReference: reference },
+      where: { depositReference: reference },
       include: { customer: true, assignedOperator: true },
     });
     if (!rescueRequest) {
       console.error('❌ No rescue request for deposit reference:', reference);
-      Sentry.captureMessage(`Deposit webhook: no request found for reference ${reference}`, 'error');
+      Sentry.captureMessage(
+        `Deposit webhook: no request found for reference ${reference}`,
+        'error',
+      );
       return;
     }
 
-    const customerId    = rescueRequest.customerId;
+    const customerId = rescueRequest.customerId;
     const customerPhone = rescueRequest.customer.phoneNumber;
 
     // Mark deposit paid and fully confirm the operator assignment — atomic
@@ -53,8 +61,14 @@ export class PaymentEventsService {
     // match; see handleUnclaimedDeposit for why that's ambiguous and must
     // not be treated as "always late payment."
     const claimed = await this.prisma.rescueRequest.updateMany({
-      where: { id: rescueRequest.id, status: RescueRequestStatus.WAITING_FOR_DEPOSIT },
-      data:  { depositPaid: true, status: RescueRequestStatus.OPERATOR_ASSIGNED },
+      where: {
+        id: rescueRequest.id,
+        status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
+      },
+      data: {
+        depositPaid: true,
+        status: RescueRequestStatus.OPERATOR_ASSIGNED,
+      },
     });
     if (claimed.count === 0) {
       await this.handleUnclaimedDeposit(rescueRequest.id, reference);
@@ -84,24 +98,29 @@ export class PaymentEventsService {
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
         operator
-          ? `✅ *Payment confirmed — operator is on the way!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType as VehicleType) : 'Unknown'}\n\nYou'll be notified when they arrive.`
+          ? `✅ *Payment confirmed — operator is on the way!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType) : 'Unknown'}\n\nYou'll be notified when they arrive.`
           : `✅ Deposit confirmed! Finding the nearest tow operator...`,
       );
     }
 
     if (operator) {
       // Operator: job is now live — send customer location + details
-      const opUser = await this.sharedService.findOrCreateCustomer(operator.phoneNumber);
+      const opUser = await this.sharedService.findOrCreateCustomer(
+        operator.phoneNumber,
+      );
       await this.sessionStore.update(opUser.id, {
-        state:           WhatsAppFlowState.OPERATOR_ON_JOB,
+        state: WhatsAppFlowState.OPERATOR_ON_JOB,
         rescueRequestId: rescueRequest.id,
       });
       const lat = Number(rescueRequest.latitude);
       const lon = Number(rescueRequest.longitude);
-      const locationSection = await this.sharedService.formatLocationSection(lat, lon);
+      const locationSection = await this.sharedService.formatLocationSection(
+        lat,
+        lon,
+      );
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(operator.phoneNumber),
-        `💰 *Payment confirmed — job is live!* — ${formatJobRef(rescueRequest.id)}\n\nCustomer: ${customerPhone}\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType as VehicleType) : 'Unknown'}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
+        `💰 *Payment confirmed — job is live!* — ${formatJobRef(rescueRequest.id)}\n\nCustomer: ${customerPhone}\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType) : 'Unknown'}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
       );
     } else {
       // Edge case: no operator was pre-assigned (e.g. admin manually sent a payment link)
@@ -117,14 +136,20 @@ export class PaymentEventsService {
    * docs/superpowers/specs/2026-08-25-deposit-window-and-refunds-design.md
    * Section 2.
    */
-  private async handleUnclaimedDeposit(rescueRequestId: string, reference: string): Promise<void> {
+  private async handleUnclaimedDeposit(
+    rescueRequestId: string,
+    reference: string,
+  ): Promise<void> {
     const fresh = await this.prisma.rescueRequest.findUniqueOrThrow({
-      where:   { id: rescueRequestId },
+      where: { id: rescueRequestId },
       include: { customer: true },
     });
 
     if (fresh.depositPaid) {
-      logger.info('deposit: duplicate confirmation ignored', { rescueRequestId, reference });
+      logger.info('deposit: duplicate confirmation ignored', {
+        rescueRequestId,
+        reference,
+      });
       return;
     }
 
@@ -133,11 +158,17 @@ export class PaymentEventsService {
       return;
     }
 
-    console.error(`Deposit confirmed for request ${rescueRequestId} in unexpected status ${fresh.status}`, { reference });
-    Sentry.captureMessage('Deposit confirmed in unexpected (non-CANCELLED) status', {
-      level: 'error',
-      extra: { rescueRequestId, reference, status: fresh.status },
-    });
+    console.error(
+      `Deposit confirmed for request ${rescueRequestId} in unexpected status ${fresh.status}`,
+      { reference },
+    );
+    Sentry.captureMessage(
+      'Deposit confirmed in unexpected (non-CANCELLED) status',
+      {
+        level: 'error',
+        extra: { rescueRequestId, reference, status: fresh.status },
+      },
+    );
   }
 
   /**
@@ -146,10 +177,13 @@ export class PaymentEventsService {
    * moved on with nothing paid yet," which is exactly and only what this
    * feature's refund path is for. Do not write ELIGIBLE anywhere else.
    */
-  private async handleLateDeposit(rescueRequest: { id: string; customer: { phoneNumber: string | null } }, reference: string): Promise<void> {
+  private async handleLateDeposit(
+    rescueRequest: { id: string; customer: { phoneNumber: string | null } },
+    reference: string,
+  ): Promise<void> {
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequest.id },
-      data:  { depositPaid: true, depositRefundStatus: 'ELIGIBLE' },
+      data: { depositPaid: true, depositRefundStatus: 'ELIGIBLE' },
     });
     if (rescueRequest.customer.phoneNumber) {
       await this.twilioService.sendWhatsAppMessage(
@@ -157,7 +191,10 @@ export class PaymentEventsService {
         `Your payment for a cancelled request has come through. We're processing a refund — you'll be notified once it's complete.`,
       );
     }
-    logger.info('deposit: late payment on a non-WAITING_FOR_DEPOSIT request', { rescueRequestId: rescueRequest.id, reference });
+    logger.info('deposit: late payment on a non-WAITING_FOR_DEPOSIT request', {
+      rescueRequestId: rescueRequest.id,
+      reference,
+    });
   }
 
   async handleBalancePaymentConfirmed(reference: string) {
@@ -169,7 +206,10 @@ export class PaymentEventsService {
     });
     if (!rescueRequest) {
       console.error('❌ No rescue request for balance reference:', reference);
-      Sentry.captureMessage(`Balance webhook: no request found for reference ${reference}`, 'error');
+      Sentry.captureMessage(
+        `Balance webhook: no request found for reference ${reference}`,
+        'error',
+      );
       return;
     }
 
@@ -181,7 +221,7 @@ export class PaymentEventsService {
     // Payout.rescueRequestId stops.
     const claimed = await this.prisma.rescueRequest.updateMany({
       where: { id: rescueRequest.id, balancePaid: false },
-      data:  { balancePaid: true, status: RescueRequestStatus.COMPLETED },
+      data: { balancePaid: true, status: RescueRequestStatus.COMPLETED },
     });
     if (claimed.count === 0) return;
 
@@ -191,9 +231,11 @@ export class PaymentEventsService {
     await this.sharedService.endRelayForEndedRequest(rescueRequest.id);
 
     // Notify customer — payment confirmed, then prompt to rate the operator
-    const customerId    = rescueRequest.customerId;
+    const customerId = rescueRequest.customerId;
     const customerPhone = rescueRequest.customer.phoneNumber;
-    const balanceNaira  = ((rescueRequest.balanceAmount ?? 0) / 100).toLocaleString();
+    const balanceNaira = (
+      (rescueRequest.balanceAmount ?? 0) / 100
+    ).toLocaleString();
     const operator = rescueRequest.assignedOperator;
     if (customerPhone) {
       await this.twilioService.sendWhatsAppMessage(
@@ -202,7 +244,9 @@ export class PaymentEventsService {
       );
       const operatorName = operator?.businessName ?? 'your operator';
       const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
-      const hasPortalAccount = Boolean(rescueRequest.customer.email && rescueRequest.customer.passwordHash);
+      const hasPortalAccount = Boolean(
+        rescueRequest.customer.email && rescueRequest.customer.passwordHash,
+      );
       const portalLine = hasPortalAccount
         ? `\n\nWant to see your receipt? Log in at ${frontendUrl}/login`
         : `\n\nWant to see your receipt and past requests? Create an account at ${frontendUrl}/register/customer`;
@@ -215,7 +259,10 @@ export class PaymentEventsService {
       state: WhatsAppFlowState.WAITING_FOR_RATING,
       rescueRequestId: rescueRequest.id,
     });
-    this.customerFlowService.scheduleRatingTimeout(customerId, rescueRequest.id);
+    this.customerFlowService.scheduleRatingTimeout(
+      customerId,
+      rescueRequest.id,
+    );
 
     // Notify operator — release the vehicle, then prompt to rate the motorist
     //
@@ -234,20 +281,34 @@ export class PaymentEventsService {
         toWhatsAppAddress(operator.phoneNumber),
         `How was your experience with this customer? — ${jobRef}\n\nReply with a number from 1 to 5 to rate them.`,
       );
-      const opUser = await this.sharedService.findOrCreateCustomer(operator.phoneNumber);
+      const opUser = await this.sharedService.findOrCreateCustomer(
+        operator.phoneNumber,
+      );
       await this.sessionStore.update(opUser.id, {
         state: WhatsAppFlowState.WAITING_FOR_RATING,
         rescueRequestId: rescueRequest.id,
       });
-      this.customerFlowService.scheduleRatingTimeout(opUser.id, rescueRequest.id);
+      this.customerFlowService.scheduleRatingTimeout(
+        opUser.id,
+        rescueRequest.id,
+      );
     }
 
     if (rescueRequest.assignedOperatorId) {
-      const payoutAmount = (rescueRequest.depositAmount ?? 0) + (rescueRequest.balanceAmount ?? 0) - (rescueRequest.serviceFeeAmount ?? 0);
-      await this.payoutService.createAndProcessPayout(rescueRequest.id, rescueRequest.assignedOperatorId, payoutAmount);
+      const payoutAmount =
+        (rescueRequest.depositAmount ?? 0) +
+        (rescueRequest.balanceAmount ?? 0) -
+        (rescueRequest.serviceFeeAmount ?? 0);
+      await this.payoutService.createAndProcessPayout(
+        rescueRequest.id,
+        rescueRequest.assignedOperatorId,
+        payoutAmount,
+      );
     }
 
-    console.log(`✅ Job ${rescueRequest.id} completed — operator and customer notified`);
+    console.log(
+      `✅ Job ${rescueRequest.id} completed — operator and customer notified`,
+    );
   }
 
   async markJobCompleted(rescueRequestId: string) {
@@ -268,12 +329,14 @@ export class PaymentEventsService {
     // payment — both the admin "mark completed" shortcut and a same-message
     // CONFIRM/DISPUTE race were the two ways this used to be bypassed.
     if (rescueRequest.disputed) {
-      throw new BadRequestException('This request has an unresolved dispute — resolve it before marking the job completed.');
+      throw new BadRequestException(
+        'This request has an unresolved dispute — resolve it before marking the job completed.',
+      );
     }
 
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequestId },
-      data:  { status: RescueRequestStatus.COMPLETED },
+      data: { status: RescueRequestStatus.COMPLETED },
     });
 
     if (!rescueRequest.balancePaid) {
@@ -287,13 +350,21 @@ export class PaymentEventsService {
 
     const balanceAmount = rescueRequest.balanceAmount;
     if (!balanceAmount) {
-      console.error('No balanceAmount persisted for rescue request:', rescueRequest.id);
-      Sentry.captureMessage(`sendBalancePaymentLink: missing balanceAmount for ${rescueRequest.id}`, 'error');
+      console.error(
+        'No balanceAmount persisted for rescue request:',
+        rescueRequest.id,
+      );
+      Sentry.captureMessage(
+        `sendBalancePaymentLink: missing balanceAmount for ${rescueRequest.id}`,
+        'error',
+      );
       return;
     }
 
     const reference = this.paystackService.generateReference('BAL');
-    const email = rescueRequest.customer.email || `${customerPhone.replace(/\D/g, '')}@lrr.ng`;
+    const email =
+      rescueRequest.customer.email ||
+      `${customerPhone.replace(/\D/g, '')}@lrr.ng`;
 
     const paymentResponse = await this.paystackService.initializePayment({
       email,
@@ -301,8 +372,8 @@ export class PaymentEventsService {
       reference,
       metadata: {
         rescueRequestId: rescueRequest.id,
-        customerId:      rescueRequest.customerId,
-        phoneNumber:     customerPhone,
+        customerId: rescueRequest.customerId,
+        phoneNumber: customerPhone,
         type: 'balance',
       },
     });
@@ -314,7 +385,7 @@ export class PaymentEventsService {
 
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequest.id },
-      data:  { balanceReference: reference },
+      data: { balanceReference: reference },
     });
 
     const balanceNaira = (balanceAmount / 100).toLocaleString();

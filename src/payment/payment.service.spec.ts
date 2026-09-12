@@ -1,3 +1,4 @@
+import * as crypto from 'crypto';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { PaymentService } from './payment.service';
@@ -37,28 +38,52 @@ describe('PaymentService', () => {
 
   describe('verifyWebhookSignature', () => {
     it('accepts a signature computed over the exact raw bytes', () => {
-      const crypto = require('crypto');
-      const rawBody = Buffer.from(JSON.stringify({ event: 'charge.success', data: { reference: 'DEP_1' } }));
-      const validSignature = crypto.createHmac('sha512', '').update(rawBody).digest('hex');
+      const rawBody = Buffer.from(
+        JSON.stringify({
+          event: 'charge.success',
+          data: { reference: 'DEP_1' },
+        }),
+      );
+      const validSignature = crypto
+        .createHmac('sha512', '')
+        .update(rawBody)
+        .digest('hex');
 
-      expect(service.verifyWebhookSignature(rawBody, validSignature)).toBe(true);
+      expect(service.verifyWebhookSignature(rawBody, validSignature)).toBe(
+        true,
+      );
     });
 
     it('rejects a signature computed over a re-serialized (not raw) body', () => {
       // Re-stringifying a parsed object isn't guaranteed to reproduce the
       // original bytes — this is exactly the bug that made real Paystack
       // webhooks fail signature verification.
-      const crypto = require('crypto');
-      const original = { data: { reference: 'DEP_1' }, event: 'charge.success' };
+      const original = {
+        data: { reference: 'DEP_1' },
+        event: 'charge.success',
+      };
       const rawBody = Buffer.from(JSON.stringify(original));
-      const validSignature = crypto.createHmac('sha512', '').update(rawBody).digest('hex');
+      const validSignature = crypto
+        .createHmac('sha512', '')
+        .update(rawBody)
+        .digest('hex');
 
-      const reserialized = JSON.stringify(JSON.parse(rawBody.toString()), Object.keys(original).reverse());
-      expect(service.verifyWebhookSignature(reserialized, validSignature)).toBe(false);
+      const reserialized = JSON.stringify(
+        JSON.parse(rawBody.toString()),
+        Object.keys(original).reverse(),
+      );
+      expect(service.verifyWebhookSignature(reserialized, validSignature)).toBe(
+        false,
+      );
     });
 
     it('rejects a mismatched signature', () => {
-      expect(service.verifyWebhookSignature(Buffer.from('{}'), 'not-a-real-signature')).toBe(false);
+      expect(
+        service.verifyWebhookSignature(
+          Buffer.from('{}'),
+          'not-a-real-signature',
+        ),
+      ).toBe(false);
     });
   });
 
@@ -69,16 +94,26 @@ describe('PaymentService', () => {
         data: { transfer_code: 'TRF_test123', reason: 'Job payout' },
       });
 
-      expect(payoutService.confirmTransferOutcome).toHaveBeenCalledWith('TRF_test123', 'SUCCESS');
+      expect(payoutService.confirmTransferOutcome).toHaveBeenCalledWith(
+        'TRF_test123',
+        'SUCCESS',
+      );
     });
 
     it('confirms FAILED with the reason on transfer.failed', async () => {
       await service.handlePaystackWebhook({
         event: 'transfer.failed',
-        data: { transfer_code: 'TRF_test123', reason: 'Invalid account number' },
+        data: {
+          transfer_code: 'TRF_test123',
+          reason: 'Invalid account number',
+        },
       });
 
-      expect(payoutService.confirmTransferOutcome).toHaveBeenCalledWith('TRF_test123', 'FAILED', 'Invalid account number');
+      expect(payoutService.confirmTransferOutcome).toHaveBeenCalledWith(
+        'TRF_test123',
+        'FAILED',
+        'Invalid account number',
+      );
     });
 
     it('confirms FAILED on transfer.reversed', async () => {
@@ -87,7 +122,11 @@ describe('PaymentService', () => {
         data: { transfer_code: 'TRF_test123', reason: 'Reversed by bank' },
       });
 
-      expect(payoutService.confirmTransferOutcome).toHaveBeenCalledWith('TRF_test123', 'FAILED', 'Reversed by bank');
+      expect(payoutService.confirmTransferOutcome).toHaveBeenCalledWith(
+        'TRF_test123',
+        'FAILED',
+        'Reversed by bank',
+      );
     });
   });
 });

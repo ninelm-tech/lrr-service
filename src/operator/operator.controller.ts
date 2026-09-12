@@ -16,7 +16,7 @@ import { OperatorService } from './operator.service';
 import { CreateOperatorDto } from './dto/create-operator.dto';
 import { UpdateOperatorProfileDto } from './dto/update-operator-profile.dto';
 import { SaveBankDetailsDto } from './dto/save-bank-details.dto';
-import { OperatorMemberRole, OperatorStatus, OperatorType, UserRole } from '@prisma/client';
+import { OperatorMemberRole, OperatorStatus, UserRole } from '@prisma/client';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -58,7 +58,9 @@ export class OperatorController {
   @UseGuards(AuthGuard)
   @Get('all-stats')
   async getAllStats(@Query('days') days?: string) {
-    const stats = await this.operatorService.getAllOperatorStats(days ? parseInt(days, 10) : 30);
+    const stats = await this.operatorService.getAllOperatorStats(
+      days ? parseInt(days, 10) : 30,
+    );
     return { data: stats };
   }
 
@@ -70,7 +72,8 @@ export class OperatorController {
   @Get('me')
   async getMyOperator(@Req() req: any) {
     const operator = await this.operatorService.findByUserId(req.user.userId);
-    if (!operator) throw new NotFoundException('No operator account found for this user');
+    if (!operator)
+      throw new NotFoundException('No operator account found for this user');
     return { data: operator };
   }
 
@@ -90,7 +93,10 @@ export class OperatorController {
   @UseGuards(AuthGuard)
   @Get(':id/stats')
   async getStats(@Param('id') id: string, @Query('days') days?: string) {
-    const stats = await this.operatorService.getOperatorStats(id, days ? parseInt(days, 10) : 30);
+    const stats = await this.operatorService.getOperatorStats(
+      id,
+      days ? parseInt(days, 10) : 30,
+    );
     return { data: stats };
   }
 
@@ -122,8 +128,14 @@ export class OperatorController {
     @Body() dto: SaveBankDetailsDto,
   ) {
     await this.operatorService.assertCanManageOperator(req.user, id);
-    if (!dto.bankCode?.trim() || !dto.bankName?.trim() || !dto.accountNumber?.trim()) {
-      throw new BadRequestException('bankCode, bankName, and accountNumber are required');
+    if (
+      !dto.bankCode?.trim() ||
+      !dto.bankName?.trim() ||
+      !dto.accountNumber?.trim()
+    ) {
+      throw new BadRequestException(
+        'bankCode, bankName, and accountNumber are required',
+      );
     }
     const operator = await this.operatorService.saveBankDetails(id, dto);
     return { message: 'Payout bank details saved', data: operator };
@@ -170,7 +182,10 @@ export class OperatorController {
     @Body('isAvailable') isAvailable: boolean,
   ) {
     await this.operatorService.assertIsMemberOrAdmin(req.user, id);
-    const operator = await this.operatorService.setAvailability(id, Boolean(isAvailable));
+    const operator = await this.operatorService.setAvailability(
+      id,
+      Boolean(isAvailable),
+    );
     return {
       message: `Operator availability set to ${isAvailable}`,
       data: operator,
@@ -199,7 +214,7 @@ export class OperatorController {
     await this.operatorService.assertCanManageOperator(req.user, id);
     const member = await this.operatorService.addMember(id, {
       userId: body.userId,
-      role:   body.role ?? OperatorMemberRole.STAFF,
+      role: body.role ?? OperatorMemberRole.STAFF,
     });
     return { message: 'Member added', data: member };
   }
