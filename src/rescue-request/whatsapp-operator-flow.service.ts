@@ -83,10 +83,21 @@ export class WhatsAppOperatorFlowService {
     // MUST come before the quote-parsing check below, which treats any bare
     // digit as a dispatch-offer price quote — without this ordering, a
     // rating reply would be silently swallowed as a bogus quote attempt.
+    //
+    // BUT only when there's no open dispatch offer right now: operators can
+    // be offered a new job while still owing a rating on a previous one
+    // (operator.service.ts findAndRankCandidates deliberately has no busy
+    // filter), and a "NO" declining that new offer must not be swallowed as
+    // an invalid rating reply. An open offer is the newer, more urgent
+    // prompt — it wins. Session state stays WAITING_FOR_RATING either way,
+    // so the operator can still rate once they're free.
     if (session.state === WhatsAppFlowState.WAITING_FOR_RATING) {
-      return this.customerFlowService.handleRatingReply(
-        userId, message, session.rescueRequestId, RatingDirection.OPERATOR_TO_MOTORIST,
-      );
+      const openOffers = await this.findOpenOffers(operator.id);
+      if (openOffers.length === 0) {
+        return this.customerFlowService.handleRatingReply(
+          userId, message, session.rescueRequestId, RatingDirection.OPERATOR_TO_MOTORIST,
+        );
+      }
     }
 
     // ── Dispatch quote / decline ─────────────────────────────────────────
@@ -155,12 +166,12 @@ export class WhatsAppOperatorFlowService {
         operatorId: operator.id, message, rescueRequestId: session.rescueRequestId,
       });
       return this.reply(
-        `📍 Send *ARRIVED* when you reach the customer location so we can notify them.`,
+        `📍 ${formatJobRef(session.rescueRequestId!)} — Send *ARRIVED* when you reach the customer location so we can notify them.`,
       );
     }
     if (session.state === WhatsAppFlowState.OPERATOR_AT_LOCATION) {
       return this.reply(
-        `✅ Send *DONE* when the job is complete. The customer will confirm and you'll both be notified.`,
+        `✅ ${formatJobRef(session.rescueRequestId!)} — Send *DONE* when the job is complete. The customer will confirm and you'll both be notified.`,
       );
     }
 
@@ -308,7 +319,7 @@ export class WhatsAppOperatorFlowService {
         operatorId: operator.id, rescueRequestId, status: rescueRequest?.status ?? 'NOT_FOUND',
       });
       await this.sessionStore.clear(operatorUserId);
-      return this.reply(`This job has already ended. Watch out for new dispatch offers.`);
+      return this.reply(`${formatJobRef(rescueRequestId)} has already ended. Watch out for new dispatch offers.`);
     }
 
     // Update request status to ARRIVED
@@ -331,7 +342,7 @@ export class WhatsAppOperatorFlowService {
       );
     }
 
-    return this.reply(`✅ Arrival confirmed! The customer has been notified.\n\nSend *DONE* when the job is complete.`);
+    return this.reply(`✅ ${formatJobRef(rescueRequestId)} — Arrival confirmed! The customer has been notified.\n\nSend *DONE* when the job is complete.`);
   }
 
   private async handleOperatorJobDone(
@@ -346,7 +357,7 @@ export class WhatsAppOperatorFlowService {
     });
     if (!rescueRequest || rescueRequest.status === RescueRequestStatus.CANCELLED || rescueRequest.status === RescueRequestStatus.COMPLETED) {
       await this.sessionStore.clear(operatorUserId);
-      return this.reply(`This job has already ended.`);
+      return this.reply(`${formatJobRef(rescueRequestId)} has already ended.`);
     }
 
     const customerPhone = rescueRequest.customer.phoneNumber;

@@ -62,6 +62,21 @@ export class WhatsAppSessionStore {
     await this.prisma.whatsAppSession.deleteMany({ where: { userId } });
   }
 
+  /**
+   * Drops any open chat relay for these users, returning how many were
+   * actually cleared so the caller can stay silent when no relay was open.
+   *
+   * updateMany, not update: a participant may have no session row at all,
+   * which update() treats as an error.
+   */
+  async clearRelayTargets(userIds: string[]): Promise<number> {
+    const { count } = await this.prisma.whatsAppSession.updateMany({
+      where: { userId: { in: userIds }, relayTarget: { not: null } },
+      data: { relayTarget: null },
+    });
+    return count;
+  }
+
   private rowToSession(row: any): WhatsAppSession {
     return {
       userId: row.userId,

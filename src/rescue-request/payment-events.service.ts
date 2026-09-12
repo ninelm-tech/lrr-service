@@ -10,6 +10,7 @@ import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { RescueRequestStatus, VehicleType } from '@prisma/client';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { formatVehicleType } from './domain/vehicle-truck-mapping';
+import { formatJobRef } from './domain/rescue-request-formatting';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { DispatchService } from './dispatch.service';
 // scheduleRatingTimeout closes a real two-way dependency with this service
@@ -177,6 +178,11 @@ export class PaymentEventsService {
       data:  { balancePaid: true, status: RescueRequestStatus.COMPLETED },
     });
 
+    // The job is over — release any chat relay before the rating prompts
+    // below land, since an open relay would otherwise swallow the replies
+    // to them (and every later message from both parties).
+    await this.sharedService.endRelayForEndedRequest(rescueRequest.id);
+
     // Notify customer — payment confirmed, then prompt to rate the operator
     const customerId    = rescueRequest.customerId;
     const customerPhone = rescueRequest.customer.phoneNumber;
@@ -205,14 +211,21 @@ export class PaymentEventsService {
     this.customerFlowService.scheduleRatingTimeout(customerId, rescueRequest.id);
 
     // Notify operator — release the vehicle, then prompt to rate the motorist
+    //
+    // Both messages carry the job ref: an operator can have more than one
+    // job in flight (no busy filter — see operator.service.ts), so a
+    // message that doesn't say which job it's about is ambiguous to them
+    // even though the customer-facing equivalent above never needs it (a
+    // motorist only ever has one active request).
     if (operator?.phoneNumber) {
+      const jobRef = formatJobRef(rescueRequest.id);
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(operator.phoneNumber),
-        `💵 *Payment received!*\n\nThe customer has paid the ₦${balanceNaira} balance in full.\n\n✅ You may now *release the vehicle*. Job complete — well done!\n\nYour payment will be remitted within 24 hours.`,
+        `💵 *Payment received!* — ${jobRef}\n\nThe customer has paid the ₦${balanceNaira} balance in full.\n\n✅ You may now *release the vehicle*. Job complete — well done!\n\nYour payment will be remitted within 24 hours.`,
       );
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(operator.phoneNumber),
-        `How was your experience with this customer? Reply with a number from 1 to 5 to rate them.`,
+        `How was your experience with this customer? — ${jobRef}\n\nReply with a number from 1 to 5 to rate them.`,
       );
       const opUser = await this.sharedService.findOrCreateCustomer(operator.phoneNumber);
       await this.sessionStore.update(opUser.id, {

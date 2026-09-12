@@ -276,6 +276,17 @@ export class WhatsAppCustomerFlowService {
           where: { id: requestIdToCancel },
           data: { status: RescueRequestStatus.CANCELLED },
         });
+        // Close out any other operators' still-PENDING offers on this job —
+        // same reasoning as RescueRequestAdminService.cancel(): without
+        // this, a cancelled-mid-bidding job keeps counting as "open" for
+        // every operator who was offered it but hasn't replied yet.
+        await this.prisma.dispatchOffer.updateMany({
+          where: { rescueRequestId: requestIdToCancel, status: 'PENDING' },
+          data: { status: 'TIMED_OUT', respondedAt: new Date() },
+        });
+        // Clearing this customer's session below drops their own relay, but
+        // the operator's sits on a separate row and would survive.
+        await this.sharedService.endRelayForEndedRequest(requestIdToCancel);
         await this.sessionStore.clear(userId);
 
         // If an operator was tentatively holding this job (awaiting customer payment),
@@ -782,6 +793,15 @@ export class WhatsAppCustomerFlowService {
     await this.prisma.dispatchOffer.updateMany({
       where: { rescueRequestId, status: 'QUOTED', id: { not: selectedOffer.id } },
       data: { status: 'NOT_SELECTED', respondedAt: new Date() },
+    });
+    // Operators who hadn't responded at all yet (never quoted, never
+    // declined) are NOT covered by the update above — it only matches
+    // QUOTED. Left PENDING, this job keeps counting as "open" for them
+    // (findOpenOffers) until their own offer's expiresAt eventually
+    // passes, well after the job has actually moved on and completed.
+    await this.prisma.dispatchOffer.updateMany({
+      where: { rescueRequestId, status: 'PENDING' },
+      data: { status: 'TIMED_OUT', respondedAt: new Date() },
     });
 
     // Notify the operators who weren't picked.

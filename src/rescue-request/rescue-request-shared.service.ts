@@ -47,6 +47,55 @@ export class RescueRequestSharedService {
   }
 
   /**
+   * Ends any masked chat relay left open on a request that has just reached
+   * a terminal state, telling both parties it's over.
+   *
+   * relayTarget is deliberately orthogonal to session state and is otherwise
+   * only cleared by an explicit END CHAT. Since the relay branch runs ahead
+   * of every other command in both flows, a job that ends mid-chat leaves
+   * both parties permanently talking into a dead job: the operator can't
+   * quote, send ARRIVED/DONE or rate, and the customer can't send SOS — or
+   * even CANCEL, which the relay swallows too. Neither can get out
+   * unprompted, so every path to a terminal status must call this.
+   *
+   * Best-effort by design: this is called from flows (payment confirmation,
+   * cancellation) that must not fail because a courtesy message didn't send.
+   */
+  async endRelayForEndedRequest(rescueRequestId: string): Promise<void> {
+    try {
+      const request = await this.prisma.rescueRequest.findUnique({
+        where: { id: rescueRequestId },
+        include: { customer: true, assignedOperator: true },
+      });
+      if (!request) return;
+
+      const phones: string[] = [];
+      const userIds: string[] = [request.customerId];
+      if (request.customer?.phoneNumber) phones.push(request.customer.phoneNumber);
+
+      if (request.assignedOperator?.phoneNumber) {
+        const operatorUser = await this.findOrCreateCustomer(request.assignedOperator.phoneNumber);
+        userIds.push(operatorUser.id);
+        phones.push(request.assignedOperator.phoneNumber);
+      }
+
+      const cleared = await this.sessionStore.clearRelayTargets(userIds);
+      if (cleared === 0) return; // no relay was open — don't message anyone
+
+      await Promise.all(
+        phones.map((phone) =>
+          this.twilioService.sendWhatsAppMessage(
+            phone,
+            `Chat ended — this job is now closed.`,
+          ),
+        ),
+      );
+    } catch (error) {
+      console.error('Failed to end chat relay for ended request:', error);
+    }
+  }
+
+  /**
    * Gives a motorist 30 minutes to pay their deposit, with reminders at
    * 5/15/25 minutes, and cancels outright at 30 — no re-dispatch, since
    * nobody declined anything; the operator was simply waiting on payment.
@@ -107,6 +156,9 @@ export class RescueRequestSharedService {
         where: { rescueRequestId, status: DispatchOfferStatus.SELECTED_PENDING_PAYMENT },
         data: { status: DispatchOfferStatus.TIMED_OUT, respondedAt: new Date() },
       });
+      // CHAT DRIVER is available from quote selection onward, so a relay can
+      // well be open on a request that dies waiting for the deposit.
+      await this.endRelayForEndedRequest(rescueRequestId);
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
         `We didn't receive payment confirmation within 30 minutes, so your request was cancelled. If your payment completes after this, we'll refund it.`,

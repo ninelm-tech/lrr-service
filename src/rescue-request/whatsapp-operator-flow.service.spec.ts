@@ -12,11 +12,19 @@ import { PlatformConfigService } from '../platform-config/platform-config.servic
 describe('WhatsAppOperatorFlowService', () => {
   describe('handleOperatorMessage — rating branch ordering', () => {
     let orderingService: WhatsAppOperatorFlowService;
-    let prisma: { operator: { findUnique: jest.Mock }; rescueRequest: { findUnique: jest.Mock } };
+    let prisma: {
+      operator: { findUnique: jest.Mock };
+      rescueRequest: { findUnique: jest.Mock };
+      dispatchOffer: { findMany: jest.Mock };
+    };
     let customerFlowService: { handleRatingReply: jest.Mock };
 
     beforeEach(async () => {
-      prisma = { operator: { findUnique: jest.fn() }, rescueRequest: { findUnique: jest.fn() } };
+      prisma = {
+        operator: { findUnique: jest.fn() },
+        rescueRequest: { findUnique: jest.fn() },
+        dispatchOffer: { findMany: jest.fn().mockResolvedValue([]) },
+      };
       customerFlowService = { handleRatingReply: jest.fn().mockResolvedValue('rated') };
 
       const module: TestingModule = await Test.createTestingModule({
@@ -24,7 +32,10 @@ describe('WhatsAppOperatorFlowService', () => {
           WhatsAppOperatorFlowService,
           { provide: PrismaService, useValue: prisma },
           { provide: TwilioService, useValue: {} },
-          { provide: DispatchService, useValue: {} },
+          {
+            provide: DispatchService,
+            useValue: { processQuoteOrDecline: jest.fn().mockResolvedValue({ message: 'declined' }) },
+          },
           { provide: PaymentEventsService, useValue: {} },
           { provide: WhatsAppCustomerFlowService, useValue: customerFlowService },
           { provide: WhatsAppSessionStore, useValue: {} },
@@ -50,6 +61,22 @@ describe('WhatsAppOperatorFlowService', () => {
         'op-user-1', '4', 'req-1', 'OPERATOR_TO_MOTORIST',
       );
       expect(result).toBe('rated');
+    });
+
+    it('routes a WAITING_FOR_RATING operator reply to the new-offer decline instead, when an offer is open', async () => {
+      const session = { state: WhatsAppFlowState.WAITING_FOR_RATING, rescueRequestId: 'req-1' } as any;
+      const operator = { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341111111111' };
+      prisma.dispatchOffer.findMany.mockResolvedValue([
+        { rescueRequestId: 'req-2', rescueRequest: { vehicleType: 'SEDAN', destination: 'Ikeja' } },
+      ]);
+      prisma.operator.findUnique.mockResolvedValue(operator);
+
+      await orderingService.handleOperatorMessage('+2341111111111', 'op-user-1', 'no', 'no', session, operator);
+
+      // A stale rating prompt must not swallow a decline for a genuinely
+      // open dispatch offer — the rating handler must not fire at all.
+      expect(customerFlowService.handleRatingReply).not.toHaveBeenCalled();
+      expect(prisma.operator.findUnique).toHaveBeenCalled();
     });
   });
 

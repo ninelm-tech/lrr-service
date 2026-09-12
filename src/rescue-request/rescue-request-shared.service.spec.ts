@@ -64,7 +64,7 @@ describe('RescueRequestSharedService', () => {
       user: { upsert: jest.Mock };
     };
     let twilioService: { sendWhatsAppMessage: jest.Mock };
-    let sessionStore: { update: jest.Mock };
+    let sessionStore: { update: jest.Mock; clearRelayTargets: jest.Mock };
 
     beforeEach(async () => {
       fullPrisma = {
@@ -73,7 +73,7 @@ describe('RescueRequestSharedService', () => {
         user: { upsert: jest.fn() },
       };
       twilioService = { sendWhatsAppMessage: jest.fn() };
-      sessionStore = { update: jest.fn() };
+      sessionStore = { update: jest.fn(), clearRelayTargets: jest.fn().mockResolvedValue(0) };
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
@@ -102,8 +102,10 @@ describe('RescueRequestSharedService', () => {
         paymentUrl: 'https://paystack.com/pay/abc',
       });
 
-      jest.advanceTimersByTime(30 * 60 * 1000);
-      await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); // flush pending microtasks from the timer callback
+      // Async variant drains the callback's microtasks for us — a fixed
+      // chain of `await Promise.resolve()` silently under-flushes as soon as
+      // the timer body gains another await.
+      await jest.advanceTimersByTimeAsync(30 * 60 * 1000);
 
       expect(fullPrisma.rescueRequest.updateMany).toHaveBeenCalledWith({
         where: { id: 'req-1', status: 'WAITING_FOR_DEPOSIT' },
@@ -170,6 +172,71 @@ describe('RescueRequestSharedService', () => {
       await Promise.resolve(); await Promise.resolve();
 
       expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('endRelayForEndedRequest', () => {
+    let service: RescueRequestSharedService;
+    let prisma: {
+      rescueRequest: { findUnique: jest.Mock };
+      user: { upsert: jest.Mock };
+    };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
+    let sessionStore: { clearRelayTargets: jest.Mock };
+
+    const requestWithOperator = {
+      id: 'req-1',
+      customerId: 'cust-user-1',
+      customer: { phoneNumber: '+2341' },
+      assignedOperator: { phoneNumber: '+2342' },
+    };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: { findUnique: jest.fn().mockResolvedValue(requestWithOperator) },
+        user: { upsert: jest.fn().mockResolvedValue({ id: 'op-user-1' }) },
+      };
+      twilioService = { sendWhatsAppMessage: jest.fn() };
+      sessionStore = { clearRelayTargets: jest.fn().mockResolvedValue(2) };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestSharedService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: GeocodingService, useValue: {} },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+        ],
+      }).compile();
+
+      service = module.get(RescueRequestSharedService);
+    });
+
+    it('clears the relay for BOTH participants — the operator sits on a separate session row', async () => {
+      await service.endRelayForEndedRequest('req-1');
+
+      expect(sessionStore.clearRelayTargets).toHaveBeenCalledWith(['cust-user-1', 'op-user-1']);
+    });
+
+    it('tells both parties the chat is over', async () => {
+      await service.endRelayForEndedRequest('req-1');
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith('+2341', expect.stringContaining('Chat ended'));
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith('+2342', expect.stringContaining('Chat ended'));
+    });
+
+    it('stays silent when no relay was open — the common case, and must not spam every completed job', async () => {
+      sessionStore.clearRelayTargets.mockResolvedValue(0);
+
+      await service.endRelayForEndedRequest('req-1');
+
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+
+    it('never throws — it runs inside payment and cancellation flows that must not fail on it', async () => {
+      prisma.rescueRequest.findUnique.mockRejectedValue(new Error('db down'));
+
+      await expect(service.endRelayForEndedRequest('req-1')).resolves.toBeUndefined();
     });
   });
 });

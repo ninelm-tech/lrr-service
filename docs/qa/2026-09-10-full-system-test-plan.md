@@ -1,9 +1,11 @@
 # LRR Full System Test Plan
 
-**Date:** 2026-09-10
-**Scope:** Every customer/operator/staff-facing flow currently implemented, on staging. Manual, WhatsApp + admin dashboard driven — the automated Jest suite (286 tests, `lrr-service`) already covers unit-level logic; this plan verifies the real, end-to-end experience a real user would have.
+**Date:** 2026-09-10 · **Last updated:** 2026-09-12 (added §13 after a live test pass found stale-state bugs)
+**Scope:** Every customer/operator/staff-facing flow currently implemented, on staging. Manual, WhatsApp + admin dashboard driven — the automated Jest suite (292 tests, `lrr-service`) already covers unit-level logic; this plan verifies the real, end-to-end experience a real user would have.
 
 **How to use this:** Work top to bottom. Each numbered case has Setup → Steps → Expected Result. Check the box when the actual result matches. If it doesn't, stop, note what actually happened, and file it rather than continuing past a failure in that flow — later cases often assume the earlier ones worked.
+
+**Do not reset between scenarios.** Run the whole plan as one continuous session with the same test operator and motorist numbers. A run that starts clean each time will pass while real users fail: the bugs found on 2026-09-12 were all cases where state from an earlier job leaked into a later one, and none of them are reachable on a first pass. §13 exists specifically to test that accumulated history, so leave it until last.
 
 **You'll need:**
 - A test motorist WhatsApp number (not staff, not an existing operator)
@@ -241,6 +243,48 @@
 - [ ] **12.3 — Cancel an active request**
   Send `CANCEL` at various stages (before deposit, after deposit, mid-dispatch).
   **Expected:** Cancels cleanly each time; no charge if deposit wasn't paid; assigned operator (if any) notified.
+
+---
+
+## 13. Stale State Across Sequential Jobs
+
+This whole section exists because of a real failure found on 2026-09-12. Running the plan top to bottom means the same test operator accumulates history — finished jobs, cancelled jobs, offers they never replied to. Several bugs only appear on the *second or third* run through a flow, never the first, so a clean single pass will not catch them.
+
+**Setup for this section:** you need the test operator to have been through at least three earlier scenarios — one completed, one cancelled, and at least one where the operator was sent an offer and simply never replied to it. If you've worked through §1–§12 in order, you already have this.
+
+- [ ] **13.1 — Open-job list contains only genuinely live jobs**
+  Get a fresh offer out to the test operator, then reply with a bare price (e.g. `28000`).
+  **Expected:** Either the quote is accepted outright (if this is their only live offer), or the "you have N jobs open at once" list appears containing **only** jobs that are actually still live. A completed or cancelled job must never appear in that list.
+  *This is the exact bug found on 2026-09-12: three old jobs were listed as open after they'd already ended.*
+
+- [ ] **13.2 — Abandoned request releases the operator's offer**
+  Start a request, let the operator receive the offer, and have the operator reply *nothing at all*. Let the request run until it auto-cancels (no operators left to try).
+  **Expected:** Once the motorist is told the request was cancelled, that job no longer counts as open for the operator — verify by triggering 13.1 again and confirming it's absent from the list.
+
+- [ ] **13.3 — Motorist-cancelled request releases the operator's offer**
+  Same as 13.2, but the motorist sends `CANCEL` while the operator's offer is still unanswered.
+  **Expected:** Same — the job disappears from the operator's open-job list immediately, not minutes later.
+
+- [ ] **13.4 — Admin-cancelled request releases the operator's offer**
+  Same again, but cancel from the admin dashboard (both the Cancel action and a manual status change to Cancelled) while the operator's offer is unanswered.
+  **Expected:** Same as 13.3.
+
+- [ ] **13.5 — Declining a new offer while a rating is still owed**
+  Complete a job so the operator is prompted to rate the motorist, and **do not reply to that prompt**. Then send the operator a fresh dispatch offer for a different job and reply `NO` to decline it.
+  **Expected:** The decline is recorded against the new job. The operator must **not** be told "please reply with a number from 1 to 5" — the outstanding rating prompt must not swallow the decline.
+  *Found 2026-09-12: the stale rating prompt intercepted the decline and recorded a 1-star rating on the old job instead.*
+
+- [ ] **13.6 — Quoting while a rating is still owed**
+  Same setup as 13.5, but reply with a price (e.g. `30000`) instead of `NO`.
+  **Expected:** Treated as a quote on the new job, not as a star rating on the old one.
+
+- [ ] **13.7 — Rating still works once no offer is live**
+  With the rating prompt still outstanding and **no** live offers, reply with a number 1–5.
+  **Expected:** Recorded as a rating as normal. (13.5/13.6 must not have broken the ordinary rating path.)
+
+- [ ] **13.8 — Every operator-facing message names its job**
+  Working through a job end to end, check each message the operator receives: dispatch offer, countdown notice, arrival confirmation, DONE/ARRIVED reminders, "payment received / release the vehicle", the rating prompt, and any "this job has already ended" reply.
+  **Expected:** Every one of them names the job reference (e.g. `Job #UH8DF7`). An operator juggling several jobs must never get a message that just says "the job" or "this customer" with no way to tell which. Motorist-facing messages don't need this — a motorist only ever has one active request.
 
 ---
 
