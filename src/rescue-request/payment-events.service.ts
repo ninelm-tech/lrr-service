@@ -101,7 +101,7 @@ export class PaymentEventsService {
       const locationSection = await this.sharedService.formatLocationSection(lat, lon);
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(operator.phoneNumber),
-        `💰 *Payment confirmed — job is live!*\n\nCustomer: ${customerPhone}\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType as VehicleType) : 'Unknown'}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
+        `💰 *Payment confirmed — job is live!* — ${formatJobRef(rescueRequest.id)}\n\nCustomer: ${customerPhone}\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType as VehicleType) : 'Unknown'}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
       );
     } else {
       // Edge case: no operator was pre-assigned (e.g. admin manually sent a payment link)
@@ -173,10 +173,17 @@ export class PaymentEventsService {
       return;
     }
 
-    await this.prisma.rescueRequest.update({
-      where: { id: rescueRequest.id },
+    // Atomic claim, mirroring handleDepositPaymentConfirmed: Paystack retries
+    // webhooks, and an unconditional update would re-run everything below on
+    // a redelivery — both parties told "payment confirmed" twice, both rating
+    // prompts re-sent, the rating session re-armed under a reply they already
+    // gave, and a duplicate payout insert that only the unique constraint on
+    // Payout.rescueRequestId stops.
+    const claimed = await this.prisma.rescueRequest.updateMany({
+      where: { id: rescueRequest.id, balancePaid: false },
       data:  { balancePaid: true, status: RescueRequestStatus.COMPLETED },
     });
+    if (claimed.count === 0) return;
 
     // The job is over — release any chat relay before the rating prompts
     // below land, since an open relay would otherwise swallow the replies

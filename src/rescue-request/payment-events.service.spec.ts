@@ -191,6 +191,25 @@ describe('PaymentEventsService', () => {
       expect(sharedService.endRelayForEndedRequest).toHaveBeenCalledWith('req-1');
     });
 
+    it('claims on balancePaid so the completion only ever runs once', async () => {
+      await service.handleBalancePaymentConfirmed('BAL_ref');
+
+      expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith({
+        where: { id: 'req-1', balancePaid: false },
+        data: { balancePaid: true, status: 'COMPLETED' },
+      });
+    });
+
+    it('is a silent no-op on a webhook redelivery — no second payout, no duplicate messages', async () => {
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 }); // already claimed
+
+      await service.handleBalancePaymentConfirmed('BAL_ref');
+
+      expect(payoutServiceMock.createAndProcessPayout).not.toHaveBeenCalled();
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+      expect(customerFlowService.scheduleRatingTimeout).not.toHaveBeenCalled();
+    });
+
     it('tells a customer who already has portal credentials to log in instead', async () => {
       prisma.rescueRequest.findFirst.mockResolvedValue({
         id: 'req-1', customerId: 'cust-1', balanceAmount: 200000, depositAmount: 50000, serviceFeeAmount: 25000,

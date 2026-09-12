@@ -5,6 +5,7 @@ import { TwilioService } from '../integrations/twilio/twilio.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { DispatchOfferStatus, RescueRequestStatus, UserRole } from '@prisma/client';
+import { formatJobRef } from './domain/rescue-request-formatting';
 
 /**
  * Small shared helpers with no WhatsApp-flow state of their own, used by
@@ -165,7 +166,7 @@ export class RescueRequestSharedService {
       );
       await this.twilioService.sendWhatsAppMessage(
         operatorPhone,
-        `⏰ This job is no longer available — the customer didn't pay in time.`,
+        `⏰ ${formatJobRef(rescueRequestId)} is no longer available — the customer didn't pay in time.`,
       );
     }, this.DEPOSIT_WINDOW_MS);
   }
