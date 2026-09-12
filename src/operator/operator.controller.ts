@@ -1,27 +1,25 @@
 import {
+  BadRequestException,
   Body,
   Controller,
+  Delete,
   Get,
+  NotFoundException,
   Param,
   Patch,
   Post,
+  Query,
+  Req,
+  UseGuards,
 } from '@nestjs/common';
 import { OperatorService } from './operator.service';
-import { OperatorStatus, OperatorType } from '@prisma/client';
-
-class CreateOperatorDto {
-  email: string;
-  password: string;
-  name?: string;
-  type?: OperatorType;
-  businessName: string;
-  contactName: string;
-  phoneNumber: string;
-  address: string;
-  latitude: number;
-  longitude: number;
-  serviceRadius?: number;
-}
+import { CreateOperatorDto } from './dto/create-operator.dto';
+import { UpdateOperatorProfileDto } from './dto/update-operator-profile.dto';
+import { SaveBankDetailsDto } from './dto/save-bank-details.dto';
+import { OperatorMemberRole, OperatorStatus, OperatorType, UserRole } from '@prisma/client';
+import { AuthGuard } from '../auth/auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
 
 @Controller('operators')
 export class OperatorController {
@@ -46,6 +44,7 @@ export class OperatorController {
   /**
    * Get all operators
    */
+  @UseGuards(AuthGuard)
   @Get()
   async findAll() {
     const operators = await this.operatorService.findAll();
@@ -53,8 +52,32 @@ export class OperatorController {
   }
 
   /**
+   * Get performance stats for ALL operators — admin leaderboard.
+   * Must be declared BEFORE `:id` routes to avoid param shadowing.
+   */
+  @UseGuards(AuthGuard)
+  @Get('all-stats')
+  async getAllStats(@Query('days') days?: string) {
+    const stats = await this.operatorService.getAllOperatorStats(days ? parseInt(days, 10) : 30);
+    return { data: stats };
+  }
+
+  /**
+   * Get the operator record for the currently authenticated user.
+   * Used by the operator dashboard to load their own operator profile.
+   */
+  @UseGuards(AuthGuard)
+  @Get('me')
+  async getMyOperator(@Req() req: any) {
+    const operator = await this.operatorService.findByUserId(req.user.userId);
+    if (!operator) throw new NotFoundException('No operator account found for this user');
+    return { data: operator };
+  }
+
+  /**
    * Get an operator by ID
    */
+  @UseGuards(AuthGuard)
   @Get(':id')
   async findById(@Param('id') id: string) {
     const operator = await this.operatorService.findById(id);
@@ -62,8 +85,68 @@ export class OperatorController {
   }
 
   /**
-   * Update operator status (admin)
+   * Get performance stats for a single operator
    */
+  @UseGuards(AuthGuard)
+  @Get(':id/stats')
+  async getStats(@Param('id') id: string, @Query('days') days?: string) {
+    const stats = await this.operatorService.getOperatorStats(id, days ? parseInt(days, 10) : 30);
+    return { data: stats };
+  }
+
+  /**
+   * Update operator business profile.
+   * Allowed: admins, or OWNER/MANAGER members of this operator.
+   */
+  @UseGuards(AuthGuard)
+  @Patch(':id')
+  async updateProfile(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() dto: UpdateOperatorProfileDto,
+  ) {
+    await this.operatorService.assertCanManageOperator(req.user, id);
+    const operator = await this.operatorService.updateProfile(id, dto);
+    return { message: 'Operator profile updated', data: operator };
+  }
+
+  /**
+   * Save payout bank details. Allowed: admins, or OWNER/MANAGER members of
+   * this operator — same permission check as updateProfile.
+   */
+  @UseGuards(AuthGuard)
+  @Patch(':id/bank-details')
+  async saveBankDetails(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() dto: SaveBankDetailsDto,
+  ) {
+    await this.operatorService.assertCanManageOperator(req.user, id);
+    if (!dto.bankCode?.trim() || !dto.bankName?.trim() || !dto.accountNumber?.trim()) {
+      throw new BadRequestException('bankCode, bankName, and accountNumber are required');
+    }
+    const operator = await this.operatorService.saveBankDetails(id, dto);
+    return { message: 'Payout bank details saved', data: operator };
+  }
+
+  /**
+   * Clear payout bank details — same permission check as saveBankDetails.
+   * Only one account is stored per operator; this is how you remove it
+   * without immediately replacing it with another.
+   */
+  @UseGuards(AuthGuard)
+  @Delete(':id/bank-details')
+  async clearBankDetails(@Req() req: any, @Param('id') id: string) {
+    await this.operatorService.assertCanManageOperator(req.user, id);
+    const operator = await this.operatorService.clearBankDetails(id);
+    return { message: 'Payout bank details removed', data: operator };
+  }
+
+  /**
+   * Update operator status (verification) — admin only.
+   */
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
   @Patch(':id/status')
   async updateStatus(
     @Param('id') id: string,
@@ -77,17 +160,59 @@ export class OperatorController {
   }
 
   /**
-   * Toggle operator availability
+   * Toggle operator availability — any member of this operator, or admin.
    */
+  @UseGuards(AuthGuard)
   @Patch(':id/availability')
   async setAvailability(
+    @Req() req: any,
     @Param('id') id: string,
     @Body('isAvailable') isAvailable: boolean,
   ) {
-    const operator = await this.operatorService.setAvailability(id, isAvailable);
+    await this.operatorService.assertIsMemberOrAdmin(req.user, id);
+    const operator = await this.operatorService.setAvailability(id, Boolean(isAvailable));
     return {
       message: `Operator availability set to ${isAvailable}`,
       data: operator,
     };
+  }
+
+  // ═══════════════════════════════════════
+  //  Member management
+  // ═══════════════════════════════════════
+
+  @UseGuards(AuthGuard)
+  @Get(':id/members')
+  async listMembers(@Req() req: any, @Param('id') id: string) {
+    await this.operatorService.assertIsMemberOrAdmin(req.user, id);
+    const members = await this.operatorService.listMembers(id);
+    return { data: members };
+  }
+
+  @UseGuards(AuthGuard)
+  @Post(':id/members')
+  async addMember(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() body: { userId: string; role?: OperatorMemberRole },
+  ) {
+    await this.operatorService.assertCanManageOperator(req.user, id);
+    const member = await this.operatorService.addMember(id, {
+      userId: body.userId,
+      role:   body.role ?? OperatorMemberRole.STAFF,
+    });
+    return { message: 'Member added', data: member };
+  }
+
+  @UseGuards(AuthGuard)
+  @Delete(':id/members/:memberId')
+  async removeMember(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Param('memberId') memberId: string,
+  ) {
+    await this.operatorService.assertCanManageOperator(req.user, id);
+    await this.operatorService.removeMember(id, memberId);
+    return { message: 'Member removed' };
   }
 }

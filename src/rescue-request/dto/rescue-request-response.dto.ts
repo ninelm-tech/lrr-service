@@ -1,4 +1,4 @@
-import { RescueRequestStatus, IssueType } from '@prisma/client';
+import { RescueRequestStatus, IssueType, VehicleType, DispatchOfferStatus, RatingDirection } from '@prisma/client';
 
 export class CustomerSummaryDto {
   id: string;
@@ -32,16 +32,55 @@ export class RescueRequestListItemDto {
   longitude?: number;
   depositPaid: boolean;
   balancePaid: boolean;
+  depositRefundStatus: 'NONE' | 'ELIGIBLE' | 'PENDING' | 'COMPLETED' | 'FAILED';
   customer: CustomerSummaryDto;
   assignedOperator?: OperatorSummaryDto;
+  disputed: boolean;
+  disputeRaisedAt?: Date;
+  disputeResolvedAt?: Date;
   createdAt: Date;
   updatedAt: Date;
+}
+
+export class DispatchOfferAdminDto {
+  operatorId: string;
+  businessName: string;
+  status: DispatchOfferStatus;
+  quotedPrice?: number;
+  motoristFacingTotal?: number;
+  offeredAt: Date;
+  respondedAt?: Date;
+}
+
+export class DispatchBoardRowDto {
+  id: string;
+  status: RescueRequestStatus;
+  vehicleType?: VehicleType;
+  destination?: string;
+  round: number;
+  createdAt: Date;
+  /** Set once the first quote arrives; null while still SEARCHING (phase 1). */
+  quoteCollectionDeadline?: Date;
+  offers: DispatchOfferAdminDto[];
+}
+
+export class RatingSummaryDto {
+  id: string;
+  direction: RatingDirection;
+  score: number;
+  comment?: string;
+  flagged: boolean;
+  flaggedAt?: Date;
+  flaggedResolvedAt?: Date;
 }
 
 export class RescueRequestDetailDto {
   id: string;
   status: RescueRequestStatus;
   issueType?: IssueType;
+  vehicleType?: VehicleType;
+  destination?: string;
+  mediaLinks: string[];
   latitude?: number;
   longitude?: number;
   depositPaid: boolean;
@@ -52,8 +91,17 @@ export class RescueRequestDetailDto {
   balanceReference?: string;
   customer: CustomerDetailDto;
   assignedOperator?: OperatorDetailDto;
+  disputed: boolean;
+  disputeRaisedAt?: Date;
+  disputeResolvedAt?: Date;
+  customerDisputeStatement?: string;
+  operatorDisputeStatement?: string;
+  disputeResolutionNote?: string;
+  disputeOriginalBalanceAmount?: number;
   createdAt: Date;
   updatedAt: Date;
+  offers?: DispatchOfferAdminDto[];
+  ratings: RatingSummaryDto[];
 }
 
 export class PaginationMetaDto {

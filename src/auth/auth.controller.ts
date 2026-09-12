@@ -1,17 +1,39 @@
-import { Body, Controller, Get, Post, UseGuards, Request, Query } from '@nestjs/common';
+import { Body, Controller, Get, Patch, Post, UseGuards, Request, Query, BadRequestException } from '@nestjs/common';
+import { UserRole } from '@prisma/client';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
-import * as bcrypt from 'bcrypt';
-import { RegisterOperatorDto } from './dto/register-operator.dto';
+import { AuthGuard } from '../auth/auth.guard';
+import { RolesGuard } from './guards/roles.guard';
+import { Roles } from './decorators/roles.decorator';
+import { CreateStaffDto } from './dto/create-staff.dto';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
+
+export class UpdateProfileDto {
+  name?: string;
+  email?: string;
+  phoneNumber?: string;
+}
+
+export class ChangePasswordDto {
+  currentPassword?: string;
+  newPassword: string;
+}
 
 export class LoginDto {
   email: string;
   password: string;
 }
 
-export class RegisterDto {
-  email: string;
-  password: string;
+/**
+ * Customer self-registration.
+ * Phone number is the primary identifier (matches WhatsApp SOS phone).
+ * Email + password are optional — used only if they want dashboard login.
+ */
+export class RegisterCustomerDto {
+  phoneNumber: string;
+  email?: string;
+  password?: string;
   name?: string;
 }
 
@@ -28,23 +50,48 @@ export class AuthController {
   }
 
   /**
-   * Register a new user (for testing/admin)
+   * Create a staff account (SUPER_ADMIN only). role is restricted to
+   * ADMIN or PRODUCT — SUPER_ADMIN is never created through this endpoint,
+   * even by a SUPER_ADMIN caller (no self-service path to a second
+   * SUPER_ADMIN account).
    */
-  @Post('register')
-  async register(@Body() dto: RegisterDto) {
-    return this.authService.register({
-      email: dto.email,
-      password: dto.password,
-      name: dto.name,
-    });
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles(UserRole.SUPER_ADMIN)
+  @Post('staff')
+  async createStaff(@Body() dto: CreateStaffDto) {
+    if (dto.role !== UserRole.ADMIN && dto.role !== UserRole.PRODUCT) {
+      throw new BadRequestException('role must be ADMIN or PRODUCT');
+    }
+    const user = await this.authService.createStaff(dto);
+    return { message: 'Staff account created', data: user };
   }
 
   /**
-   * Register a new operator (for testing/admin)
+   * Register a new customer (self-service).
+   * Phone number is required — it must match the WhatsApp number they'll SOS from.
+   * Returns a JWT so they can log in immediately.
    */
-  @Post('register/operator')
-  async registerOperator(@Body() dto: RegisterOperatorDto) {
-    return this.authService.registerOperator(dto);
+  @Post('register/customer')
+  async registerCustomer(@Body() dto: RegisterCustomerDto) {
+    return this.authService.registerCustomer(dto);
+  }
+
+  /**
+   * Request a password-reset code (email or phone). Unauthenticated by
+   * definition — the caller is locked out. Response is always generic,
+   * never reveals whether an account was found.
+   */
+  @Post('forgot-password')
+  async forgotPassword(@Body() dto: ForgotPasswordDto) {
+    return this.authService.requestPasswordReset(dto.identifier, dto.newPassword);
+  }
+
+  /**
+   * Verify a password-reset code and set the new password.
+   */
+  @Post('reset-password')
+  async resetPassword(@Body() dto: ResetPasswordDto) {
+    return this.authService.resetPasswordWithCode(dto.phoneNumber, dto.code, dto.newPassword);
   }
 
   /**
@@ -56,10 +103,38 @@ export class AuthController {
     return this.authService.getUserById(req.user.id);
   }
 
-  @Get('hash-password')
-  async hashPassword(@Query('password') password: string) {
-    if (!password) return { error: 'Password is required' };
-    const hash = await bcrypt.hash(password, 10);
-    return { hash };
+  /**
+   * Update the current user's profile (name, email, phone).
+   */
+  @UseGuards(JwtAuthGuard)
+  @Patch('me')
+  async updateProfile(@Request() req: any, @Body() dto: UpdateProfileDto) {
+    const user = await this.authService.updateProfile(req.user.id, dto);
+    return { message: 'Profile updated', data: user };
+  }
+
+  /**
+   * Change (or set) the current user's password.
+   */
+  @UseGuards(JwtAuthGuard)
+  @Post('change-password')
+  async changePassword(@Request() req: any, @Body() dto: ChangePasswordDto) {
+    return this.authService.changePassword(req.user.id, dto);
+  }
+
+  /**
+   * List all users — Super Admin only.
+   * Supports ?role=CUSTOMER|OPERATOR|ADMIN|SUPER_ADMIN&search=&page=&limit=
+   */
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @Get('users')
+  async listUsers(
+    @Query('role') role?: string,
+    @Query('search') search?: string,
+    @Query('page') page = '1',
+    @Query('limit') limit = '25',
+  ) {
+    return this.authService.listUsers({ role, search, page: +page, limit: +limit });
   }
 }

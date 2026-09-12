@@ -1,29 +1,146 @@
 
-import { Body, Controller, Header, Post, Get, Param, Query, Req, UseGuards } from '@nestjs/common';
-import { RescueRequestService } from './rescue-request.service';
+import { Body, Controller, Get, Param, Patch, Post, Query, Req, UseGuards } from '@nestjs/common';
+import { UserRole } from '@prisma/client';
+import { DisputeService } from './dispute.service';
+import { RescueRequestAdminService } from './rescue-request-admin.service';
+import { DispatchService } from './dispatch.service';
 import type { Request } from 'express';
 import { AdminRescueRequestQueryDto } from './dto/admin-rescue-request.dto';
+import { AssignOperatorDto } from './dto/assign-operator.dto';
+import { ResolveDisputeDto } from './dto/resolve-dispute.dto';
 import { AuthGuard } from '../auth/auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
 
 @UseGuards(AuthGuard)
-@Controller()
+@Controller('rescue-requests')
 export class RescueRequestController {
-  constructor(private readonly rescueRequestService: RescueRequestService) {}
+  constructor(
+    private readonly disputeService: DisputeService,
+    private readonly rescueRequestAdminService: RescueRequestAdminService,
+    private readonly dispatchService: DispatchService,
+  ) {}
 
-  @Post('webhooks/rescue-request/whatsapp')
-  @Header('Content-Type', 'text/xml')
-  receiveWhatsAppMessage(@Body() body: Record<string, any>) {
-    return this.rescueRequestService.handleIncomingWhatsAppMessage(body);
-  }
-
-  @Get('rescue-requests')
+  @Get()
   async list(@Req() req: Request, @Query() query: AdminRescueRequestQueryDto) {
     // req.user will have userId, phone, role
-    return this.rescueRequestService.listForUser(req.user, query);
+    return this.rescueRequestAdminService.listForUser(req.user, query);
   }
 
-  @Get('rescue-requests/:id')
+  // ── Dispatch offers (operator dashboard) ─────────────────────────────────
+  // Declared before ':id' to avoid param shadowing.
+
+  /** Pending offers for the logged-in operator's business(es). */
+  @Get('offers/mine')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.OPERATOR)
+  async myOffers(@Req() req: Request) {
+    return this.dispatchService.listMyPendingOffers((req.user as any).userId);
+  }
+
+  /** Submit a quote or decline a pending offer from the dashboard. */
+  @Post('offers/:offerId/respond')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.OPERATOR)
+  async respondToOffer(
+    @Req() req: Request,
+    @Param('offerId') offerId: string,
+    @Body() body: { priceNaira?: number },
+  ) {
+    const priceKobo = body.priceNaira !== undefined ? Math.round(body.priceNaira * 100) : undefined;
+    return this.dispatchService.respondToOffer(
+      (req.user as any).userId,
+      offerId,
+      priceKobo,
+    );
+  }
+
+  /** Live + recent dispatch state across all requests, for the admin ops board. */
+  @Get('dispatch-board')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.PRODUCT)
+  async dispatchBoard() {
+    const rows = await this.dispatchService.getDispatchBoard();
+    return { data: rows };
+  }
+
+  @Post(':id/expand-radius')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async expandRadius(@Param('id') id: string) {
+    await this.dispatchService.expandRadiusNow(id);
+    return { message: 'Radius expansion triggered' };
+  }
+
+  @Post(':id/offer-to/:operatorId')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async offerToOperator(@Param('id') id: string, @Param('operatorId') operatorId: string) {
+    await this.dispatchService.manualOfferToOperator(id, operatorId);
+    return { message: 'Offer sent' };
+  }
+
+  @Get(':id')
   async detail(@Req() req: Request, @Param('id') id: string) {
-    return this.rescueRequestService.detailForUser(req.user, id);
+    return this.rescueRequestAdminService.detailForUser(req.user, id);
+  }
+
+  // ── Admin mutations ─────────────────────────────────────────────────────
+
+  /**
+   * Manually assign an operator (e.g. when auto-dispatch found nobody).
+   * Requires the agreed price — this goes through the same fee split and
+   * deposit-payment-link flow as a customer selecting a quote themselves.
+   */
+  @Patch(':id/assign-operator')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async assignOperator(
+    @Param('id') id: string,
+    @Body() dto: AssignOperatorDto,
+  ) {
+    return this.rescueRequestAdminService.assignOperator(id, dto);
+  }
+
+  /**
+   * Admin-triggered refund for a deposit that arrived after its request was
+   * already cancelled. Always refunds the full deposit amount.
+   */
+  @Post(':id/refund-deposit')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async refundDeposit(@Param('id') id: string) {
+    await this.rescueRequestAdminService.refundDeposit(id);
+    return { message: 'Refund initiated' };
+  }
+
+  /** Update request status (admin override). */
+  @Patch(':id/status')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async updateStatus(
+    @Param('id') id: string,
+    @Body() body: { status: string },
+  ) {
+    return this.rescueRequestAdminService.updateStatus(id, { status: body.status });
+  }
+
+  /** Cancel a request, optionally with a reason sent to the customer. */
+  @Patch(':id/cancel')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async cancel(
+    @Param('id') id: string,
+    @Body() body: { reason?: string },
+  ) {
+    return this.rescueRequestAdminService.cancel(id, { reason: body.reason });
+  }
+
+  /** Mark a disputed request resolved. Idempotent — safe to call more than once. */
+  @Patch(':id/resolve-dispute')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async resolveDispute(@Param('id') id: string, @Body() dto: ResolveDisputeDto) {
+    return this.disputeService.resolveDispute(id, dto.resolutionNote, dto.balanceAdjustmentPercent);
   }
 }

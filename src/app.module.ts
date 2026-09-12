@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { APP_INTERCEPTOR } from '@nestjs/core';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { IntegrationsModule } from './integrations/integrations.module';
@@ -8,6 +9,12 @@ import { RescueRequestModule } from './rescue-request/rescue-request.module';
 import { PaymentModule } from './payment/payment.module';
 import { OperatorModule } from './operator/operator.module';
 import { AuthModule } from './auth/auth.module';
+import { WebhooksModule } from './webhooks/webhooks.module';
+import { MediaModule } from './media/media.module';
+import { PlatformConfigModule } from './platform-config/platform-config.module';
+import { RatingModule } from './rating/rating.module';
+import { OtpModule } from './otp/otp.module';
+import { SentryInterceptor } from './common/sentry.interceptor';
 
 @Module({
   imports: [
@@ -20,8 +27,17 @@ import { AuthModule } from './auth/auth.module';
     RescueRequestModule,
     PaymentModule,
     OperatorModule,
+    WebhooksModule,
+    MediaModule,
+    PlatformConfigModule,
+    RatingModule,
+    OtpModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    // Auto-capture every unhandled 5xx exception into Sentry
+    { provide: APP_INTERCEPTOR, useClass: SentryInterceptor },
+  ],
 })
 export class AppModule {}

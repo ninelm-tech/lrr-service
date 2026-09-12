@@ -8,9 +8,20 @@ datasource db {
 
 // ============== ENUMS ==============
 
+enum DispatchOfferStatus {
+  PENDING
+  QUOTED
+  SELECTED_PENDING_PAYMENT
+  ACCEPTED
+  DECLINED
+  NOT_SELECTED
+  TIMED_OUT
+}
+
 enum UserRole {
   CUSTOMER
   OPERATOR
+  PRODUCT
   ADMIN
   SUPER_ADMIN
 }
@@ -41,14 +52,24 @@ enum OperatorStatus {
 enum RescueRequestStatus {
   WAITING_FOR_LOCATION
   WAITING_FOR_ISSUE_TYPE
+  WAITING_FOR_MEDIA
   WAITING_FOR_DEPOSIT
   DISPATCHING
   OPERATOR_ASSIGNED
   IN_PROGRESS
   ARRIVED
+  IN_DISPUTE
   COMPLETED
   CANCELLED
   STALLED
+}
+
+enum RefundStatus {
+  NONE      // not a late-payment case
+  ELIGIBLE  // handleLateDeposit fired — admin can refund
+  PENDING   // refund initiated at Paystack, awaiting webhook confirmation
+  COMPLETED
+  FAILED
 }
 
 enum IssueType {
@@ -56,6 +77,26 @@ enum IssueType {
   ACCIDENT
   FLAT_TYRE
   FUEL
+}
+
+enum TruckClass {
+  LIGHT_DUTY
+  TEN_TYRE
+  LOW_BED
+  HIAB
+}
+
+enum VehicleType {
+  SEDAN
+  SUV
+  ARMORED_LUXURY
+  HEAVY_TRAILER
+}
+
+enum MediaType {
+  IMAGE
+  VIDEO
+  AUDIO
 }
 
 // ============== MODELS ==============
@@ -70,6 +111,8 @@ model User {
 
   operatorMemberships OperatorMember[]
   rescueRequests      RescueRequest[]
+  whatsAppSession     WhatsAppSession?
+  ratings             Rating[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -82,6 +125,7 @@ model Operator {
   id            String         @id @default(cuid())
 
   type          OperatorType   @default(TOW_TRUCK)
+  truckClasses  TruckClass[]   @default([])
 
   businessName  String
   contactName   String
@@ -99,8 +143,19 @@ model Operator {
   verifiedAt    DateTime?
   notes         String?
 
-  members       OperatorMember[]
+  // Payout bank details, minimized: the full account number is sent to
+  // Paystack to create a transfer recipient and then discarded — only
+  // display-safe data and the resulting recipient code are kept.
+  bankName              String?
+  accountName           String?
+  accountNumberLast4    String?
+  paystackRecipientCode String?
+
+  members        OperatorMember[]
   rescueRequests RescueRequest[]
+  dispatchOffers DispatchOffer[]
+  ratings        Rating[]
+  payouts        Payout[]
 
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
@@ -142,13 +197,32 @@ model RescueRequest {
   longitude          Decimal?
 
   issueType          IssueType?
+  vehicleType        VehicleType?
+  destination        String?
 
   depositPaid        Boolean             @default(false)
   depositAmount      Int?
+  serviceFeeAmount    Int?
   depositReference   String?
+  depositRefundStatus RefundStatus       @default(NONE)
+  depositRefundId    Int?
   balancePaid        Boolean             @default(false)
   balanceAmount      Int?
   balanceReference   String?
+
+  disputed           Boolean             @default(false)
+  disputeRaisedAt    DateTime?
+  disputeResolvedAt  DateTime?
+  // Free-text statement each side sends when asked "what happened?" after a
+  // dispute is raised. Each is captured once — not an open-ended thread.
+  customerDisputeStatement String?
+  operatorDisputeStatement String?
+  // Staff's note on what was found/decided, entered alongside the settlement.
+  disputeResolutionNote    String?
+  // Snapshot of balanceAmount taken at resolution time, before any
+  // adjustment — balanceAmount itself becomes the settled figure, so this
+  // is the only place "what was originally owed" survives.
+  disputeOriginalBalanceAmount Int?
 
   assignedOperatorId String?
   assignedOperator   Operator?           @relation(fields: [assignedOperatorId], references: [id])
@@ -156,8 +230,218 @@ model RescueRequest {
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
 
+  quoteCollectionDeadline DateTime?
+
+  dispatchOffers     DispatchOffer[]
+  media              RequestMedia[]
+  ratings            Rating[]
+  payout             Payout?
+
   @@index([customerId])
   @@index([status])
   @@index([createdAt])
   @@index([depositReference])
+  @@index([balanceReference])
+}
+
+// Singleton row — platform-wide pricing configuration, admin-editable.
+// Read fresh at quote-selection time; never cached, never re-read after a
+// job's amounts are persisted onto its RescueRequest.
+model PlatformConfig {
+  id                    String   @id @default(cuid())
+  serviceFeePercent     Decimal  @default(10.0)
+  depositPercent        Decimal  @default(10.0)
+  // How long (minutes) each batch of offered operators has to respond
+  // (quote or decline) before the round expires and dispatch retries.
+  dispatchWindowMinutes Int      @default(10)
+  // WhatsApp number staff disputes are alerted to. Optional — unset means
+  // the staff alert step is skipped, not an error.
+  disputeAlertPhoneNumber String?
+  quoteCollectionMinutes Int      @default(5)
+  dispatchBatchSize      Int      @default(3)
+  updatedAt             DateTime @updatedAt
+}
+
+// Photos/video/audio submitted by the motorist for a request, forwarded
+// to operators as signed redirect links in the dispatch offer.
+model RequestMedia {
+  id               String        @id @default(cuid())
+
+  rescueRequestId  String
+  rescueRequest    RescueRequest @relation(fields: [rescueRequestId], references: [id])
+
+  mediaType        MediaType
+  s3Key            String
+  contentType      String
+
+  createdAt        DateTime      @default(now())
+
+  @@index([rescueRequestId])
+}
+
+// Tracks each operator offer during dispatch (accept/decline/timeout)
+model DispatchOffer {
+  id               String              @id @default(cuid())
+
+  rescueRequestId  String
+  rescueRequest    RescueRequest       @relation(fields: [rescueRequestId], references: [id])
+
+  operatorId       String
+  operator         Operator            @relation(fields: [operatorId], references: [id])
+
+  status           DispatchOfferStatus @default(PENDING)
+  quotedPrice      Int?
+  offeredAt        DateTime            @default(now())
+  respondedAt      DateTime?
+  expiresAt        DateTime
+
+  batchId          String
+
+  @@index([rescueRequestId])
+  @@index([operatorId])
+  @@index([status])
+  @@index([rescueRequestId, batchId])
+}
+
+enum RatingDirection {
+  MOTORIST_TO_OPERATOR
+  OPERATOR_TO_MOTORIST
+}
+
+// Two-way post-job rating — one row per direction per completed job,
+// collected via WhatsApp (score) and an optional unauthenticated web link
+// (comment), sent right after balance payment confirms.
+model Rating {
+  id               String          @id @default(cuid())
+
+  rescueRequestId  String
+  rescueRequest    RescueRequest   @relation(fields: [rescueRequestId], references: [id])
+
+  direction        RatingDirection
+
+  operatorId       String
+  operator         Operator        @relation(fields: [operatorId], references: [id])
+
+  customerId       String
+  customer         User            @relation(fields: [customerId], references: [id])
+
+  score            Int
+  comment          String?
+
+  // Set when score is 1-2 — durable record so a low rating survives past
+  // the one-time staff WhatsApp alert, and is visible/filterable later.
+  flagged          Boolean         @default(false)
+  flaggedAt        DateTime?
+  flaggedResolvedAt DateTime?
+
+  createdAt        DateTime        @default(now())
+
+  @@unique([rescueRequestId, direction])
+  @@index([operatorId])
+  @@index([customerId])
+}
+
+// WhatsApp conversation sessions (DB-backed, survives restarts)
+// One session per User — userId is the primary lookup key.
+// Twilio gives us a phone number on every inbound message; we always
+// resolve it to a User (creating one if needed) before touching this table.
+model WhatsAppSession {
+  id      String @id @default(cuid())
+
+  // Every session belongs to exactly one User (created on first SOS if unregistered).
+  userId  String @unique
+  user    User   @relation(fields: [userId], references: [id])
+
+  // Flow state (matches WhatsAppFlowState enum)
+  state   String @default("IDLE")
+
+  // Location captured during flow
+  latitude    Decimal?
+  longitude   Decimal?
+
+  // Issue selected
+  issueType   String?
+  vehicleType String?
+  destination String?
+
+  // Linked rescue request once created
+  rescueRequestId String?
+
+  // Payment reference (deposit)
+  depositReference String?
+
+  // Dispatch tracking
+  dispatchRound      Int    @default(0)
+  offeredOperatorIds String @default("[]") // JSON array of operator IDs already tried
+
+  // Masked chat relay — 'OPERATOR' on the customer's own session means "I'm
+  // relaying to my operator"; 'CUSTOMER' on the operator's own session means
+  // "I'm relaying to my customer". Null means not in a relay.
+  relayTarget String?
+
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+}
+
+// Short-lived rows backing WhatsApp OTP verification — used to prove
+// ownership of a phone number before letting an existing customer
+// register as an operator on the same number. Rows are cheap to accumulate;
+// no cleanup job in this pass, expiry is enforced at query time only.
+model PhoneVerification {
+  id                      String    @id @default(cuid())
+
+  phoneNumber             String
+  createdAt               DateTime  @default(now())
+
+  codeHash                String
+  expiresAt               DateTime
+  verifiedAt              DateTime?
+  attempts                Int       @default(0)
+
+  // Issued on successful verify — proves this row was already validated
+  // once, without re-exposing the original code.
+  verificationTokenHash   String?
+  tokenExpiresAt          DateTime?
+  consumedAt              DateTime?
+
+  @@index([phoneNumber])
+}
+
+enum PayoutStatus {
+  PENDING     // created; either not yet attempted, or blocked from attempting (see blockReason)
+  PROCESSING  // transfer initiated, awaiting webhook confirmation
+  SUCCESS
+  FAILED      // an actual transfer attempt was made and did not succeed
+}
+
+enum PayoutBlockReason {
+  NO_BANK_DETAILS
+  INSUFFICIENT_BALANCE
+}
+
+// One payout per completed job — created and processed synchronously
+// inside handleBalancePaymentConfirmed. PENDING with a non-null blockReason
+// means the payout was never attempted (no bank details / insufficient
+// platform balance); FAILED means an attempt was made and did not succeed.
+// Both cases require an admin-triggered retry — never auto-retried.
+model Payout {
+  id                   String             @id @default(cuid())
+
+  rescueRequestId      String             @unique
+  rescueRequest        RescueRequest      @relation(fields: [rescueRequestId], references: [id])
+
+  operatorId           String
+  operator             Operator           @relation(fields: [operatorId], references: [id])
+
+  amount               Int
+  status               PayoutStatus       @default(PENDING)
+  blockReason          PayoutBlockReason?
+  paystackTransferCode String?            @unique
+  failureReason        String?
+
+  createdAt            DateTime           @default(now())
+  completedAt          DateTime?
+
+  @@index([operatorId])
+  @@index([status])
 }

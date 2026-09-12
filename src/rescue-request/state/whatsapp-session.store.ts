@@ -1,37 +1,84 @@
 import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
 import {
   WhatsAppFlowState,
   WhatsAppSession,
 } from './whatsapp-session.types';
 
+/**
+ * DB-backed WhatsApp session store, keyed by userId.
+ *
+ * Every inbound Twilio message carries a phone number. The caller is responsible
+ * for resolving that to a User (creating one if needed) BEFORE calling this store.
+ * That way the session table has no redundant phone number column.
+ */
 @Injectable()
 export class WhatsAppSessionStore {
-  private readonly sessions = new Map<string, WhatsAppSession>();
+  constructor(private readonly prisma: PrismaService) {}
 
-  getOrCreate(phoneNumber: string): WhatsAppSession {
-    const existing = this.sessions.get(phoneNumber);
-    if (existing) return existing;
-    const session: WhatsAppSession = {
-      phoneNumber,
-      state: WhatsAppFlowState.IDLE,
-      updatedAt: new Date(),
-    };
-    this.sessions.set(phoneNumber, session);
-    return session;
+  async getOrCreate(userId: string): Promise<WhatsAppSession> {
+    const row = await this.prisma.whatsAppSession.upsert({
+      where:  { userId },
+      create: {
+        userId,
+        state: WhatsAppFlowState.IDLE,
+        offeredOperatorIds: '[]',
+      },
+      update: {}, // just fetch if already exists
+    });
+
+    return this.rowToSession(row);
   }
 
-  update(phoneNumber: string, updates: Partial<WhatsAppSession>) {
-    const session = this.getOrCreate(phoneNumber);
-    const updatedSession: WhatsAppSession = {
-      ...session,
-      ...updates,
-      updatedAt: new Date(),
-    };
-    this.sessions.set(phoneNumber, updatedSession);
-    return updatedSession;
+  async update(
+    userId: string,
+    updates: Partial<WhatsAppSession>,
+  ): Promise<WhatsAppSession> {
+    const data: Record<string, any> = {};
+
+    if (updates.state !== undefined)            data.state = updates.state;
+    if (updates.latitude !== undefined)         data.latitude = updates.latitude;
+    if (updates.longitude !== undefined)        data.longitude = updates.longitude;
+    if (updates.issueType !== undefined)        data.issueType = updates.issueType;
+    if (updates.vehicleType !== undefined)      data.vehicleType = updates.vehicleType;
+    if (updates.destination !== undefined)      data.destination = updates.destination;
+    if (updates.rescueRequestId !== undefined)  data.rescueRequestId = updates.rescueRequestId;
+    if (updates.depositReference !== undefined) data.depositReference = updates.depositReference;
+    if (updates.dispatchRound !== undefined)    data.dispatchRound = updates.dispatchRound;
+    if (updates.offeredOperatorIds !== undefined) {
+      data.offeredOperatorIds = JSON.stringify(updates.offeredOperatorIds);
+    }
+    if (updates.relayTarget !== undefined)      data.relayTarget = updates.relayTarget;
+
+    const row = await this.prisma.whatsAppSession.update({
+      where:  { userId },
+      data,
+    });
+
+    return this.rowToSession(row);
   }
 
-  clear(phoneNumber: string) {
-    this.sessions.delete(phoneNumber);
+  async clear(userId: string): Promise<void> {
+    await this.prisma.whatsAppSession.deleteMany({ where: { userId } });
+  }
+
+  private rowToSession(row: any): WhatsAppSession {
+    return {
+      userId: row.userId,
+      state: row.state as WhatsAppFlowState,
+      latitude: row.latitude != null ? Number(row.latitude) : undefined,
+      longitude: row.longitude != null ? Number(row.longitude) : undefined,
+      issueType: row.issueType ?? undefined,
+      vehicleType: row.vehicleType ?? undefined,
+      destination: row.destination ?? undefined,
+      rescueRequestId: row.rescueRequestId ?? undefined,
+      depositReference: row.depositReference ?? undefined,
+      dispatchRound: row.dispatchRound ?? 0,
+      offeredOperatorIds: row.offeredOperatorIds
+        ? JSON.parse(row.offeredOperatorIds)
+        : [],
+      relayTarget: row.relayTarget ?? undefined,
+      updatedAt: row.updatedAt,
+    };
   }
 }
