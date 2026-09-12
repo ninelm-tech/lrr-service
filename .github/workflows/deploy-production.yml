@@ -12,8 +12,8 @@ on:
 env:
   AWS_REGION: us-east-2
   ECR_REPOSITORY: lrr/service
-  ECS_CLUSTER: lrr-prod
-  ECS_SERVICE: lrr-service-prod
+  ECS_CLUSTER: lrr-production
+  ECS_SERVICE: lrr-service-production
   IMAGE_TAG: prod
 
 jobs:
