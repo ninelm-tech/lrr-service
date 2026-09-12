@@ -511,12 +511,15 @@ describe('RescueRequestAdminService', () => {
 
   describe('cancel', () => {
     let service: RescueRequestAdminService;
-    let prisma: { rescueRequest: { update: jest.Mock } };
+    let prisma: { rescueRequest: { update: jest.Mock }; dispatchOffer: { updateMany: jest.Mock } };
     let twilioService: { sendWhatsAppMessage: jest.Mock };
     let sessionStore: { clear: jest.Mock };
 
     beforeEach(async () => {
-      prisma = { rescueRequest: { update: jest.fn() } };
+      prisma = {
+        rescueRequest: { update: jest.fn() },
+        dispatchOffer: { updateMany: jest.fn() },
+      };
       twilioService = { sendWhatsAppMessage: jest.fn() };
       sessionStore = { clear: jest.fn() };
 
@@ -529,7 +532,7 @@ describe('RescueRequestAdminService', () => {
           { provide: PlatformConfigService, useValue: {} },
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: {} },
-          { provide: RescueRequestSharedService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: { endRelayForEndedRequest: jest.fn() } },
           { provide: WhatsAppSessionStore, useValue: sessionStore },
         ],
       }).compile();
@@ -551,6 +554,21 @@ describe('RescueRequestAdminService', () => {
         '+2348012345678',
         expect.stringContaining('cancelled'),
       );
+    });
+
+    it('closes out other operators\' still-PENDING offers on the cancelled job', async () => {
+      prisma.rescueRequest.update.mockResolvedValue({
+        id: 'req-1', customerId: 'cust-1', status: 'CANCELLED',
+        customer: { id: 'cust-1', phoneNumber: '+2348012345678' },
+        media: [], dispatchOffers: [],
+      });
+
+      await service.cancel('req-1', {});
+
+      expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith({
+        where: { rescueRequestId: 'req-1', status: 'PENDING' },
+        data: { status: 'TIMED_OUT', respondedAt: expect.any(Date) },
+      });
     });
   });
 });

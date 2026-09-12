@@ -228,8 +228,23 @@ export class RescueRequestAdminService {
       include: { customer: true },
     });
 
+    if (
+      status === RescueRequestStatus.COMPLETED ||
+      status === RescueRequestStatus.CANCELLED
+    ) {
+      await this.sharedService.endRelayForEndedRequest(id);
+    }
+
     if (status === RescueRequestStatus.COMPLETED) {
       await this.paymentEventsService.markJobCompleted(id);
+    } else if (status === RescueRequestStatus.CANCELLED) {
+      // Same reasoning as cancel() below — this is a separate admin path
+      // to CANCELLED and must close out leftover PENDING offers the same
+      // way, or other operators keep seeing this job as open.
+      await this.prisma.dispatchOffer.updateMany({
+        where: { rescueRequestId: id, status: 'PENDING' },
+        data: { status: 'TIMED_OUT', respondedAt: new Date() },
+      });
     }
     return { data: this.mapToDetailDto(updated) };
   }
@@ -240,6 +255,22 @@ export class RescueRequestAdminService {
       data:  { status: RescueRequestStatus.CANCELLED },
       include: { customer: true },
     });
+
+    // Any operator still holding a PENDING offer on this job (other than
+    // whoever was assigned, if anyone) must have it closed out here — this
+    // update is the only place that marks the request CANCELLED for these
+    // rows, since closeBidding only fires from the normal bidding-timeout
+    // path. Left PENDING, those operators keep seeing a cancelled job as
+    // "open" (counted in "you have N jobs open at once", quotable, etc.)
+    // until each offer's own expiresAt eventually passes on its own.
+    await this.prisma.dispatchOffer.updateMany({
+      where: { rescueRequestId: id, status: 'PENDING' },
+      data: { status: 'TIMED_OUT', respondedAt: new Date() },
+    });
+
+    // An open chat relay outlives session state and would leave both
+    // parties relaying into this now-dead job forever.
+    await this.sharedService.endRelayForEndedRequest(id);
 
     // The customer's WhatsApp session may still be mid-flow (e.g. sitting
     // in AWAITING_COMPLETION_CONFIRM) and pointed at this now-dead request.

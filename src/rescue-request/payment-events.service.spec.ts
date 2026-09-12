@@ -33,6 +33,7 @@ describe('PaymentEventsService', () => {
   let sharedService: {
     findOrCreateCustomer: jest.Mock;
     formatLocationSection: jest.Mock;
+    endRelayForEndedRequest: jest.Mock;
   };
   let dispatchService: { startDispatch: jest.Mock };
   let customerFlowService: { scheduleRatingTimeout: jest.Mock };
@@ -63,6 +64,7 @@ describe('PaymentEventsService', () => {
     sharedService = {
       findOrCreateCustomer: jest.fn().mockResolvedValue({ id: 'op-user-1' }),
       formatLocationSection: jest.fn().mockResolvedValue('https://maps.google.com/?q=6.5,3.4'),
+      endRelayForEndedRequest: jest.fn(),
     };
     dispatchService = { startDispatch: jest.fn() };
     customerFlowService = { scheduleRatingTimeout: jest.fn() };
@@ -181,6 +183,12 @@ describe('PaymentEventsService', () => {
         '+2348012345678',
         expect.stringContaining('/register/customer'),
       );
+    });
+
+    it('releases any open chat relay — otherwise it swallows the rating replies prompted just below', async () => {
+      await service.handleBalancePaymentConfirmed('BAL_ref');
+
+      expect(sharedService.endRelayForEndedRequest).toHaveBeenCalledWith('req-1');
     });
 
     it('tells a customer who already has portal credentials to log in instead', async () => {

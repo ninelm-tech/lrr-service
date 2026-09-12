@@ -594,6 +594,17 @@ export class DispatchService {
           where: { id: rescueRequestId },
           data: { status: RescueRequestStatus.CANCELLED },
         });
+        // Every operator already offered this job is, by definition, still
+        // sitting on an unanswered PENDING offer — being already-offered is
+        // exactly why this path ran out of candidates and reached the cap.
+        // closeBidding never fired for them (this is the no-candidates
+        // branch, not the deadline path), so without this sweep the job
+        // stays "open" in their job list until each offer's own expiresAt
+        // passes, long after the request itself is dead.
+        await this.prisma.dispatchOffer.updateMany({
+          where: { rescueRequestId, status: 'PENDING' },
+          data: { status: 'TIMED_OUT', respondedAt: new Date() },
+        });
         await this.sessionStore.clear(customerId);
 
         if (customerPhone) {

@@ -47,29 +47,4 @@ export class WebhooksController {
 
     return this.paymentService.handlePaystackWebhook(body);
   }
-
-  // Test endpoint - manually trigger webhook for testing
-  @Post('paystack/test')
-  @HttpCode(200)
-  async testPaystackWebhook() {
-    console.log('🧪 Testing Paystack webhook handler');
-    
-    // Use a real reference from your database for testing
-    // You'll need to replace this with an actual reference
-    const testReference = 'DEP_1778031930959_zoo6eh7'; // Replace with your actual reference
-    
-    await this.paymentService.handlePaystackWebhook({
-      event: 'charge.success',
-      data: {
-        reference: testReference,
-        status: 'success',
-        amount: 500000,
-        metadata: {
-          type: 'deposit',
-        },
-      },
-    });
-
-    return { status: 'success', message: 'Test webhook processed' };
-  }
 }
