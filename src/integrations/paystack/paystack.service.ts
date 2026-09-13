@@ -2,8 +2,10 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   PaystackInitializeResult,
+  PaystackListRefundsResult,
   PaystackRefundResult,
   PaystackTransferResult,
+  PaystackVerifyTransactionResult,
 } from './dto/paystack-outcome.dto';
 
 interface InitializePaymentParams {
@@ -20,23 +22,6 @@ interface PaystackInitializeResponse {
     authorization_url: string;
     access_code: string;
     reference: string;
-  };
-}
-
-interface PaystackVerifyResponse {
-  status: boolean;
-  message: string;
-  data: {
-    status: string; // 'success', 'failed', 'abandoned'
-    reference: string;
-    amount: number;
-    paid_at: string;
-    channel: string;
-    customer: {
-      email: string;
-      phone: string;
-    };
-    metadata: Record<string, any>;
   };
 }
 
@@ -98,23 +83,107 @@ export class PaystackService {
   }
 
   /**
-   * Verify a payment by reference
+   * Verify a transaction (a deposit or balance collection) by OUR reference.
+   *
+   * `transaction_not_found` is Paystack's answer for a reference it has
+   * never heard of — 400, not the transfer verify endpoint's 404 `not_found`.
+   * Never conflate the two; a caller branching on the wrong code treats a
+   * transaction result as a transfer result and vice versa.
    */
-  async verifyPayment(reference: string): Promise<PaystackVerifyResponse> {
-    const response = await fetch(
-      `${this.baseUrl}/transaction/verify/${reference}`,
-      {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${this.secretKey}`,
-          'Content-Type': 'application/json',
-        },
-      },
-    );
+  async verifyTransaction(
+    reference: string,
+  ): Promise<PaystackVerifyTransactionResult> {
+    let response: Response;
+    try {
+      response = await fetch(
+        `${this.baseUrl}/transaction/verify/${reference}`,
+        { headers: { Authorization: `Bearer ${this.secretKey}` } },
+      );
+    } catch (error) {
+      return { outcome: 'ambiguous', message: (error as Error).message };
+    }
 
-    const data = await response.json();
-    console.log('Paystack verify response:', data);
-    return data as PaystackVerifyResponse;
+    const data = (await response.json().catch(() => ({}))) as {
+      status?: boolean;
+      message?: string;
+      code?: string;
+      data?: { status: string; id: number; amount: number; fees?: number };
+    };
+    console.log('Paystack verify transaction response:', data);
+
+    if (!data.status || !data.data) {
+      if (response.status >= 500) {
+        return { outcome: 'ambiguous', message: data.message };
+      }
+      return { outcome: 'rejected', code: data.code, message: data.message };
+    }
+    return { outcome: 'ok', data: data.data };
+  }
+
+  /**
+   * Verify a transfer (a payout) by OUR reference — never by
+   * `transfer_code`, which a lost create response leaves us without.
+   *
+   * Returns the same shape as `initiateTransfer`: both eventually feed
+   * PaymentVerifyCheck's shared classification, since a not-found here is
+   * resolved by calling initiateTransfer again with the identical reference.
+   */
+  async verifyTransfer(reference: string): Promise<PaystackTransferResult> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/transfer/verify/${reference}`, {
+        headers: { Authorization: `Bearer ${this.secretKey}` },
+      });
+    } catch (error) {
+      return { outcome: 'ambiguous', message: (error as Error).message };
+    }
+
+    const data = (await response.json().catch(() => ({}))) as {
+      status?: boolean;
+      message?: string;
+      code?: string;
+      data?: { status: string; transfer_code: string };
+    };
+    console.log('Paystack verify transfer response:', data);
+
+    if (!data.status || !data.data) {
+      if (response.status >= 500) {
+        return { outcome: 'ambiguous', message: data.message };
+      }
+      return { outcome: 'rejected', code: data.code, message: data.message };
+    }
+    return { outcome: 'ok', data: data.data };
+  }
+
+  /**
+   * List refunds against Paystack's NUMERIC transaction id — never our
+   * reference, which returns 200 with an empty list and looks exactly like
+   * "no refund exists". See *Refund recovery*.
+   */
+  async listRefunds(transactionId: string): Promise<PaystackListRefundsResult> {
+    let response: Response;
+    try {
+      response = await fetch(
+        `${this.baseUrl}/refund?transaction=${transactionId}`,
+        { headers: { Authorization: `Bearer ${this.secretKey}` } },
+      );
+    } catch (error) {
+      return { outcome: 'ambiguous', message: (error as Error).message };
+    }
+
+    const data = (await response.json().catch(() => ({}))) as {
+      status?: boolean;
+      message?: string;
+      data?: Array<{ id: number; status: string; merchant_note?: string }>;
+    };
+    console.log('Paystack list refunds response:', data);
+
+    // No `rejected` case: the endpoint answers 200 even for a transaction id
+    // with zero refunds. Only a genuine failure to read is ambiguous.
+    if (!data.status) {
+      return { outcome: 'ambiguous', message: data.message };
+    }
+    return { outcome: 'ok', data: data.data ?? [] };
   }
 
   /**

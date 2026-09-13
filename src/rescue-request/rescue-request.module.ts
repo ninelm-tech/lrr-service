@@ -13,6 +13,7 @@ import { BiddingCloseCheck } from './reconciler/checks/bidding-close.check';
 import { BatchResolveCheck } from './reconciler/checks/batch-resolve.check';
 import { QuoteSelectionTimeoutCheck } from './reconciler/checks/quote-selection-timeout.check';
 import { StalledConfirmationCheck } from './reconciler/checks/stalled-confirmation.check';
+import { PaymentVerifyCheck } from './reconciler/checks/payment-verify.check';
 import { WhatsAppOperatorFlowService } from './whatsapp-operator-flow.service';
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 import { WhatsAppInboundService } from './whatsapp-inbound.service';
@@ -67,6 +68,7 @@ import { AuthGuard } from '../auth/auth.guard';
     BatchResolveCheck,
     QuoteSelectionTimeoutCheck,
     StalledConfirmationCheck,
+    PaymentVerifyCheck,
     ReconcilerService,
     {
       // The checks the 15-second loop runs, in order. A check is registered
@@ -81,6 +83,7 @@ import { AuthGuard } from '../auth/auth.guard';
         batchResolve: BatchResolveCheck,
         quoteSelectionTimeout: QuoteSelectionTimeoutCheck,
         stalledConfirmation: StalledConfirmationCheck,
+        paymentVerify: PaymentVerifyCheck,
       ) => [
         offerSweep,
         depositExpiry,
@@ -89,6 +92,7 @@ import { AuthGuard } from '../auth/auth.guard';
         batchResolve,
         quoteSelectionTimeout,
         stalledConfirmation,
+        paymentVerify,
       ],
       inject: [
         OfferSweepCheck,
@@ -98,6 +102,7 @@ import { AuthGuard } from '../auth/auth.guard';
         BatchResolveCheck,
         QuoteSelectionTimeoutCheck,
         StalledConfirmationCheck,
+        PaymentVerifyCheck,
       ],
     },
     WhatsAppOperatorFlowService,

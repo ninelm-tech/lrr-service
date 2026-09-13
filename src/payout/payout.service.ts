@@ -15,24 +15,10 @@ import { PrismaService } from '../prisma/prisma.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { PaymentLedgerService } from '../payment/payment-ledger.service';
 import { mapTransferStatus } from '../payment/domain/paystack-status';
+import { isDuplicateReference } from '../payment/domain/duplicate-reference';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { formatJobRef } from '../rescue-request/domain/rescue-request-formatting';
-
-/**
- * A duplicate-reference rejection is evidence the original transfer LANDED —
- * the opposite of a failure. Marking it FAILED would make a fresh row and a
- * fresh reference legal, which is the double-pay this design exists to
- * prevent.
- *
- * Matches the provider code and falls back to the message, so a wording
- * change on Paystack's side cannot silently turn a duplicate into a
- * rejection.
- */
-function isDuplicateReference(r: { code?: string; message?: string }): boolean {
-  if (r.code === 'duplicate_reference') return true;
-  return /reference.*(already|used|exist)/i.test(r.message ?? '');
-}
 
 /**
  * The two block reasons we cause ourselves. Nothing was ever sent to

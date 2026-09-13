@@ -72,3 +72,44 @@ export type PaystackRefundResult =
   | { outcome: 'ok'; data: { id: number; status: string } }
   | { outcome: 'rejected'; code?: string; message?: string }
   | { outcome: 'ambiguous'; message?: string };
+
+/**
+ * A transaction verify response.
+ *
+ * `rejected` here means the read itself came back 4xx with a `code` — most
+ * importantly `transaction_not_found`, Paystack's answer for a reference it
+ * has never heard of. That is definitive for a collection: nothing moved.
+ * Never conflate it with `not_found`, the transfer verify code below — the
+ * two differ in both HTTP status (400 vs 404) and spelling, verified against
+ * the live test integration.
+ */
+export type PaystackVerifyTransactionResult =
+  | {
+      outcome: 'ok';
+      data: { status: string; id: number; amount: number; fees?: number };
+    }
+  | { outcome: 'rejected'; code?: string; message?: string }
+  | { outcome: 'ambiguous'; message?: string };
+
+/**
+ * A refund record as Paystack's list endpoint returns it — one entry among
+ * possibly several for the same transaction, of which `merchant_note` is
+ * what makes any one of them ours. See *Refund recovery*.
+ */
+export interface PaystackRefundRecord {
+  id: number;
+  status: string;
+  merchant_note?: string;
+}
+
+/**
+ * `GET /refund?transaction=<numeric id>` always answers 200, even for zero
+ * matches — verified against the live test integration, where our own
+ * reference (rather than the numeric id) produced exactly this: 200, empty
+ * list. So there is no `rejected` case here; an empty `data` array is a
+ * legitimate answer, not a failure, and the caller decides what "no match"
+ * means. Only a genuine 5xx or thrown error is `ambiguous`.
+ */
+export type PaystackListRefundsResult =
+  | { outcome: 'ok'; data: PaystackRefundRecord[] }
+  | { outcome: 'ambiguous'; message?: string };
