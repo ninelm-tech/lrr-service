@@ -1,5 +1,5 @@
 import { PrismaService } from '../../src/prisma/prisma.service';
-import { DispatchOfferSweeperService } from '../../src/rescue-request/dispatch-offer-sweeper.service';
+import { OfferSweepCheck } from '../../src/rescue-request/reconciler/checks/offer-sweep.check';
 import {
   createCustomer,
   createOffer,
@@ -9,7 +9,7 @@ import {
 } from './factories';
 
 /**
- * The sweeper is pure database behaviour — which rows its filters match is
+ * The sweep is pure database behaviour — which rows its filters match is
  * the entire feature. A unit test with a mocked Prisma can only assert the
  * shape of the query object it was handed, never that the query selects the
  * right rows, so these run against real Postgres.
@@ -17,13 +17,13 @@ import {
  * The first case here is the bug found during the 2026-09-12 test pass: an
  * operator was shown three "open" jobs that had already ended.
  */
-describe('DispatchOfferSweeperService (integration)', () => {
+describe('OfferSweepCheck (integration)', () => {
   let prisma: PrismaService;
-  let sweeper: DispatchOfferSweeperService;
+  let check: OfferSweepCheck;
 
   beforeAll(() => {
     prisma = new PrismaService();
-    sweeper = new DispatchOfferSweeperService(prisma);
+    check = new OfferSweepCheck(prisma);
   });
 
   afterAll(async () => {
@@ -44,7 +44,7 @@ describe('DispatchOfferSweeperService (integration)', () => {
     // misses it and the operator kept seeing a finished job as open.
     const offer = await createOffer(prisma, request.id, operator.id);
 
-    await sweeper.sweep();
+    await check.run(new Date());
 
     const after = await prisma.dispatchOffer.findUnique({
       where: { id: offer.id },
@@ -60,7 +60,7 @@ describe('DispatchOfferSweeperService (integration)', () => {
     });
     const offer = await createOffer(prisma, request.id, operator.id);
 
-    await sweeper.sweep();
+    await check.run(new Date());
 
     const after = await prisma.dispatchOffer.findUnique({
       where: { id: offer.id },
@@ -71,12 +71,16 @@ describe('DispatchOfferSweeperService (integration)', () => {
   it('leaves a live offer on a live request alone — the sweep must never close a real bid', async () => {
     const customer = await createCustomer(prisma);
     const operator = await createOperator(prisma);
+    // WAITING_FOR_DEPOSIT rather than DISPATCHING deliberately: a DISPATCHING
+    // request is excluded wholesale by the ownership rule below, so this case
+    // would pass without the expiry condition ever being consulted and prove
+    // nothing about it.
     const request = await createRequest(prisma, customer.id, {
-      status: 'DISPATCHING',
+      status: 'WAITING_FOR_DEPOSIT',
     });
     const offer = await createOffer(prisma, request.id, operator.id);
 
-    await sweeper.sweep();
+    await check.run(new Date());
 
     const after = await prisma.dispatchOffer.findUnique({
       where: { id: offer.id },
@@ -88,13 +92,13 @@ describe('DispatchOfferSweeperService (integration)', () => {
     const customer = await createCustomer(prisma);
     const operator = await createOperator(prisma);
     const request = await createRequest(prisma, customer.id, {
-      status: 'DISPATCHING',
+      status: 'WAITING_FOR_DEPOSIT',
     });
     const offer = await createOffer(prisma, request.id, operator.id, {
       expiresAt: new Date(Date.now() - 60 * 1000),
     });
 
-    await sweeper.sweep();
+    await check.run(new Date());
 
     const after = await prisma.dispatchOffer.findUnique({
       where: { id: offer.id },
@@ -113,11 +117,29 @@ describe('DispatchOfferSweeperService (integration)', () => {
       quotedPrice: 2_500_000,
     });
 
-    await sweeper.sweep();
+    await check.run(new Date());
 
     const after = await prisma.dispatchOffer.findUnique({
       where: { id: offer.id },
     });
     expect(after?.status).toBe('QUOTED');
+  });
+
+  it('leaves expired offers alone while the request is still dispatching — batch resolve owns those', async () => {
+    const customer = await createCustomer(prisma);
+    const operator = await createOperator(prisma);
+    const request = await createRequest(prisma, customer.id, {
+      status: 'DISPATCHING',
+    });
+    const offer = await createOffer(prisma, request.id, operator.id, {
+      expiresAt: new Date(Date.now() - 60_000),
+    });
+
+    await check.run(new Date());
+
+    expect(
+      (await prisma.dispatchOffer.findUnique({ where: { id: offer.id } }))
+        ?.status,
+    ).toBe('PENDING');
   });
 });

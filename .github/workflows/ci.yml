@@ -45,7 +45,7 @@ jobs:
       # today's count so the debt cannot grow while it is paid down. This
       # number is a ratchet: lower it as warnings are fixed, never raise it.
       - name: Lint
-        run: npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 657
+        run: npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 646
 
       - name: Test
         run: yarn test --ci

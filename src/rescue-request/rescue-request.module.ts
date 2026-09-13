@@ -4,7 +4,9 @@ import { DisputeService } from './dispute.service';
 import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestAdminService } from './rescue-request-admin.service';
 import { DispatchService } from './dispatch.service';
-import { DispatchOfferSweeperService } from './dispatch-offer-sweeper.service';
+import { ReconcilerService } from './reconciler/reconciler.service';
+import { RECONCILER_CHECKS } from './reconciler/reconciler-check.interface';
+import { OfferSweepCheck } from './reconciler/checks/offer-sweep.check';
 import { WhatsAppOperatorFlowService } from './whatsapp-operator-flow.service';
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 import { WhatsAppInboundService } from './whatsapp-inbound.service';
@@ -45,7 +47,16 @@ import { AuthGuard } from '../auth/auth.guard';
     PaymentEventsService,
     RescueRequestAdminService,
     DispatchService,
-    DispatchOfferSweeperService,
+    OfferSweepCheck,
+    ReconcilerService,
+    {
+      // The checks the 15-second loop runs, in order. A check is registered
+      // here and nowhere else, so this list is the whole inventory of
+      // scheduled work in the service.
+      provide: RECONCILER_CHECKS,
+      useFactory: (offerSweep: OfferSweepCheck) => [offerSweep],
+      inject: [OfferSweepCheck],
+    },
     WhatsAppOperatorFlowService,
     WhatsAppCustomerFlowService,
     WhatsAppInboundService,

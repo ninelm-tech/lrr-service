@@ -2666,7 +2666,12 @@ Expected: **no output.** Any hit is a scheduled job this plan failed to migrate.
 
 - [ ] **Step 7: Run everything**
 
-Run: `yarn tsc --noEmit && npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 657 && yarn jest && yarn test:integration`
+Run: `yarn tsc --noEmit && npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings <current ratchet> && yarn jest && yarn test:integration`
+
+Take the ratchet from `.github/workflows/ci.yml`, not from this plan — deleting
+files removes warnings with them, so the number falls as this work proceeds and
+a figure written here would be stale. Whenever a task lowers the real count,
+lower CI's number to match in the same commit; it may never go up.
 Expected: all green.
 
 - [ ] **Step 8: Commit**
