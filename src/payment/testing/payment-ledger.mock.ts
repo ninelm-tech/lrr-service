@@ -5,21 +5,24 @@ import { REFERENCE_PREFIX } from '../payment.constants';
  * A test double for PaymentLedgerService, for unit specs whose subject
  * happens to move money but whose assertions are about something else.
  *
- * It covers only the four methods the collection flows actually call. A mock
- * that also stubs claimTerminal/unblock/backOff would imply those paths are
- * exercised here; they are not — they belong to the webhook and the verify
- * check, which are tested against a real database.
- *
  * Two behaviours are real rather than stubbed, because tests assert on them:
  * `create` echoes its input back as the row, and `referenceFor` uses the same
  * prefix map as production, so a spec asserting `DEP_<id>` is asserting
  * against the live format rather than a constant restated in the test.
+ *
+ * The state machine itself is NOT modelled here — every claim succeeds by
+ * default. Whether a claim can actually win against a given row is a property
+ * of the database, and the integration specs test it there.
  */
 export interface PaymentLedgerMock {
   create: jest.Mock;
   claimForSubmission: jest.Mock;
   referenceFor: jest.Mock;
   recordRejection: jest.Mock;
+  recordBlocked: jest.Mock;
+  unblock: jest.Mock;
+  claimTerminal: jest.Mock;
+  backOff: jest.Mock;
 }
 
 export function createPaymentLedgerMock(
@@ -46,6 +49,11 @@ export function createPaymentLedgerMock(
       return prefix ? `${prefix}_${payment.id}` : '';
     }),
     recordRejection: jest.fn(),
+    recordBlocked: jest.fn(),
+    // Like claimForSubmission, the default is the winner's path.
+    unblock: jest.fn().mockResolvedValue(true),
+    claimTerminal: jest.fn().mockResolvedValue(true),
+    backOff: jest.fn(),
     ...overrides,
   };
 }

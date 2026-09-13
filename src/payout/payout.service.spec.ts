@@ -3,6 +3,11 @@ import { PayoutService } from './payout.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
+import { PaymentLedgerService } from '../payment/payment-ledger.service';
+import {
+  createPaymentLedgerMock,
+  PaymentLedgerMock,
+} from '../payment/testing/payment-ledger.mock';
 
 describe('PayoutService', () => {
   let service: PayoutService;
@@ -14,12 +19,13 @@ describe('PayoutService', () => {
       findUnique: jest.Mock;
     };
     operator: { findUnique: jest.Mock };
+    payment: { findFirst: jest.Mock; update: jest.Mock };
   };
   let paystack: {
     checkBalance: jest.Mock;
     initiateTransfer: jest.Mock;
-    generateReference: jest.Mock;
   };
+  let paymentLedger: PaymentLedgerMock;
   let twilio: {
     sendWhatsAppMessage: jest.Mock;
     sendWhatsAppTemplateMessage: jest.Mock;
@@ -48,12 +54,18 @@ describe('PayoutService', () => {
         findUnique: jest.fn(),
       },
       operator: { findUnique: jest.fn() },
+      payment: {
+        // No in-flight payout row by default: the common case is a first
+        // attempt, which inserts rather than resuming.
+        findFirst: jest.fn().mockResolvedValue(null),
+        update: jest.fn().mockResolvedValue({}),
+      },
     };
     paystack = {
       checkBalance: jest.fn(),
       initiateTransfer: jest.fn(),
-      generateReference: jest.fn().mockReturnValue('PAYOUT_test123'),
     };
+    paymentLedger = createPaymentLedgerMock();
     twilio = {
       sendWhatsAppMessage: jest.fn(),
       sendWhatsAppTemplateMessage: jest.fn(),
@@ -67,6 +79,7 @@ describe('PayoutService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: PaystackService, useValue: paystack },
         { provide: TwilioService, useValue: twilio },
+        { provide: PaymentLedgerService, useValue: paymentLedger },
       ],
     }).compile();
 
@@ -213,16 +226,18 @@ describe('PayoutService', () => {
       });
       paystack.checkBalance.mockResolvedValue(1000000);
       paystack.initiateTransfer.mockResolvedValue({
-        transferCode: 'TRF_test123',
-        status: 'pending',
+        outcome: 'ok',
+        data: { transfer_code: 'TRF_test123', status: 'pending' },
       });
 
       await service.createAndProcessPayout('req-1', 'op-1', 250000);
 
+      // The reference is the ledger row's id, so verification and the webhook
+      // can both find the payment it belongs to.
       expect(paystack.initiateTransfer).toHaveBeenCalledWith({
         recipientCode: 'RCP_existing',
         amount: 250000,
-        reference: 'PAYOUT_test123',
+        reference: 'payout_pay-1',
         reason: 'Job payout — req-1',
       });
       expect(prisma.payout.update).toHaveBeenCalledWith({
@@ -235,7 +250,10 @@ describe('PayoutService', () => {
       });
     });
 
-    it('marks FAILED when the transfer API call throws', async () => {
+    it('does NOT fail the payment when the transfer result is ambiguous', async () => {
+      // The old shape threw here and the payout was marked FAILED. That is
+      // the double-pay: a 5xx or a dropped connection may have moved money,
+      // and FAILED makes a fresh reference legal.
       prisma.payout.create.mockResolvedValue({ id: 'payout-1' });
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
@@ -243,16 +261,71 @@ describe('PayoutService', () => {
         businessName: 'Swift Towing',
       });
       paystack.checkBalance.mockResolvedValue(1000000);
-      paystack.initiateTransfer.mockRejectedValue(new Error('Paystack 500'));
+      paystack.initiateTransfer.mockResolvedValue({
+        outcome: 'ambiguous',
+        message: 'Paystack 500',
+      });
 
       await service.createAndProcessPayout('req-1', 'op-1', 250000);
 
+      expect(paymentLedger.recordRejection).not.toHaveBeenCalled();
+      expect(paymentLedger.claimTerminal).not.toHaveBeenCalled();
+      // The legacy row follows the same reading: still in flight.
+      expect(prisma.payout.update).toHaveBeenCalledWith({
+        where: { id: 'payout-1' },
+        data: { status: 'PROCESSING', blockReason: null },
+      });
+    });
+
+    it('treats a duplicate reference as evidence the original landed, not a rejection', async () => {
+      prisma.payout.create.mockResolvedValue({ id: 'payout-1' });
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1',
+        paystackRecipientCode: 'RCP_existing',
+        businessName: 'Swift Towing',
+      });
+      paystack.checkBalance.mockResolvedValue(1000000);
+      paystack.initiateTransfer.mockResolvedValue({
+        outcome: 'rejected',
+        code: 'duplicate_reference',
+        message: 'Transfer reference has already been used',
+      });
+
+      await service.createAndProcessPayout('req-1', 'op-1', 250000);
+
+      expect(paymentLedger.recordRejection).not.toHaveBeenCalled();
+      expect(prisma.payout.update).toHaveBeenCalledWith({
+        where: { id: 'payout-1' },
+        data: { status: 'PROCESSING', blockReason: null },
+      });
+    });
+
+    it('fails the payment on a definitive, non-duplicate rejection', async () => {
+      prisma.payout.create.mockResolvedValue({ id: 'payout-1' });
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1',
+        paystackRecipientCode: 'RCP_existing',
+        businessName: 'Swift Towing',
+      });
+      paystack.checkBalance.mockResolvedValue(1000000);
+      paystack.initiateTransfer.mockResolvedValue({
+        outcome: 'rejected',
+        code: 'invalid_recipient',
+        message: 'Recipient is invalid',
+      });
+
+      await service.createAndProcessPayout('req-1', 'op-1', 250000);
+
+      expect(paymentLedger.recordRejection).toHaveBeenCalledWith(
+        'pay-1',
+        'Recipient is invalid',
+      );
       expect(prisma.payout.update).toHaveBeenCalledWith({
         where: { id: 'payout-1' },
         data: {
           status: 'FAILED',
           blockReason: null,
-          failureReason: 'Paystack 500',
+          failureReason: 'Recipient is invalid',
         },
       });
     });

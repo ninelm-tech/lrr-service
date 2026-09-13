@@ -1,6 +1,9 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { PaystackInitializeResult } from './dto/paystack-outcome.dto';
+import {
+  PaystackInitializeResult,
+  PaystackTransferResult,
+} from './dto/paystack-outcome.dto';
 
 interface InitializePaymentParams {
   email: string;
@@ -114,7 +117,13 @@ export class PaystackService {
   }
 
   /**
-   * Generate a unique payment reference
+   * Generate a unique payment reference.
+   *
+   * @deprecated Nothing uses this any more, and new money-moving code must
+   * not. A reference generated here is tied to no Payment row, so neither a
+   * webhook nor verification can find what it belongs to — that disconnect
+   * is what the payment model replaced. Use
+   * `PaymentLedgerService.referenceFor(payment)`. Removed in Task 11.
    */
   generateReference(prefix: string = 'LRR'): string {
     return `${prefix}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
@@ -383,27 +392,50 @@ export class PaystackService {
     amount: number;
     reference: string;
     reason: string;
-  }): Promise<{ transferCode: string; status: string }> {
-    const res = await fetch(`${this.baseUrl}/transfer`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.secretKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        source: 'balance',
-        amount: params.amount,
-        recipient: params.recipientCode,
-        reference: params.reference,
-        reason: params.reason,
-      }),
-    });
-    const data = await res.json();
-    console.log('Paystack initiate transfer:', data);
-    if (!data.status || !data.data) {
-      throw new Error(data.message || 'Paystack transfer initiation failed');
+  }): Promise<PaystackTransferResult> {
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/transfer`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.secretKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          source: 'balance',
+          amount: params.amount,
+          recipient: params.recipientCode,
+          reference: params.reference,
+          reason: params.reason,
+        }),
+      });
+    } catch (error) {
+      // The instruction may have landed. Ambiguous, never a rejection —
+      // throwing here is what the old shape did, and a caught throw that
+      // reads as "failed" is how a transfer gets sent twice.
+      return { outcome: 'ambiguous', message: (error as Error).message };
     }
-    return { transferCode: data.data.transfer_code, status: data.data.status };
+
+    const data = (await res.json().catch(() => ({}))) as {
+      status?: boolean;
+      message?: string;
+      code?: string;
+      data?: { status: string; transfer_code: string };
+    };
+    console.log('Paystack initiate transfer:', data);
+
+    if (!data.status || !data.data) {
+      // A 5xx tells us nothing about whether the transfer landed; only a 4xx
+      // with a provider code is definitive. Getting this wrong is a
+      // double-pay, because FAILED makes a fresh reference legal.
+      if (res.status >= 500) {
+        return { outcome: 'ambiguous', message: data.message };
+      }
+      // Branch on `code` — Paystack's machine-readable identifier. `message`
+      // is prose and not a contract.
+      return { outcome: 'rejected', code: data.code, message: data.message };
+    }
+    return { outcome: 'ok', data: data.data };
   }
 
   // ── Paystack Refunds ─────────────────────────────────────────────────────

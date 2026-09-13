@@ -36,3 +36,21 @@ export type PaystackInitializeResult =
     }
   | { outcome: 'rejected'; code?: string; message?: string }
   | { outcome: 'ambiguous'; message?: string };
+
+/**
+ * A transfer's acceptance, not its result.
+ *
+ * `ok` means Paystack took the instruction; `data.status` then says what it
+ * did with it — `otp` (waiting on a human), `pending`/`queued` (working on
+ * it), even `success`. None of those may be claimed as SUCCEEDED here: that
+ * comes only from a webhook or from verification.
+ *
+ * The outbound direction is where `rejected` needs the most care. A
+ * duplicate-reference rejection is POSITIVE EVIDENCE the original transfer
+ * landed — the opposite of a failure — so callers must check for it before
+ * treating a rejection as one.
+ */
+export type PaystackTransferResult =
+  | { outcome: 'ok'; data: { status: string; transfer_code: string } }
+  | { outcome: 'rejected'; code?: string; message?: string }
+  | { outcome: 'ambiguous'; message?: string };

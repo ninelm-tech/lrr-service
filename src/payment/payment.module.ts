@@ -9,7 +9,7 @@ import { PayoutModule } from '../payout/payout.module';
   imports: [
     PaystackModule,
     forwardRef(() => RescueRequestModule),
-    PayoutModule,
+    forwardRef(() => PayoutModule),
   ],
   providers: [PaymentService, PaymentLedgerService],
   // The ledger is exported because every money-moving flow — deposits,

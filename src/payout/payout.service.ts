@@ -4,12 +4,47 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import * as Sentry from '@sentry/node';
-import { PayoutStatus, PayoutBlockReason } from '@prisma/client';
+import {
+  Payment,
+  PaymentBlockReason,
+  PaymentStatus,
+  PayoutStatus,
+  PayoutBlockReason,
+} from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
+import { PaymentLedgerService } from '../payment/payment-ledger.service';
+import { mapTransferStatus } from '../payment/domain/paystack-status';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { formatJobRef } from '../rescue-request/domain/rescue-request-formatting';
+
+/**
+ * A duplicate-reference rejection is evidence the original transfer LANDED —
+ * the opposite of a failure. Marking it FAILED would make a fresh row and a
+ * fresh reference legal, which is the double-pay this design exists to
+ * prevent.
+ *
+ * Matches the provider code and falls back to the message, so a wording
+ * change on Paystack's side cannot silently turn a duplicate into a
+ * rejection.
+ */
+function isDuplicateReference(r: { code?: string; message?: string }): boolean {
+  if (r.code === 'duplicate_reference') return true;
+  return /reference.*(already|used|exist)/i.test(r.message ?? '');
+}
+
+/**
+ * The two block reasons we cause ourselves. Nothing was ever sent to
+ * Paystack, so the attempt can legitimately resume on the SAME row — see
+ * claimPayoutPayment. The other two (AWAITING_OTP, NEEDS_CUSTOMER_DETAILS)
+ * mean the money movement already exists provider-side and must never be
+ * re-submitted.
+ */
+const OUR_OWN_BLOCKS: PaymentBlockReason[] = [
+  PaymentBlockReason.NO_BANK_DETAILS,
+  PaymentBlockReason.INSUFFICIENT_BALANCE,
+];
 
 @Injectable()
 export class PayoutService {
@@ -17,6 +52,7 @@ export class PayoutService {
     private readonly prisma: PrismaService,
     private readonly paystackService: PaystackService,
     private readonly twilioService: TwilioService,
+    private readonly paymentLedger: PaymentLedgerService,
   ) {}
 
   /**
@@ -103,10 +139,111 @@ export class PayoutService {
   }
 
   /**
+   * The ledger row for this attempt, claimed and ready to submit.
+   *
+   * A retry reuses whatever its previous attempt left in flight rather than
+   * inserting a sibling: the in-flight partial unique index permits only one,
+   * and for the two blocks we cause ourselves the row never reached Paystack,
+   * so returning it to SUBMITTED is safe and keeps the reference stable.
+   *
+   * Returns null when this attempt must not proceed — the row is already at
+   * Paystack (SUBMITTED, or BLOCKED awaiting a human there), or another
+   * caller won the claim. **A null means do not call Paystack.**
+   */
+  private async claimPayoutPayment(
+    rescueRequestId: string,
+    operatorId: string,
+    amount: number,
+  ): Promise<Payment | null> {
+    const existing = await this.prisma.payment.findFirst({
+      where: {
+        rescueRequestId,
+        type: 'PAYOUT',
+        status: {
+          in: [
+            PaymentStatus.PENDING,
+            PaymentStatus.SUBMITTED,
+            PaymentStatus.BLOCKED,
+          ],
+        },
+      },
+    });
+
+    if (!existing) {
+      let created: Payment;
+      try {
+        created = await this.paymentLedger.create({
+          rescueRequestId,
+          type: 'PAYOUT',
+          amount,
+          operatorId,
+        });
+      } catch {
+        // The index refused it: a concurrent attempt inserted between our
+        // read and our write. That attempt owns the payout, not us.
+        return null;
+      }
+      return (await this.paymentLedger.claimForSubmission(
+        created.id,
+        new Date(),
+      ))
+        ? created
+        : null;
+    }
+
+    if (existing.status === PaymentStatus.PENDING) {
+      return (await this.paymentLedger.claimForSubmission(
+        existing.id,
+        new Date(),
+      ))
+        ? existing
+        : null;
+    }
+
+    if (
+      existing.status === PaymentStatus.BLOCKED &&
+      existing.blockReason &&
+      OUR_OWN_BLOCKS.includes(existing.blockReason)
+    ) {
+      return (await this.paymentLedger.unblock(existing.id, new Date()))
+        ? existing
+        : null;
+    }
+
+    return null;
+  }
+
+  /**
+   * Record a block we caused ourselves, on a row that never reached Paystack.
+   *
+   * Silently does nothing if a real transfer is in flight for this request —
+   * overwriting a SUBMITTED row with a block would lose track of money that
+   * is actually moving.
+   */
+  private async blockPayment(
+    rescueRequestId: string,
+    operatorId: string,
+    amount: number,
+    reason: PaymentBlockReason,
+  ): Promise<void> {
+    const payment = await this.claimPayoutPayment(
+      rescueRequestId,
+      operatorId,
+      amount,
+    );
+    if (!payment) return;
+    await this.paymentLedger.recordBlocked(payment.id, reason);
+  }
+
+  /**
    * Never creates a Paystack recipient here — that only happens once,
    * synchronously, inside OperatorService.saveBankDetails (the one place
    * the full account number is ever available). This method only ever
    * consumes an already-existing paystackRecipientCode.
+   *
+   * The Payout row is still written and transitioned alongside the Payment
+   * row — the additive-migration rule. Every branch below that moves one
+   * moves the other. Task 11 deletes the table and its readers together.
    */
   private async attemptPayout(
     payoutId: string,
@@ -151,6 +288,16 @@ export class PayoutService {
           },
         });
 
+        // The ledger's equivalent of the block above. Recorded regardless of
+        // whether this call is the one that newly blocked it — that flag
+        // governs re-notification, not the row's state.
+        await this.blockPayment(
+          rescueRequestId,
+          operatorId,
+          amount,
+          PaymentBlockReason.NO_BANK_DETAILS,
+        );
+
         if (newlyBlocked.count === 0) {
           // Already blocked for this reason — don't re-notify, but the row
           // still needs its status put back: a retry left it at PROCESSING,
@@ -177,6 +324,12 @@ export class PayoutService {
 
       const balance = await this.paystackService.checkBalance();
       if (balance < amount) {
+        await this.blockPayment(
+          rescueRequestId,
+          operatorId,
+          amount,
+          PaymentBlockReason.INSUFFICIENT_BALANCE,
+        );
         await this.prisma.payout.update({
           where: { id: payoutId },
           data: {
@@ -188,22 +341,96 @@ export class PayoutService {
         return;
       }
 
-      const reference = this.paystackService.generateReference('PAYOUT');
-      const transfer = await this.paystackService.initiateTransfer({
+      // Claimed only now that we are actually going to transfer. Claiming
+      // before the guards above would leave a SUBMITTED row behind whenever
+      // checkBalance throws — and a submitted payout that never reached
+      // Paystack is one verification can never settle, because a not-found
+      // must never fail a payout.
+      const payment = await this.claimPayoutPayment(
+        rescueRequestId,
+        operatorId,
+        amount,
+      );
+      if (!payment) return;
+
+      const result = await this.paystackService.initiateTransfer({
         recipientCode: operator.paystackRecipientCode,
         amount,
-        reference,
+        reference: this.paymentLedger.referenceFor(payment),
         reason: `Job payout — ${rescueRequestId}`,
       });
 
+      // Ambiguous first: a 5xx or a dropped connection may still have moved
+      // money, so the row stays SUBMITTED and verification resolves it. The
+      // legacy row goes to PROCESSING for the same reason.
+      if (result.outcome === 'ambiguous') {
+        await this.prisma.payout.update({
+          where: { id: payoutId },
+          data: { status: 'PROCESSING', blockReason: null },
+        });
+        return;
+      }
+
+      if (result.outcome === 'rejected') {
+        // Positive evidence the original landed — treat it as in flight, not
+        // as a failure. See isDuplicateReference.
+        if (isDuplicateReference(result)) {
+          await this.prisma.payout.update({
+            where: { id: payoutId },
+            data: { status: 'PROCESSING', blockReason: null },
+          });
+          return;
+        }
+        const failureReason = result.message ?? 'transfer rejected';
+        await this.paymentLedger.recordRejection(payment.id, failureReason);
+        await this.prisma.payout.update({
+          where: { id: payoutId },
+          data: { status: 'FAILED', blockReason: null, failureReason },
+        });
+        return;
+      }
+
+      // Recorded regardless — useful context, even though verification keys
+      // on our own reference rather than this.
+      await this.prisma.payment.update({
+        where: { id: payment.id },
+        data: { providerRef: `trf:${result.data.transfer_code}` },
+      });
       await this.prisma.payout.update({
         where: { id: payoutId },
         data: {
           status: 'PROCESSING',
           blockReason: null,
-          paystackTransferCode: transfer.transferCode,
+          paystackTransferCode: result.data.transfer_code,
         },
       });
+
+      // A 2xx is not success. `otp` and `pending` are both possible, and even
+      // a body saying `success` may NOT be claimed here — SUCCEEDED comes
+      // only from a webhook or from verification. From this point the
+      // response may move the row to BLOCKED or to a definitive failure, and
+      // nowhere else.
+      const mapped = mapTransferStatus(result.data.status);
+      if (mapped.status === PaymentStatus.BLOCKED) {
+        // The live bug's sibling: an `otp` transfer left SUBMITTED would be
+        // polled forever, because nothing finishes it but a human.
+        await this.paymentLedger.recordBlocked(payment.id, mapped.blockReason!);
+      } else if (
+        mapped.status === PaymentStatus.FAILED ||
+        mapped.status === PaymentStatus.REVERSED
+      ) {
+        // `abandoned` lands here — the live bug. OTP was never answered, so
+        // nothing moved and the transfer is dead.
+        await this.paymentLedger.claimTerminal(payment.id, mapped);
+        await this.prisma.payout.update({
+          where: { id: payoutId },
+          data: {
+            status: 'FAILED',
+            failureReason: `Transfer ${result.data.status}`,
+          },
+        });
+      }
+      // Everything else — including `success` — stays SUBMITTED.
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error';
       console.error('❌ Payout attempt failed:', message);

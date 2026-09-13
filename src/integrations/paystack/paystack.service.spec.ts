@@ -139,8 +139,63 @@ describe('PaystackService', () => {
         }),
       );
       expect(result).toEqual({
-        transferCode: 'TRF_test123',
-        status: 'pending',
+        outcome: 'ok',
+        data: { transfer_code: 'TRF_test123', status: 'pending' },
+      });
+    });
+
+    it('classifies a 5xx as ambiguous — the transfer may still have landed', async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        status: 502,
+        json: async () => ({ status: false, message: 'Bad gateway' }),
+      }) as any;
+
+      expect(
+        await service.initiateTransfer({
+          recipientCode: 'RCP_test123',
+          amount: 250000,
+          reference: 'payout_1',
+          reason: 'Job payout',
+        }),
+      ).toEqual({ outcome: 'ambiguous', message: 'Bad gateway' });
+    });
+
+    it('classifies a thrown network error as ambiguous, never a rejection', async () => {
+      global.fetch = jest
+        .fn()
+        .mockRejectedValue(new Error('ECONNRESET')) as any;
+
+      expect(
+        await service.initiateTransfer({
+          recipientCode: 'RCP_test123',
+          amount: 250000,
+          reference: 'payout_1',
+          reason: 'Job payout',
+        }),
+      ).toEqual({ outcome: 'ambiguous', message: 'ECONNRESET' });
+    });
+
+    it('classifies a 4xx with a provider code as a definitive rejection', async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        status: 400,
+        json: async () => ({
+          status: false,
+          code: 'invalid_recipient',
+          message: 'Recipient is invalid',
+        }),
+      }) as any;
+
+      expect(
+        await service.initiateTransfer({
+          recipientCode: 'RCP_bad',
+          amount: 250000,
+          reference: 'payout_1',
+          reason: 'Job payout',
+        }),
+      ).toEqual({
+        outcome: 'rejected',
+        code: 'invalid_recipient',
+        message: 'Recipient is invalid',
       });
     });
   });

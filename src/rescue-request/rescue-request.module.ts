@@ -44,7 +44,10 @@ import { AuthGuard } from '../auth/auth.guard';
     OperatorModule,
     PlatformConfigModule,
     RatingModule,
-    PayoutModule,
+    // Also forwardRef'd: PayoutModule -> PaymentModule -> this module ->
+    // PayoutModule is a cycle, so entering the graph from PayoutModule
+    // evaluates this decorator while PayoutModule is still undefined.
+    forwardRef(() => PayoutModule),
     JwtModule.register({
       secret: process.env.JWT_SECRET || 'your-secret-key',
       signOptions: { expiresIn: '24h' },
