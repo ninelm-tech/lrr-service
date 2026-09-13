@@ -1,7 +1,7 @@
 # LRR Full System Test Plan
 
-**Date:** 2026-09-10 · **Last updated:** 2026-09-12 (added §13 after a live test pass found stale-state bugs)
-**Scope:** Every customer/operator/staff-facing flow currently implemented, on staging. Manual, WhatsApp + admin dashboard driven — the automated Jest suite (292 tests, `lrr-service`) already covers unit-level logic; this plan verifies the real, end-to-end experience a real user would have.
+**Date:** 2026-09-10 · **Last updated:** 2026-09-13 (updated for the payment-model rewrite: §10's statuses now match the Payment ledger, added Paystack-dashboard verification steps to §2/§9/§10, added §14 admin-triggered refund and §15 Paystack customer identity)
+**Scope:** Every customer/operator/staff-facing flow currently implemented, on staging. Manual, WhatsApp + admin dashboard driven — the automated Jest suite (332 unit + 146 integration tests, `lrr-service`) already covers unit-level logic and real-database behaviour; this plan verifies the real, end-to-end experience a real user would have, including the one thing the automated suite cannot: that money actually moves at Paystack, not just in our own database.
 
 **How to use this:** Work top to bottom. Each numbered case has Setup → Steps → Expected Result. Check the box when the actual result matches. If it doesn't, stop, note what actually happened, and file it rather than continuing past a failure in that flow — later cases often assume the earlier ones worked.
 
@@ -13,6 +13,8 @@
 - Admin dashboard access (ADMIN or SUPER_ADMIN role)
 - `disputeAlertPhoneNumber` set in Platform Settings, and access to that number's WhatsApp — it now receives dispute alerts, low-rating alerts, *and* stalled-confirmation alerts
 - A real (or test-mode) Paystack card for payment steps
+- Access to the Paystack dashboard for the same mode (test/live) the environment under test actually uses — several steps below only pass if the money movement shows up there, not just in our own UI
+- An admin/staff bearer token for one direct API call in §14 (there's no dashboard button for it yet) — the same token your admin dashboard session already holds; grab it from your browser's dev tools (Storage) or however your team normally makes authenticated calls against the API
 
 ---
 
@@ -64,7 +66,7 @@
 
 - [ ] **2.6 — Successful payment**
   On a fresh request, pay the deposit within the window.
-  **Expected:** Motorist gets operator confirmation; operator gets "payment confirmed, job is live."
+  **Expected:** Motorist gets operator confirmation; operator gets "payment confirmed, job is live." **Then open the Paystack dashboard's Transactions list and confirm a successful charge exists for this exact amount, dated just now** — our own confirmation message says what *we* think happened, not what actually happened at Paystack.
 
 - [ ] **2.7 — Re-prompt if motorist messages before paying**
   On a fresh request, send any random text before paying (don't use the payment link).
@@ -187,7 +189,7 @@
 
 - [ ] **9.1 — Successful balance payment (undisputed job)**
   Complete a normal (non-disputed) job through to balance payment.
-  **Expected:** Motorist gets payment confirmation + rating prompt. Operator gets "release the vehicle" + rating prompt.
+  **Expected:** Motorist gets payment confirmation + rating prompt. Operator gets "release the vehicle" + rating prompt. **Confirm in the Paystack dashboard's Transactions list** that a successful charge for the balance amount exists, separate from the deposit's transaction in §2.6.
 
 ---
 
@@ -195,15 +197,15 @@
 
 - [ ] **10.1 — Successful payout**
   With an operator who has bank details on file, confirm a payout fires after balance payment.
-  **Expected:** Operator receives "payment sent" with the amount; payout shows `SUCCESS` in the admin Payouts tab.
+  **Expected:** Operator receives "payment sent" with the amount; payout shows `Success` in the admin Payouts tab. **Then open the Paystack dashboard's Transfers list and confirm a successful transfer exists for this exact amount, to this operator's bank account** — check the recipient and amount match, not just that some transfer exists.
 
 - [ ] **10.2 — Missing bank details**
   Repeat with an operator who has no bank details on file.
-  **Expected:** Payout shows `PENDING` with reason "No bank details on file" in the admin Payouts tab; operator is notified to add bank details.
+  **Expected:** Payout shows `Blocked` with reason "No bank details on file" in the admin Payouts tab; operator is notified to add bank details. (This used to show as `Pending` — if you see `Pending` here, that's a regression, not the expected state.)
 
 - [ ] **10.3 — Retry after fixing bank details**
   Add bank details for the blocked operator, then click Retry in the admin Payouts tab.
-  **Expected:** Payout proceeds to `SUCCESS`.
+  **Expected:** Payout proceeds to `Success`. Confirm in the Paystack dashboard as in 10.1.
 
 - [ ] **10.4 — Payout on a disputed request shows the dispute badge**
   Find a payout tied to a request that was disputed (from §8).
@@ -285,6 +287,36 @@ This whole section exists because of a real failure found on 2026-09-12. Running
 - [ ] **13.8 — Every operator-facing message names its job**
   Working through a job end to end, check each message the operator receives: dispatch offer, countdown notice, arrival confirmation, DONE/ARRIVED reminders, "payment received / release the vehicle", the rating prompt, and any "this job has already ended" reply.
   **Expected:** Every one of them names the job reference (e.g. `Job #UH8DF7`). An operator juggling several jobs must never get a message that just says "the job" or "this customer" with no way to tell which. Motorist-facing messages don't need this — a motorist only ever has one active request.
+
+---
+
+## 14. Admin-Triggered Refund
+
+There's no dashboard button for this yet — it's a direct API call only. Don't file "there's no Refund button" as a bug here; it's a known gap, tracked separately from this plan.
+
+**Setup:** Pay a deposit (§2.6), then cancel the request from the admin dashboard (§12.3, the "after deposit" case). This leaves a request that's `Cancelled` with a successfully paid deposit — the exact "deposit arrived after the request was already cancelled" case this feature exists for.
+
+- [ ] **14.1 — Trigger the refund**
+  Using your admin bearer token, call `POST /rescue-requests/:id/refund-deposit` (no body) with the cancelled request's id from the setup above.
+  **Expected:** Returns `{"message": "Refund initiated"}`. **In the Paystack dashboard, find the original deposit's transaction and confirm a refund for the full amount now exists against it**, eventually showing `Processed`.
+
+- [ ] **14.2 — Refund cannot be double-triggered**
+  Call the same endpoint again for the same request — once right after 14.1 (while the refund is still in flight), and once after 14.1 shows `Processed`.
+  **Expected:** Both calls are rejected with a 400 (`"A refund is already in progress for this request"` while in flight, `"Not eligible for refund..."` once it's done). Neither call creates a second refund at Paystack — check the transaction's refund history, not just the API response.
+
+- [ ] **14.3 — Refunding a request with no paid deposit is rejected**
+  Call the same endpoint on a cancelled request that never had its deposit paid.
+  **Expected:** Rejected with `"Not eligible for refund — already refunded/in progress, or not a late-payment case."` — no refund attempt is made for money that was never collected.
+
+---
+
+## 15. Paystack Customer Identity
+
+This isn't a user-visible flow — it's a data-integrity property that only the real Paystack dashboard can confirm. Paystack treats the email on a payment as the customer's identity, and that identity can never be changed later. A motorist who pays once as a guest and later registers a real email must stay the *same* Paystack customer — otherwise a card saved under the first identity can never be charged under the second, which only becomes visible once memberships/saved cards exist. The row-lock mechanics are already covered by `paystack-customer-identity.int-spec.ts`; this section checks the one thing only Paystack's own records can show.
+
+- [ ] **15.1 — Guest pays, registers a real email, pays again — still one customer**
+  As a fresh motorist with no email on file, complete a deposit payment (§2.6). Then register a portal account for that same phone number using a real email address. Then start a second request and pay its deposit too.
+  **Expected:** In the **Paystack dashboard's Customers list**, search by phone number and by the real email just registered. Only **one** customer record exists for this person. Its email on file is the auto-generated `<digits>@lrr.ng` address from the *first* payment, not the real email registered afterward — that's expected, not a bug: the identity is frozen on first payment and Paystack has no way to update a customer's email later.
 
 ---
 
