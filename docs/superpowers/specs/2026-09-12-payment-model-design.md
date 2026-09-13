@@ -398,9 +398,28 @@ a transfer by its `transfer_code` is useless in precisely the case recovery
 exists for: if the response was lost, we never learned the code. Only a
 reference we chose ourselves is guaranteed to be in hand.
 
-(Confirm both endpoint paths against Paystack's current documentation at
-implementation time. The design depends on *a* lookup keyed by caller
-reference existing for transfers, not on this exact spelling.)
+**Both paths are verified against the live test integration** (2026-09-12),
+not taken from documentation:
+
+| Probe | Result |
+|---|---|
+| `GET /transfer/verify/PAYOUT_1789263636848_u1i0o3n` | `200` — a real record, returned by **our** reference |
+| `GET /transfer/verify/does_not_exist` | `404`, `code: "not_found"` |
+| `GET /transaction/verify/does_not_exist` | `400`, `code: "transaction_not_found"` |
+| `GET /refund?transaction=1` | `200`, filter accepted |
+
+**Branch on `code`, never on `message`.** Paystack returns a stable
+machine-readable `code` alongside the prose, and the prose is not a contract.
+Note the two "not found" cases differ in HTTP status as well as code — 404 for
+transfers, 400 for transactions — so neither may be treated as the general
+shape of the other.
+
+**Still unverified:** whether `merchant_note` survives a round trip on a
+refund record. The test integration has no refunds, so the field shape could
+not be observed. The refund-recovery strategy depends on it, so Task 1 of the
+implementation plan must establish it empirically before any code relies on
+it — and if it does not round-trip, that strategy needs rethinking rather than
+patching.
 
 A `SUBMITTED` row Paystack has never heard of is **not** conclusive for
 outbound money — see *Resolving a SUBMITTED row*. A payout re-submits the
@@ -409,6 +428,29 @@ same reference and backs off; a refund is recovered read-only, by matching on
 
 This check is what would have surfaced the stuck payout on its own, about a
 minute after it stuck.
+
+### Provider status mapping
+
+Observed on the live test integration rather than inferred:
+
+| Paystack transfer status | Our state | Why |
+|---|---|---|
+| `success` | `SUCCEEDED` | money moved |
+| `failed`, `reversed` | `FAILED` / `REVERSED` | definitive |
+| `pending`, `processing` | `SUBMITTED` | waiting resolves it |
+| `otp` | `BLOCKED` + `AWAITING_OTP` | a human must act |
+| **`abandoned`** | **`FAILED`** | initiated, never finalised — see below |
+
+**`abandoned` is terminal and means no money moved.** All three transfers
+currently on the test integration are in it, with `transferred_at: null` and
+`fee_charged: 0`. It is what a transfer becomes when it is initiated and never
+finalised — the OTP path, left unanswered. Because nothing moved and the
+transfer will not resume, `FAILED` is correct and a retry may legitimately
+create a fresh attempt with a new reference.
+
+Today's code handles none of these: it sets `PROCESSING` on the initiate
+response and waits for a `transfer.success`/`transfer.failed` webhook that
+never arrives for an abandoned transfer. That is the stranded payout, exactly.
 
 ### Actionable non-terminal states
 
@@ -433,13 +475,40 @@ check resolves it from there, exactly as for any other submitted row. It may
 go terminal immediately, but only if Paystack actually returns a terminal
 status.
 
-**Production prerequisite: transfers OTP must be disabled.** With it enabled
-every payout stops at `AWAITING_OTP` until a person reads a code, which no
-amount of automation fixes and which defeats the point of automated payouts.
-Finalizing OTP programmatically is not an option worth building — it needs a
-human in the loop by design. This belongs beside the balance configuration
-below: both are account settings that a correct implementation still depends
-on.
+**Production prerequisite: transfers OTP must be disabled. This is already
+biting.** Every transfer on the test integration is `abandoned` — initiated,
+never finalised, no money moved — which is what happens when OTP is on and
+nobody supplies the code. It is not a hypothetical: it is why the payout you
+went looking for was not in the Transfers tab.
+
+With OTP enabled every payout stops at `AWAITING_OTP` until a person reads a
+code, which no amount of automation fixes and which defeats the point of
+automated payouts. Finalizing OTP programmatically is not worth building — it
+needs a human in the loop by design. Disable it under Settings →
+Preferences → Transfers, on **each** integration you intend to pay from.
+
+**What disabling OTP costs, and what to do about it.** OTP is a second factor
+on money leaving the account. Without it the secret key alone can move funds
+to any recipient the holder creates — and that key lives in the ECS
+environment. Going from two factors to one secret is a real reduction, so it
+should be paired rather than done alone:
+
+- **IP-allowlist transfer initiation.** ECS sits behind a NAT gateway with a
+  stable egress IP, so pinning it makes a leaked key largely useless off the
+  network. This is the highest-value control and the closest substitute for
+  the factor being removed.
+- Hold the secret in Secrets Manager rather than a plain task-definition
+  environment variable.
+- Alert on any payout above a threshold, so an anomaly is noticed in minutes
+  rather than at reconciliation.
+
+Automated payouts genuinely cannot coexist with a human-in-the-loop OTP, so
+disabling it is the right call — but disable it *and* allowlist, not just
+disable.
+
+Note this applies only to the outbound leg. Collections are unaffected: the
+customer authenticates with their own bank or card, and there is no OTP on our
+side to turn off.
 
 `needs-attention` has no such escape and needs a staff path — the refund
 cannot proceed until the customer's bank details are supplied.
@@ -525,8 +594,10 @@ deposit window has passed.
 
 ## Fees are captured because they cannot be recovered
 
-`providerFee` and `netAmount` arrive in the `charge.success` payload and are
-**discarded today**. If they are not stored at the time, reconstructing what
+`providerFee` and `netAmount` come from two different places, and both are
+**discarded today**: for collections they arrive in the `charge.success`
+payload; for payouts they are `fee_charged` and `fees_breakdown` on the
+transfer record itself. If they are not stored at the time, reconstructing what
 was actually netted on a job months later means re-querying Paystack
 transaction by transaction. For a business whose model is commission on
 service price, gross-versus-net is not optional history.
@@ -548,6 +619,18 @@ the `RescueRequest` payment columns are dropped rather than migrated.
 If that changes before implementation, the backfill is mechanical — one
 `Payment` row per `Payout` row, plus one per request with `depositPaid` or
 `balancePaid` set — and this section should be revisited rather than assumed.
+
+## Operational note: test versus live integrations
+
+Transfers, transactions and refunds are scoped to the integration whose
+secret key made them. The service currently runs on `sk_test`, so everything
+it has created lives on the **test** integration — which is why the live
+dashboard's Transfers tab was empty while transfers plainly existed.
+
+Worth stating because it costs an afternoon every time: an empty dashboard tab
+is as likely to mean "wrong integration" as "nothing happened". The
+verification check inherits this for free — it asks with the same key the
+write used, so it can only ever see the integration that key belongs to.
 
 ## Operational note: Paystack balance
 
