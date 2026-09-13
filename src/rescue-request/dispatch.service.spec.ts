@@ -13,11 +13,6 @@ import { ConfigModule } from '@nestjs/config';
  * Batch timers are keyed `requestId:batchId`, so a test can't clear one by
  * request id alone. Tests that schedule real timers drain the whole map.
  */
-function clearAllBatchTimers(service: DispatchService) {
-  const timers = (service as any).batchTimers as Map<string, NodeJS.Timeout>;
-  timers.forEach((t) => clearTimeout(t));
-  timers.clear();
-}
 
 describe('DispatchService', () => {
   it('registers as a singleton — two module resolutions return the same batchTimers instance', async () => {
@@ -173,7 +168,7 @@ describe('DispatchService', () => {
   });
 
   describe('batch identity survives the expiresAt rewrite', () => {
-    it('resolveBatch (via maybeResolveBatchEarly) still finds offers sharing a batchId even when one has a rewritten, shorter expiresAt', async () => {
+    it('maybeResolveBatchEarly still finds offers sharing a batchId even when one has a rewritten, shorter expiresAt', async () => {
       // Simulates Task 5's transition: an offer's expiresAt can be shortened
       // independently of the rest of its batch. Lookups must key off batchId,
       // never expiresAt, or a rewritten offer silently drops out of its batch.
@@ -194,6 +189,7 @@ describe('DispatchService', () => {
               expiresAt: new Date(Date.now() + 60 * 1000),
             }, // rewritten shorter
           ]),
+          updateMany: jest.fn(),
         },
       };
 
@@ -210,10 +206,6 @@ describe('DispatchService', () => {
       }).compile();
       const service = module.get<DispatchService>(DispatchService);
 
-      const resolveBatchSpy = jest
-        .spyOn(service as any, 'resolveBatch')
-        .mockResolvedValue(undefined);
-
       await (service as any).maybeResolveBatchEarly('req-1', 'batch-shared');
 
       expect(prisma.dispatchOffer.findMany).toHaveBeenCalledWith(
@@ -221,13 +213,17 @@ describe('DispatchService', () => {
           where: { rescueRequestId: 'req-1', batchId: 'batch-shared' },
         }),
       );
-      expect(resolveBatchSpy).toHaveBeenCalledWith(
-        'req-1',
-        ['op-1', 'op-2'],
-        'cust-1',
-        0,
-        'batch-shared',
-      );
+      // Everyone in the batch has answered, so its offers are expired now and
+      // BatchResolveCheck picks them up on its next tick — rather than a
+      // second code path resolving the batch itself and racing that check.
+      expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith({
+        where: {
+          rescueRequestId: 'req-1',
+          batchId: 'batch-shared',
+          expiresAt: { gt: expect.any(Date) },
+        },
+        data: { expiresAt: expect.any(Date) },
+      });
     });
   });
 
@@ -256,7 +252,6 @@ describe('DispatchService', () => {
     };
 
     afterEach(() => {
-      clearAllBatchTimers(service);
       // No close timers to drain any more — bidding closes off
       // quoteCollectionDeadline, via BiddingCloseCheck.
       if (originalCountdownSid === undefined)
@@ -543,14 +538,22 @@ describe('DispatchService', () => {
   describe('expandRadiusNow', () => {
     let radiusService: DispatchService;
     let prisma: {
-      rescueRequest: { findUnique: jest.Mock; updateMany: jest.Mock };
+      rescueRequest: {
+        findUnique: jest.Mock;
+        updateMany: jest.Mock;
+        update: jest.Mock;
+      };
       dispatchOffer: { updateMany: jest.Mock };
     };
     let sessionStore: { getOrCreate: jest.Mock };
 
     beforeEach(async () => {
       prisma = {
-        rescueRequest: { findUnique: jest.fn(), updateMany: jest.fn() },
+        rescueRequest: {
+          findUnique: jest.fn(),
+          updateMany: jest.fn(),
+          update: jest.fn(),
+        },
         dispatchOffer: { updateMany: jest.fn() },
       };
       sessionStore = { getOrCreate: jest.fn() };
@@ -637,10 +640,15 @@ describe('DispatchService', () => {
 
       await radiusService.expandRadiusNow('req-1');
 
-      expect(startDispatchSpy).toHaveBeenCalledWith('req-1', 'cust-1', 4);
+      expect(startDispatchSpy).toHaveBeenCalledWith('req-1', 'cust-1');
       // The invariant: an admin adding operators never pushes the motorist's
-      // deadline out. Nothing wrote to the request at all.
+      // deadline out. The round advances (that IS the expansion), but the
+      // deadline is untouched.
       expect(prisma.rescueRequest.updateMany).not.toHaveBeenCalled();
+      const [[updateArgs]] = prisma.rescueRequest.update.mock.calls as [
+        [{ data: Record<string, unknown> }],
+      ];
+      expect(Object.keys(updateArgs.data)).toEqual(['dispatchRound']);
     });
 
     it('starts a new round with an expanded radius', async () => {
@@ -657,9 +665,14 @@ describe('DispatchService', () => {
 
       await radiusService.expandRadiusNow('req-1');
 
-      // round 1 → current radius approximated as 1 * RADIUS_EXPANSION_KM (2) = 2,
-      // expanded by one more increment = 4
-      expect(startDispatchSpy).toHaveBeenCalledWith('req-1', 'cust-1', 4);
+      // Advancing the round IS the expansion: prepareNextRound derives the
+      // radius from it, so there is no separate radius argument to get out
+      // of step with the persisted round.
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { dispatchRound: 2 },
+      });
+      expect(startDispatchSpy).toHaveBeenCalledWith('req-1', 'cust-1');
     });
 
     it('leaves offers that operators are still holding completely alone', async () => {
@@ -678,19 +691,12 @@ describe('DispatchService', () => {
         .spyOn(radiusService as any, 'startDispatch')
         .mockResolvedValue(undefined);
 
-      const liveBatchTimer = setTimeout(() => {}, 100000);
-      const key = (radiusService as any).batchKey('req-1', 'batch-live');
-      (radiusService as any).batchTimers.set(key, liveBatchTimer);
-
       await radiusService.expandRadiusNow('req-1');
 
+      // No offer is touched at all. In-flight batches keep their own
+      // expiresAt and resolve on their own schedule via BatchResolveCheck —
+      // there is no timer for an expand to cancel any more.
       expect(prisma.dispatchOffer.updateMany).not.toHaveBeenCalled();
-      // The in-flight batch's own timer is untouched, so it still resolves on
-      // its own schedule rather than being cancelled by the expand.
-      expect((radiusService as any).batchTimers.has(key)).toBe(true);
-
-      clearTimeout(liveBatchTimer);
-      (radiusService as any).batchTimers.delete(key);
     });
   });
 
@@ -887,8 +893,6 @@ describe('DispatchService', () => {
         );
         // The offer was clamped TO the deadline — it never moved it.
         expect(deadline.getTime()).toBe(Date.now() + 90 * 1000);
-
-        clearAllBatchTimers(manualService);
       } finally {
         jest.useRealTimers();
       }
@@ -927,8 +931,6 @@ describe('DispatchService', () => {
         expect(created.expiresAt.getTime()).toBeLessThan(
           Date.now() + 5 * 60 * 1000,
         );
-
-        clearAllBatchTimers(manualService);
       } finally {
         jest.useRealTimers();
       }
@@ -954,7 +956,7 @@ describe('DispatchService', () => {
       ).rejects.toThrow('not an active operator');
     });
 
-    it('creates a single-operator round: offer created, WhatsApp sent, session updated, timer scheduled', async () => {
+    it('creates a single-operator round: offer created and recorded in one transaction, WhatsApp sent', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
         id: 'req-1',
         status: 'DISPATCHING',
@@ -995,21 +997,14 @@ describe('DispatchService', () => {
       });
       // And it commits with the offer, not after it.
       expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-      // One timer, keyed to this batch rather than to the request.
-      const keys = [...(manualService as any).batchTimers.keys()] as string[];
-      expect(keys).toHaveLength(1);
-      expect(keys[0]).toMatch(/^req-1:[0-9a-f-]+$/);
-
-      // Clean up the real timer this test scheduled
-      clearTimeout((manualService as any).batchTimers.get(keys[0]));
     });
 
     it('adds its batch alongside an in-flight one instead of replacing it', async () => {
       // Previously this called supersedeActiveRound, which cancelled the
-      // pending offers AND the existing timer so only one round was ever live.
-      // Now both batches coexist, each resolving its own operator set on its
-      // own schedule — which is only safe because the timers are keyed per
-      // batch rather than per request.
+      // pending offers so only one round was ever live. Now both batches
+      // coexist, each resolving its own operator set on its own schedule —
+      // safe because each offer carries its own expiresAt and batchId, and
+      // BatchResolveCheck groups by batch.
       prisma.rescueRequest.findUnique.mockResolvedValue({
         id: 'req-1',
         status: 'DISPATCHING',
@@ -1027,25 +1022,15 @@ describe('DispatchService', () => {
       });
       prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
 
-      const priorTimer = setTimeout(() => {}, 100000);
-      const priorKey = (manualService as any).batchKey('req-1', 'batch-prior');
-      (manualService as any).batchTimers.set(priorKey, priorTimer);
-
       await manualService.manualOfferToOperator('req-1', 'op-1');
 
-      // The in-flight batch survives untouched...
-      expect((manualService as any).batchTimers.get(priorKey)).toBe(priorTimer);
-      // ...and no offer was cancelled to make room for the new one.
+      // No offer was cancelled to make room for the new one — the in-flight
+      // batch keeps its own expiry and resolves on its own schedule.
       expect(prisma.dispatchOffer.updateMany).not.toHaveBeenCalled();
-
-      const keys = [...(manualService as any).batchTimers.keys()] as string[];
-      expect(keys).toHaveLength(2);
-      keys.forEach((k) =>
-        clearTimeout((manualService as any).batchTimers.get(k)),
-      );
+      expect(prisma.dispatchOffer.create).toHaveBeenCalledTimes(1);
     });
 
-    it('passes the current accumulated radius (not a hardcoded 0) to resolveBatch on timeout, and includes media links in the message', async () => {
+    it('arms no timer for the offer window, and includes media links in the message', async () => {
       jest.useFakeTimers();
       const prevApiBaseUrl = process.env.API_BASE_URL;
       process.env.API_BASE_URL = 'https://api.example.com';
@@ -1076,9 +1061,7 @@ describe('DispatchService', () => {
           dispatchRound: 1,
         });
 
-        const resolveBatchSpy = jest
-          .spyOn(manualService as any, 'resolveBatch')
-          .mockResolvedValue(undefined);
+        const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
 
         await manualService.manualOfferToOperator('req-1', 'op-1');
 
@@ -1090,15 +1073,10 @@ describe('DispatchService', () => {
           expect.stringContaining('media-1'),
         );
 
+        // No timer is armed at all: the offer's own expiresAt is what
+        // BatchResolveCheck matches on, so this survives a restart.
         jest.advanceTimersByTime(5 * 60 * 1000);
-
-        expect(resolveBatchSpy).toHaveBeenCalledWith(
-          'req-1',
-          ['op-1'],
-          'cust-1',
-          2,
-          expect.any(String),
-        );
+        expect(setTimeoutSpy).not.toHaveBeenCalled();
       } finally {
         jest.useRealTimers();
         process.env.API_BASE_URL = prevApiBaseUrl;
@@ -1144,8 +1122,6 @@ describe('DispatchService', () => {
       // live template declares exactly 7 variables, and sending an extra
       // key fails the whole send with Twilio 21656.
       expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
-
-      clearAllBatchTimers(manualService);
     });
 
     it('logs to Sentry and re-throws (does not silently succeed) when the send fails', async () => {
@@ -1179,11 +1155,21 @@ describe('DispatchService', () => {
   describe('startDispatch — batch operator notification', () => {
     let batchService: DispatchService;
     let prisma: {
-      rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
+      rescueRequest: {
+        findUnique: jest.Mock;
+        findUniqueOrThrow: jest.Mock;
+        update: jest.Mock;
+      };
       user: { findUnique: jest.Mock };
       operator: { count: jest.Mock };
-      dispatchOffer: { createMany: jest.Mock };
+      dispatchOffer: {
+        createMany: jest.Mock;
+        count: jest.Mock;
+        updateMany: jest.Mock;
+      };
       requestMedia: { findMany: jest.Mock };
+      whatsAppSession: { updateMany: jest.Mock };
+      $transaction: jest.Mock;
     };
     let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
     let operatorService: { findAndRankCandidates: jest.Mock };
@@ -1228,7 +1214,12 @@ describe('DispatchService', () => {
             // Dispatch progression is read from the request now, not the session.
             dispatchRound: 0,
             offeredOperatorIds: [],
+            quoteCollectionDeadline: null,
+            biddingClosedAt: null,
           }),
+          findUniqueOrThrow: jest
+            .fn()
+            .mockResolvedValue({ quoteCollectionDeadline: null }),
           update: jest.fn(),
         },
         user: {
@@ -1237,8 +1228,16 @@ describe('DispatchService', () => {
             .mockResolvedValue({ phoneNumber: '+2348000000000' }),
         },
         operator: { count: jest.fn() },
-        dispatchOffer: { createMany: jest.fn() },
+        dispatchOffer: {
+          createMany: jest.fn(),
+          count: jest.fn().mockResolvedValue(0),
+          updateMany: jest.fn(),
+        },
         requestMedia: { findMany: jest.fn().mockResolvedValue([]) },
+        whatsAppSession: { updateMany: jest.fn() },
+        // Offers and the offeredOperatorIds append commit together now, so
+        // the callback runs against this same mock as its transaction client.
+        $transaction: jest.fn((fn: (tx: unknown) => unknown) => fn(prisma)),
       };
       sessionStore = {
         getOrCreate: jest.fn().mockResolvedValue({}),
@@ -1291,8 +1290,6 @@ describe('DispatchService', () => {
       expect(prisma.dispatchOffer.createMany).toHaveBeenCalledWith({
         data: [expect.objectContaining({ operatorId: 'op-a' })],
       });
-
-      clearAllBatchTimers(batchService);
     });
 
     it('sends via the Content Template, with per-operator distance+ETA combined into {{4}} (the template has no separate ETA slot), when TWILIO_DISPATCH_OFFER_TEMPLATE_SID is set', async () => {
@@ -1323,8 +1320,6 @@ describe('DispatchService', () => {
         }),
       );
       expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
-
-      clearAllBatchTimers(batchService);
     });
 
     it('sends exactly the seven variables the live template declares — an extra key fails the whole send with Twilio 21656', async () => {
@@ -1342,8 +1337,6 @@ describe('DispatchService', () => {
         '6',
         '7',
       ]);
-
-      clearAllBatchTimers(batchService);
     });
 
     it('no variable contains a newline, tab, 4+ consecutive spaces, or is empty — all are Twilio 21656 triggers', async () => {
@@ -1374,8 +1367,6 @@ describe('DispatchService', () => {
         // Content survives flattening — both media links still present.
         expect(vars['6']).toContain('media-1');
         expect(vars['6']).toContain('media-2');
-
-        clearAllBatchTimers(batchService);
       } finally {
         process.env.API_BASE_URL = prevApiBaseUrl;
       }
@@ -1397,8 +1388,6 @@ describe('DispatchService', () => {
         expect.stringContaining('+2349022222222'),
         expect.any(String),
       ); // the other operator still got theirs
-
-      clearAllBatchTimers(batchService);
     });
 
     it('sends the shortlist instead of auto-cancelling when candidates run out but a quote already exists — LRR-SERVICE-5', async () => {
@@ -1410,19 +1399,26 @@ describe('DispatchService', () => {
       // not this one.
       operatorService.findAndRankCandidates.mockResolvedValue([]); // nobody left to offer
       prisma.operator.count.mockResolvedValue(5); // operators exist nearby — not a coverage gap
+      // The quote guard runs before any transaction, off this count.
+      (prisma as any).dispatchOffer.count = jest.fn().mockResolvedValue(2);
       (prisma as any).dispatchOffer.findMany = jest
         .fn()
         .mockResolvedValue([{ id: 'offer-1', status: 'QUOTED' }]);
       (prisma as any).rescueRequest.update = jest.fn();
-      sessionStore.getOrCreate.mockResolvedValue({
-        offeredOperatorIds: ['op-a', 'op-b'],
+      (prisma as any).rescueRequest.findUnique = jest.fn().mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
         dispatchRound: 3,
+        offeredOperatorIds: ['op-a', 'op-b'],
+        quoteCollectionDeadline: null,
+        biddingClosedAt: null,
       });
       const shortlistSpy = jest
         .spyOn(batchService, 'deliverQuoteShortlist')
         .mockResolvedValue(undefined);
 
-      await batchService.startDispatch('req-1', 'cust-1', 6);
+      await batchService.startDispatch('req-1', 'cust-1');
 
       expect(shortlistSpy).toHaveBeenCalledWith('req-1', 'cust-1');
       expect((prisma as any).rescueRequest.update).not.toHaveBeenCalled();
@@ -1430,99 +1426,6 @@ describe('DispatchService', () => {
         expect.any(String),
         expect.stringContaining('automatically cancelled'),
       );
-    });
-  });
-
-  describe('resolveBatch — no-quotes continuation (Task 7)', () => {
-    // Task 7: the DISPATCH_RETRY_MINUTES delayed retry is gone. A batch that
-    // resolves with zero quotes must move to the next batch on the SAME
-    // TICK (no setTimeout) — unless phase 2 has already started
-    // (quoteCollectionDeadline set on the request), in which case this
-    // automatic continuation must no-op and leave phase 2's own
-    // closeBidding/deadline timer (Tasks 4-6) to own what happens next.
-    let service: DispatchService;
-    let prisma: {
-      rescueRequest: { findUnique: jest.Mock };
-      dispatchOffer: { updateMany: jest.Mock; findMany: jest.Mock };
-    };
-
-    beforeEach(async () => {
-      prisma = {
-        rescueRequest: { findUnique: jest.fn() },
-        dispatchOffer: {
-          updateMany: jest.fn().mockResolvedValue({ count: 0 }),
-          findMany: jest.fn().mockResolvedValue([]), // no QUOTED offers — the no-quotes path
-        },
-      };
-
-      const module: TestingModule = await Test.createTestingModule({
-        providers: [
-          DispatchService,
-          { provide: PrismaService, useValue: prisma },
-          { provide: TwilioService, useValue: {} },
-          { provide: OperatorService, useValue: {} },
-          { provide: PlatformConfigService, useValue: {} },
-          { provide: WhatsAppSessionStore, useValue: {} },
-          { provide: RescueRequestSharedService, useValue: {} },
-        ],
-      }).compile();
-
-      service = module.get<DispatchService>(DispatchService);
-    });
-
-    function seedBatchTimer(requestId: string, batchId: string) {
-      const key = (service as any).batchKey(requestId, batchId);
-      const timer = setTimeout(() => {}, 1_000_000); // never fires in the test
-      (service as any).batchTimers.set(key, timer);
-      return key;
-    }
-
-    it('phase 1 (no deadline set): calls startDispatch again immediately, with no setTimeout scheduled', async () => {
-      prisma.rescueRequest.findUnique.mockResolvedValue({
-        status: 'DISPATCHING',
-        quoteCollectionDeadline: null,
-      });
-      const startDispatchSpy = jest
-        .spyOn(service, 'startDispatch')
-        .mockResolvedValue(undefined);
-      seedBatchTimer('req-1', 'batch-1'); // pre-existing decoy timer, seeded BEFORE the spy below
-
-      const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
-      await (service as any).resolveBatch(
-        'req-1',
-        ['op-1'],
-        'cust-1',
-        2,
-        'batch-1',
-      );
-
-      expect(startDispatchSpy).toHaveBeenCalledWith('req-1', 'cust-1', 2);
-      // resolveBatch itself must not schedule any new timer for a retry —
-      // the old DISPATCH_RETRY_MINUTES setTimeout is gone; continuation
-      // happens synchronously via the startDispatch call above.
-      expect(setTimeoutSpy).not.toHaveBeenCalled();
-      setTimeoutSpy.mockRestore();
-    });
-
-    it('phase 2 already active (quoteCollectionDeadline set): does NOT call startDispatch again', async () => {
-      prisma.rescueRequest.findUnique.mockResolvedValue({
-        status: 'DISPATCHING',
-        quoteCollectionDeadline: new Date(Date.now() + 5 * 60 * 1000),
-      });
-      const startDispatchSpy = jest
-        .spyOn(service, 'startDispatch')
-        .mockResolvedValue(undefined);
-
-      seedBatchTimer('req-1', 'batch-1');
-      await (service as any).resolveBatch(
-        'req-1',
-        ['op-1'],
-        'cust-1',
-        2,
-        'batch-1',
-      );
-
-      expect(startDispatchSpy).not.toHaveBeenCalled();
     });
   });
 });

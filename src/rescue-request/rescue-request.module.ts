@@ -10,6 +10,7 @@ import { OfferSweepCheck } from './reconciler/checks/offer-sweep.check';
 import { DepositExpiryCheck } from './reconciler/checks/deposit-expiry.check';
 import { DepositReminderCheck } from './reconciler/checks/deposit-reminder.check';
 import { BiddingCloseCheck } from './reconciler/checks/bidding-close.check';
+import { BatchResolveCheck } from './reconciler/checks/batch-resolve.check';
 import { WhatsAppOperatorFlowService } from './whatsapp-operator-flow.service';
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 import { WhatsAppInboundService } from './whatsapp-inbound.service';
@@ -54,6 +55,7 @@ import { AuthGuard } from '../auth/auth.guard';
     DepositExpiryCheck,
     DepositReminderCheck,
     BiddingCloseCheck,
+    BatchResolveCheck,
     ReconcilerService,
     {
       // The checks the 15-second loop runs, in order. A check is registered
@@ -65,12 +67,20 @@ import { AuthGuard } from '../auth/auth.guard';
         depositExpiry: DepositExpiryCheck,
         depositReminder: DepositReminderCheck,
         biddingClose: BiddingCloseCheck,
-      ) => [offerSweep, depositExpiry, depositReminder, biddingClose],
+        batchResolve: BatchResolveCheck,
+      ) => [
+        offerSweep,
+        depositExpiry,
+        depositReminder,
+        biddingClose,
+        batchResolve,
+      ],
       inject: [
         OfferSweepCheck,
         DepositExpiryCheck,
         DepositReminderCheck,
         BiddingCloseCheck,
+        BatchResolveCheck,
       ],
     },
     WhatsAppOperatorFlowService,

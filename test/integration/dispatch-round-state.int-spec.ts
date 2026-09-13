@@ -25,29 +25,8 @@ describe('dispatch round state (integration)', () => {
     await prisma.$disconnect();
   });
 
-  /**
-   * Every DispatchService built by a test, so their timers can be drained.
-   *
-   * startDispatch still arms real in-memory batch timers with delays of
-   * minutes, and Node keeps the process alive for them — jest then hangs
-   * after the run and CI times out. Task 7 deletes those timers entirely and
-   * this hook goes with them; until then, clearing them is what lets this
-   * spec exit.
-   */
-  const built: DispatchService[] = [];
-
   beforeEach(async () => {
     await truncateAll(prisma);
-    built.length = 0;
-  });
-
-  afterEach(() => {
-    for (const service of built) {
-      const timers = (service as unknown as Record<string, unknown>)
-        .batchTimers as Map<string, NodeJS.Timeout>;
-      for (const timer of timers.values()) clearTimeout(timer);
-      timers.clear();
-    }
   });
 
   /**
@@ -99,7 +78,7 @@ describe('dispatch round state (integration)', () => {
       formatLocationSection: jest.fn().mockResolvedValue('Lekki'),
     };
 
-    const service = new DispatchService(
+    return new DispatchService(
       prisma,
       twilio as never,
       operatorService as never,
@@ -107,8 +86,6 @@ describe('dispatch round state (integration)', () => {
       sessionStore as never,
       shared as never,
     );
-    built.push(service);
-    return service;
   }
 
   it('records the round and the operators offered on the REQUEST, not the session', async () => {

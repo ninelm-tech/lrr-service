@@ -10,7 +10,7 @@ import { toWhatsAppAddress } from '../common/phone.util';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { PrismaService } from '../prisma/prisma.service';
-import { RescueRequestStatus } from '@prisma/client';
+import { Prisma, RescueRequestStatus, VehicleType } from '@prisma/client';
 import {
   getEligibleTruckClasses,
   formatVehicleType,
@@ -25,6 +25,7 @@ import { OperatorService } from '../operator/operator.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { DispatchBoardRowDto } from './dto/rescue-request-response.dto';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
+import { PendingOffer } from './dto/pending-offer.dto';
 
 // ── Dispatch config ────────────────────────────────────────────────────────────
 const MAX_FAILED_ROUNDS_BEFORE_ALERT = Number(
@@ -34,6 +35,20 @@ const MAX_ROUNDS_BEFORE_AUTO_CANCEL = Number(
   process.env.DISPATCH_MAX_ROUNDS ?? 4,
 ); // ~RETRY*MAX min total
 const RADIUS_EXPANSION_KM = 2;
+
+/**
+ * What prepareNextRound found. `exhausted: false` always carries at least one
+ * offer; `exhausted: true` always carries no offers and a reason, and
+ * obliges the caller to cancel the request in the same transaction.
+ */
+type PrepareNextRoundResult =
+  | { offers: PendingOffer[]; exhausted: false; round: number }
+  | {
+      offers: never[];
+      exhausted: true;
+      reason: 'no-coverage' | 'rounds-exhausted';
+      round: number;
+    };
 
 /**
  * WhatsApp rejects template *parameters* (not static body text) containing
@@ -141,36 +156,6 @@ export class DispatchService {
         `🚨 *NEW RESCUE JOB* — Job #${variables.jobRef}\n\nVehicle: ${variables.vehicle}\nDestination: ${variables.destination}\n${variables.distanceLine}Location: ${variables.location}${variables.mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\n${variables.etaLine}Reply *NO* to decline.\nYou have ${variables.window} to respond.\n\n📌 If you have more than one job open at once, reply "${variables.jobRef} 25000" instead of just the price, so we know which job you mean.`,
       );
     }
-  }
-
-  /**
-   * In-memory map from BATCH to that batch's pending window timer.
-   * Doubles as a simple single-process mutex: whichever code path (the
-   * timer firing, or an operator's response completing the batch early)
-   * finds and deletes the entry first is the one that resolves the batch;
-   * the other finds it already gone and returns immediately. Fine for a
-   * single-instance pilot deployment — not a distributed lock.
-   *
-   * Keyed per batch (`requestId:expiresAt`), NOT per request. This is load
-   * bearing: a request can have several batches in flight at once, because
-   * expanding the radius adds operators without cancelling the offers other
-   * operators are still holding. With a per-request key the second batch
-   * overwrote the first's entry, the orphaned timer later fired, and
-   * resolveBatch ran with the OLD batch's operator list against the NEW
-   * batch's state.
-   *
-   * supersedeActiveRound used to avoid that collision by cancelling every
-   * pending offer so only one batch was ever live — i.e. by destroying the
-   * work of operators who simply hadn't answered yet. It was deleted along
-   * with this change; the two go together. If a stale-timer symptom ever
-   * reappears, fix it here in the key, never by cancelling offers.
-   * See docs/superpowers/specs/2026-08-24-dispatch-parallel-batches-design.md
-   */
-  private readonly batchTimers = new Map<string, NodeJS.Timeout>();
-
-  /** `requestId:batchId` — see batchTimers. */
-  private batchKey(rescueRequestId: string, batchId: string): string {
-    return `${rescueRequestId}:${batchId}`;
   }
 
   /**
@@ -455,93 +440,89 @@ export class DispatchService {
   //  DISPATCH — parallel batch offer, dynamic window, retry + radius expansion
   // ══════════════════════════════════════════════════════
 
-  async startDispatch(
+  /**
+   * Selects and records the next round's offers.
+   *
+   * Takes a transaction client so the caller can commit the offer rows
+   * atomically with whatever claimed the round. Performs NO messaging — the
+   * returned payloads are what to send once that transaction has committed.
+   *
+   * `exhausted` is true when no operator remains to try: either nobody is
+   * within reach at any radius, or the round cap is hit. The caller MUST
+   * cancel the request in the same transaction when it sees this. Returning
+   * an empty offer list without cancelling would leave a DISPATCHING request
+   * with nothing to expire, which no reconciler check can ever match again.
+   *
+   * INVARIANT: `exhausted: false` guarantees at least one offer was created.
+   * `{ offers: [], exhausted: false }` is never returned — a caller acting on
+   * it would advance the round having created nothing.
+   *
+   * The radius expansion loop lives here rather than across reconciler ticks
+   * for the same reason: with no offers created, nothing expires, so a later
+   * tick would have no trigger to retry on.
+   */
+  async prepareNextRound(
+    tx: Prisma.TransactionClient,
     rescueRequestId: string,
-    customerId: string,
-    extraRadiusKm: number = 0,
-  ) {
-    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+    round: number,
+  ): Promise<PrepareNextRoundResult> {
+    const rescueRequest = await tx.rescueRequest.findUnique({
       where: { id: rescueRequestId },
     });
-    if (!rescueRequest) return;
-    if (
-      rescueRequest.status === RescueRequestStatus.CANCELLED ||
-      rescueRequest.status === RescueRequestStatus.COMPLETED ||
-      rescueRequest.status === RescueRequestStatus.OPERATOR_ASSIGNED ||
-      rescueRequest.status === RescueRequestStatus.WAITING_FOR_DEPOSIT // payment window active
-    )
-      return;
-
-    // Resolve the customer's phone number for Twilio messages
-    const customerRecord = await this.prisma.user.findUnique({
-      where: { id: customerId },
-      select: { phoneNumber: true },
-    });
-    const customerPhone = customerRecord?.phoneNumber ?? null;
-
-    const config = await this.platformConfigService.getConfig();
-
-    // Dispatch progression lives on the request, not the customer's session:
-    // a session is per-person, so a customer with two requests would have had
-    // them share one round and one exclusion list.
-    const alreadyOffered: string[] = rescueRequest.offeredOperatorIds;
-    const round = rescueRequest.dispatchRound;
+    if (!rescueRequest) {
+      return { offers: [], exhausted: true, reason: 'no-coverage', round };
+    }
 
     const lat = Number(rescueRequest.latitude);
     const lon = Number(rescueRequest.longitude);
-
+    const config = await this.platformConfigService.getConfig();
     const eligibleTruckClasses = rescueRequest.vehicleType
       ? getEligibleTruckClasses(rescueRequest.vehicleType)
       : undefined;
 
-    // Get all ranked candidates (excluding already-offered operators)
-    const candidates = await this.operatorService.findAndRankCandidates(
-      lat,
-      lon,
-      alreadyOffered,
-      extraRadiusKm,
-      undefined,
-      eligibleTruckClasses,
-    );
+    let attemptRound = round;
+    let extraRadiusKm = Math.max(0, round - 1) * RADIUS_EXPANSION_KM;
 
-    logger.info('dispatch: candidate search', {
-      rescueRequestId,
-      round,
-      radiusExpansionKm: extraRadiusKm,
-      alreadyOfferedOperatorIds: alreadyOffered,
-      candidateCount: candidates.length,
-      candidateIds: candidates.map((c) => c.id),
-    });
+    // Expand and retry in this one call. The old code did the same thing by
+    // recursing into startDispatch immediately — untried candidates at a
+    // wider radius are either there now or they aren't, so a delay only made
+    // a stranded motorist wait longer.
+    for (;;) {
+      const candidates = await this.operatorService.findAndRankCandidates(
+        lat,
+        lon,
+        rescueRequest.offeredOperatorIds,
+        extraRadiusKm,
+        undefined,
+        eligibleTruckClasses,
+      );
 
-    if (candidates.length === 0) {
-      // Never auto-cancel a request that already has a usable quote sitting
-      // on it. resolveBatch's own tail into startDispatch already checks
-      // this (it only reaches here with zero quotes), but expandRadiusNow
-      // calls startDispatch directly and has no such check of its own — an
-      // admin expanding the radius on a request that already has quotes
-      // would otherwise run this exact "no candidates found" logic all the
-      // way to auto-cancel, discarding real quotes. Confirmed on staging
-      // (Sentry LRR-SERVICE-5): "Auto-cancelled: no operator after 4 rounds"
-      // fired from POST /rescue-requests/:id/expand-radius while the request
-      // had 2 valid QUOTED offers.
-      const quotedOffers = await this.prisma.dispatchOffer.findMany({
-        where: { rescueRequestId, status: 'QUOTED' },
+      logger.info('dispatch: candidate search', {
+        rescueRequestId,
+        round: attemptRound,
+        radiusExpansionKm: extraRadiusKm,
+        alreadyOfferedOperatorIds: rescueRequest.offeredOperatorIds,
+        candidateCount: candidates.length,
+        candidateIds: candidates.map((c) => c.id),
       });
-      if (quotedOffers.length > 0) {
-        await this.deliverQuoteShortlist(rescueRequestId, customerId);
-        return;
+
+      if (candidates.length > 0) {
+        const offers = await this.writeRound(
+          tx,
+          rescueRequest,
+          candidates.slice(0, config.dispatchBatchSize),
+          attemptRound,
+          extraRadiusKm,
+          config.dispatchWindowMinutes * 60 * 1000,
+        );
+        return { offers, exhausted: false, round: attemptRound };
       }
 
-      // Fast-fail: check if there are ANY active operators near this location
-      // (ignoring isAvailable — counts operators who switched themselves off).
-      // If zero, it's a geography/coverage gap — retrying with an expanded
-      // radius won't help, so cancel immediately rather than making the
-      // customer wait 15-20 minutes for the same result.
-      //
-      // ~1.5° ≈ 150 km bounding box — larger than any realistic service radius,
-      // so this covers the maximum possible expansion area upfront.
+      // Fast-fail on a coverage gap: if there is no ACTIVE operator anywhere
+      // in a box larger than any realistic expansion, widening the radius
+      // cannot help. ~1.5° ≈ 150 km.
       const COVERAGE_DELTA_DEG = 1.5;
-      const nearbyOperatorCount = await this.prisma.operator.count({
+      const nearbyOperatorCount = await tx.operator.count({
         where: {
           status: 'ACTIVE', // isAvailable intentionally omitted (see findAndRankCandidates)
           latitude: {
@@ -554,110 +535,55 @@ export class DispatchService {
           },
         },
       });
-
       if (nearbyOperatorCount === 0) {
-        // No operator infrastructure in this area at all — cancel immediately
-        await this.prisma.rescueRequest.update({
-          where: { id: rescueRequestId },
-          data: { status: RescueRequestStatus.CANCELLED },
-        });
-        await this.sessionStore.clear(customerId);
-        if (customerPhone) {
-          await this.twilioService.sendWhatsAppMessage(
-            customerPhone,
-            `😔 Sorry, there are no tow operators available in your area at the moment.\n\nYour request has been cancelled.\n\nPlease try again later or call your breakdown provider.`,
-          );
-        }
-        await this.alertAdminNoOperator(rescueRequestId, lat, lon, 0);
-        return;
+        return {
+          offers: [],
+          exhausted: true,
+          reason: 'no-coverage',
+          round: attemptRound,
+        };
       }
 
-      // Operators exist in the area but are currently busy or offline —
-      // proceed with the normal retry + radius-expansion cycle.
-      const newRound = round + 1;
-      // offeredOperatorIds is deliberately NOT reset here. It used to be, so
-      // that timed-out operators could be re-offered after the retry delay —
-      // but combined with resolveBatch's tail call into startDispatch that
-      // formed a loop: no candidates (everyone already offered) → reset →
-      // the same operators become eligible → the same job is offered to them
-      // again, round after round, until MAX_ROUNDS_BEFORE_AUTO_CANCEL.
-      // Observed on staging 2026-08-24: an operator received one job
-      // repeatedly and could still quote on it after it had apparently ended.
-      //
-      // Once an operator has been asked, they have been asked. The radius
-      // expansion below is what finds new people.
-      await this.prisma.rescueRequest.update({
-        where: { id: rescueRequestId },
-        data: { dispatchRound: newRound },
-      });
-
-      if (newRound >= MAX_ROUNDS_BEFORE_AUTO_CANCEL) {
-        // Tried long enough — auto-cancel the request and notify everyone
-        await this.prisma.rescueRequest.update({
-          where: { id: rescueRequestId },
-          data: { status: RescueRequestStatus.CANCELLED },
-        });
-        // Every operator already offered this job is, by definition, still
-        // sitting on an unanswered PENDING offer — being already-offered is
-        // exactly why this path ran out of candidates and reached the cap.
-        // closeBidding never fired for them (this is the no-candidates
-        // branch, not the deadline path), so without this sweep the job
-        // stays "open" in their job list until each offer's own expiresAt
-        // passes, long after the request itself is dead.
-        await this.prisma.dispatchOffer.updateMany({
-          where: { rescueRequestId, status: 'PENDING' },
-          data: { status: 'TIMED_OUT', respondedAt: new Date() },
-        });
-        await this.sessionStore.clear(customerId);
-
-        if (customerPhone) {
-          await this.twilioService.sendWhatsAppMessage(
-            customerPhone,
-            `😔 We're sorry — no tow operator was available near you after an extended search.\n\nYour request has been automatically cancelled.\n\nPlease try again shortly or call your breakdown cover provider.`,
-          );
-        }
-
-        await this.alertAdminNoOperator(rescueRequestId, lat, lon, newRound);
-        console.warn(
-          `🚨 Auto-cancelled request ${rescueRequestId} after ${newRound} rounds with no operator found.`,
-        );
-        Sentry.withScope((scope) => {
-          scope.setLevel('warning');
-          scope.setContext('dispatch', {
-            rescueRequestId,
-            lat,
-            lon,
-            rounds: newRound,
-          });
-          Sentry.captureMessage(
-            `Auto-cancelled: no operator after ${newRound} rounds`,
-          );
-        });
-        return;
+      attemptRound += 1;
+      if (attemptRound >= MAX_ROUNDS_BEFORE_AUTO_CANCEL) {
+        return {
+          offers: [],
+          exhausted: true,
+          reason: 'rounds-exhausted',
+          round: attemptRound,
+        };
       }
-
-      if (newRound > MAX_FAILED_ROUNDS_BEFORE_ALERT) {
-        await this.alertAdminNoOperator(rescueRequestId, lat, lon, newRound);
-      }
-
-      if (customerPhone) {
-        await this.twilioService.sendWhatsAppMessage(
-          customerPhone,
-          `⏳ Still searching for a tow operator nearby (attempt ${newRound}/${MAX_ROUNDS_BEFORE_AUTO_CANCEL - 1}). Expanding the search area. Thank you for your patience.`,
-        );
-      }
-
-      // No timer: expand the radius and try the next batch immediately, in
-      // the same tick. The old DISPATCH_RETRY_MINUTES delay just made a
-      // stranded motorist wait longer for no benefit — untried candidates
-      // (or a wider radius) are either there now or they aren't.
-      const expandedRadius = extraRadiusKm + RADIUS_EXPANSION_KM;
-      void this.startDispatch(rescueRequestId, customerId, expandedRadius);
-      return;
+      extraRadiusKm += RADIUS_EXPANSION_KM;
     }
+  }
 
-    // Take the next batch of top-ranked candidates
-    const batch = candidates.slice(0, config.dispatchBatchSize);
+  /**
+   * Writes one round's offer rows and the record of who was asked, on `tx`.
+   *
+   * The two are inseparable: a crash between them loses the record, and the
+   * next round re-offers the same job to the same operators — the re-offer
+   * loop observed on staging 2026-08-24.
+   */
+  private async writeRound(
+    tx: Prisma.TransactionClient,
+    rescueRequest: {
+      id: string;
+      vehicleType: string | null;
+      destination: string | null;
+      latitude: unknown;
+      longitude: unknown;
+    },
+    batch: {
+      id: string;
+      phoneNumber: string;
+      businessName: string;
+      distance: number;
+    }[],
+    round: number,
+    extraRadiusKm: number,
+    windowMs: number,
+  ): Promise<PendingOffer[]> {
+    const rescueRequestId = rescueRequest.id;
     const batchOperatorIds = batch.map((op) => op.id);
 
     logger.info('dispatch: batch offered', {
@@ -671,27 +597,21 @@ export class DispatchService {
       })),
     });
 
-    // Clamped against a deadline read right now — a first quote may have
-    // landed while findAndRankCandidates was running.
-    const windowMs = config.dispatchWindowMinutes * 60 * 1000;
-    const expiresAt = await this.offerExpiryClampedToDeadline(
-      rescueRequestId,
-      windowMs,
-    );
+    // Clamped against the deadline as it stands inside this transaction — a
+    // first quote may have landed while findAndRankCandidates was running.
+    const fresh = await tx.rescueRequest.findUniqueOrThrow({
+      where: { id: rescueRequestId },
+      select: { quoteCollectionDeadline: true },
+    });
+    const now = Date.now();
+    const expiresAt = fresh.quoteCollectionDeadline
+      ? new Date(
+          Math.min(now + windowMs, fresh.quoteCollectionDeadline.getTime()),
+        )
+      : new Date(now + windowMs);
     const batchId = crypto.randomUUID();
 
-    // Re-check right before the write. expandRadiusNow checks
-    // assertBiddingStillOpen up front but then fires this method off
-    // unawaited (`void this.startDispatch(...)`) — the real write happens
-    // after findAndRankCandidates, well after that guard ran. An early close
-    // (BiddingCloseCheck stamping biddingClosedAt) can land in that window,
-    // so re-read and guard again here, silently, the same way the other
-    // early-return branches above do — this is reached from several
-    // fire-and-forget call sites and must not throw an unhandled rejection.
-    if (await this.isBiddingClosed(rescueRequestId)) return;
-
-    // Create all offers in one batch insert
-    await this.prisma.dispatchOffer.createMany({
+    await tx.dispatchOffer.createMany({
       data: batch.map((op) => ({
         rescueRequestId,
         operatorId: op.id,
@@ -701,24 +621,25 @@ export class DispatchService {
       })),
     });
 
-    // `push` appends in the database. Reading the array and writing a spread
-    // would lose entries whenever two dispatch paths append concurrently —
-    // the automatic round and an admin's manual offer, for instance — and
-    // the lost operators would then be offered the same job again.
-    await this.prisma.rescueRequest.update({
+    // Same transaction, and `push` rather than a read-modify-write so a
+    // concurrent append (an admin's manual offer) cannot be lost.
+    await tx.rescueRequest.update({
       where: { id: rescueRequestId },
-      data: { offeredOperatorIds: { push: batchOperatorIds } },
+      data: {
+        offeredOperatorIds: { push: batchOperatorIds },
+        dispatchRound: round,
+      },
     });
 
+    const lat = Number(rescueRequest.latitude);
+    const lon = Number(rescueRequest.longitude);
     const vehicleLabel = rescueRequest.vehicleType
-      ? formatVehicleType(rescueRequest.vehicleType)
+      ? formatVehicleType(rescueRequest.vehicleType as VehicleType)
       : 'Unknown';
     const destinationLabel = rescueRequest.destination ?? 'Not specified';
 
-    const mediaItems = await this.prisma.requestMedia
-      .findMany({
-        where: { rescueRequestId },
-      })
+    const mediaItems = await tx.requestMedia
+      .findMany({ where: { rescueRequestId } })
       .catch((error) => {
         console.error('Failed to fetch media for dispatch offer:', error);
         Sentry.captureException(error);
@@ -729,126 +650,198 @@ export class DispatchService {
       lat,
       lon,
     );
-
-    // Notify all batch operators simultaneously. allSettled (not all) —
-    // one operator's send failing (e.g. Twilio 63016, no open session with
-    // them) must not prevent the others in the same batch from being
-    // notified, and must not throw an unhandled rejection out of this
-    // fire-and-forget dispatch round.
     const jobRef = formatJobRef(rescueRequestId);
-    const sendResults = await Promise.allSettled(
-      batch.map((op) =>
-        this.sendDispatchOfferMessage(op.phoneNumber, {
-          jobRef: jobRef.replace('Job #', ''),
-          vehicle: vehicleLabel,
-          destination: destinationLabel,
-          distanceLine: `Distance: ${op.distance.toFixed(1)} km\n`,
-          location: locationSection,
-          mediaSection,
-          etaLine: `Est. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.\n`,
-          // From the offer's ACTUAL expiry, not the configured window: an
-          // offer created inside phase 2 may only have ninety seconds, and
-          // the message must not claim otherwise.
-          window: this.formatRemaining(expiresAt),
-        }),
+
+    return batch.map((op) => ({
+      operatorId: op.id,
+      operatorPhone: op.phoneNumber,
+      jobRef: jobRef.replace('Job #', ''),
+      vehicle: vehicleLabel,
+      destination: destinationLabel,
+      distanceLine: `Distance: ${op.distance.toFixed(1)} km\n`,
+      location: locationSection,
+      mediaSection,
+      etaLine: `Est. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.\n`,
+      // From the offer's ACTUAL expiry, not the configured window: an offer
+      // created inside phase 2 may only have ninety seconds, and the message
+      // must not claim otherwise.
+      window: this.formatRemaining(expiresAt),
+    }));
+  }
+
+  /**
+   * Sends the offers prepared above, after their transaction has committed.
+   *
+   * allSettled, not all — one operator's send failing (e.g. Twilio 63016, no
+   * open session with them) must not stop the others in the batch, and must
+   * not throw out of a fire-and-forget dispatch round.
+   */
+  async deliverOffers(offers: PendingOffer[]): Promise<void> {
+    const results = await Promise.allSettled(
+      offers.map((offer) =>
+        this.sendDispatchOfferMessage(offer.operatorPhone, offer),
       ),
     );
-    sendResults.forEach((result, i) => {
+    results.forEach((result, i) => {
       if (result.status === 'rejected') {
-        const op = batch[i];
         console.error(
-          `Failed to send dispatch offer to operator ${op.id}:`,
+          `Failed to send dispatch offer to operator ${offers[i].operatorId}:`,
           result.reason,
         );
         Sentry.captureException(result.reason, {
-          extra: { rescueRequestId, operatorId: op.id },
+          extra: {
+            rescueRequestId: offers[i].jobRef,
+            operatorId: offers[i].operatorId,
+          },
         });
       }
     });
-
-    // Single timeout covers the entire batch — stored so an early-resolved
-    // batch (Step below) can prevent this from firing a second time. Fires
-    // when the offers actually expire, which is earlier than the full window
-    // if they were clamped to the quote-collection deadline.
-    const timer = setTimeout(
-      () =>
-        void this.resolveBatch(
-          rescueRequestId,
-          batchOperatorIds,
-          customerId,
-          extraRadiusKm,
-          batchId,
-        ),
-      Math.max(0, expiresAt.getTime() - Date.now()),
-    );
-    this.batchTimers.set(this.batchKey(rescueRequestId, batchId), timer);
   }
 
-  private async resolveBatch(
+  /**
+   * Message-only: tells the motorist no operator was found, and alerts staff.
+   * The cancellation itself is the caller's, inside its transaction.
+   */
+  async notifyNoOperatorAvailable(
     rescueRequestId: string,
-    batchOperatorIds: string[],
     customerId: string,
-    extraRadiusKm: number,
-    batchId: string,
-  ) {
-    // Mutex: only the caller that finds (and removes) the timer entry proceeds.
-    // Scoped to THIS batch — another batch of the same request resolving must
-    // not consume this one's entry.
-    const key = this.batchKey(rescueRequestId, batchId);
-    const timer = this.batchTimers.get(key);
-    if (!timer) return; // already resolved by the other path
-    clearTimeout(timer);
-    this.batchTimers.delete(key);
+    reason: 'no-coverage' | 'rounds-exhausted' = 'rounds-exhausted',
+    roundsTried = 0,
+  ): Promise<void> {
+    const request = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      select: { latitude: true, longitude: true },
+    });
+    const lat = Number(request?.latitude ?? 0);
+    const lon = Number(request?.longitude ?? 0);
 
-    // Bidding already closed for the whole request — the shortlist has gone
-    // out. Resolving a batch now would send the motorist a second one.
-    if (await this.isBiddingClosed(rescueRequestId)) return;
+    const customerRecord = await this.prisma.user.findUnique({
+      where: { id: customerId },
+      select: { phoneNumber: true },
+    });
+    if (customerRecord?.phoneNumber) {
+      await this.twilioService.sendWhatsAppMessage(
+        customerRecord.phoneNumber,
+        reason === 'no-coverage'
+          ? `😔 Sorry, there are no tow operators available in your area at the moment.\n\nYour request has been cancelled.\n\nPlease try again later or call your breakdown provider.`
+          : `😔 We're sorry — no tow operator was available near you after an extended search.\n\nYour request has been automatically cancelled.\n\nPlease try again shortly or call your breakdown cover provider.`,
+      );
+    }
 
-    // Race condition guard — skip if the request moved on for any other reason
+    await this.alertAdminNoOperator(rescueRequestId, lat, lon, roundsTried);
+
+    if (reason === 'rounds-exhausted') {
+      console.warn(
+        `🚨 Auto-cancelled request ${rescueRequestId} after ${roundsTried} rounds with no operator found.`,
+      );
+      Sentry.withScope((scope) => {
+        scope.setLevel('warning');
+        scope.setContext('dispatch', {
+          rescueRequestId,
+          lat,
+          lon,
+          rounds: roundsTried,
+        });
+        Sentry.captureMessage(
+          `Auto-cancelled: no operator after ${roundsTried} rounds`,
+        );
+      });
+    }
+  }
+
+  /**
+   * Opens dispatch for a request: one round of offers, or a cancellation if
+   * nobody can be reached.
+   *
+   * Shares prepareNextRound with BatchResolveCheck, so the initial round and
+   * every later one have the same failure mode. Handling exhaustion
+   * differently here would strand a request the reconciler could never
+   * rescue: with no offers created, nothing expires, so batch resolve would
+   * never see it.
+   */
+  async startDispatch(rescueRequestId: string, customerId: string) {
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
       where: { id: rescueRequestId },
-      select: { status: true, quoteCollectionDeadline: true },
+      select: { status: true, dispatchRound: true },
     });
+    if (!rescueRequest) return;
     if (
-      !rescueRequest ||
-      rescueRequest.status === RescueRequestStatus.OPERATOR_ASSIGNED ||
-      rescueRequest.status === RescueRequestStatus.WAITING_FOR_DEPOSIT ||
+      rescueRequest.status === RescueRequestStatus.CANCELLED ||
       rescueRequest.status === RescueRequestStatus.COMPLETED ||
-      rescueRequest.status === RescueRequestStatus.CANCELLED
+      rescueRequest.status === RescueRequestStatus.OPERATOR_ASSIGNED ||
+      rescueRequest.status === RescueRequestStatus.WAITING_FOR_DEPOSIT // payment window active
     )
       return;
 
-    // Mark all still-pending offers in this batch as timed out
-    await this.prisma.dispatchOffer.updateMany({
-      where: {
-        rescueRequestId,
-        operatorId: { in: batchOperatorIds },
-        status: 'PENDING',
-      },
-      data: { status: 'TIMED_OUT', respondedAt: new Date() },
-    });
-
-    const quotedOffers = await this.prisma.dispatchOffer.findMany({
+    // Never auto-cancel a request that already has a usable quote. An admin
+    // expanding the radius on a request with quotes would otherwise run the
+    // "no candidates" path all the way to auto-cancel and discard them —
+    // confirmed on staging (Sentry LRR-SERVICE-5).
+    const quotedCount = await this.prisma.dispatchOffer.count({
       where: { rescueRequestId, status: 'QUOTED' },
     });
-
-    if (quotedOffers.length > 0) {
+    if (quotedCount > 0) {
       await this.deliverQuoteShortlist(rescueRequestId, customerId);
       return;
     }
 
-    // No quotes at all this round. This is phase 1's automatic continuation
-    // path — it must go quiet the moment phase 2 starts (quoteCollectionDeadline
-    // set), even though bidding itself stays open through the end of phase 2.
-    // Once phase 2 has started, closeBidding/the deadline timer from Tasks
-    // 4-6 already owns what happens next; admin-initiated continuation
-    // (expandRadiusNow, manualOfferToOperator) is unaffected by this check —
-    // it keeps working via assertBiddingStillOpen, not this guard.
-    if (rescueRequest.quoteCollectionDeadline) return;
+    if (await this.isBiddingClosed(rescueRequestId)) return;
 
-    // Move to next batch (same radius; untried operators may still be
-    // available), exactly as before.
-    void this.startDispatch(rescueRequestId, customerId, extraRadiusKm);
+    const outcome = await this.prisma.$transaction(async (tx) => {
+      const next = await this.prepareNextRound(
+        tx,
+        rescueRequestId,
+        rescueRequest.dispatchRound,
+      );
+      if (!next.exhausted) return next;
+
+      await tx.rescueRequest.update({
+        where: { id: rescueRequestId },
+        data: {
+          status: RescueRequestStatus.CANCELLED,
+          dispatchRound: next.round,
+        },
+      });
+      // Every operator already offered this job is still sitting on an
+      // unanswered PENDING offer — being already-offered is exactly why this
+      // path ran out of candidates. Without this sweep the job stays "open"
+      // in their list until each offer's own expiresAt passes, long after
+      // the request itself is dead.
+      await tx.dispatchOffer.updateMany({
+        where: { rescueRequestId, status: 'PENDING' },
+        data: { status: 'TIMED_OUT', respondedAt: new Date() },
+      });
+      await tx.whatsAppSession.updateMany({
+        where: { userId: customerId },
+        data: { state: 'IDLE', rescueRequestId: null },
+      });
+      return next;
+    });
+
+    if (outcome.exhausted) {
+      await this.notifyNoOperatorAvailable(
+        rescueRequestId,
+        customerId,
+        outcome.reason,
+        outcome.round,
+      );
+      return;
+    }
+
+    if (outcome.round > MAX_FAILED_ROUNDS_BEFORE_ALERT) {
+      const request = await this.prisma.rescueRequest.findUnique({
+        where: { id: rescueRequestId },
+        select: { latitude: true, longitude: true },
+      });
+      await this.alertAdminNoOperator(
+        rescueRequestId,
+        Number(request?.latitude ?? 0),
+        Number(request?.longitude ?? 0),
+        outcome.round,
+      );
+    }
+
+    await this.deliverOffers(outcome.offers);
   }
 
   /**
@@ -908,35 +901,37 @@ export class DispatchService {
     const stillPending = batchOffers.some((o) => o.status === 'PENDING');
     if (stillPending) return;
 
-    const batchOperatorIds = batchOffers.map((o) => o.operatorId);
-    // extraRadiusKm isn't tracked per-batch outside the session; 0 is correct
-    // here because an early-resolved batch (all responded) never needed a
-    // radius expansion to find candidates — expansion only happens when
-    // zero candidates exist at all, a separate path in startDispatch.
-    void this.resolveBatch(
-      rescueRequestId,
-      batchOperatorIds,
-      rescueRequest.customerId,
-      0,
-      batchId,
-    );
+    // Everyone in this batch has answered, so there is nothing left to wait
+    // for. Rather than resolving here — a second path racing
+    // BatchResolveCheck over the same batch — expire the offers now so the
+    // check matches them on its next tick, within 15 seconds.
+    //
+    // Same shape as the phase-2 early close above: make the row match the
+    // check that already exists instead of adding another actor that can
+    // progress a request.
+    await this.prisma.dispatchOffer.updateMany({
+      where: { rescueRequestId, batchId, expiresAt: { gt: new Date() } },
+      data: { expiresAt: new Date() },
+    });
   }
 
   //
   // supersedeActiveRound used to live here. It cancelled every PENDING offer
   // on a request so an admin-initiated round could take over "the round slot",
-  // because batchTimers was keyed per request and a second batch would
-  // otherwise clobber the first's entry.
+  // because the batch timer map was keyed per request and a second batch
+  // would otherwise clobber the first's entry.
   //
   // It bought that safety by destroying other operators' work: an operator two
   // minutes into a ten-minute window lost the offer because an admin clicked
   // Expand — asked a question and never allowed to answer. Expanding the
   // radius means "also ask these people", never "un-ask those people".
   //
-  // Per-batch timer keys (see batchTimers) remove the collision it existed to
-  // prevent, so it is gone. Do not restore it, and do not add any other
-  // blanket PENDING → TIMED_OUT sweep scoped to a whole request. An offer ends
-  // when the operator answers it or when its own expiresAt passes.
+  // Batches no longer compete for a single timer slot at all — each offer
+  // carries its own expiresAt and dispatchRound, and BatchResolveCheck groups
+  // by batch — so the collision it existed to prevent cannot occur. Do not
+  // restore it, and do not add any other blanket PENDING → TIMED_OUT sweep
+  // scoped to a whole request. An offer ends when the operator answers it or
+  // when its own expiresAt passes.
   //
 
   /**
@@ -990,14 +985,16 @@ export class DispatchService {
 
     // Deliberately does NOT touch existing offers — operators still inside
     // their window keep them. Expanding adds people; it never un-asks anyone.
-    const currentRadius = rescueRequest.dispatchRound * RADIUS_EXPANSION_KM;
-    const expandedRadius = currentRadius + RADIUS_EXPANSION_KM;
+    //
+    // The radius is derived from the round rather than passed around, so
+    // advancing the round IS the expansion. One source of truth, and it
+    // survives a restart mid-expansion.
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequestId },
+      data: { dispatchRound: rescueRequest.dispatchRound + 1 },
+    });
 
-    void this.startDispatch(
-      rescueRequestId,
-      rescueRequest.customerId,
-      expandedRadius,
-    );
+    void this.startDispatch(rescueRequestId, rescueRequest.customerId);
   }
 
   /**
@@ -1131,19 +1128,10 @@ export class DispatchService {
       throw error;
     }
 
-    const currentRadius = rescueRequest.dispatchRound * RADIUS_EXPANSION_KM;
-    const timer = setTimeout(
-      () =>
-        void this.resolveBatch(
-          rescueRequestId,
-          [operatorId],
-          rescueRequest.customerId,
-          currentRadius,
-          batchId,
-        ),
-      Math.max(0, expiresAt.getTime() - Date.now()),
-    );
-    this.batchTimers.set(this.batchKey(rescueRequestId, batchId), timer);
+    // No timer. The offer's own expiresAt is the whole mechanism now:
+    // BatchResolveCheck picks this batch up when it passes, so an admin's
+    // manual offer survives the restart that used to discard this timer and
+    // leave the operator holding a job nobody would ever resolve.
   }
 
   async deliverQuoteShortlist(rescueRequestId: string, customerId: string) {
