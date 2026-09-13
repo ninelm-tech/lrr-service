@@ -414,12 +414,24 @@ Note the two "not found" cases differ in HTTP status as well as code — 404 for
 transfers, 400 for transactions — so neither may be treated as the general
 shape of the other.
 
-**Still unverified:** whether `merchant_note` survives a round trip on a
-refund record. The test integration has no refunds, so the field shape could
-not be observed. The refund-recovery strategy depends on it, so Task 1 of the
-implementation plan must establish it empirically before any code relies on
-it — and if it does not round-trip, that strategy needs rethinking rather than
-patching.
+**`merchant_note` round-trips — verified 2026-09-13** against the test
+integration, on a real refund of a real charge. It is echoed on the create
+response, on `GET /refund/:id`, and on the list. The refund-recovery strategy
+stands.
+
+**But the refund list is keyed on Paystack's NUMERIC transaction id, not on
+our reference.** Also measured:
+
+| Query | Result |
+|---|---|
+| `GET /refund?transaction=probe_1789301096` (our reference) | `200`, **0 rows** |
+| `GET /refund?transaction=6554155210` (numeric id) | `200`, 1 row, note intact |
+
+This is a trap: it returns `200` with an empty list rather than an error, so
+passing our reference looks exactly like "no refund exists" — and under the
+recovery rule that leaves the row `SUBMITTED` forever, waiting for a refund
+the query was never going to find. See *Refund recovery* for what this
+requires.
 
 A `SUBMITTED` row Paystack has never heard of is **not** conclusive for
 outbound money — see *Resolving a SUBMITTED row*. A payout re-submits the
@@ -522,9 +534,27 @@ endpoint that takes a reference of ours. Retrying the POST would issue a
 route. The `merchant_note` written at create time is what makes recovery
 possible at all.
 
-The recovery is to list refunds against the original transaction
-(`GET /refund?transaction=…`) and find the one whose `merchant_note` is this
-`Payment.id`:
+**The lookup needs the deposit's numeric transaction id, not its reference.**
+`GET /refund?transaction=` matches only Paystack's own numeric id; given our
+reference it returns `200` with an empty list, indistinguishable from "no
+refund". That id arrives on `charge.success` and is already stored on the
+DEPOSIT payment as `providerRef = "txn:<id>"`, so refund recovery reads its
+sibling deposit row to get it:
+
+```ts
+const deposit = await prisma.payment.findFirstOrThrow({
+  where: { rescueRequestId: payment.rescueRequestId, type: 'DEPOSIT', status: 'SUCCEEDED' },
+});
+const transactionId = deposit.providerRef!.replace('txn:', '');
+```
+
+If that deposit has no `providerRef` — possible if its own webhook never
+arrived — the refund cannot be recovered by listing at all, and the row must
+be escalated to staff rather than left to poll.
+
+The recovery is then to list refunds against that id
+(`GET /refund?transaction=<numeric id>`) and find the one whose
+`merchant_note` is this `Payment.id`:
 
 - **A refund carrying our note exists** → adopt its id as `providerRef`
   (namespaced `refund:…`) and claim the terminal state from its status. The
@@ -545,6 +575,145 @@ time.
 `refund.processed` and `refund.failed` must also be handled in
 `PaymentService`, which today handles neither. The verification check is the
 backstop; the webhook is the fast path, and right now there is no path at all.
+
+## What we send Paystack, and what we keep
+
+```
+COLLECTIONS  (money in — customer pays)
+┌──────────────────────────────────────────────────────────────────────────┐
+│ POST /transaction/initialize                                             │
+│   email      ← User.email ?? <digits>@lrr.ng      ⚠ identity, see below  │
+│   amount     ← RescueRequest.depositAmount | balanceAmount  (kobo)       │
+│   reference  ← "DEP_" | "BAL_" + Payment.id       ← WE choose it         │
+│   metadata   ← { rescueRequestId, customerId, phoneNumber, type }        │
+├──────────────────────────────────────────────────────────────────────────┤
+│ ← authorization_url ─────────────────────────────→ Payment.checkoutUrl   │
+│ ← nothing else stored; a URL is not a payment                            │
+├──────────────────────────────────────────────────────────────────────────┤
+│ webhook charge.success                                                   │
+│   data.reference → strip prefix → Payment.id → claimTerminal(SUCCEEDED)  │
+│   data.id        ─────────────────────────────→ Payment.providerRef      │
+│                                                  ("txn:<id>")            │
+│   data.fees      ─────────────────────────────→ Payment.providerFee      │
+│                                                  netAmount = amount−fees │
+└──────────────────────────────────────────────────────────────────────────┘
+
+PAYOUTS  (money out — we pay the operator)
+┌──────────────────────────────────────────────────────────────────────────┐
+│ POST /transferrecipient   (once per operator, at onboarding)             │
+│   bank + account number ──────→ recipient_code → Operator                │
+│                                   .paystackRecipientCode                 │
+│   the account number itself is NOT stored — only last4 and the code      │
+├──────────────────────────────────────────────────────────────────────────┤
+│ POST /transfer                                                           │
+│   source     ← "balance"          ⚠ needs a funded Paystack balance      │
+│   recipient  ← Operator.paystackRecipientCode                            │
+│   reference  ← "payout_" + Payment.id             ← WE choose it         │
+│   amount     ← deposit + balance − platform fee                          │
+├──────────────────────────────────────────────────────────────────────────┤
+│ ← transfer_code ─────────────────────────────→ Payment.providerRef       │
+│ ← status: pending | otp | success               ("trf:<code>")           │
+│   otp → BLOCKED                                                          │
+├──────────────────────────────────────────────────────────────────────────┤
+│ webhook transfer.success / .failed / .reversed                           │
+│   data.reference   → Payment.id → claimTerminal(...)                     │
+│   data.fee_charged ─────────────────────────→ Payment.providerFee        │
+└──────────────────────────────────────────────────────────────────────────┘
+
+REFUNDS  (money back — the odd one out)
+┌──────────────────────────────────────────────────────────────────────────┐
+│ POST /refund                                                             │
+│   transaction    ← the DEPOSIT Payment's reference                       │
+│   amount         ← depositAmount                                         │
+│   merchant_note  ← Payment.id      ⚠ NO reference field exists; this is  │
+│                                      the only identifier of ours that    │
+│                                      travels                             │
+├──────────────────────────────────────────────────────────────────────────┤
+│ ← refund id ─────────────────────────────────→ Payment.providerRef       │
+│                                                 ("refund:<id>")          │
+│ webhook refund.processed / .failed → claimTerminal                       │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+Three properties the diagram makes visible: every identifier flowing *into*
+Paystack is one we chose and committed first; every identifier flowing *back*
+is namespaced, because their number spaces overlap; and refunds are the only
+flow with no reference field, which is why they alone need `merchant_note`.
+
+## Paystack customer identity
+
+The `email` on `/transaction/initialize` is not a contact detail — Paystack
+uses it to **find or create a Customer**, and saved cards and authorizations
+attach to that customer.
+
+Today every collection sends `User.email ?? <digits>@lrr.ng`, and
+`createOrFetchCustomer` — which exists in `PaystackService` — is never called.
+Nothing stores a customer code. So:
+
+```
+first SOS, no account   →  2348012345678@lrr.ng  →  Paystack Customer A
+… the user registers and sets a real email …
+next deposit            →  ada@example.com       →  Paystack Customer B
+```
+
+One person, two customers, history split permanently.
+
+That is tolerable while every payment is one-off. It stops being tolerable
+with memberships: a card saved under Customer A cannot be charged under
+Customer B, so a renewal fails for a card the member believes is on file.
+Fixing it after real cards are attached means migrating customers at
+Paystack; fixing it before costs one column.
+
+**The Paystack identity email is not the user's contact email.** They look
+alike and must not be conflated:
+
+| | changes? | used for |
+|---|---|---|
+| `User.email` | freely — the user may set or change it | our comms, login |
+| `User.paystackCustomerEmail` | **never, once set** | `/transaction/initialize` |
+
+Paystack's Update Customer API accepts `first_name`, `last_name`, `phone` and
+`metadata` — **not `email`**. The identity email cannot be corrected after the
+fact, so the only way to keep one customer per person is to never change what
+we send. And `/transaction/initialize` requires an email; it will not take a
+`customer_code`.
+
+**The rule:** a `User` has exactly one Paystack customer for life.
+
+- On first payment, resolve the customer via the existing
+  `createOrFetchCustomer` and store **both** `paystackCustomerCode` and the
+  exact `paystackCustomerEmail` used.
+- Every later transaction sends `paystackCustomerEmail`, never `User.email`.
+  The user can change their real email as often as they like; Paystack never
+  sees it.
+- Subscriptions, when they come, address the customer by `customer_code`
+  directly — no email involved.
+
+**Creating the customer must be serialised, and the serialisation cannot be a
+plain claim-after-the-fact.** Two concurrent first payments both call
+`createOrFetchCustomer` — a GET followed by a POST — before either writes to
+`User`. A conditional update afterwards decides only which code *we* keep; it
+says nothing about how many customers Paystack created. Whether a concurrent
+same-email `POST /customer` dedupes provider-side is **not known** and must
+not be assumed.
+
+So the resolution happens under a row lock, with the write in the same
+transaction:
+
+```sql
+SELECT "paystackCustomerCode" FROM "User" WHERE id = $1 FOR UPDATE;
+```
+
+The loser blocks until the winner commits, then reads the stored code and
+makes no call. This holds a row lock across an HTTP round trip, which is
+ordinarily worth avoiding — acceptable here because it happens once per user,
+on a path that is already waiting on Paystack.
+
+The plan carries an optional probe for this (Task 1, Step 4b: three concurrent
+same-email creates, then count the customer codes). If it shows Paystack
+dedupes, the lock could be relaxed to a simpler claim — but that is a
+deliberate later decision, not a prerequisite. The lock is correct either way
+and stays until someone removes it on the strength of that answer.
 
 ## What is removed
 
@@ -616,9 +785,20 @@ No backfill. Production has no live users and no payment history worth
 preserving; staging and local data is test traffic. Existing `Payout` rows and
 the `RescueRequest` payment columns are dropped rather than migrated.
 
-If that changes before implementation, the backfill is mechanical — one
-`Payment` row per `Payout` row, plus one per request with `depositPaid` or
-`balancePaid` set — and this section should be revisited rather than assumed.
+**Staging is truncated, not backfilled.** Dropping the columns without
+backfill would leave staging requests reading as unpaid, since no `Payment`
+row exists for them — test data that is quietly wrong, which is worse than
+absent. Backfilling is the wrong answer too: `providerFee`, `netAmount` and a
+real `providerRef` cannot be reconstructed for old deposits, so the rows would
+be invented, and invented rows in a money table get trusted later.
+
+The transactional tables are cleared and the accounts kept, as Task 11 Step 0
+of the plan sets out. Everything needs re-testing against the new
+implementation regardless, which regenerates realistic data through the real
+flows.
+
+If production ever holds real payments before this lands, this section must be
+revisited rather than assumed.
 
 ## Operational note: test versus live integrations
 

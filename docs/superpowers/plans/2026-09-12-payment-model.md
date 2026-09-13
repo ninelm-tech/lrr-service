@@ -48,17 +48,48 @@
 
 ---
 
-### Task 1: Verify the one unverified provider assumption
+### Task 1: Settle the two unverified provider behaviours
 
-**Files:** none — this task writes no code. It answers a question the rest of the plan depends on.
+**Files:** none — this task writes no code. It answers two questions the rest of the plan depends on.
 
-The spec's refund recovery matches Paystack refunds on `merchant_note` carrying our `Payment.id`. Every other provider behaviour was verified against the test integration on 2026-09-12; this one could not be, because the integration has no refunds. **Do not build refund recovery on an unverified round trip.**
+Most provider behaviour was verified against the test integration on
+2026-09-12. Two things could not be, and each is load bearing somewhere:
 
-- [ ] **Step 1: Create a refundable transaction in test mode**
+| Question | Depended on by | Status |
+|---|---|---|
+| Does `merchant_note` round-trip on a refund? | Task 8, Task 10 | ✅ **ANSWERED 2026-09-13 — yes** |
+| Do concurrent same-email `POST /customer` calls dedupe? | Task 12 | Open, and **optional** — the row lock is correct either way |
+
+**Steps 1–4 are done.** Recorded here so the work is not repeated, and because
+the probe found something the spec had wrong.
+
+**Result 1 — `merchant_note` round-trips.** Charged a test card (₦100, test
+mode), refunded it with a known note, read it back. The note is present on the
+create response, on `GET /refund/:id`, and on the list. Refund recovery stands
+as designed.
+
+**Result 2 — the refund list is keyed on Paystack's NUMERIC transaction id,
+not our reference.** This was not in the design:
+
+| Query | Result |
+|---|---|
+| `GET /refund?transaction=probe_1789301096` (our reference) | `200`, **0 rows** |
+| `GET /refund?transaction=6554155210` (numeric id) | `200`, 1 row, note intact |
+
+An empty list is not an error, so passing our reference looks exactly like
+"no refund exists" — and the recovery rule would then leave the row
+`SUBMITTED` forever, waiting on a query that could never match. **Task 8 and
+Task 10 must read the numeric id from the sibling DEPOSIT payment's
+`providerRef`** (`txn:<id>`, written by `charge.success`). The spec's *Refund
+recovery* section carries the code.
+
+Only Step 4b remains, and it is optional.
+
+- [x] **Step 1: Create a refundable transaction in test mode** — done (test card via `POST /charge`, ₦100)
 
 A refund needs a *successful* transaction to refund. Drive one through the app's own deposit flow on staging or locally, paying with a Paystack test card, so the transaction exists on the test integration.
 
-- [ ] **Step 2: Create a refund carrying a known note**
+- [x] **Step 2: Create a refund carrying a known note** — done (refund `18256918`)
 
 ```bash
 K=$(grep -o 'PAYSTACK_SECRET_KEY=.*' .env | head -1 | sed 's/PAYSTACK_SECRET_KEY=//;s/"//g')
@@ -67,19 +98,40 @@ curl -s https://api.paystack.co/refund -H "Authorization: Bearer $K" \
   -d '{"transaction":"<the reference from step 1>","merchant_note":"probe_merchant_note_roundtrip"}'
 ```
 
-- [ ] **Step 3: Read it back and look for the note**
+- [x] **Step 3: Read it back and look for the note** — done; note intact, but only when queried by numeric id
 
 ```bash
 curl -s "https://api.paystack.co/refund?transaction=<the reference>" -H "Authorization: Bearer $K" \
   | python3 -m json.tool
 ```
 
-- [ ] **Step 4: Record the answer in the spec**
+- [x] **Step 4: Record the answer in the spec** — done
 
 Replace the spec's *Still unverified* paragraph with what was observed.
 
 - **If `merchant_note` round-trips:** the refund-recovery strategy stands as written. Note the exact field name on the read shape — it may differ from the create field.
 - **If it does not:** stop and revisit the design. Do not fall back to amount-and-time matching without saying so explicitly — that is the ambiguous matching the spec rejects, and it would silently reintroduce the risk of adopting the wrong refund. Bring it back for a decision.
+
+- [ ] **Step 4b: Probe concurrent customer creation** *(optional)*
+
+Task 12 serialises customer creation under a row lock, and that lock is
+correct regardless of what this probe says. It is worth running only because
+a negative answer would let the lock be simplified later. Skip it freely.
+
+```bash
+E="probe_$(date +%s)@lrr.ng"
+for i in 1 2 3; do
+  curl -s https://api.paystack.co/customer -H "Authorization: Bearer $K" \
+    -H 'Content-Type: application/json' -d "{\"email\":\"$E\"}" &
+done; wait
+curl -s "https://api.paystack.co/customer?perPage=10" -H "Authorization: Bearer $K" \
+  | python3 -c "import json,sys;print([c['customer_code'] for c in json.load(sys.stdin)['data'] if c['email']=='$E'])"
+```
+
+One code back means Paystack dedupes and the row lock could later be relaxed
+to a simpler claim. More than one means the lock is load bearing. Record
+which in Task 12's comment, either way — **the lock stays in place until
+someone deliberately removes it on the strength of this answer.**
 
 - [ ] **Step 5: Commit the spec update**
 
@@ -1250,7 +1302,7 @@ Resolution differs by type, and **refunds are not like the others**:
 |---|---|
 | `charge.success` | strip the `DEP_`/`BAL_` prefix from `data.reference`, look up by id |
 | `transfer.*` | strip the `payout_` prefix from `data.reference`, look up by id |
-| `refund.*` | `providerRef = refund:<data.id>`, falling back to `merchant_note` if Task 1 proved it is present in the webhook shape |
+| `refund.*` | `providerRef = refund:<data.id>`; `merchant_note` is present on refund records (verified) and is the fallback |
 
 A refund carries no reference of ours, so prefix-stripping cannot work for it.
 `providerRef` was written on the create response in Task 8, which covers the
@@ -1297,7 +1349,15 @@ The seventh check, following the same `ReconcilerCheck` contract as the six buil
 
 - [ ] **Step 2: Verify by our reference, per type**
 
-`GET /transaction/verify/:reference` for collections, `GET /transfer/verify/:reference` for payouts, `GET /refund?transaction=…` plus a `merchant_note` match for refunds. Branch on `code`: `not_found` (404) and `transaction_not_found` (400).
+`GET /transaction/verify/:reference` for collections, `GET /transfer/verify/:reference` for payouts. Branch on `code`: `not_found` (404) and `transaction_not_found` (400).
+
+Refunds are the exception and the one easy to get wrong:
+`GET /refund?transaction=` takes Paystack's **numeric transaction id**, not
+our reference — given the reference it returns `200` with an empty list, which
+is indistinguishable from "no refund exists". Read the numeric id from the
+sibling `DEPOSIT` payment's `providerRef` (`txn:<id>`); if that deposit has no
+`providerRef`, escalate to staff rather than polling a query that cannot
+match. The spec's *Refund recovery* section carries the code.
 
 - [ ] **Step 3: Respect the inbound/outbound asymmetry**
 
@@ -1388,6 +1448,33 @@ git commit -m "feat: chase unresolved payments from the database"
 
 Only now, with `Payment` written by every flow and read by the checks, does the duplicate state come out.
 
+- [ ] **Step 0: Clear staging's transactional data**
+
+Dropping the columns without backfill leaves every existing staging request
+reading as unpaid, because no `Payment` row exists for it. Backfilling is not
+the answer — `providerFee`, `netAmount` and a real `providerRef` cannot be
+reconstructed for old deposits, so the rows would be invented, and invented
+rows in a money table get trusted later.
+
+Clear the traffic, keep the accounts:
+
+```sql
+-- Keeps User, Operator, OperatorMember and PlatformConfig — the accounts and
+-- config you test against. Drops only what a test run regenerates.
+TRUNCATE TABLE
+  "Rating", "Payout", "RequestMedia", "DispatchOffer",
+  "RescueRequest", "WhatsAppSession"
+RESTART IDENTITY CASCADE;
+```
+
+`WhatsAppSession` is included deliberately: sessions carry `rescueRequestId`,
+so leaving them points live conversations at deleted requests — the stale-state
+class the durable-scheduling work exists to remove.
+
+Two practical notes. Run it when nobody is mid-test, or the tester loses an
+in-flight job. And confirm the `PlatformConfig` row survives — dispatch reads
+its fees and windows, and an empty table changes behaviour.
+
 - [ ] **Step 1: Convert the readers**
 
 `depositPaid` → `payments: { some: { type: 'DEPOSIT', status: 'SUCCEEDED' } }`, and the same for `balancePaid`. The admin list filter becomes a relation filter; the response DTOs keep the same field names, derived. `refundEligible` becomes *a succeeded `DEPOSIT` exists, the request is
@@ -1448,6 +1535,148 @@ git commit -m "refactor: Payment becomes the only record of money movement"
 
 ---
 
+### Task 12: One Paystack customer per user, for life
+
+**Files:**
+- Modify: `prisma/schema.prisma`, `src/rescue-request/whatsapp-customer-flow.service.ts`, `src/rescue-request/payment-events.service.ts`, `src/rescue-request/rescue-request-admin.service.ts`, `src/integrations/paystack/paystack.service.ts`
+- Create: `test/integration/paystack-customer-identity.int-spec.ts`
+
+Paystack treats the `email` on `/transaction/initialize` as the **customer
+identity**, and saved cards attach to that customer. Today we send
+`User.email ?? <digits>@lrr.ng`, and `createOrFetchCustomer` — which already
+exists in `PaystackService` — is never called. A user who registers a real
+email after their first payment silently becomes a second Paystack customer.
+
+Harmless while every payment is one-off. Not harmless with memberships: a card
+saved under the first customer cannot be charged under the second.
+
+**The identity email cannot be corrected later.** Paystack's Update Customer
+API takes `first_name`, `last_name`, `phone` and `metadata` — not `email`. And
+`/transaction/initialize` requires an email; it will not accept a
+`customer_code`. So the only way to keep one customer per person is to freeze
+what we send and never change it, which means storing it.
+
+- [ ] **Step 1: Store the code**
+
+```prisma
+model User {
+  // ...existing fields unchanged...
+  // Resolved once, on first payment, and never replaced. Paystack attaches
+  // saved cards and authorizations to this customer, so a second code for
+  // the same person splits their payment instruments.
+  paystackCustomerCode  String? @unique
+  // The email that customer was created under. NOT User.email: Paystack
+  // cannot change a customer's email after creation, so this is frozen and
+  // sent on every later transaction. User.email stays free to change — the
+  // two are different things that happen to look alike.
+  paystackCustomerEmail String?
+}
+```
+
+- [ ] **Step 2: Resolve it once, before the first payment**
+
+A small helper on `PaymentLedgerService` (or a `PaystackCustomerService` if
+that reads better) that all four collection sites call in place of building an
+email inline:
+
+```ts
+  /**
+   * The Paystack customer for this user, created on first use.
+   *
+   * Serialised under a ROW LOCK, not a claim afterwards. Two concurrent
+   * first payments would otherwise both reach createOrFetchCustomer — a GET
+   * then a POST — before either wrote anything, and a conditional update
+   * after the fact decides only which code WE keep. It says nothing about
+   * how many customers Paystack created, and whether a concurrent
+   * same-email POST dedupes provider-side is not known.
+   *
+   * This holds a row lock across an HTTP round trip, which is normally worth
+   * avoiding. It is acceptable here because it happens once per user, on a
+   * path already waiting on Paystack.
+   */
+  async customerFor(userId: string): Promise<{ code: string; email: string }> {
+    return this.prisma.$transaction(async (tx) => {
+      const [locked] = await tx.$queryRaw<
+        { paystackCustomerCode: string | null; paystackCustomerEmail: string | null;
+          email: string | null; phoneNumber: string | null }[]
+      >`SELECT "paystackCustomerCode", "paystackCustomerEmail", "email", "phoneNumber"
+          FROM "User" WHERE id = ${userId} FOR UPDATE`;
+
+      if (locked.paystackCustomerCode && locked.paystackCustomerEmail) {
+        return { code: locked.paystackCustomerCode, email: locked.paystackCustomerEmail };
+      }
+
+      // The identity email is chosen ONCE here and frozen. User.email may
+      // change afterwards; Paystack never sees the change.
+      const identityEmail =
+        locked.email ?? `${locked.phoneNumber!.replace(/\D/g, '')}@lrr.ng`;
+      const { customer_code } = await this.paystack.createOrFetchCustomer({
+        email: identityEmail,
+        phone: locked.phoneNumber ?? undefined,
+      });
+
+      await tx.user.update({
+        where: { id: userId },
+        data: { paystackCustomerCode: customer_code, paystackCustomerEmail: identityEmail },
+      });
+      return { code: customer_code, email: identityEmail };
+    });
+  }
+```
+
+Every collection site then sends `(await customerFor(userId)).email` — never
+`User.email`.
+
+- [ ] **Step 3: Change nothing when the user's email changes**
+
+This is the step that does *not* exist, and it is worth stating so nobody
+adds it later. Paystack cannot change a customer's email, so there is no
+call to make. `User.email` changes freely and `paystackCustomerEmail` stays
+put; the Paystack dashboard will show the original address for that customer,
+which is the price of a stable identity.
+
+If the dashboard address matters operationally, put the current email in the
+customer's `metadata` — which *is* updatable — rather than trying to move the
+identity.
+
+- [ ] **Step 4: Test the property**
+
+```ts
+  it('keeps one identity when the user later sets a real email', async () => {
+    const user = await createCustomer(prisma);            // phone only
+    const first = await ledger.customerFor(user.id);
+
+    await prisma.user.update({ where: { id: user.id }, data: { email: 'ada@example.com' } });
+    const second = await ledger.customerFor(user.id);
+
+    expect(second).toEqual(first);
+    // The frozen identity email is sent, NOT the new real one.
+    expect(second.email).not.toBe('ada@example.com');
+    expect(paystack.createOrFetchCustomer).toHaveBeenCalledTimes(1);
+  });
+
+  it('calls Paystack once when two payments start at once', async () => {
+    // The row lock is what makes this true. A claim after the call would
+    // pass the first assertion and fail this one.
+    const user = await createCustomer(prisma);
+    const [a, b] = await Promise.all([
+      ledger.customerFor(user.id),
+      ledger.customerFor(user.id),
+    ]);
+    expect(a).toEqual(b);
+    expect(paystack.createOrFetchCustomer).toHaveBeenCalledTimes(1);
+  });
+```
+
+- [ ] **Step 5: Verify and commit**
+
+```bash
+git add -A src test prisma
+git commit -m "feat: one Paystack customer per user, resolved once and kept"
+```
+
+---
+
 ## Verification after the final task
 
 - [ ] A payout that returns `otp` lands `BLOCKED`, not `PROCESSING`, and appears in a staff queue.
@@ -1455,3 +1684,5 @@ git commit -m "refactor: Payment becomes the only record of money movement"
 - [ ] `SELECT status, count(*) FROM "Payment" GROUP BY status` on staging shows nothing stuck in `SUBMITTED` beyond the backoff ceiling.
 - [ ] Transfers OTP is disabled and transfer IP allowlisting is configured (spec §Actionable non-terminal states) — without this, payouts abandon regardless of code.
 - [ ] Test plan §13 still passes on staging.
+- [ ] A user who pays, then registers an email, then pays again has **one**
+      Paystack customer — check the dashboard, not just the column.
