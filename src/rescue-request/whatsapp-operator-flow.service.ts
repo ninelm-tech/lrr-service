@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { logger } from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
-import { scheduleSafely } from '../common/safe-timer';
+import { STALLED_CONFIRMATION_MS } from './confirmation.constants';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import {
   RescueRequestStatus,
@@ -469,67 +469,54 @@ export class WhatsAppOperatorFlowService {
     const customerPhone = rescueRequest.customer.phoneNumber;
     const customerId = rescueRequest.customerId;
 
-    // Put customer session in AWAITING_COMPLETION_CONFIRM
-    if (customerId) {
-      await this.sessionStore.update(customerId, {
-        state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
-        rescueRequestId,
+    // The DONE transition is three writes, and all three must land together.
+    //
+    // confirmationDueAt is the only thing that will ever bring staff back to
+    // this job: nothing else sets that column, so a write that fails — or a
+    // process that dies between the writes — loses the alert permanently and
+    // the customer's silence goes unnoticed. The two session moves are in
+    // here for the same reason: an operator freed while the customer was
+    // never asked to confirm, or the reverse, is a state no check repairs.
+    //
+    // Staff are alerted after 30 minutes; the job is never auto-completed.
+    // By this point the vehicle has moved and the operator is waiting to be
+    // paid, so forcing COMPLETED on nothing but silence would move money and
+    // custody without confirmation. A quiet customer (dead phone, long tow,
+    // simply busy) looks identical to one avoiding payment — only a human
+    // can tell those apart. The job stays in AWAITING_COMPLETION_CONFIRM
+    // until the customer responds or staff resolve it.
+    await this.prisma.$transaction(async (tx) => {
+      await tx.rescueRequest.update({
+        where: { id: rescueRequestId },
+        data: {
+          confirmationDueAt: new Date(Date.now() + STALLED_CONFIRMATION_MS),
+        },
       });
-    }
+      if (customerId) {
+        await tx.whatsAppSession.updateMany({
+          where: { userId: customerId },
+          data: {
+            state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
+            rescueRequestId,
+          },
+        });
+      }
+      // On the transaction client, not sessionStore — a clear on the default
+      // client would commit independently and could survive a rollback of
+      // the other two.
+      await tx.whatsAppSession.updateMany({
+        where: { userId: operatorUserId },
+        data: { state: WhatsAppFlowState.IDLE, rescueRequestId: null },
+      });
+    });
+
+    // Notification only after the commit, like every other in this design.
     if (customerPhone) {
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
         `🔧 ${operator.businessName} says the job is done!\n\nReply *CONFIRM* to release your vehicle and receive the balance payment link.\n\nIf there's a problem, reply *DISPUTE* and our team will investigate.`,
       );
     }
-
-    // Alert staff after 30 minutes if the customer hasn't confirmed — never
-    // auto-complete on their behalf. By this point the vehicle has already
-    // moved and the operator is waiting to be paid, so forcing the job to
-    // COMPLETED and telling the operator to release the vehicle based on
-    // nothing but silence would move money and vehicle custody without any
-    // genuine confirmation the job actually went as reported. A quiet
-    // customer (dead phone, multi-hour tow, generally busy) looks
-    // identical to one deliberately avoiding payment — only a human
-    // following up can tell those apart. The job stays in
-    // AWAITING_COMPLETION_CONFIRM indefinitely until the customer responds
-    // or staff resolve it.
-    scheduleSafely(
-      async () => {
-        const fresh = await this.prisma.rescueRequest.findUnique({
-          where: { id: rescueRequestId },
-          select: { status: true, disputed: true },
-        });
-        if (
-          !fresh ||
-          fresh.disputed ||
-          fresh.status === RescueRequestStatus.COMPLETED ||
-          fresh.status === RescueRequestStatus.CANCELLED
-        ) {
-          return;
-        }
-        try {
-          const config = await this.platformConfigService.getConfig();
-          if (!config.disputeAlertPhoneNumber) return;
-          await this.twilioService.sendWhatsAppMessage(
-            toWhatsAppAddress(config.disputeAlertPhoneNumber),
-            `⏱ ${formatJobRef(rescueRequestId)}: customer hasn't confirmed completion 30 minutes after the operator marked it DONE. Please check on them.`,
-          );
-        } catch (error) {
-          console.error(
-            'Failed to send stalled-confirmation staff alert:',
-            error,
-          );
-        }
-      },
-      30 * 60 * 1000,
-      'stalled-confirmation-alert',
-    );
-
-    await this.sessionStore.update(operatorUserId, {
-      state: WhatsAppFlowState.IDLE,
-      rescueRequestId: undefined,
-    });
 
     return this.reply(
       `✅ Job marked as done! Waiting for customer confirmation.\n\nIf they confirm, you'll receive a notification. Thank you 🙏`,
