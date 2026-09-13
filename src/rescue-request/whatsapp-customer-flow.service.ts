@@ -765,7 +765,7 @@ export class WhatsAppCustomerFlowService {
 
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequest.id },
-      data: { depositReference: reference, depositPaymentUrl: checkoutUrl },
+      data: { depositPaymentUrl: checkoutUrl },
     });
 
     await this.sessionStore.update(customer.id, {
@@ -1047,7 +1047,7 @@ export class WhatsAppCustomerFlowService {
     });
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequestId },
-      data: { depositReference: reference, depositPaymentUrl: checkoutUrl },
+      data: { depositPaymentUrl: checkoutUrl },
     });
 
     const depositNaira = (depositAmount / 100).toLocaleString();

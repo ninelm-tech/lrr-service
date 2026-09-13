@@ -178,7 +178,7 @@ export class DisputeService {
    * balanceAdjustmentPercent (1-100, default 100 = no change) settles what
    * the customer actually owes. Status is deliberately left at IN_DISPUTE —
    * it only becomes COMPLETED once the settled amount is actually paid
-   * (handleBalancePaymentConfirmed), same trigger every job already uses.
+   * (confirmBalance), same trigger every job already uses.
    * This snapshots the pre-adjustment balance onto
    * disputeOriginalBalanceAmount before overwriting balanceAmount with the
    * settled figure, so "quoted vs. actually charged" is never lost.

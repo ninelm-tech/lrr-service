@@ -14,7 +14,7 @@ export async function truncateAll(prisma: PrismaService): Promise<void> {
   // serial columns predictable between tests.
   await prisma.$executeRawUnsafe(`
     TRUNCATE TABLE
-      "Rating", "Payout", "RequestMedia", "DispatchOffer",
+      "Rating", "RequestMedia", "DispatchOffer",
       "RescueRequest", "WhatsAppSession", "OperatorMember",
       "Operator", "User"
     RESTART IDENTITY CASCADE

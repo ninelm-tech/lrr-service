@@ -22,10 +22,10 @@ describe('Payment webhooks (integration)', () => {
   let ledger: PaymentLedgerService;
   let service: PaymentService;
   let paymentEvents: {
-    handleDepositPaymentConfirmed: jest.Mock;
-    handleBalancePaymentConfirmed: jest.Mock;
+    confirmDeposit: jest.Mock;
+    confirmBalance: jest.Mock;
   };
-  let payout: { confirmTransferOutcome: jest.Mock };
+  let payout: { notifyPayoutOutcome: jest.Mock };
 
   beforeAll(() => {
     prisma = new PrismaService();
@@ -39,10 +39,10 @@ describe('Payment webhooks (integration)', () => {
   beforeEach(async () => {
     await truncateAll(prisma);
     paymentEvents = {
-      handleDepositPaymentConfirmed: jest.fn().mockResolvedValue(undefined),
-      handleBalancePaymentConfirmed: jest.fn().mockResolvedValue(undefined),
+      confirmDeposit: jest.fn().mockResolvedValue(undefined),
+      confirmBalance: jest.fn().mockResolvedValue(undefined),
     };
-    payout = { confirmTransferOutcome: jest.fn().mockResolvedValue(undefined) };
+    payout = { notifyPayoutOutcome: jest.fn().mockResolvedValue(undefined) };
 
     service = new PaymentService(
       { get: () => undefined } as never,
@@ -57,9 +57,7 @@ describe('Payment webhooks (integration)', () => {
   async function submitted(type: 'DEPOSIT' | 'BALANCE' | 'PAYOUT' | 'REFUND') {
     const customer = await createCustomer(prisma);
     const operator = type === 'PAYOUT' ? await createOperator(prisma) : null;
-    const request = await createRequest(prisma, customer.id, {
-      depositRefundStatus: type === 'REFUND' ? 'PENDING' : undefined,
-    });
+    const request = await createRequest(prisma, customer.id);
     const payment = await ledger.create({
       rescueRequestId: request.id,
       type,
@@ -100,7 +98,7 @@ describe('Payment webhooks (integration)', () => {
     expect(after.netAmount).toBe(492_500);
   });
 
-  it('still runs the business side effects, which this task does not move', async () => {
+  it('runs the business side effects with the settled Payment row, keyed on its own type — not the echoed metadata', async () => {
     const { payment } = await submitted('DEPOSIT');
 
     await send({
@@ -112,24 +110,28 @@ describe('Payment webhooks (integration)', () => {
       },
     });
 
-    expect(paymentEvents.handleDepositPaymentConfirmed).toHaveBeenCalledWith(
-      `DEP_${payment.id}`,
+    expect(paymentEvents.confirmDeposit).toHaveBeenCalledWith(
+      expect.objectContaining({ id: payment.id, status: 'SUCCEEDED' }),
     );
+    expect(paymentEvents.confirmBalance).not.toHaveBeenCalled();
   });
 
-  it('runs the side effects even for a legacy reference that matches no row', async () => {
-    // References predating the payment model cannot resolve to a Payment.
-    // Those requests must still complete.
+  it('does not run the business side effects for a reference that matches no row', async () => {
+    // Every live reference now has a Payment row — Task 11 removed the
+    // RescueRequest columns a legacy reference would have matched against.
+    // A miss here is a genuine anomaly, not a tolerated transition case:
+    // there is no Payment to build the confirmation from.
     await send({
       event: 'charge.success',
       data: {
-        reference: 'DEP_1757000000000_ab12cd3',
+        reference: 'DEP_nonexistent',
         id: 5,
         metadata: { type: 'deposit' },
       },
     });
 
-    expect(paymentEvents.handleDepositPaymentConfirmed).toHaveBeenCalled();
+    expect(paymentEvents.confirmDeposit).not.toHaveBeenCalled();
+    expect(paymentEvents.confirmBalance).not.toHaveBeenCalled();
     expect(await prisma.payment.count()).toBe(0);
   });
 
@@ -149,6 +151,10 @@ describe('Payment webhooks (integration)', () => {
     expect(after.status).toBe('SUCCEEDED');
     expect(after.providerRef).toBe('trf:TRF_xyz');
     expect(after.providerFee).toBe(1_000);
+    // Only this call — the one that actually settled it — notifies.
+    expect(payout.notifyPayoutOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({ id: payment.id, status: 'SUCCEEDED' }),
+    );
   });
 
   it('maps transfer.reversed to REVERSED rather than a plain failure', async () => {
@@ -162,8 +168,8 @@ describe('Payment webhooks (integration)', () => {
     expect((await reload(payment.id)).status).toBe('REVERSED');
   });
 
-  it('finds a refund by providerRef and completes the request-level status', async () => {
-    const { request, payment } = await submitted('REFUND');
+  it('finds a refund by providerRef and settles it', async () => {
+    const { payment } = await submitted('REFUND');
     await prisma.payment.update({
       where: { id: payment.id },
       data: { providerRef: 'refund:4242' },
@@ -171,13 +177,11 @@ describe('Payment webhooks (integration)', () => {
 
     await send({ event: 'refund.processed', data: { id: 4242 } });
 
+    // The admin-facing status this used to cascade onto RescueRequest is now
+    // purely derived from this row — see derive-payment-state.ts and
+    // payment-refund-flow.int-spec.ts. Settling the Payment row is the
+    // handler's whole job.
     expect((await reload(payment.id)).status).toBe('SUCCEEDED');
-    // Nothing wrote COMPLETED before this handler existed, so every finished
-    // refund used to sit at PENDING forever.
-    const after = await prisma.rescueRequest.findUniqueOrThrow({
-      where: { id: request.id },
-    });
-    expect(after.depositRefundStatus).toBe('COMPLETED');
   });
 
   it('falls back to merchant_note when the create response was lost', async () => {
@@ -208,15 +212,14 @@ describe('Payment webhooks (integration)', () => {
     expect((await reload(payment.id)).status).toBe('SUBMITTED');
   });
 
-  it('does not overwrite depositRefundStatus when a refund webhook loses its claim', async () => {
-    // The Payment row is already FAILED — an earlier refund.failed webhook
-    // settled it. A stray or redelivered refund.processed arriving after
-    // must not report the request as COMPLETED: claimTerminal's WHERE only
-    // matches SUBMITTED/BLOCKED, so the row correctly stays FAILED, and the
-    // cascade onto depositRefundStatus must not fire at all for a call that
-    // settled nothing — it must not stamp COMPLETED over a request whose
-    // refund actually failed.
-    const { request, payment } = await submitted('REFUND');
+  it('a stray refund.processed arriving after the row already FAILED does not resettle it', async () => {
+    // An earlier refund.failed webhook already settled this row.
+    // claimTerminal's WHERE only matches SUBMITTED/BLOCKED, so this call
+    // finds nothing to claim and the row correctly stays FAILED — the same
+    // guarantee claimTerminal gives everywhere else, already covered in
+    // payment-ledger.int-spec.ts. There is no separate cascade left to get
+    // wrong here (see the previous test).
+    const { payment } = await submitted('REFUND');
     await prisma.payment.update({
       where: { id: payment.id },
       data: { providerRef: 'refund:777' },
@@ -226,12 +229,6 @@ describe('Payment webhooks (integration)', () => {
     await send({ event: 'refund.processed', data: { id: 777 } });
 
     expect((await reload(payment.id)).status).toBe('FAILED');
-    const after = await prisma.rescueRequest.findUniqueOrThrow({
-      where: { id: request.id },
-    });
-    // Untouched — this call settled nothing, so it must not have written
-    // COMPLETED over whatever the request's status already was.
-    expect(after.depositRefundStatus).toBe('PENDING');
   });
 
   it('a webhook and a verification racing the same payment produce one transition', async () => {
@@ -279,14 +276,18 @@ describe('Payment webhooks (integration)', () => {
     expect(second.settledAt).toEqual(first.settledAt);
   });
 
-  it('never lets a bookkeeping failure block the business side effects', async () => {
-    // The payment row is the recoverable part; a notification never sent is
-    // not. A malformed body must not cost the customer their confirmation.
-    await send({
-      event: 'charge.success',
-      data: { metadata: { type: 'deposit' } },
-    });
+  it('a malformed body with no reference settles nothing and calls no business side effect, without throwing', async () => {
+    // No reference means no Payment can ever be resolved — post-Task-11
+    // there is nothing else to fall back to. Safe handling here means
+    // logging/alerting and returning cleanly, not guessing at a request.
+    await expect(
+      send({
+        event: 'charge.success',
+        data: { metadata: { type: 'deposit' } },
+      }),
+    ).resolves.toEqual({ status: 'success' });
 
-    expect(paymentEvents.handleDepositPaymentConfirmed).toHaveBeenCalled();
+    expect(paymentEvents.confirmDeposit).not.toHaveBeenCalled();
+    expect(paymentEvents.confirmBalance).not.toHaveBeenCalled();
   });
 });

@@ -14,10 +14,10 @@ import {
 describe('PaymentService', () => {
   let service: PaymentService;
   let paymentEventsService: {
-    handleDepositPaymentConfirmed: jest.Mock;
-    handleBalancePaymentConfirmed: jest.Mock;
+    confirmDeposit: jest.Mock;
+    confirmBalance: jest.Mock;
   };
-  let payoutService: { confirmTransferOutcome: jest.Mock };
+  let payoutService: { notifyPayoutOutcome: jest.Mock };
   let paymentLedger: PaymentLedgerMock;
   let prisma: {
     payment: { findUnique: jest.Mock };
@@ -26,10 +26,10 @@ describe('PaymentService', () => {
 
   beforeEach(async () => {
     paymentEventsService = {
-      handleDepositPaymentConfirmed: jest.fn(),
-      handleBalancePaymentConfirmed: jest.fn(),
+      confirmDeposit: jest.fn(),
+      confirmBalance: jest.fn(),
     };
-    payoutService = { confirmTransferOutcome: jest.fn() };
+    payoutService = { notifyPayoutOutcome: jest.fn() };
     paymentLedger = createPaymentLedgerMock();
     prisma = {
       // No matching row by default: the legacy-reference case, where the
@@ -108,45 +108,69 @@ describe('PaymentService', () => {
   });
 
   describe('handlePaystackWebhook — transfer events', () => {
-    it('confirms SUCCESS on transfer.success', async () => {
+    const PAYOUT_PAYMENT = {
+      id: 'pay-1',
+      type: 'PAYOUT',
+      rescueRequestId: 'req-1',
+      operatorId: 'op-1',
+      status: 'SUBMITTED',
+      amount: 250000,
+    };
+
+    beforeEach(() => {
+      prisma.payment.findUnique.mockResolvedValue(PAYOUT_PAYMENT);
+    });
+
+    it('notifies the operator on transfer.success — the only place that does', async () => {
       await service.handlePaystackWebhook({
         event: 'transfer.success',
-        data: { transfer_code: 'TRF_test123', reason: 'Job payout' },
+        data: {
+          reference: 'payout_pay-1',
+          transfer_code: 'TRF_test123',
+          reason: 'Job payout',
+        },
       });
 
-      expect(payoutService.confirmTransferOutcome).toHaveBeenCalledWith(
-        'TRF_test123',
-        'SUCCESS',
+      expect(payoutService.notifyPayoutOutcome).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'pay-1', status: 'SUCCEEDED' }),
       );
     });
 
-    it('confirms FAILED with the reason on transfer.failed', async () => {
+    it('does not notify on transfer.failed — matches the pre-existing behaviour', async () => {
       await service.handlePaystackWebhook({
         event: 'transfer.failed',
         data: {
+          reference: 'payout_pay-1',
           transfer_code: 'TRF_test123',
           reason: 'Invalid account number',
         },
       });
 
-      expect(payoutService.confirmTransferOutcome).toHaveBeenCalledWith(
-        'TRF_test123',
-        'FAILED',
-        'Invalid account number',
-      );
+      expect(payoutService.notifyPayoutOutcome).not.toHaveBeenCalled();
     });
 
-    it('confirms FAILED on transfer.reversed', async () => {
+    it('does not notify on transfer.reversed', async () => {
       await service.handlePaystackWebhook({
         event: 'transfer.reversed',
-        data: { transfer_code: 'TRF_test123', reason: 'Reversed by bank' },
+        data: {
+          reference: 'payout_pay-1',
+          transfer_code: 'TRF_test123',
+          reason: 'Reversed by bank',
+        },
       });
 
-      expect(payoutService.confirmTransferOutcome).toHaveBeenCalledWith(
-        'TRF_test123',
-        'FAILED',
-        'Reversed by bank',
-      );
+      expect(payoutService.notifyPayoutOutcome).not.toHaveBeenCalled();
+    });
+
+    it('does not notify when this call loses the race — claimTerminal returns false', async () => {
+      paymentLedger.claimTerminal.mockResolvedValue(false);
+
+      await service.handlePaystackWebhook({
+        event: 'transfer.success',
+        data: { reference: 'payout_pay-1', transfer_code: 'TRF_test123' },
+      });
+
+      expect(payoutService.notifyPayoutOutcome).not.toHaveBeenCalled();
     });
   });
 });

@@ -6,14 +6,19 @@ import {
   forwardRef,
   Inject,
 } from '@nestjs/common';
-import * as Sentry from '@sentry/node';
 import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { PaymentEventsService } from './payment-events.service';
-import { PaymentStatus, Prisma, RescueRequestStatus } from '@prisma/client';
+import {
+  Payment,
+  PaymentStatus,
+  PaymentType,
+  Prisma,
+  RescueRequestStatus,
+} from '@prisma/client';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { DEPOSIT_WINDOW_MS } from './deposit.constants';
 import {
@@ -28,6 +33,11 @@ import { DispatchService } from './dispatch.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { PaymentLedgerService } from '../payment/payment-ledger.service';
 import { mapRefundStatus } from '../payment/domain/paystack-status';
+import {
+  deriveRefundStatus,
+  hasSucceededPayment,
+  refundEligiblePaymentsFilter,
+} from './domain/derive-payment-state';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 
 @Injectable()
@@ -64,14 +74,17 @@ export class RescueRequestAdminService {
     if (status) where.status = status;
     if (issueType) where.issueType = issueType;
     if (operatorId) where.assignedOperatorId = operatorId;
-    if (depositPaid !== undefined)
-      where.depositPaid = depositPaid === 'true' || depositPaid === true;
-    if (balancePaid !== undefined)
-      where.balancePaid = balancePaid === 'true' || balancePaid === true;
+
+    const paymentFilters = this.buildPaymentFilters({
+      depositPaid,
+      balancePaid,
+    });
     if (refundEligible === 'true' || refundEligible === true) {
       where.status = RescueRequestStatus.CANCELLED;
-      where.depositRefundStatus = { in: ['ELIGIBLE', 'FAILED'] };
+      paymentFilters.push({ payments: refundEligiblePaymentsFilter() });
     }
+    if (paymentFilters.length > 0) where.AND = paymentFilters;
+
     if (from && to)
       where.createdAt = { gte: new Date(from), lte: new Date(to) };
     if (search) {
@@ -246,7 +259,6 @@ export class RescueRequestAdminService {
         serviceFeeAmount,
         depositAmount,
         balanceAmount,
-        depositReference: reference,
         depositPaymentUrl: checkoutUrl,
         // Same statement as the transition — see the matching claim in
         // WhatsAppCustomerFlowService.handleQuoteSelected. WAITING_FOR_DEPOSIT
@@ -254,7 +266,11 @@ export class RescueRequestAdminService {
         depositWindowExpiresAt: new Date(Date.now() + DEPOSIT_WINDOW_MS),
         depositRemindersSent: 0,
       },
-      include: { customer: true, assignedOperator: true },
+      include: {
+        customer: true,
+        assignedOperator: true,
+        payments: { select: { id: true, type: true, status: true } },
+      },
     });
 
     const customerPhone = toWhatsAppAddress(request.customer.phoneNumber);
@@ -286,39 +302,44 @@ export class RescueRequestAdminService {
    * other reason.
    */
   async refundDeposit(id: string): Promise<void> {
-    const claimed = await this.prisma.rescueRequest.updateMany({
-      where: {
-        id,
-        status: RescueRequestStatus.CANCELLED,
-        depositRefundStatus: { in: ['ELIGIBLE', 'FAILED'] },
+    const request = await this.prisma.rescueRequest.findUnique({
+      where: { id },
+      include: {
+        payments: { select: { id: true, type: true, status: true } },
       },
-      data: { depositRefundStatus: 'PENDING' },
     });
-    if (claimed.count === 0) {
+    if (!request) throw new NotFoundException('Rescue request not found');
+
+    // Eligibility is now derived, not a separately claimed flag — see
+    // domain/derive-payment-state.ts. ELIGIBLE and FAILED are both claimable
+    // (a FAILED attempt must stay retryable, same shape as
+    // PayoutService.retryPayout); NONE is deliberately not claimable — a
+    // request that was never late-paid after cancellation is not this
+    // feature's concern, even if it's CANCELLED with a paid deposit for some
+    // other reason; PENDING/COMPLETED are already in progress or done.
+    //
+    // This read is a courtesy check, not the safety guarantee — two admins
+    // clicking Refund simultaneously both pass it. The actual guard is the
+    // in-flight partial unique index below, on paymentLedger.create().
+    const refundStatus = deriveRefundStatus(request.status, request.payments);
+    if (refundStatus !== 'ELIGIBLE' && refundStatus !== 'FAILED') {
       throw new BadRequestException(
         'Not eligible for refund — already refunded/in progress, or not a late-payment case.',
       );
     }
-
-    // Which failures may release the claim back to FAILED is the whole
-    // safety question here. FAILED is retryable, and a refund retry is a
-    // SECOND REAL REFUND — there is no duplicate-reference protection on
-    // Paystack's refund API, and no endpoint that takes an identifier we
-    // chose. So the claim is released only where we know for certain that
-    // nothing was created: before the POST, or on a definitive rejection.
-    const request = await this.prisma.rescueRequest.findUniqueOrThrow({
-      where: { id },
-    });
-    if (!request.depositReference || !request.depositAmount) {
-      // Nothing was sent — releasing the claim is safe, and an admin needs
-      // to fix the data before this can succeed.
-      await this.releaseRefundClaim(id);
+    if (!request.depositAmount) {
       throw new BadRequestException(
-        `Cannot refund request ${id}: missing depositReference or depositAmount`,
+        `Cannot refund request ${id}: missing depositAmount`,
       );
     }
+    // Guaranteed to exist: both ELIGIBLE and FAILED require a succeeded
+    // deposit — see deriveRefundStatus.
+    const depositPayment = request.payments.find(
+      (p) =>
+        p.type === PaymentType.DEPOSIT && p.status === PaymentStatus.SUCCEEDED,
+    )!;
 
-    let payment;
+    let payment: Payment;
     try {
       payment = await this.paymentLedger.create({
         rescueRequestId: id,
@@ -330,14 +351,10 @@ export class RescueRequestAdminService {
         error instanceof Prisma.PrismaClientKnownRequestError &&
         error.code === 'P2002'
       ) {
-        // A refund attempt is already in flight. Deliberately does NOT
-        // release the claim: that earlier attempt may have created a refund
-        // at Paystack, so this must not become retryable.
         throw new BadRequestException(
           'A refund is already in progress for this request',
         );
       }
-      await this.releaseRefundClaim(id);
       throw error;
     }
 
@@ -350,7 +367,8 @@ export class RescueRequestAdminService {
     }
 
     const result = await this.paystackService.refundTransaction({
-      transaction: request.depositReference,
+      // The deposit's OWN reference — the original transaction to refund.
+      transaction: this.paymentLedger.referenceFor(depositPayment),
       amount: request.depositAmount,
       // The BARE id, not the formatted reference — refunds have no reference,
       // and this note is what recovery matches on.
@@ -358,7 +376,8 @@ export class RescueRequestAdminService {
     });
 
     if (result.outcome === 'ambiguous') {
-      // The row stays SUBMITTED and the claim stays PENDING (not retryable).
+      // Nothing to release: eligibility is derived from this Payment row's
+      // own status, and a SUBMITTED row already reads as not-retryable.
       // Verification adopts whatever landed; a second POST would refund twice.
       throw new BadRequestException(
         `Refund status unknown — it is being verified. Do not retry yet.`,
@@ -367,62 +386,29 @@ export class RescueRequestAdminService {
     if (result.outcome === 'rejected') {
       const failureReason = result.message ?? 'refund rejected';
       await this.paymentLedger.recordRejection(payment.id, failureReason);
-      await this.releaseRefundClaim(id);
       throw new BadRequestException(`Refund failed: ${failureReason}`);
     }
 
     // providerRef first: it is how the refund webhook will find this row,
-    // since refunds carry no reference of ours.
+    // since refunds carry no reference of ours. There is no separate
+    // "depositRefundId" column any more — this providerRef IS the refund's
+    // recorded identity now.
     await this.prisma.payment.update({
       where: { id: payment.id },
       data: { providerRef: `refund:${result.data.id}` },
     });
-
-    try {
-      await this.prisma.rescueRequest.update({
-        where: { id },
-        data: { depositRefundId: result.data.id },
-      });
-    } catch (err) {
-      // The refund exists at Paystack. Do NOT release the claim: FAILED is
-      // retryable and a retry would refund a second time. Leave it PENDING
-      // and alert a human to reconcile the missing depositRefundId.
-      Sentry.captureException(err, {
-        extra: {
-          rescueRequestId: id,
-          refundId: result.data.id,
-          reason:
-            'deposit refund created at Paystack but failed to persist depositRefundId',
-        },
-      });
-    }
 
     // As with transfers, the POST may not produce SUCCEEDED — `processed`
     // included. Only BLOCKED and a definitive failure may come from here.
     const mapped = mapRefundStatus(result.data.status);
     if (mapped.status === PaymentStatus.BLOCKED) {
       // Paystack has the refund and is waiting on customer details. It
-      // exists, so the claim stays PENDING rather than becoming retryable.
+      // exists, so this must not become retryable.
       await this.paymentLedger.recordBlocked(payment.id, mapped.blockReason!);
     } else if (mapped.status === PaymentStatus.FAILED) {
       await this.paymentLedger.claimTerminal(payment.id, mapped);
-      await this.releaseRefundClaim(id);
     }
     // Everything else — including `processed` — stays SUBMITTED.
-  }
-
-  /**
-   * Return depositRefundStatus to FAILED so an admin can try again.
-   *
-   * Only ever called where nothing was created at Paystack. Calling it after
-   * a refund may exist turns "unknown" into "retry me", and the retry is a
-   * second real refund.
-   */
-  private async releaseRefundClaim(id: string): Promise<void> {
-    await this.prisma.rescueRequest.update({
-      where: { id },
-      data: { depositRefundStatus: 'FAILED' },
-    });
   }
 
   async updateStatus(id: string, dto: { status: string }) {
@@ -433,7 +419,10 @@ export class RescueRequestAdminService {
     const updated = await this.prisma.rescueRequest.update({
       where: { id },
       data: { status },
-      include: { customer: true },
+      include: {
+        customer: true,
+        payments: { select: { id: true, type: true, status: true } },
+      },
     });
 
     if (
@@ -461,7 +450,10 @@ export class RescueRequestAdminService {
     const updated = await this.prisma.rescueRequest.update({
       where: { id },
       data: { status: RescueRequestStatus.CANCELLED },
-      include: { customer: true },
+      include: {
+        customer: true,
+        payments: { select: { id: true, type: true, status: true } },
+      },
     });
 
     // Any operator still holding a PENDING offer on this job (other than
@@ -534,6 +526,7 @@ export class RescueRequestAdminService {
             email: true,
           },
         },
+        payments: { select: { id: true, type: true, status: true } },
       },
     });
 
@@ -563,10 +556,13 @@ export class RescueRequestAdminService {
     const whereClause: any = {};
     if (status) whereClause.status = status;
     if (issueType) whereClause.issueType = issueType;
-    if (depositPaid !== undefined)
-      whereClause.depositPaid = depositPaid === 'true' || depositPaid === true;
-    if (balancePaid !== undefined)
-      whereClause.balancePaid = balancePaid === 'true' || balancePaid === true;
+
+    const paymentFilters = this.buildPaymentFilters({
+      depositPaid,
+      balancePaid,
+    });
+    if (paymentFilters.length > 0) whereClause.AND = paymentFilters;
+
     if (from && to)
       whereClause.createdAt = { gte: new Date(from), lte: new Date(to) };
     else if (from) whereClause.createdAt = { gte: new Date(from) };
@@ -649,6 +645,7 @@ export class RescueRequestAdminService {
           orderBy: { offeredAt: 'asc' },
         },
         ratings: true,
+        payments: { select: { id: true, type: true, status: true } },
       },
     });
     if (!raw) throw new UnauthorizedException('Rescue request not found');
@@ -712,6 +709,7 @@ export class RescueRequestAdminService {
         include: {
           customer: { select: { id: true, phoneNumber: true } },
           assignedOperator: { select: { id: true, businessName: true } },
+          payments: { select: { id: true, type: true, status: true } },
         },
         orderBy: { createdAt: 'desc' },
       }),
@@ -724,9 +722,9 @@ export class RescueRequestAdminService {
       issueType: item.issueType ?? undefined,
       latitude: item.latitude ? Number(item.latitude) : undefined,
       longitude: item.longitude ? Number(item.longitude) : undefined,
-      depositPaid: item.depositPaid,
-      balancePaid: item.balancePaid,
-      depositRefundStatus: item.depositRefundStatus,
+      depositPaid: hasSucceededPayment(item.payments, PaymentType.DEPOSIT),
+      balancePaid: hasSucceededPayment(item.payments, PaymentType.BALANCE),
+      depositRefundStatus: deriveRefundStatus(item.status, item.payments),
       customer: {
         id: item.customer.id,
         phoneNumber: item.customer.phoneNumber!,
@@ -769,12 +767,18 @@ export class RescueRequestAdminService {
       mediaLinks,
       latitude: raw.latitude ? Number(raw.latitude) : undefined,
       longitude: raw.longitude ? Number(raw.longitude) : undefined,
-      depositPaid: raw.depositPaid,
+      depositPaid: hasSucceededPayment(raw.payments, PaymentType.DEPOSIT),
       depositAmount: raw.depositAmount,
-      depositReference: raw.depositReference,
-      balancePaid: raw.balancePaid,
+      depositReference: this.latestPaymentReference(
+        raw.payments,
+        PaymentType.DEPOSIT,
+      ),
+      balancePaid: hasSucceededPayment(raw.payments, PaymentType.BALANCE),
       balanceAmount: raw.balanceAmount,
-      balanceReference: raw.balanceReference,
+      balanceReference: this.latestPaymentReference(
+        raw.payments,
+        PaymentType.BALANCE,
+      ),
       customer: {
         id: raw.customer.id,
         phoneNumber: raw.customer.phoneNumber,
@@ -810,5 +814,57 @@ export class RescueRequestAdminService {
         flaggedResolvedAt: r.flaggedResolvedAt ?? undefined,
       })),
     };
+  }
+
+  /**
+   * The reference field this DTO exposes is now derived, not stored: the
+   * SUCCEEDED attempt if one exists, else whichever attempt is most recent
+   * (a request mid-flow, or one whose only attempts failed). Undefined when
+   * no payment of that type was ever created.
+   */
+  private latestPaymentReference(
+    payments: Pick<Payment, 'id' | 'type' | 'status' | 'createdAt'>[],
+    type: PaymentType,
+  ): string | undefined {
+    const candidates = payments.filter((p) => p.type === type);
+    if (candidates.length === 0) return undefined;
+    const chosen =
+      candidates.find((p) => p.status === PaymentStatus.SUCCEEDED) ??
+      candidates.reduce((latest, p) =>
+        p.createdAt > latest.createdAt ? p : latest,
+      );
+    return this.paymentLedger.referenceFor(chosen);
+  }
+
+  /**
+   * depositPaid/balancePaid as Prisma relation-filter fragments, one entry
+   * per filter actually supplied. Kept as a list rather than assigned onto
+   * one `where.payments` key, since adminList can ALSO need a THIRD
+   * payments-relation condition (refundEligible) — a single key would let
+   * the later assignment silently overwrite the earlier one.
+   */
+  private buildPaymentFilters(query: {
+    depositPaid?: unknown;
+    balancePaid?: unknown;
+  }): Array<{ payments: unknown }> {
+    const filters: Array<{ payments: unknown }> = [];
+    const succeededFilter = (type: PaymentType, want: boolean) =>
+      want
+        ? { some: { type, status: PaymentStatus.SUCCEEDED } }
+        : { none: { type, status: PaymentStatus.SUCCEEDED } };
+
+    if (query.depositPaid !== undefined) {
+      const want = query.depositPaid === 'true' || query.depositPaid === true;
+      filters.push({
+        payments: succeededFilter(PaymentType.DEPOSIT, want),
+      });
+    }
+    if (query.balancePaid !== undefined) {
+      const want = query.balancePaid === 'true' || query.balancePaid === true;
+      filters.push({
+        payments: succeededFilter(PaymentType.BALANCE, want),
+      });
+    }
+    return filters;
   }
 }

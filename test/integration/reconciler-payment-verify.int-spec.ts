@@ -38,6 +38,8 @@ describe('PaymentVerifyCheck (integration)', () => {
     listRefunds: jest.Mock;
   };
   let twilio: { sendWhatsAppMessage: jest.Mock };
+  let paymentEvents: { confirmDeposit: jest.Mock; confirmBalance: jest.Mock };
+  let payoutServiceMock: { notifyPayoutOutcome: jest.Mock };
   const captureMessage = Sentry.captureMessage as jest.Mock;
 
   const past = () => new Date(Date.now() - 60_000);
@@ -63,11 +65,20 @@ describe('PaymentVerifyCheck (integration)', () => {
       listRefunds: jest.fn(),
     };
     twilio = { sendWhatsAppMessage: jest.fn().mockResolvedValue(undefined) };
+    paymentEvents = {
+      confirmDeposit: jest.fn().mockResolvedValue(undefined),
+      confirmBalance: jest.fn().mockResolvedValue(undefined),
+    };
+    payoutServiceMock = {
+      notifyPayoutOutcome: jest.fn().mockResolvedValue(undefined),
+    };
     check = new PaymentVerifyCheck(
       prisma,
       paystack as never,
       twilio as never,
       ledger,
+      paymentEvents as never,
+      payoutServiceMock as never,
     );
     captureMessage.mockClear();
   });
@@ -120,7 +131,7 @@ describe('PaymentVerifyCheck (integration)', () => {
   // ── PENDING → initiate ──────────────────────────────────────────────────
 
   describe('PENDING: no call was ever made', () => {
-    it('initiates a deposit, persists the checkout URL and depositReference, and sends it', async () => {
+    it('initiates a deposit, persists the checkout URL on the request, and sends it', async () => {
       const { request } = await seedRequest({ status: 'DISPATCHING' });
       await pendingPayment('DEPOSIT', request.id);
       paystack.initializePayment.mockResolvedValue({
@@ -139,10 +150,13 @@ describe('PaymentVerifyCheck (integration)', () => {
       expect(payment.status).toBe('SUBMITTED');
       expect(payment.checkoutUrl).toBe('https://paystack.test/pay/recovered');
 
+      // No RescueRequest.depositReference any more — the webhook and this
+      // check both find the request via the Payment row's own
+      // rescueRequestId. depositPaymentUrl alone is kept, for the deposit
+      // reminder check to resend without a fresh Paystack call.
       const after = await prisma.rescueRequest.findUniqueOrThrow({
         where: { id: request.id },
       });
-      expect(after.depositReference).toBe(`DEP_${payment.id}`);
       expect(after.depositPaymentUrl).toBe(
         'https://paystack.test/pay/recovered',
       );
@@ -152,7 +166,7 @@ describe('PaymentVerifyCheck (integration)', () => {
       );
     });
 
-    it('initiates a balance payment and persists balanceReference, with no URL column of its own', async () => {
+    it('initiates a balance payment and sends it, writing no RescueRequest field at all', async () => {
       const { request } = await seedRequest();
       await pendingPayment('BALANCE', request.id);
       paystack.initializePayment.mockResolvedValue({
@@ -166,12 +180,16 @@ describe('PaymentVerifyCheck (integration)', () => {
 
       await check.run(future());
 
-      const payment = await prisma.payment.findFirstOrThrow();
+      // A balance link is only ever sent once, never resent from a stored
+      // copy — unlike a deposit, there is no column for it to land in.
       const after = await prisma.rescueRequest.findUniqueOrThrow({
         where: { id: request.id },
       });
-      expect(after.balanceReference).toBe(`BAL_${payment.id}`);
-      expect(twilio.sendWhatsAppMessage).toHaveBeenCalled();
+      expect(after.depositPaymentUrl).toBeNull();
+      expect(twilio.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.stringContaining('https://paystack.test/pay/bal'),
+      );
     });
 
     it('fails a rejected recovered collection, and never sends anything', async () => {
@@ -231,12 +249,18 @@ describe('PaymentVerifyCheck (integration)', () => {
       expect(twilio.sendWhatsAppMessage).not.toHaveBeenCalled();
     });
 
-    it('initiates a refund with the bare Payment.id as merchant_note', async () => {
-      const { request } = await seedRequest({
-        depositReference: 'DEP_ref_1',
-        depositAmount: 500_000,
+    it("initiates a refund against the deposit payment's OWN reference, with the bare id as merchant_note", async () => {
+      const { request } = await seedRequest();
+      const deposit = await ledger.create({
+        rescueRequestId: request.id,
+        type: 'DEPOSIT',
+        amount: 500_000,
       });
-      await pendingPayment('REFUND', request.id);
+      await ledger.claimForSubmission(deposit.id, new Date());
+      await ledger.claimTerminal(deposit.id, { status: 'SUCCEEDED' });
+      const refund = await pendingPayment('REFUND', request.id, {
+        amount: 500_000,
+      });
       paystack.refundTransaction.mockResolvedValue({
         outcome: 'ok',
         data: { id: 999, status: 'pending' },
@@ -244,24 +268,23 @@ describe('PaymentVerifyCheck (integration)', () => {
 
       await check.run(future());
 
-      const payment = await prisma.payment.findFirstOrThrow();
       expect(paystack.refundTransaction).toHaveBeenCalledWith({
-        transaction: 'DEP_ref_1',
+        transaction: `DEP_${deposit.id}`,
         amount: 500_000,
-        merchantNote: payment.id,
+        merchantNote: refund.id,
       });
-      expect(payment.status).toBe('SUBMITTED');
+      expect((await reload(refund.id)).status).toBe('SUBMITTED');
     });
 
-    it('escalates rather than guesses when a recovered refund has no depositReference', async () => {
-      const { request } = await seedRequest(); // no depositReference
+    it('escalates rather than guesses when a recovered refund has no succeeded deposit to refund against', async () => {
+      const { request } = await seedRequest(); // no deposit at all
       await pendingPayment('REFUND', request.id);
 
       await check.run(future());
 
       expect(paystack.refundTransaction).not.toHaveBeenCalled();
       expect(captureMessage).toHaveBeenCalledWith(
-        expect.stringContaining('depositReference'),
+        expect.stringContaining('succeeded deposit'),
         expect.anything(),
       );
       expect((await prisma.payment.findFirstOrThrow()).status).toBe(

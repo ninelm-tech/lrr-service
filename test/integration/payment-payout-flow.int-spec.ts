@@ -163,9 +163,8 @@ describe('Payout submission protocol (integration)', () => {
       data: { paystackRecipientCode: 'RCP_existing' },
     });
     initiateTransfer.mockResolvedValue(transferOk('pending'));
-    const payout = await prisma.payout.findFirstOrThrow();
 
-    await service.retryPayout(payout.id);
+    await service.retryPayout(blocked.id);
 
     expect(await prisma.payment.count({ where: { type: 'PAYOUT' } })).toBe(1);
     const after = await payoutPayment();
@@ -186,17 +185,5 @@ describe('Payout submission protocol (integration)', () => {
 
     expect(initiateTransfer).toHaveBeenCalledTimes(1);
     expect(await prisma.payment.count({ where: { type: 'PAYOUT' } })).toBe(1);
-  });
-
-  it('keeps the legacy Payout row in step with the ledger', async () => {
-    // Dual-written until Task 11 removes the table and its readers together.
-    const { operator, request } = await payableJob();
-    initiateTransfer.mockResolvedValue(transferOk('pending'));
-
-    await run(request.id, operator.id);
-
-    const payout = await prisma.payout.findFirstOrThrow();
-    expect(payout.status).toBe('PROCESSING');
-    expect(payout.paystackTransferCode).toBe('TRF_abc123');
   });
 });

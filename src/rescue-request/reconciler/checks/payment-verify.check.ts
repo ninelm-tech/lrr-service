@@ -18,6 +18,8 @@ import {
 } from '../../../integrations/paystack/dto/paystack-outcome.dto';
 import { toWhatsAppAddress } from '../../../common/phone.util';
 import { ReconcilerCheck } from '../reconciler-check.interface';
+import { PaymentEventsService } from '../../payment-events.service';
+import { PayoutService } from '../../../payout/payout.service';
 
 /**
  * Chases every `Payment` row whose work is overdue: a `PENDING` row nobody
@@ -46,6 +48,8 @@ export class PaymentVerifyCheck implements ReconcilerCheck {
     private readonly paystackService: PaystackService,
     private readonly twilioService: TwilioService,
     private readonly paymentLedger: PaymentLedgerService,
+    private readonly paymentEventsService: PaymentEventsService,
+    private readonly payoutService: PayoutService,
   ) {}
 
   async run(now: Date): Promise<number> {
@@ -165,17 +169,17 @@ export class PaymentVerifyCheck implements ReconcilerCheck {
       data: { checkoutUrl },
     });
 
-    // The webhook finds the request by THIS field, not by the Payment row —
-    // handleDepositPaymentConfirmed/handleBalancePaymentConfirmed both key on
-    // it. Without this write the payment settles correctly but the business
-    // side effects (assigning the operator, marking the job complete) never
-    // fire, because nothing points the webhook back at this request.
-    await this.prisma.rescueRequest.update({
-      where: { id: request.id },
-      data: isDeposit
-        ? { depositReference: reference, depositPaymentUrl: checkoutUrl }
-        : { balanceReference: reference },
-    });
+    // Deposits alone get a reminder-friendly URL column; a balance link is
+    // only ever sent once, never resent from a stored copy. Neither type
+    // needs its reference written anywhere else any more — the webhook and
+    // this check both find the request via the Payment row's own
+    // rescueRequestId, not by looking a reference up on RescueRequest.
+    if (isDeposit) {
+      await this.prisma.rescueRequest.update({
+        where: { id: request.id },
+        data: { depositPaymentUrl: checkoutUrl },
+      });
+    }
 
     if (request.customer.phoneNumber) {
       await this.twilioService.sendWhatsAppMessage(
@@ -209,23 +213,31 @@ export class PaymentVerifyCheck implements ReconcilerCheck {
       reference: this.paymentLedger.referenceFor(payment),
       reason: `Job payout — ${payment.rescueRequestId}`,
     });
-    await this.applyTransferResult(payment.id, result);
+    await this.applyTransferResult(payment, result);
   }
 
   private async initiateRefund(payment: Payment): Promise<void> {
-    const request = await this.prisma.rescueRequest.findUnique({
-      where: { id: payment.rescueRequestId },
+    // The original transaction to refund is the sibling deposit's OWN
+    // reference — there is no RescueRequest column for this any more (see
+    // refundDeposit, which reaches this same state before ever creating the
+    // REFUND row, so a succeeded deposit is guaranteed to exist here too).
+    const depositPayment = await this.prisma.payment.findFirst({
+      where: {
+        rescueRequestId: payment.rescueRequestId,
+        type: PaymentType.DEPOSIT,
+        status: PaymentStatus.SUCCEEDED,
+      },
     });
-    if (!request?.depositReference) {
+    if (!depositPayment) {
       this.escalate(
         payment,
-        'recovered refund has no depositReference to refund against',
+        'recovered refund has no succeeded deposit to refund against',
       );
       return;
     }
 
     const result = await this.paystackService.refundTransaction({
-      transaction: request.depositReference,
+      transaction: this.paymentLedger.referenceFor(depositPayment),
       amount: payment.amount,
       merchantNote: payment.id,
     });
@@ -291,14 +303,32 @@ export class PaymentVerifyCheck implements ReconcilerCheck {
     if (mapped.status !== PaymentStatus.SUBMITTED) {
       // A real terminal answer — success/failed/reversed — decides this
       // regardless of whether we ever captured the checkout URL.
-      await this.paymentLedger.claimTerminal(payment.id, mapped, {
-        providerRef: `txn:${result.data.id}`,
-        providerFee: result.data.fees,
-        netAmount:
-          result.data.fees !== undefined
-            ? result.data.amount - result.data.fees
-            : undefined,
-      });
+      const claimed = await this.paymentLedger.claimTerminal(
+        payment.id,
+        mapped,
+        {
+          providerRef: `txn:${result.data.id}`,
+          providerFee: result.data.fees,
+          netAmount:
+            result.data.fees !== undefined
+              ? result.data.amount - result.data.fees
+              : undefined,
+        },
+      );
+      // Only the caller whose claim actually won runs the business side
+      // effects — the same rule as the webhook's own settle(). This is the
+      // fix for the gap a webhook-only design would otherwise leave: a
+      // payment settled by verification, rather than by a webhook, must
+      // still assign the operator / complete the job, or the money lands
+      // and the job never moves.
+      if (claimed && mapped.status === PaymentStatus.SUCCEEDED) {
+        const settled = { ...payment, ...mapped };
+        if (payment.type === PaymentType.DEPOSIT) {
+          await this.paymentEventsService.confirmDeposit(settled);
+        } else {
+          await this.paymentEventsService.confirmBalance(settled);
+        }
+      }
       return;
     }
 
@@ -390,13 +420,13 @@ export class PaymentVerifyCheck implements ReconcilerCheck {
         reference: this.paymentLedger.referenceFor(payment),
         reason: `Job payout — ${payment.rescueRequestId}`,
       });
-      const outcome = await this.applyTransferResult(payment.id, resubmit);
+      const outcome = await this.applyTransferResult(payment, resubmit);
       if (outcome === 'pending')
         await this.paymentLedger.backOff(payment.id, now);
       return;
     }
 
-    const outcome = await this.applyTransferResult(payment.id, result);
+    const outcome = await this.applyTransferResult(payment, result);
     if (outcome === 'pending')
       await this.paymentLedger.backOff(payment.id, now);
   }
@@ -410,18 +440,12 @@ export class PaymentVerifyCheck implements ReconcilerCheck {
    * Returns whether the row reached a stopping point. The caller decides
    * whether to back off: the PENDING branch's own CAS already pushed
    * `verifyAfter` out, so it never needs to; the SUBMITTED branch does.
-   *
-   * Deliberately does NOT touch the legacy `Payout` row. Task 11 removes
-   * that table; keeping it in sync from a recovery path this narrow (a crash
-   * between create() and the CAS, or a lost verify response) would duplicate
-   * `PayoutService`'s own update logic for a table with days left to live.
-   * The `Payout` row may show stale status until Task 11; the `Payment` row
-   * — the actual money-movement record — is always correct either way.
    */
   private async applyTransferResult(
-    paymentId: string,
+    payment: Payment,
     result: PaystackTransferResult,
   ): Promise<'settled' | 'pending'> {
+    const paymentId = payment.id;
     if (result.outcome === 'ambiguous') return 'pending';
     if (result.outcome === 'rejected') {
       if (isDuplicateReference(result)) return 'pending';
@@ -453,7 +477,14 @@ export class PaymentVerifyCheck implements ReconcilerCheck {
       return 'settled';
     }
     if (mapped.status !== PaymentStatus.SUBMITTED) {
-      await this.paymentLedger.claimTerminal(paymentId, mapped);
+      const claimed = await this.paymentLedger.claimTerminal(paymentId, mapped);
+      // Same rule as the collection side: only the caller whose claim won
+      // notifies the operator. The webhook path does this too
+      // (payment.service.ts) — a payout resolved by this check instead of
+      // a webhook must still tell the operator they've been paid.
+      if (claimed && mapped.status === PaymentStatus.SUCCEEDED) {
+        await this.payoutService.notifyPayoutOutcome({ ...payment, ...mapped });
+      }
       return 'settled';
     }
     return 'pending';

@@ -22,10 +22,9 @@ import {
  * Our reference format, reversed. `DEP_`/`BAL_` are collections and `payout_`
  * is a transfer; everything after the underscore is the Payment id.
  *
- * References predating the payment model look like `DEP_<timestamp>_<rand>`
- * and will not match any row. That is handled, not an error: those requests
- * still complete through the business side effects below, which key on
- * RescueRequest.depositReference and are untouched by this task.
+ * Every live reference now has a Payment row — the old RescueRequest columns
+ * a legacy reference would have matched against are gone (Task 11), so a
+ * miss here is a genuine anomaly rather than a tolerated transition case.
  */
 const REFERENCE_PATTERN = /^(?:DEP|BAL|payout)_(.+)$/;
 
@@ -77,7 +76,7 @@ export class PaymentService {
       case 'charge.success': {
         // The transaction id recorded here is what refund recovery reads
         // back off the deposit row to list refunds against.
-        await this.settle(
+        const payment = await this.settle(
           () => this.findByReference(data.reference),
           mapTransactionStatus('success'),
           {
@@ -90,23 +89,24 @@ export class PaymentService {
           },
           event,
         );
+        if (!payment) break;
 
-        const { reference, metadata } = data;
+        // settle() returns the PRE-claim object — its .status still reads
+        // SUBMITTED. Neither confirmDeposit/confirmBalance reads .status
+        // today, but passing the object claimTerminal actually produced
+        // (rather than the one it was given) is the same discipline
+        // applied to the transfer case below, and keeps this from becoming
+        // a trap for whichever one of them checks status next.
+        const settled = { ...payment, status: 'SUCCEEDED' as const };
 
-        if (metadata?.type === 'deposit') {
-          await this.paymentEventsService.handleDepositPaymentConfirmed(
-            reference!,
-          );
-        } else if (metadata?.type === 'balance') {
-          await this.paymentEventsService.handleBalancePaymentConfirmed(
-            reference!,
-          );
-        } else {
-          console.warn('⚠️ Unknown charge metadata type:', metadata?.type);
-          Sentry.captureMessage(
-            `Paystack charge.success with unknown metadata type: ${metadata?.type}`,
-            'warning',
-          );
+        // The Payment row's OWN type, not the webhook's echoed-back
+        // metadata — metadata is client-supplied and only ever meant for
+        // humans reading the Paystack dashboard, not a thing to branch on
+        // when we already have our own authoritative record of what this is.
+        if (payment.type === 'DEPOSIT') {
+          await this.paymentEventsService.confirmDeposit(settled);
+        } else if (payment.type === 'BALANCE') {
+          await this.paymentEventsService.confirmBalance(settled);
         }
         break;
       }
@@ -118,9 +118,10 @@ export class PaymentService {
         // The event name is the status; the body's own field is not trusted
         // to agree with it.
         const status = event.slice('transfer.'.length);
-        await this.settle(
+        const mapped = mapTransferStatus(status);
+        const payment = await this.settle(
           () => this.findByReference(data.reference),
-          mapTransferStatus(status),
+          mapped,
           {
             providerRef: data.transfer_code
               ? `trf:${data.transfer_code}`
@@ -130,30 +131,28 @@ export class PaymentService {
           event,
         );
 
-        if (event === 'transfer.success') {
-          await this.payoutService.confirmTransferOutcome(
-            data.transfer_code!,
-            'SUCCESS',
-          );
-        } else {
-          // The reason only belongs on a failure — passing it on success
-          // would record a failureReason for a transfer that worked.
-          await this.payoutService.confirmTransferOutcome(
-            data.transfer_code!,
-            'FAILED',
-            data.reason,
-          );
+        // payment truthy means THIS call settled it; mapped.status is what
+        // it was settled TO — payment.status itself is still the stale
+        // pre-claim value, so notifyPayoutOutcome (which reads .status) must
+        // be given the settled value, not the object settle() found. Only a
+        // genuine success notifies the operator, matching pre-Task-11.
+        if (payment && mapped.status === 'SUCCEEDED') {
+          await this.payoutService.notifyPayoutOutcome({
+            ...payment,
+            ...mapped,
+          });
         }
         break;
       }
 
       // ── Refund outcome ────────────────────────────────────────────────────
-      // New here. A code comment elsewhere claimed these were handled; they
-      // were not, which is why a completed refund never left PENDING.
       case 'refund.processed':
       case 'refund.failed': {
         const status = event === 'refund.processed' ? 'processed' : 'failed';
-        const payment = await this.settle(
+        // The request-level refund status the admin list reads is now fully
+        // derived from this Payment row's own status (see
+        // domain/derive-payment-state.ts) — settling it here is the whole job.
+        await this.settle(
           () => this.findRefund(data),
           mapRefundStatus(status),
           {
@@ -162,28 +161,6 @@ export class PaymentService {
           },
           event,
         );
-
-        if (payment) {
-          // The request-level status the admin list reads. Nothing has ever
-          // written COMPLETED before this, so every finished refund sat at
-          // PENDING forever.
-          await this.prisma.rescueRequest
-            .update({
-              where: { id: payment.rescueRequestId },
-              data: {
-                depositRefundStatus:
-                  status === 'processed' ? 'COMPLETED' : 'FAILED',
-              },
-            })
-            .catch((err: unknown) => {
-              Sentry.captureException(err, {
-                extra: {
-                  rescueRequestId: payment.rescueRequestId,
-                  reason: 'refund webhook could not update depositRefundStatus',
-                },
-              });
-            });
-        }
         break;
       }
 
@@ -206,12 +183,12 @@ export class PaymentService {
    * lost, both land here legitimately.
    *
    * Returns the payment only when THIS call's claim actually won — never
-   * merely when one was found. A caller that cascades a request-level status
-   * off the return value (refunds do, onto depositRefundStatus) must not run
-   * that cascade for a lost race or a redelivered webhook arriving after the
-   * row already moved to a DIFFERENT terminal state: claimTerminal's WHERE
-   * only matches SUBMITTED/BLOCKED, so a row already FAILED stays FAILED
-   * while the caller would otherwise still write COMPLETED over it.
+   * merely when one was found. Both callers that act on the return value
+   * (confirmDeposit/confirmBalance, and notifyPayoutOutcome) must not run for
+   * a lost race or a redelivered webhook arriving after the row already
+   * moved to a terminal state: claimTerminal's WHERE only matches
+   * SUBMITTED/BLOCKED, so a second arrival correctly finds nothing left to
+   * claim, and the caller must skip its side effect rather than repeat it.
    */
   private async settle(
     find: () => Promise<Payment | null>,

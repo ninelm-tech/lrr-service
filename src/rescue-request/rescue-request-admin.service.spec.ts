@@ -13,9 +13,7 @@ import { PlatformConfigService } from '../platform-config/platform-config.servic
 import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
-import * as Sentry from '@sentry/node';
-
-jest.mock('@sentry/node', () => ({ captureException: jest.fn() }));
+import { Prisma } from '@prisma/client';
 
 describe('RescueRequestAdminService', () => {
   describe('detailForUser — quote-compliance data', () => {
@@ -64,12 +62,11 @@ describe('RescueRequestAdminService', () => {
       destination: 'Mainland',
       latitude: null,
       longitude: null,
-      depositPaid: false,
       depositAmount: undefined,
-      depositReference: undefined,
-      balancePaid: false,
       balanceAmount: undefined,
-      balanceReference: undefined,
+      // depositPaid/balancePaid/depositReference/balanceReference are now
+      // derived from this relation — see domain/derive-payment-state.ts.
+      payments: [],
       createdAt: new Date('2026-08-10T00:00:00Z'),
       updatedAt: new Date('2026-08-10T00:00:00Z'),
       customer: {
@@ -239,7 +236,7 @@ describe('RescueRequestAdminService', () => {
       );
     });
 
-    it("filters to refund-eligible requests when refundEligible=true is passed, matching refundDeposit's own claim condition (status CANCELLED + depositRefundStatus)", async () => {
+    it("filters to refund-eligible requests when refundEligible=true is passed, matching refundDeposit's own eligibility condition (status CANCELLED + a succeeded deposit + no active/succeeded refund)", async () => {
       prisma.rescueRequest.findMany.mockResolvedValue([]);
       prisma.rescueRequest.count.mockResolvedValue(0);
 
@@ -249,13 +246,25 @@ describe('RescueRequestAdminService', () => {
         expect.objectContaining({
           where: expect.objectContaining({
             status: 'CANCELLED',
-            depositRefundStatus: { in: ['ELIGIBLE', 'FAILED'] },
+            AND: [
+              {
+                payments: {
+                  some: { type: 'DEPOSIT', status: 'SUCCEEDED' },
+                  none: {
+                    type: 'REFUND',
+                    status: {
+                      in: ['PENDING', 'SUBMITTED', 'BLOCKED', 'SUCCEEDED'],
+                    },
+                  },
+                },
+              },
+            ],
           }),
         }),
       );
     });
 
-    it('includes depositRefundStatus in each list item', async () => {
+    it('derives depositPaid, balancePaid, and depositRefundStatus from the payments relation', async () => {
       prisma.rescueRequest.findMany.mockResolvedValue([
         {
           id: 'req-1',
@@ -264,9 +273,7 @@ describe('RescueRequestAdminService', () => {
           destination: null,
           latitude: null,
           longitude: null,
-          depositPaid: true,
-          balancePaid: false,
-          depositRefundStatus: 'ELIGIBLE',
+          payments: [{ id: 'pay-1', type: 'DEPOSIT', status: 'SUCCEEDED' }],
           customer: { id: 'cust-1', phoneNumber: '+2341' },
           assignedOperator: null,
           createdAt: new Date(),
@@ -277,7 +284,28 @@ describe('RescueRequestAdminService', () => {
 
       const result = await service.adminList({});
 
+      expect(result.data[0].depositPaid).toBe(true);
+      expect(result.data[0].balancePaid).toBe(false);
+      // CANCELLED + a succeeded deposit + no refund attempt yet = ELIGIBLE.
       expect(result.data[0].depositRefundStatus).toBe('ELIGIBLE');
+    });
+
+    it('combines depositPaid and balancePaid filters instead of one overwriting the other', async () => {
+      prisma.rescueRequest.findMany.mockResolvedValue([]);
+      prisma.rescueRequest.count.mockResolvedValue(0);
+
+      await service.adminList({ depositPaid: 'true', balancePaid: 'false' });
+
+      expect(prisma.rescueRequest.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            AND: [
+              { payments: { some: { type: 'DEPOSIT', status: 'SUCCEEDED' } } },
+              { payments: { none: { type: 'BALANCE', status: 'SUCCEEDED' } } },
+            ],
+          }),
+        }),
+      );
     });
   });
 
@@ -324,6 +352,7 @@ describe('RescueRequestAdminService', () => {
             ...request,
             ...data,
             assignedOperator: operator,
+            payments: [],
           })),
         },
         dispatchOffer: {
@@ -534,23 +563,24 @@ describe('RescueRequestAdminService', () => {
   describe('refundDeposit', () => {
     let service: RescueRequestAdminService;
     let prisma: {
-      rescueRequest: {
-        updateMany: jest.Mock;
-        findUniqueOrThrow: jest.Mock;
-        update: jest.Mock;
-      };
+      rescueRequest: { findUnique: jest.Mock };
       payment: { update: jest.Mock };
     };
     let paystackService: { refundTransaction: jest.Mock };
     let paymentLedger: PaymentLedgerMock;
 
+    /** A CANCELLED request with a succeeded deposit — the eligible case. */
+    const eligibleRequest = (overrides: Record<string, unknown> = {}) => ({
+      id: 'req-1',
+      status: 'CANCELLED',
+      depositAmount: 500000,
+      payments: [{ id: 'dep-1', type: 'DEPOSIT', status: 'SUCCEEDED' }],
+      ...overrides,
+    });
+
     beforeEach(async () => {
       prisma = {
-        rescueRequest: {
-          updateMany: jest.fn(),
-          findUniqueOrThrow: jest.fn(),
-          update: jest.fn(),
-        },
+        rescueRequest: { findUnique: jest.fn() },
         payment: { update: jest.fn().mockResolvedValue({}) },
       };
       paystackService = { refundTransaction: jest.fn() };
@@ -574,63 +604,44 @@ describe('RescueRequestAdminService', () => {
       service = module.get<RescueRequestAdminService>(
         RescueRequestAdminService,
       );
-      (Sentry.captureException as jest.Mock).mockClear();
     });
 
-    it('claims ELIGIBLE → PENDING, calls Paystack, stores the refund id', async () => {
-      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
-      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
-        id: 'req-1',
-        depositReference: 'DEP_ref_1',
-        depositAmount: 500000,
-      });
+    it("refunds against the deposit payment's OWN reference, and stores the provider refund id", async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(eligibleRequest());
       paystackService.refundTransaction.mockResolvedValue({
         outcome: 'ok',
         data: { id: 999, status: 'pending' },
       });
-      prisma.rescueRequest.update.mockResolvedValue({});
 
       await service.refundDeposit('req-1');
 
-      expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith({
-        where: {
-          id: 'req-1',
-          status: 'CANCELLED',
-          depositRefundStatus: { in: ['ELIGIBLE', 'FAILED'] },
-        },
-        data: { depositRefundStatus: 'PENDING' },
+      expect(paymentLedger.create).toHaveBeenCalledWith({
+        rescueRequestId: 'req-1',
+        type: 'REFUND',
+        amount: 500000,
       });
-      // The BARE Payment.id, not a formatted reference — refunds carry no
-      // reference of ours, so this note is the only recovery handle.
+      // referenceFor(depositPayment) — the deposit's OWN reference, not a
+      // stored RescueRequest column, and the BARE Payment.id as the note.
       expect(paystackService.refundTransaction).toHaveBeenCalledWith({
-        transaction: 'DEP_ref_1',
+        transaction: 'DEP_dep-1',
         amount: 500000,
         merchantNote: 'pay-1',
       });
       // Namespaced, and written before anything else — it is how the refund
-      // webhook finds this row.
+      // webhook finds this row. There is no separate depositRefundId column
+      // any more; this providerRef IS the refund's recorded identity.
       expect(prisma.payment.update).toHaveBeenCalledWith({
         where: { id: 'pay-1' },
         data: { providerRef: 'refund:999' },
       });
-      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
-        where: { id: 'req-1' },
-        data: { depositRefundId: 999 },
-      });
     });
 
     it('does not claim SUCCEEDED even when the refund body says processed', async () => {
-      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
-      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
-        id: 'req-1',
-        depositReference: 'DEP_ref_1',
-        depositAmount: 500000,
-      });
+      prisma.rescueRequest.findUnique.mockResolvedValue(eligibleRequest());
       paystackService.refundTransaction.mockResolvedValue({
         outcome: 'ok',
         data: { id: 999, status: 'processed' },
       });
-      prisma.rescueRequest.update.mockResolvedValue({});
 
       await service.refundDeposit('req-1');
 
@@ -638,18 +649,12 @@ describe('RescueRequestAdminService', () => {
       expect(paymentLedger.claimTerminal).not.toHaveBeenCalled();
     });
 
-    it('blocks, and does NOT release the retry claim, when the refund needs customer details', async () => {
-      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
-      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
-        id: 'req-1',
-        depositReference: 'DEP_ref_1',
-        depositAmount: 500000,
-      });
+    it('blocks when the refund needs customer details', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(eligibleRequest());
       paystackService.refundTransaction.mockResolvedValue({
         outcome: 'ok',
         data: { id: 999, status: 'needs-attention' },
       });
-      prisma.rescueRequest.update.mockResolvedValue({});
 
       await service.refundDeposit('req-1');
 
@@ -657,31 +662,81 @@ describe('RescueRequestAdminService', () => {
         'pay-1',
         'NEEDS_CUSTOMER_DETAILS',
       );
-      // The refund exists at Paystack, so this must not become retryable.
-      expect(prisma.rescueRequest.update).not.toHaveBeenCalledWith(
-        expect.objectContaining({ data: { depositRefundStatus: 'FAILED' } }),
-      );
     });
 
-    it('rejects the claim (BadRequestException) when depositRefundStatus is NONE — not eligible', async () => {
-      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 });
+    it('rejects with BadRequestException when the request was never CANCELLED — not eligible', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(
+        eligibleRequest({ status: 'COMPLETED' }),
+      );
+
+      await expect(service.refundDeposit('req-1')).rejects.toThrow(
+        'Not eligible for refund',
+      );
+      expect(paymentLedger.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects with BadRequestException when no deposit ever succeeded', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(
+        eligibleRequest({ payments: [] }),
+      );
 
       await expect(service.refundDeposit('req-1')).rejects.toThrow(
         'Not eligible for refund',
       );
     });
 
-    it('never fails an ambiguous refund — a second attempt would refund twice', async () => {
-      // This replaced a test asserting the opposite. The old code marked the
-      // request FAILED whenever the Paystack call threw, and FAILED is
-      // retryable — but refunds have no duplicate-reference protection, so
-      // the retry issues a SECOND real refund.
-      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
-      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
-        id: 'req-1',
-        depositReference: 'DEP_ref_1',
-        depositAmount: 500000,
+    it('rejects when a refund is already active or has already succeeded — but a FAILED attempt stays retryable', async () => {
+      const withActiveRefund = eligibleRequest({
+        payments: [
+          { id: 'dep-1', type: 'DEPOSIT', status: 'SUCCEEDED' },
+          { id: 'ref-1', type: 'REFUND', status: 'SUBMITTED' },
+        ],
       });
+      prisma.rescueRequest.findUnique.mockResolvedValue(withActiveRefund);
+
+      await expect(service.refundDeposit('req-1')).rejects.toThrow(
+        'Not eligible for refund',
+      );
+    });
+
+    it('permits a retry after a FAILED refund attempt — a failed row is history, not a claim', async () => {
+      const withFailedRefund = eligibleRequest({
+        payments: [
+          { id: 'dep-1', type: 'DEPOSIT', status: 'SUCCEEDED' },
+          { id: 'ref-1', type: 'REFUND', status: 'FAILED' },
+        ],
+      });
+      prisma.rescueRequest.findUnique.mockResolvedValue(withFailedRefund);
+      paystackService.refundTransaction.mockResolvedValue({
+        outcome: 'ok',
+        data: { id: 999, status: 'pending' },
+      });
+
+      await expect(service.refundDeposit('req-1')).resolves.toBeUndefined();
+      expect(paymentLedger.create).toHaveBeenCalled();
+    });
+
+    it('rejects when the in-flight index refuses a concurrent refund attempt', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(eligibleRequest());
+      const p2002 = Object.assign(new Error('duplicate'), { code: 'P2002' });
+      Object.setPrototypeOf(
+        p2002,
+        Prisma.PrismaClientKnownRequestError.prototype,
+      );
+      paymentLedger.create.mockRejectedValue(p2002);
+
+      await expect(service.refundDeposit('req-1')).rejects.toThrow(
+        'A refund is already in progress for this request',
+      );
+      expect(paystackService.refundTransaction).not.toHaveBeenCalled();
+    });
+
+    it('never fails an ambiguous refund — a second attempt would refund twice', async () => {
+      // The old code marked the request FAILED whenever the Paystack call
+      // threw, and FAILED is retryable — but refunds have no
+      // duplicate-reference protection, so the retry issues a SECOND real
+      // refund.
+      prisma.rescueRequest.findUnique.mockResolvedValue(eligibleRequest());
       paystackService.refundTransaction.mockResolvedValue({
         outcome: 'ambiguous',
         message: 'socket hang up',
@@ -692,25 +747,15 @@ describe('RescueRequestAdminService', () => {
       );
 
       expect(paymentLedger.recordRejection).not.toHaveBeenCalled();
-      // Stays PENDING: not retryable, pending verification.
-      expect(prisma.rescueRequest.update).not.toHaveBeenCalledWith(
-        expect.objectContaining({ data: { depositRefundStatus: 'FAILED' } }),
-      );
     });
 
-    it('releases the retry claim on a definitive rejection — nothing was created', async () => {
-      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
-      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
-        id: 'req-1',
-        depositReference: 'DEP_ref_1',
-        depositAmount: 500000,
-      });
+    it('fails the row on a definitive rejection — nothing was created, so a fresh attempt is legal', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(eligibleRequest());
       paystackService.refundTransaction.mockResolvedValue({
         outcome: 'rejected',
         code: 'transaction_not_found',
         message: 'Transaction not found',
       });
-      prisma.rescueRequest.update.mockResolvedValue({});
 
       await expect(service.refundDeposit('req-1')).rejects.toThrow(
         'Refund failed: Transaction not found',
@@ -719,47 +764,6 @@ describe('RescueRequestAdminService', () => {
       expect(paymentLedger.recordRejection).toHaveBeenCalledWith(
         'pay-1',
         'Transaction not found',
-      );
-      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
-        where: { id: 'req-1' },
-        data: { depositRefundStatus: 'FAILED' },
-      });
-    });
-
-    it('leaves depositRefundStatus at PENDING (not FAILED) and alerts Sentry when Paystack succeeds but the depositRefundId write throws — a retry here would double-refund', async () => {
-      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
-      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
-        id: 'req-1',
-        depositReference: 'DEP_ref_1',
-        depositAmount: 500000,
-      });
-      paystackService.refundTransaction.mockResolvedValue({
-        outcome: 'ok',
-        data: { id: 999, status: 'pending' },
-      });
-      prisma.rescueRequest.update.mockRejectedValue(
-        new Error('DB write failed'),
-      );
-
-      await expect(service.refundDeposit('req-1')).resolves.toBeUndefined();
-
-      // Only the depositRefundId write was attempted — no FAILED write.
-      expect(prisma.rescueRequest.update).toHaveBeenCalledTimes(1);
-      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
-        where: { id: 'req-1' },
-        data: { depositRefundId: 999 },
-      });
-      expect(prisma.rescueRequest.update).not.toHaveBeenCalledWith(
-        expect.objectContaining({ data: { depositRefundStatus: 'FAILED' } }),
-      );
-      expect(Sentry.captureException).toHaveBeenCalledWith(
-        expect.any(Error),
-        expect.objectContaining({
-          extra: expect.objectContaining({
-            rescueRequestId: 'req-1',
-            refundId: 999,
-          }),
-        }),
       );
     });
   });
@@ -807,9 +811,7 @@ describe('RescueRequestAdminService', () => {
           issueType: null,
           latitude: null,
           longitude: null,
-          depositPaid: true,
-          balancePaid: false,
-          depositRefundStatus: 'NONE',
+          payments: [{ id: 'dep-1', type: 'DEPOSIT', status: 'SUCCEEDED' }],
           customer: { id: 'cust-1', phoneNumber: '+2348012345678' },
           assignedOperator: null,
           disputed: true,
@@ -879,6 +881,7 @@ describe('RescueRequestAdminService', () => {
         customer: { id: 'cust-1', phoneNumber: '+2348012345678' },
         media: [],
         dispatchOffers: [],
+        payments: [],
       });
 
       await service.cancel('req-1', {});
@@ -898,6 +901,7 @@ describe('RescueRequestAdminService', () => {
         customer: { id: 'cust-1', phoneNumber: '+2348012345678' },
         media: [],
         dispatchOffers: [],
+        payments: [],
       });
 
       await service.cancel('req-1', {});
