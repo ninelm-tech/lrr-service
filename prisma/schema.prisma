@@ -101,6 +101,17 @@ model User {
   name         String?
   role         UserRole
 
+  // A Paystack customer, resolved once on first payment and never replaced —
+  // see PaystackCustomerService. Paystack attaches saved cards and
+  // authorizations to the customer, so a second code for the same person
+  // would split their payment instruments.
+  paystackCustomerCode String? @unique
+  // The email that customer was created under. NOT the same thing as
+  // `email` above: Paystack cannot change a customer's email after
+  // creation, so this is frozen and sent on every later transaction, while
+  // `email` stays free to change for our own comms/login purposes.
+  paystackCustomerEmail String?
+
   operatorMemberships OperatorMember[]
   rescueRequests      RescueRequest[]
   whatsAppSession     WhatsAppSession?

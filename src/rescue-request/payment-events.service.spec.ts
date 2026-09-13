@@ -5,6 +5,8 @@ import { PaymentEventsService } from './payment-events.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaymentLedgerService } from '../payment/payment-ledger.service';
 import { createPaymentLedgerMock } from '../payment/testing/payment-ledger.mock';
+import { PaystackCustomerService } from '../payment/paystack-customer.service';
+import { createPaystackCustomerServiceMock } from '../payment/testing/paystack-customer.mock';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PayoutService } from '../payout/payout.service';
@@ -92,6 +94,10 @@ describe('PaymentEventsService', () => {
         {
           provide: PaymentLedgerService,
           useValue: createPaymentLedgerMock(),
+        },
+        {
+          provide: PaystackCustomerService,
+          useValue: createPaystackCustomerServiceMock(),
         },
         { provide: PaystackService, useValue: {} },
         { provide: TwilioService, useValue: twilioService },

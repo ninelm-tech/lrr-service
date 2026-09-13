@@ -3,6 +3,8 @@ import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaymentLedgerService } from '../payment/payment-ledger.service';
 import { createPaymentLedgerMock } from '../payment/testing/payment-ledger.mock';
+import { PaystackCustomerService } from '../payment/paystack-customer.service';
+import { createPaystackCustomerServiceMock } from '../payment/testing/paystack-customer.mock';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { S3Service } from '../integrations/s3/s3.service';
 import { GeocodingService } from '../integrations/geocoding/geocoding.service';
@@ -36,6 +38,10 @@ describe('WhatsAppCustomerFlowService', () => {
           {
             provide: PaymentLedgerService,
             useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
           },
           { provide: TwilioService, useValue: {} },
           { provide: S3Service, useValue: {} },
@@ -167,6 +173,10 @@ describe('WhatsAppCustomerFlowService', () => {
             provide: PaymentLedgerService,
             useValue: createPaymentLedgerMock(),
           },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
           { provide: TwilioService, useValue: twilioService },
           { provide: S3Service, useValue: {} },
           { provide: GeocodingService, useValue: {} },
@@ -276,6 +286,10 @@ describe('WhatsAppCustomerFlowService', () => {
           {
             provide: PaymentLedgerService,
             useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
           },
           {
             provide: TwilioService,
@@ -431,6 +445,10 @@ describe('WhatsAppCustomerFlowService', () => {
             useValue: createPaymentLedgerMock(),
           },
           {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          {
             provide: TwilioService,
             useValue: { sendWhatsAppMessage: jest.fn() },
           },
@@ -510,6 +528,10 @@ describe('WhatsAppCustomerFlowService', () => {
           {
             provide: PaymentLedgerService,
             useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
           },
           { provide: TwilioService, useValue: twilioService },
           { provide: S3Service, useValue: {} },
@@ -689,6 +711,10 @@ describe('WhatsAppCustomerFlowService', () => {
           {
             provide: PaymentLedgerService,
             useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
           },
           {
             provide: TwilioService,

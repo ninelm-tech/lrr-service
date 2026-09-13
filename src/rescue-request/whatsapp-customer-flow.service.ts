@@ -46,6 +46,7 @@ import { DisputeService } from './dispute.service';
 import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { PaymentLedgerService } from '../payment/payment-ledger.service';
+import { PaystackCustomerService } from '../payment/paystack-customer.service';
 
 const DEPOSIT_AMOUNT_KOBO = 500000; // ₦5,000
 const MAX_MEDIA_ITEMS = 5;
@@ -72,6 +73,7 @@ export class WhatsAppCustomerFlowService {
     private readonly sessionStore: WhatsAppSessionStore,
     private readonly sharedService: RescueRequestSharedService,
     private readonly paymentLedger: PaymentLedgerService,
+    private readonly paystackCustomerService: PaystackCustomerService,
   ) {}
 
   /**
@@ -720,7 +722,12 @@ export class WhatsAppCustomerFlowService {
       );
     }
     const reference = this.paymentLedger.referenceFor(payment);
-    const email = customer.email || `${phoneNumber.replace(/\D/g, '')}@lrr.ng`;
+    // Never customer.email directly — the frozen identity Paystack already
+    // knows this user by, so a real email set later doesn't split them into
+    // a second Paystack customer. See PaystackCustomerService.
+    const { email } = await this.paystackCustomerService.customerFor(
+      customer.id,
+    );
 
     // 3. Call Paystack.
     const paymentResponse = await this.paystackService.initializePayment({
@@ -1008,9 +1015,10 @@ export class WhatsAppCustomerFlowService {
       );
     }
     const reference = this.paymentLedger.referenceFor(payment);
-    const email =
-      rescueRequest.customer.email ??
-      `${phoneNumber.replace(/\D/g, '')}@lrr.ng`;
+    // Never rescueRequest.customer.email directly — see initiateDeposit.
+    const { email } = await this.paystackCustomerService.customerFor(
+      rescueRequest.customerId,
+    );
 
     const paymentResponse = await this.paystackService.initializePayment({
       email,

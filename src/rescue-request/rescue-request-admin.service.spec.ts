@@ -7,6 +7,8 @@ import {
   createPaymentLedgerMock,
   PaymentLedgerMock,
 } from '../payment/testing/payment-ledger.mock';
+import { PaystackCustomerService } from '../payment/paystack-customer.service';
+import { createPaystackCustomerServiceMock } from '../payment/testing/paystack-customer.mock';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
@@ -38,6 +40,10 @@ describe('RescueRequestAdminService', () => {
           {
             provide: PaymentLedgerService,
             useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
           },
           { provide: PaystackService, useValue: {} },
           { provide: TwilioService, useValue: {} },
@@ -221,6 +227,10 @@ describe('RescueRequestAdminService', () => {
             provide: PaymentLedgerService,
             useValue: createPaymentLedgerMock(),
           },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
           { provide: PaystackService, useValue: {} },
           { provide: TwilioService, useValue: {} },
           { provide: PlatformConfigService, useValue: {} },
@@ -389,6 +399,10 @@ describe('RescueRequestAdminService', () => {
           RescueRequestAdminService,
           { provide: PrismaService, useValue: prisma },
           { provide: PaymentLedgerService, useValue: paymentLedger },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
           { provide: PaystackService, useValue: paystackService },
           { provide: TwilioService, useValue: twilioService },
           { provide: PlatformConfigService, useValue: platformConfigService },
@@ -591,6 +605,10 @@ describe('RescueRequestAdminService', () => {
           RescueRequestAdminService,
           { provide: PrismaService, useValue: prisma },
           { provide: PaymentLedgerService, useValue: paymentLedger },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
           { provide: PaystackService, useValue: paystackService },
           { provide: TwilioService, useValue: {} },
           { provide: PlatformConfigService, useValue: {} },
@@ -788,6 +806,10 @@ describe('RescueRequestAdminService', () => {
             provide: PaymentLedgerService,
             useValue: createPaymentLedgerMock(),
           },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
           { provide: PaystackService, useValue: {} },
           { provide: TwilioService, useValue: {} },
           { provide: PlatformConfigService, useValue: {} },
@@ -854,6 +876,10 @@ describe('RescueRequestAdminService', () => {
           {
             provide: PaymentLedgerService,
             useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
           },
           { provide: PaystackService, useValue: {} },
           { provide: TwilioService, useValue: twilioService },

@@ -5,6 +5,7 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { PaystackService } from '../../../integrations/paystack/paystack.service';
 import { TwilioService } from '../../../integrations/twilio/twilio.service';
 import { PaymentLedgerService } from '../../../payment/payment-ledger.service';
+import { PaystackCustomerService } from '../../../payment/paystack-customer.service';
 import {
   mapRefundStatus,
   mapTransactionStatus,
@@ -50,6 +51,7 @@ export class PaymentVerifyCheck implements ReconcilerCheck {
     private readonly paymentLedger: PaymentLedgerService,
     private readonly paymentEventsService: PaymentEventsService,
     private readonly payoutService: PayoutService,
+    private readonly paystackCustomerService: PaystackCustomerService,
   ) {}
 
   async run(now: Date): Promise<number> {
@@ -137,9 +139,10 @@ export class PaymentVerifyCheck implements ReconcilerCheck {
     }
 
     const isDeposit = payment.type === PaymentType.DEPOSIT;
-    const email =
-      request.customer.email ||
-      `${request.customer.phoneNumber.replace(/\D/g, '')}@lrr.ng`;
+    // Never build the identity email inline — see PaystackCustomerService.
+    const { email } = await this.paystackCustomerService.customerFor(
+      request.customerId,
+    );
     const reference = this.paymentLedger.referenceFor(payment);
 
     const result = await this.paystackService.initializePayment({

@@ -44,6 +44,11 @@ describe('Refund submission protocol (integration)', () => {
       {} as never,
       { clear: jest.fn() } as never,
       ledger,
+      {
+        customerFor: jest
+          .fn()
+          .mockResolvedValue({ code: 'cus_test', email: 'customer@lrr.ng' }),
+      } as never,
     );
   });
 

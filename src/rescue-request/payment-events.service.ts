@@ -19,6 +19,7 @@ import { formatJobRef } from './domain/rescue-request-formatting';
 import { hasSucceededPayment } from './domain/derive-payment-state';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { PaymentLedgerService } from '../payment/payment-ledger.service';
+import { PaystackCustomerService } from '../payment/paystack-customer.service';
 import { BalancePaymentTarget } from './dto/balance-payment-target.dto';
 import { DispatchService } from './dispatch.service';
 // A real two-way dependency with this service
@@ -39,6 +40,7 @@ export class PaymentEventsService {
     @Inject(forwardRef(() => WhatsAppCustomerFlowService))
     private readonly customerFlowService: WhatsAppCustomerFlowService,
     private readonly paymentLedger: PaymentLedgerService,
+    private readonly paystackCustomerService: PaystackCustomerService,
   ) {}
 
   /**
@@ -360,9 +362,10 @@ export class PaymentEventsService {
       return; // another caller owns this one
     }
     const reference = this.paymentLedger.referenceFor(payment);
-    const email =
-      rescueRequest.customer.email ||
-      `${customerPhone.replace(/\D/g, '')}@lrr.ng`;
+    // Never build the identity email inline — see PaystackCustomerService.
+    const { email } = await this.paystackCustomerService.customerFor(
+      rescueRequest.customerId,
+    );
 
     const paymentResponse = await this.paystackService.initializePayment({
       email,

@@ -32,6 +32,7 @@ import {
 import { DispatchService } from './dispatch.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { PaymentLedgerService } from '../payment/payment-ledger.service';
+import { PaystackCustomerService } from '../payment/paystack-customer.service';
 import { mapRefundStatus } from '../payment/domain/paystack-status';
 import {
   deriveRefundStatus,
@@ -53,6 +54,7 @@ export class RescueRequestAdminService {
     private readonly sharedService: RescueRequestSharedService,
     private readonly sessionStore: WhatsAppSessionStore,
     private readonly paymentLedger: PaymentLedgerService,
+    private readonly paystackCustomerService: PaystackCustomerService,
   ) {}
 
   async adminList(query: any) {
@@ -209,9 +211,10 @@ export class RescueRequestAdminService {
       );
     }
     const reference = this.paymentLedger.referenceFor(payment);
-    const email =
-      request.customer.email ??
-      `${request.customer.phoneNumber.replace(/\D/g, '')}@lrr.ng`;
+    // Never request.customer.email directly — see PaystackCustomerService.
+    const { email } = await this.paystackCustomerService.customerFor(
+      request.customerId,
+    );
     const paymentResponse = await this.paystackService.initializePayment({
       email,
       amount: depositAmount,

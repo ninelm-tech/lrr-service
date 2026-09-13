@@ -51,6 +51,11 @@ describe('Deposit submission protocol (integration)', () => {
       {} as never,
       { clear: jest.fn() } as never,
       new PaymentLedgerService(prisma),
+      {
+        customerFor: jest
+          .fn()
+          .mockResolvedValue({ code: 'cus_test', email: 'customer@lrr.ng' }),
+      } as never,
     );
   });
 

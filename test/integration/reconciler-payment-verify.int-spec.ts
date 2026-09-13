@@ -79,6 +79,11 @@ describe('PaymentVerifyCheck (integration)', () => {
       ledger,
       paymentEvents as never,
       payoutServiceMock as never,
+      {
+        customerFor: jest
+          .fn()
+          .mockResolvedValue({ code: 'cus_test', email: 'customer@lrr.ng' }),
+      } as never,
     );
     captureMessage.mockClear();
   });
