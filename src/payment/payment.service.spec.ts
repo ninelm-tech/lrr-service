@@ -4,6 +4,12 @@ import { ConfigService } from '@nestjs/config';
 import { PaymentService } from './payment.service';
 import { PaymentEventsService } from '../rescue-request/payment-events.service';
 import { PayoutService } from '../payout/payout.service';
+import { PrismaService } from '../prisma/prisma.service';
+import { PaymentLedgerService } from './payment-ledger.service';
+import {
+  createPaymentLedgerMock,
+  PaymentLedgerMock,
+} from './testing/payment-ledger.mock';
 
 describe('PaymentService', () => {
   let service: PaymentService;
@@ -12,6 +18,11 @@ describe('PaymentService', () => {
     handleBalancePaymentConfirmed: jest.Mock;
   };
   let payoutService: { confirmTransferOutcome: jest.Mock };
+  let paymentLedger: PaymentLedgerMock;
+  let prisma: {
+    payment: { findUnique: jest.Mock };
+    rescueRequest: { update: jest.Mock };
+  };
 
   beforeEach(async () => {
     paymentEventsService = {
@@ -19,6 +30,13 @@ describe('PaymentService', () => {
       handleBalancePaymentConfirmed: jest.fn(),
     };
     payoutService = { confirmTransferOutcome: jest.fn() };
+    paymentLedger = createPaymentLedgerMock();
+    prisma = {
+      // No matching row by default: the legacy-reference case, where the
+      // business side effects must still run.
+      payment: { findUnique: jest.fn().mockResolvedValue(null) },
+      rescueRequest: { update: jest.fn().mockResolvedValue({}) },
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -26,6 +44,8 @@ describe('PaymentService', () => {
         { provide: ConfigService, useValue: { get: () => undefined } },
         { provide: PaymentEventsService, useValue: paymentEventsService },
         { provide: PayoutService, useValue: payoutService },
+        { provide: PrismaService, useValue: prisma },
+        { provide: PaymentLedgerService, useValue: paymentLedger },
       ],
     }).compile();
 
