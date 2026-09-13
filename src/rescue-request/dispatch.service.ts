@@ -10,7 +10,6 @@ import { toWhatsAppAddress } from '../common/phone.util';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { PrismaService } from '../prisma/prisma.service';
-import { scheduleSafely } from '../common/safe-timer';
 import { RescueRequestStatus } from '@prisma/client';
 import {
   getEligibleTruckClasses,
@@ -175,33 +174,6 @@ export class DispatchService {
   }
 
   /**
-   * Phase 2 close timers, one per request, started when the FIRST quote sets
-   * `quoteCollectionDeadline`. Replaces the old `graceTimers`/`QUOTE_GRACE_MS`
-   * pair: that was a batch-scoped grace period that competed with batch
-   * expiry, this is the single request-level ceiling.
-   *
-   * The timer is a CEILING on stragglers, not a mandatory wait —
-   * `maybeResolveBatchEarly` still closes bidding the moment nothing is
-   * pending, and `closeBidding` clears this entry when it does.
-   */
-  private readonly closeTimers = new Map<string, NodeJS.Timeout>();
-
-  /**
-   * Requests whose bidding has already closed (shortlist sent). In-process
-   * only, like every other timer/mutex in this service — durability across
-   * restarts is explicitly out of scope for this spec.
-   *
-   * Needed on top of the `quoteCollectionDeadline` check because bidding can
-   * close EARLY (everyone answered before the deadline). Between an early
-   * close and the deadline the persisted deadline still reads "in future", so
-   * without this a quote on an admin-added offer in that gap would be recorded
-   * as QUOTED and never appear on the shortlist the motorist already has.
-   */
-  private readonly closedRequests = new Set<string>();
-
-  private readonly QUOTE_SELECTION_WINDOW_MS = 5 * 60 * 1000;
-
-  /**
    * Channel-agnostic core: an operator submitted a price (quote) or declined
    * a specific PENDING offer. `quotedPriceKobo` is undefined for a decline.
    * Used by both the WhatsApp reply handler and the dashboard quote
@@ -293,13 +265,19 @@ export class DispatchService {
     };
   }
 
-  /** True once the shortlist has gone out, or once the deadline has passed. */
+  /**
+   * True once the shortlist has gone out, or once the deadline has passed.
+   *
+   * `biddingClosedAt` is the durable record of the former — it replaces an
+   * in-memory Set that every restart emptied, which is why a redeployed
+   * process would happily send a second shortlist.
+   */
   private async isBiddingClosed(rescueRequestId: string): Promise<boolean> {
-    if (this.closedRequests.has(rescueRequestId)) return true;
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
       where: { id: rescueRequestId },
-      select: { quoteCollectionDeadline: true },
+      select: { quoteCollectionDeadline: true, biddingClosedAt: true },
     });
+    if (rescueRequest?.biddingClosedAt) return true;
     const deadline = rescueRequest?.quoteCollectionDeadline;
     return !!deadline && Date.now() >= deadline.getTime();
   }
@@ -351,19 +329,10 @@ export class DispatchService {
 
     await this.notifyPendingOperatorsOfCountdown(rescueRequestId, deadline);
 
-    // Scheduled off the DEADLINE, not off `quoteCollectionMs`: the countdown
-    // notify above is N Twilio round-trips, and a full-window delay measured
-    // from after those sends fires at deadline + notify-latency, pushing the
-    // motorist's shortlist out by however long WhatsApp took. Same reason the
-    // batch timers are scheduled from their offers' expiresAt.
-    const timer = setTimeout(
-      () => {
-        this.closeTimers.delete(rescueRequestId);
-        void this.closeBidding(rescueRequestId);
-      },
-      Math.max(0, deadline.getTime() - Date.now()),
-    );
-    this.closeTimers.set(rescueRequestId, timer);
+    // No timer here any more. `quoteCollectionDeadline` is now the whole
+    // mechanism: BiddingCloseCheck matches on it every 15 seconds, so the
+    // close survives the restart that used to discard this timer and strand
+    // the request in DISPATCHING forever.
   }
 
   /**
@@ -482,63 +451,6 @@ export class DispatchService {
       : new Date(now + windowMs);
   }
 
-  /**
-   * Bidding is over: no further quote can join the shortlist. Marks whatever
-   * is still PENDING as TIMED_OUT, then sends the ranked shortlist.
-   *
-   * The single place both close triggers funnel through — the
-   * quoteCollectionDeadline timer, and maybeResolveBatchEarly when nothing is
-   * left pending. Idempotent: whichever gets here first wins and the other
-   * returns immediately.
-   *
-   * This is the one request-wide PENDING → TIMED_OUT sweep the design allows
-   * (see the supersedeActiveRound note below). It is legitimate precisely
-   * because bidding has ended for everyone at once; it is NOT a licence to
-   * add other request-scoped sweeps.
-   */
-  private async closeBidding(rescueRequestId: string): Promise<void> {
-    const closeTimer = this.closeTimers.get(rescueRequestId);
-    if (closeTimer) {
-      clearTimeout(closeTimer);
-      this.closeTimers.delete(rescueRequestId);
-    }
-    if (this.closedRequests.has(rescueRequestId)) return;
-
-    const rescueRequest = await this.prisma.rescueRequest.findUnique({
-      where: { id: rescueRequestId },
-      select: { status: true, customerId: true },
-    });
-    if (
-      !rescueRequest ||
-      rescueRequest.status === RescueRequestStatus.OPERATOR_ASSIGNED ||
-      rescueRequest.status === RescueRequestStatus.WAITING_FOR_DEPOSIT ||
-      rescueRequest.status === RescueRequestStatus.COMPLETED ||
-      rescueRequest.status === RescueRequestStatus.CANCELLED
-    )
-      return;
-
-    this.closedRequests.add(rescueRequestId);
-
-    // Any batch timer still outstanding for this request belongs to a batch
-    // whose offers have just been closed. Left alone it would later fire
-    // resolveBatch, find QUOTED offers and send the motorist a SECOND
-    // shortlist. Drain them here.
-    for (const [key, timer] of this.batchTimers) {
-      if (key.startsWith(`${rescueRequestId}:`)) {
-        clearTimeout(timer);
-        this.batchTimers.delete(key);
-      }
-    }
-
-    await this.prisma.dispatchOffer.updateMany({
-      where: { rescueRequestId, status: 'PENDING' },
-      data: { status: 'TIMED_OUT', respondedAt: new Date() },
-    });
-
-    logger.info('dispatch: bidding closed', { rescueRequestId });
-    await this.sendQuoteShortlist(rescueRequestId, rescueRequest.customerId);
-  }
-
   // ══════════════════════════════════════════════════════
   //  DISPATCH — parallel batch offer, dynamic window, retry + radius expansion
   // ══════════════════════════════════════════════════════
@@ -616,7 +528,7 @@ export class DispatchService {
         where: { rescueRequestId, status: 'QUOTED' },
       });
       if (quotedOffers.length > 0) {
-        await this.sendQuoteShortlist(rescueRequestId, customerId);
+        await this.deliverQuoteShortlist(rescueRequestId, customerId);
         return;
       }
 
@@ -772,12 +684,11 @@ export class DispatchService {
     // assertBiddingStillOpen up front but then fires this method off
     // unawaited (`void this.startDispatch(...)`) — the real write happens
     // after findAndRankCandidates, well after that guard ran. An early close
-    // (closeBidding, triggered by the last outstanding offer being answered)
-    // can land in that window, so guard again here, silently, the same way
-    // the other early-return branches above do — this is reached from
-    // several fire-and-forget call sites and must not throw an unhandled
-    // rejection.
-    if (this.closedRequests.has(rescueRequestId)) return;
+    // (BiddingCloseCheck stamping biddingClosedAt) can land in that window,
+    // so re-read and guard again here, silently, the same way the other
+    // early-return branches above do — this is reached from several
+    // fire-and-forget call sites and must not throw an unhandled rejection.
+    if (await this.isBiddingClosed(rescueRequestId)) return;
 
     // Create all offers in one batch insert
     await this.prisma.dispatchOffer.createMany({
@@ -891,7 +802,7 @@ export class DispatchService {
 
     // Bidding already closed for the whole request — the shortlist has gone
     // out. Resolving a batch now would send the motorist a second one.
-    if (this.closedRequests.has(rescueRequestId)) return;
+    if (await this.isBiddingClosed(rescueRequestId)) return;
 
     // Race condition guard — skip if the request moved on for any other reason
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
@@ -922,7 +833,7 @@ export class DispatchService {
     });
 
     if (quotedOffers.length > 0) {
-      await this.sendQuoteShortlist(rescueRequestId, customerId);
+      await this.deliverQuoteShortlist(rescueRequestId, customerId);
       return;
     }
 
@@ -970,7 +881,23 @@ export class DispatchService {
         where: { rescueRequestId, status: 'PENDING' },
       });
       if (pendingAnywhere > 0) return; // stragglers — let the deadline handle them
-      await this.closeBidding(rescueRequestId);
+
+      // Everyone has answered, so there is nothing left to wait for. Rather
+      // than closing here — a second closing path, racing BiddingCloseCheck
+      // for the same request — pull the deadline forward so the row matches
+      // that check now. It closes on the next tick, within 15 seconds.
+      //
+      // `biddingClosedAt: null` in the WHERE keeps this from resurrecting a
+      // request the check has already closed.
+      await this.prisma.rescueRequest.updateMany({
+        where: {
+          id: rescueRequestId,
+          status: RescueRequestStatus.DISPATCHING,
+          biddingClosedAt: null,
+          quoteCollectionDeadline: { gt: new Date() },
+        },
+        data: { quoteCollectionDeadline: new Date() },
+      });
       return;
     }
 
@@ -1035,13 +962,13 @@ export class DispatchService {
    * already been shown quotes for.
    */
   private assertBiddingStillOpen(
-    rescueRequestId: string,
     quoteCollectionDeadline: Date | null | undefined,
+    biddingClosedAt: Date | null | undefined,
   ): void {
     const deadlinePassed =
       !!quoteCollectionDeadline &&
       Date.now() >= quoteCollectionDeadline.getTime();
-    if (deadlinePassed || this.closedRequests.has(rescueRequestId)) {
+    if (deadlinePassed || biddingClosedAt) {
       throw new BadRequestException('Bidding has closed for this request');
     }
   }
@@ -1057,8 +984,8 @@ export class DispatchService {
       throw new BadRequestException('Request is not currently DISPATCHING');
     }
     this.assertBiddingStillOpen(
-      rescueRequestId,
       rescueRequest.quoteCollectionDeadline,
+      rescueRequest.biddingClosedAt,
     );
 
     // Deliberately does NOT touch existing offers — operators still inside
@@ -1094,8 +1021,8 @@ export class DispatchService {
       throw new BadRequestException('Request is not currently DISPATCHING');
     }
     this.assertBiddingStillOpen(
-      rescueRequestId,
       rescueRequest.quoteCollectionDeadline,
+      rescueRequest.biddingClosedAt,
     );
 
     const operator = await this.prisma.operator.findUnique({
@@ -1119,11 +1046,11 @@ export class DispatchService {
 
     // Re-check right before the write, not just at the top of the method:
     // offerExpiryClampedToDeadline only re-reads the deadline, it does not
-    // know about an early close (every offer answered, closeBidding fires,
-    // this request added to closedRequests) that can happen during the
-    // operator lookup / deadline re-read above. Without this, a stray
-    // PENDING offer gets created for a job whose shortlist was already sent.
-    if (this.closedRequests.has(rescueRequestId)) {
+    // know about an early close (BiddingCloseCheck stamping biddingClosedAt)
+    // that can happen during the operator lookup / deadline re-read above.
+    // Without this, a stray PENDING offer gets created for a job whose
+    // shortlist was already sent.
+    if (await this.isBiddingClosed(rescueRequestId)) {
       throw new BadRequestException('Bidding has closed for this request');
     }
 
@@ -1219,7 +1146,7 @@ export class DispatchService {
     this.batchTimers.set(this.batchKey(rescueRequestId, batchId), timer);
   }
 
-  async sendQuoteShortlist(rescueRequestId: string, customerId: string) {
+  async deliverQuoteShortlist(rescueRequestId: string, customerId: string) {
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
       where: { id: rescueRequestId },
       include: { customer: true },
@@ -1277,42 +1204,6 @@ export class DispatchService {
     await this.sessionStore.update(customerId, {
       state: WhatsAppFlowState.WAITING_FOR_QUOTE_SELECTION,
     });
-
-    scheduleSafely(
-      async () => {
-        const fresh = await this.sessionStore.getOrCreate(customerId);
-        if (fresh.state !== WhatsAppFlowState.WAITING_FOR_QUOTE_SELECTION)
-          return; // already selected
-
-        // Timed out — release every quoting operator and let the motorist retry.
-        await this.prisma.dispatchOffer.updateMany({
-          where: { rescueRequestId, status: 'QUOTED' },
-          data: { status: 'TIMED_OUT', respondedAt: new Date() },
-        });
-        await this.prisma.rescueRequest.update({
-          where: { id: rescueRequestId },
-          data: { status: RescueRequestStatus.CANCELLED },
-        });
-        await this.sessionStore.clear(customerId);
-
-        if (customerPhone) {
-          await this.twilioService.sendWhatsAppMessage(
-            customerPhone,
-            `⏰ You didn't choose a quote in time. Your request has been cancelled — send SOS to start again.`,
-          );
-        }
-        await Promise.all(
-          quotedOffers.map((offer) =>
-            this.twilioService.sendWhatsAppMessage(
-              toWhatsAppAddress(offer.operator.phoneNumber),
-              `⏰ ${formatJobRef(rescueRequestId)} is no longer available — the customer didn't choose a quote in time. Watch for new offers!`,
-            ),
-          ),
-        );
-      },
-      this.QUOTE_SELECTION_WINDOW_MS,
-      'quote-selection-timeout',
-    );
   }
 
   // ══════════════════════════════════════════════════════

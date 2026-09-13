@@ -257,12 +257,8 @@ describe('DispatchService', () => {
 
     afterEach(() => {
       clearAllBatchTimers(service);
-      const closeTimers = (service as any).closeTimers as Map<
-        string,
-        NodeJS.Timeout
-      >;
-      closeTimers.forEach((t) => clearTimeout(t));
-      closeTimers.clear();
+      // No close timers to drain any more — bidding closes off
+      // quoteCollectionDeadline, via BiddingCloseCheck.
       if (originalCountdownSid === undefined)
         delete process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID;
       else
@@ -419,18 +415,15 @@ describe('DispatchService', () => {
       expect(row.quoteCollectionDeadline).toBe(deadlineBefore);
     });
 
-    it('closes bidding EARLY when nothing is left pending — at t=40s, not at the 5-minute deadline', async () => {
-      // The regression an earlier draft of the spec introduced. The deadline
-      // is a ceiling on stragglers, never a floor on how fast the motorist
-      // can be shown a shortlist.
+    it('closes bidding EARLY when nothing is left pending — by pulling the deadline forward, not waiting it out', async () => {
+      // The deadline is a ceiling on stragglers, never a floor on how fast
+      // the motorist can be shown a shortlist. Early close is now expressed
+      // as making the row match BiddingCloseCheck immediately, rather than a
+      // second code path that closes bidding itself and races that check.
       jest.useFakeTimers();
       try {
-        const closeSpy = jest
-          .spyOn(service as any, 'sendQuoteShortlist')
-          .mockResolvedValue(undefined);
-
         await service.processQuoteOrDecline(offer, 2_500_000); // t=0, deadline = t+5min
-        expect(closeSpy).not.toHaveBeenCalled(); // one straggler still pending
+        prisma.rescueRequest.updateMany.mockClear();
 
         jest.advanceTimersByTime(40 * 1000);
         prisma.dispatchOffer.count.mockResolvedValue(0); // last outstanding offer just answered
@@ -439,55 +432,41 @@ describe('DispatchService', () => {
           2_400_000,
         );
 
-        // t=40s: shortlist already out, without advancing to the deadline.
-        expect(closeSpy).toHaveBeenCalledWith('req-1', 'cust-1');
-        expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith({
-          where: { rescueRequestId: 'req-1', status: 'PENDING' },
-          data: { status: 'TIMED_OUT', respondedAt: expect.any(Date) },
+        expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith({
+          where: {
+            id: 'req-1',
+            status: 'DISPATCHING',
+            biddingClosedAt: null,
+            quoteCollectionDeadline: { gt: expect.any(Date) },
+          },
+          data: { quoteCollectionDeadline: expect.any(Date) },
         });
-        // ...and the close timer was cancelled rather than left to fire a
-        // second shortlist at the deadline.
-        expect((service as any).closeTimers.size).toBe(0);
-        closeSpy.mockClear();
-        jest.advanceTimersByTime(10 * 60 * 1000);
-        await Promise.resolve();
-        expect(closeSpy).not.toHaveBeenCalled();
       } finally {
         jest.useRealTimers();
       }
     });
 
-    it('fires the close timer AT the deadline, not a full window after the countdown sends finish', async () => {
-      // The countdown notice is N Twilio round-trips and is awaited before the
-      // timer is scheduled. Scheduling `quoteCollectionMs` from that point
-      // fires at deadline + notify-latency — the persisted deadline stays
-      // correct but the motorist's shortlist goes out late.
+    it('leaves the deadline alone while stragglers are still pending', async () => {
       jest.useFakeTimers();
       try {
-        const t0 = Date.now();
-        prisma.dispatchOffer.findMany.mockResolvedValue([
-          { operatorId: 'op-2', operator: { phoneNumber: '+2349022222222' } },
-        ]);
-        // Two seconds of WhatsApp latency, on the clock the timer is scheduled against.
-        twilioService.sendWhatsAppMessage.mockImplementation(async () => {
-          jest.advanceTimersByTime(2000);
-        });
-        const closeSpy = jest
-          .spyOn(service as any, 'sendQuoteShortlist')
-          .mockResolvedValue(undefined);
-
         await service.processQuoteOrDecline(offer, 2_500_000);
-        expect(row.quoteCollectionDeadline).toEqual(
-          new Date(t0 + 5 * 60 * 1000),
+        prisma.rescueRequest.updateMany.mockClear();
+
+        prisma.dispatchOffer.count.mockResolvedValue(2); // stragglers
+        await service.processQuoteOrDecline(
+          { ...offer, id: 'offer-3' },
+          2_400_000,
         );
 
-        prisma.dispatchOffer.count.mockResolvedValue(2); // stragglers: only the timer can close this
-        await jest.advanceTimersByTimeAsync(5 * 60 * 1000 - 2000 - 1);
-        expect(closeSpy).not.toHaveBeenCalled();
-
-        await jest.advanceTimersByTimeAsync(1); // now exactly at the deadline
-        expect(Date.now()).toBe(row.quoteCollectionDeadline!.getTime());
-        expect(closeSpy).toHaveBeenCalledWith('req-1', 'cust-1');
+        // Nothing pulled forward — the deadline remains the ceiling, and
+        // BiddingCloseCheck closes when it passes. Asserted on the
+        // early-close signature specifically: beginQuoteCollectionIfFirst
+        // also calls updateMany, so a bare "not called" would be wrong.
+        const pulledForward = prisma.rescueRequest.updateMany.mock.calls.some(
+          ([args]: [{ where: Record<string, unknown> }]) =>
+            'biddingClosedAt' in args.where,
+        );
+        expect(pulledForward).toBe(false);
       } finally {
         jest.useRealTimers();
       }
@@ -629,8 +608,10 @@ describe('DispatchService', () => {
         status: 'DISPATCHING',
         customerId: 'cust-1',
         quoteCollectionDeadline: new Date(Date.now() + 4 * 60 * 1000),
+        // Durable, unlike the in-memory Set this replaces: a restart used to
+        // forget the close and let an Expand reopen a decided auction.
+        biddingClosedAt: new Date(),
       });
-      (radiusService as any).closedRequests.add('req-1');
       const startDispatchSpy = jest
         .spyOn(radiusService as any, 'startDispatch')
         .mockResolvedValue(undefined);
@@ -826,8 +807,8 @@ describe('DispatchService', () => {
         latitude: 6.5,
         longitude: 3.4,
         quoteCollectionDeadline: new Date(Date.now() + 4 * 60 * 1000),
+        biddingClosedAt: new Date(),
       });
-      (manualService as any).closedRequests.add('req-1');
 
       await expect(
         manualService.manualOfferToOperator('req-1', 'op-1'),
@@ -838,10 +819,12 @@ describe('DispatchService', () => {
     it('refuses when bidding closes DURING the method — after the top-of-method guard passes but before the create', async () => {
       // Simulates the exact gap the review flagged: the initial
       // assertBiddingStillOpen call (right after the first findUnique) sees
-      // bidding still open, but closeBidding fires (e.g. the last outstanding
-      // offer on this request gets answered) while the awaited operator
-      // lookup is in flight — before dispatchOffer.create runs.
-      prisma.rescueRequest.findUnique.mockResolvedValue({
+      // bidding still open, but BiddingCloseCheck stamps biddingClosedAt
+      // (e.g. the last outstanding offer on this request gets answered)
+      // while the awaited operator lookup is in flight — before
+      // dispatchOffer.create runs. The pre-create guard re-reads, so it sees
+      // a close that landed after the first read.
+      const open = {
         id: 'req-1',
         status: 'DISPATCHING',
         customerId: 'cust-1',
@@ -850,9 +833,13 @@ describe('DispatchService', () => {
         latitude: 6.5,
         longitude: 3.4,
         quoteCollectionDeadline: new Date(Date.now() + 4 * 60 * 1000),
-      });
+        biddingClosedAt: null as Date | null,
+      };
+      prisma.rescueRequest.findUnique.mockImplementation(() =>
+        Promise.resolve({ ...open }),
+      );
       prisma.operator.findUnique.mockImplementation(async () => {
-        (manualService as any).closedRequests.add('req-1');
+        open.biddingClosedAt = new Date(); // closes mid-method
         return {
           id: 'op-1',
           status: 'ACTIVE',
@@ -1432,7 +1419,7 @@ describe('DispatchService', () => {
         dispatchRound: 3,
       });
       const shortlistSpy = jest
-        .spyOn(batchService, 'sendQuoteShortlist')
+        .spyOn(batchService, 'deliverQuoteShortlist')
         .mockResolvedValue(undefined);
 
       await batchService.startDispatch('req-1', 'cust-1', 6);

@@ -28,7 +28,7 @@ describe('dispatch round state (integration)', () => {
   /**
    * Every DispatchService built by a test, so their timers can be drained.
    *
-   * startDispatch still arms real in-memory batch/close timers with delays of
+   * startDispatch still arms real in-memory batch timers with delays of
    * minutes, and Node keeps the process alive for them — jest then hangs
    * after the run and CI times out. Task 7 deletes those timers entirely and
    * this hook goes with them; until then, clearing them is what lets this
@@ -43,13 +43,10 @@ describe('dispatch round state (integration)', () => {
 
   afterEach(() => {
     for (const service of built) {
-      for (const field of ['batchTimers', 'closeTimers'] as const) {
-        const timers = (service as unknown as Record<string, unknown>)[
-          field
-        ] as Map<string, NodeJS.Timeout>;
-        for (const timer of timers.values()) clearTimeout(timer);
-        timers.clear();
-      }
+      const timers = (service as unknown as Record<string, unknown>)
+        .batchTimers as Map<string, NodeJS.Timeout>;
+      for (const timer of timers.values()) clearTimeout(timer);
+      timers.clear();
     }
   });
 
