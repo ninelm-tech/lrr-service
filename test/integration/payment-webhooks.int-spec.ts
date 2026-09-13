@@ -50,6 +50,7 @@ describe('Payment webhooks (integration)', () => {
       payout as never,
       prisma,
       ledger,
+      { record: jest.fn().mockResolvedValue(undefined) } as never,
     );
   });
 

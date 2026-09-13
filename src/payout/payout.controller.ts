@@ -1,10 +1,20 @@
-import { Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Param,
+  Post,
+  Query,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { PayoutService } from './payout.service';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { UserRole, PaymentStatus, PaymentType } from '@prisma/client';
+import { AuditLogService } from '../audit-log/audit-log.service';
+import type { AuthenticatedRequest } from '../auth/authenticated-request.interface';
 
 /**
  * Payouts, read and retried from the Payment ledger directly (Task 11 — the
@@ -19,6 +29,7 @@ export class PayoutController {
   constructor(
     private readonly prisma: PrismaService,
     private readonly payoutService: PayoutService,
+    private readonly auditLogService: AuditLogService,
   ) {}
 
   @Get()
@@ -36,12 +47,50 @@ export class PayoutController {
       },
       orderBy: { createdAt: 'desc' },
     });
-    return { data: payments };
+
+    // A job can have an older FAILED/BLOCKED row sitting right alongside a
+    // newer SUCCEEDED sibling — a normal retry that inserted a fresh
+    // attempt which later succeeded. That older row's own status says
+    // nothing about whether the job is done. Computed separately, unfiltered
+    // by `status`, so this holds even when the admin is viewing a
+    // status-filtered list that wouldn't otherwise include the succeeded
+    // sibling. Scoped to just the jobs on THIS page rather than every
+    // succeeded payout ever, so the query stays bounded as the table grows.
+    const requestIds = [...new Set(payments.map((p) => p.rescueRequestId))];
+    const succeeded = requestIds.length
+      ? await this.prisma.payment.findMany({
+          where: {
+            type: PaymentType.PAYOUT,
+            status: PaymentStatus.SUCCEEDED,
+            rescueRequestId: { in: requestIds },
+          },
+          select: { rescueRequestId: true },
+        })
+      : [];
+    const succeededRequestIds = new Set(
+      succeeded.map((p) => p.rescueRequestId),
+    );
+
+    const data = payments.map((p) => ({
+      ...p,
+      alreadySucceeded: succeededRequestIds.has(p.rescueRequestId),
+    }));
+    return { data };
   }
 
   @Post(':id/retry')
-  async retry(@Param('id') id: string) {
+  async retry(@Req() req: AuthenticatedRequest, @Param('id') id: string) {
     const payment = await this.payoutService.retryPayout(id);
+    await this.auditLogService.record({
+      category: 'payout_retried',
+      message: `Retried payout ${id}`,
+      details: {
+        paymentId: id,
+        resultStatus: payment?.status ?? null,
+        resultPaymentId: payment?.id ?? null,
+      },
+      actorId: req.user.userId,
+    });
     return { message: describeRetryOutcome(payment), data: payment };
   }
 }

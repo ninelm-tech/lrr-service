@@ -212,4 +212,39 @@ describe('Payout submission protocol (integration)', () => {
     expect(initiateTransfer).toHaveBeenCalledTimes(1);
     expect(await prisma.payment.count({ where: { type: 'PAYOUT' } })).toBe(1);
   });
+
+  it('refuses to retry a stale FAILED row once a sibling has already succeeded', async () => {
+    // The original attempt abandons and lands FAILED. A retry inserts a
+    // fresh sibling with a new reference — that's the normal, expected
+    // path — and THAT one later succeeds (e.g. via a webhook, simulated
+    // here with a direct update since how it got there isn't what this
+    // test is about). The old FAILED row must never become retryable
+    // again just because it's individually a retryable status: a job can
+    // have any number of dead attempts sitting next to the one that
+    // actually landed.
+    const { operator, request } = await payableJob();
+    initiateTransfer.mockResolvedValue(transferOk('abandoned'));
+    await run(request.id, operator.id);
+    const failed = await payoutPayment();
+    expect(failed.status).toBe('FAILED');
+
+    initiateTransfer.mockResolvedValue(transferOk('pending'));
+    await service.retryPayout(failed.id);
+    expect(await prisma.payment.count({ where: { type: 'PAYOUT' } })).toBe(2);
+    const fresh = await prisma.payment.findFirstOrThrow({
+      where: { type: 'PAYOUT', id: { not: failed.id } },
+    });
+    await prisma.payment.update({
+      where: { id: fresh.id },
+      data: { status: 'SUCCEEDED', settledAt: new Date() },
+    });
+
+    initiateTransfer.mockClear();
+    await expect(service.retryPayout(failed.id)).rejects.toThrow(
+      'already succeeded',
+    );
+
+    expect(initiateTransfer).not.toHaveBeenCalled();
+    expect(await prisma.payment.count({ where: { type: 'PAYOUT' } })).toBe(2);
+  });
 });

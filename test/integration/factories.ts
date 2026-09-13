@@ -16,7 +16,7 @@ export async function truncateAll(prisma: PrismaService): Promise<void> {
     TRUNCATE TABLE
       "Rating", "RequestMedia", "DispatchOffer",
       "RescueRequest", "WhatsAppSession", "OperatorMember",
-      "Operator", "User"
+      "Operator", "User", "AuditLog"
     RESTART IDENTITY CASCADE
   `);
 }

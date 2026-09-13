@@ -17,6 +17,7 @@ import {
   PaystackWebhookBody,
   PaystackWebhookData,
 } from './dto/paystack-webhook.dto';
+import { AuditLogService } from '../audit-log/audit-log.service';
 
 /**
  * Our reference format, reversed. `DEP_`/`BAL_` are collections and `payout_`
@@ -38,6 +39,7 @@ export class PaymentService {
     private readonly payoutService: PayoutService,
     private readonly prisma: PrismaService,
     private readonly paymentLedger: PaymentLedgerService,
+    private readonly auditLogService: AuditLogService,
   ) {}
 
   /**
@@ -129,6 +131,33 @@ export class PaymentService {
             providerFee: data.fee_charged,
           },
           event,
+          () => {
+            // A transfer webhook with no matching Payment row means money
+            // moved that we have no record of tracking — most likely
+            // someone acted directly in Paystack's dashboard rather than
+            // through our own retry. Unlike a stray charge webhook, this is
+            // never routine: alert instead of leaving it in a server log
+            // nobody watches. Both fire together — Sentry for immediate
+            // paging, the audit log for a durable, queryable record that
+            // doesn't age out.
+            const details = {
+              event,
+              reference: data.reference,
+              transferCode: data.transfer_code,
+              amount: data.amount,
+              reason: data.reason,
+            };
+            Sentry.captureMessage(
+              'Unrecognized transfer webhook — no matching Payment row. Money may have moved outside our tracking; check Paystack directly.',
+              { level: 'warning', extra: details },
+            );
+            void this.auditLogService.record({
+              category: 'unrecognized_transfer_webhook',
+              message:
+                'Unrecognized transfer webhook — no matching Payment row',
+              details,
+            });
+          },
         );
 
         // payment truthy means THIS call settled it; mapped.status is what
@@ -195,11 +224,17 @@ export class PaymentService {
     mapped: MappedStatus,
     fields: { providerRef?: string; providerFee?: number; netAmount?: number },
     event: string,
+    onNotFound?: () => void,
   ): Promise<Payment | null> {
     try {
       const payment = await find();
       if (!payment) {
         console.warn(`⚠️ ${event}: no Payment row matched`);
+        // Distinct from the claim below losing a race (the normal case,
+        // never alerted on) — this means no row EVER existed for this
+        // reference. A caller passes this in when that's not routine for
+        // its event type (see the transfer case).
+        onNotFound?.();
         return null;
       }
 

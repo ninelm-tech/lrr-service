@@ -18,6 +18,8 @@ import { Roles } from './decorators/roles.decorator';
 import { CreateStaffDto } from './dto/create-staff.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
+import { AuditLogService } from '../audit-log/audit-log.service';
+import type { AuthenticatedRequest } from './authenticated-request.interface';
 
 export class UpdateProfileDto {
   name?: string;
@@ -49,7 +51,10 @@ export class RegisterCustomerDto {
 
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly auditLogService: AuditLogService,
+  ) {}
 
   /**
    * Login with email and password
@@ -68,11 +73,20 @@ export class AuthController {
   @UseGuards(AuthGuard, RolesGuard)
   @Roles(UserRole.SUPER_ADMIN)
   @Post('staff')
-  async createStaff(@Body() dto: CreateStaffDto) {
+  async createStaff(
+    @Request() req: AuthenticatedRequest,
+    @Body() dto: CreateStaffDto,
+  ) {
     if (dto.role !== UserRole.ADMIN && dto.role !== UserRole.PRODUCT) {
       throw new BadRequestException('role must be ADMIN or PRODUCT');
     }
     const user = await this.authService.createStaff(dto);
+    await this.auditLogService.record({
+      category: 'staff_created',
+      message: `Created ${dto.role} staff account for ${dto.email}`,
+      details: { newUserId: user.id, role: dto.role, email: dto.email },
+      actorId: req.user.userId,
+    });
     return { message: 'Staff account created', data: user };
   }
 

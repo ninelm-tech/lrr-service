@@ -1,6 +1,7 @@
 import * as crypto from 'crypto';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
+import * as Sentry from '@sentry/node';
 import { PaymentService } from './payment.service';
 import { PaymentEventsService } from '../rescue-request/payment-events.service';
 import { PayoutService } from '../payout/payout.service';
@@ -10,6 +11,13 @@ import {
   createPaymentLedgerMock,
   PaymentLedgerMock,
 } from './testing/payment-ledger.mock';
+import { AuditLogService } from '../audit-log/audit-log.service';
+import { createAuditLogServiceMock } from '../audit-log/testing/audit-log.mock';
+
+jest.mock('@sentry/node', () => ({
+  captureException: jest.fn(),
+  captureMessage: jest.fn(),
+}));
 
 describe('PaymentService', () => {
   let service: PaymentService;
@@ -19,18 +27,22 @@ describe('PaymentService', () => {
   };
   let payoutService: { notifyPayoutOutcome: jest.Mock };
   let paymentLedger: PaymentLedgerMock;
+  let auditLogService: ReturnType<typeof createAuditLogServiceMock>;
   let prisma: {
     payment: { findUnique: jest.Mock };
     rescueRequest: { update: jest.Mock };
   };
 
   beforeEach(async () => {
+    (Sentry.captureMessage as jest.Mock).mockClear();
+    (Sentry.captureException as jest.Mock).mockClear();
     paymentEventsService = {
       confirmDeposit: jest.fn(),
       confirmBalance: jest.fn(),
     };
     payoutService = { notifyPayoutOutcome: jest.fn() };
     paymentLedger = createPaymentLedgerMock();
+    auditLogService = createAuditLogServiceMock();
     prisma = {
       // No matching row by default: the legacy-reference case, where the
       // business side effects must still run.
@@ -46,6 +58,7 @@ describe('PaymentService', () => {
         { provide: PayoutService, useValue: payoutService },
         { provide: PrismaService, useValue: prisma },
         { provide: PaymentLedgerService, useValue: paymentLedger },
+        { provide: AuditLogService, useValue: auditLogService },
       ],
     }).compile();
 
@@ -171,6 +184,77 @@ describe('PaymentService', () => {
       });
 
       expect(payoutService.notifyPayoutOutcome).not.toHaveBeenCalled();
+      // Losing a claim race is the normal case (a webhook and verification
+      // arriving for the same row) — never worth an alert.
+      expect(Sentry.captureMessage).not.toHaveBeenCalled();
+    });
+
+    it('alerts via Sentry when a transfer reference matches no Payment row at all', async () => {
+      // A reference with none of our prefixes (DEP_/BAL_/payout_) is exactly
+      // what Paystack's own auto-generated reference looks like when a
+      // transfer was created directly in their dashboard rather than
+      // through our API.
+      await service.handlePaystackWebhook({
+        event: 'transfer.success',
+        data: {
+          reference: '0wx9yba55hqq595kfncp',
+          transfer_code: 'TRF_dashboard',
+          amount: 700000,
+          reason: 'Manual payout',
+        },
+      });
+
+      expect(payoutService.notifyPayoutOutcome).not.toHaveBeenCalled();
+      expect(Sentry.captureMessage).toHaveBeenCalledWith(
+        expect.stringContaining('Unrecognized transfer webhook'),
+        expect.objectContaining({
+          level: 'warning',
+          extra: expect.objectContaining({
+            event: 'transfer.success',
+            reference: '0wx9yba55hqq595kfncp',
+            transferCode: 'TRF_dashboard',
+            amount: 700000,
+          }),
+        }),
+      );
+      // Both fire together — Sentry for paging, this for a durable,
+      // queryable record that doesn't age out.
+      expect(auditLogService.record).toHaveBeenCalledWith({
+        category: 'unrecognized_transfer_webhook',
+        message: 'Unrecognized transfer webhook — no matching Payment row',
+        details: {
+          event: 'transfer.success',
+          reference: '0wx9yba55hqq595kfncp',
+          transferCode: 'TRF_dashboard',
+          amount: 700000,
+          reason: 'Manual payout',
+        },
+      });
+    });
+
+    it('does not write an audit entry when this call loses the race — claimTerminal returns false', async () => {
+      paymentLedger.claimTerminal.mockResolvedValue(false);
+
+      await service.handlePaystackWebhook({
+        event: 'transfer.success',
+        data: { reference: 'payout_pay-1', transfer_code: 'TRF_test123' },
+      });
+
+      expect(auditLogService.record).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('handlePaystackWebhook — charge.success with no matching row', () => {
+    // Uses the outer beforeEach's default (findUnique resolves null) rather
+    // than the transfer describe's override — this is the actual
+    // legacy-reference / genuinely-unmatched case for a collection.
+    it('does not alert — collections keep their existing quiet behaviour', async () => {
+      await service.handlePaystackWebhook({
+        event: 'charge.success',
+        data: { reference: 'DEP_unknown-id', id: 123 },
+      });
+
+      expect(Sentry.captureMessage).not.toHaveBeenCalled();
     });
   });
 });

@@ -33,6 +33,7 @@ import { PlatformConfigModule } from '../platform-config/platform-config.module'
 import { RatingModule } from '../rating/rating.module';
 import { PayoutModule } from '../payout/payout.module';
 import { AuthGuard } from '../auth/auth.guard';
+import { AuditLogModule } from '../audit-log/audit-log.module';
 
 @Module({
   imports: [
@@ -45,6 +46,7 @@ import { AuthGuard } from '../auth/auth.guard';
     OperatorModule,
     PlatformConfigModule,
     RatingModule,
+    AuditLogModule,
     // Also forwardRef'd: PayoutModule -> PaymentModule -> this module ->
     // PayoutModule is a cycle, so entering the graph from PayoutModule
     // evaluates this decorator while PayoutModule is still undefined.

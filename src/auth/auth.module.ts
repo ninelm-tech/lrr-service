@@ -9,11 +9,13 @@ import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { RolesGuard } from './guards/roles.guard';
 import { PrismaModule } from '../prisma/prisma.module';
 import { OtpModule } from '../otp/otp.module';
+import { AuditLogModule } from '../audit-log/audit-log.module';
 
 @Module({
   imports: [
     PrismaModule,
     OtpModule,
+    AuditLogModule,
     PassportModule.register({ defaultStrategy: 'jwt' }),
     JwtModule.registerAsync({
       imports: [ConfigModule],

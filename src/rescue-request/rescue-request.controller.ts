@@ -20,6 +20,8 @@ import { ResolveDisputeDto } from './dto/resolve-dispute.dto';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { AuditLogService } from '../audit-log/audit-log.service';
+import type { AuthenticatedRequest } from '../auth/authenticated-request.interface';
 
 @UseGuards(AuthGuard)
 @Controller('rescue-requests')
@@ -28,6 +30,7 @@ export class RescueRequestController {
     private readonly disputeService: DisputeService,
     private readonly rescueRequestAdminService: RescueRequestAdminService,
     private readonly dispatchService: DispatchService,
+    private readonly auditLogService: AuditLogService,
   ) {}
 
   @Get()
@@ -127,8 +130,17 @@ export class RescueRequestController {
   @Post(':id/refund-deposit')
   @UseGuards(RolesGuard)
   @Roles(UserRole.SUPER_ADMIN)
-  async refundDeposit(@Param('id') id: string) {
+  async refundDeposit(
+    @Req() req: AuthenticatedRequest,
+    @Param('id') id: string,
+  ) {
     await this.rescueRequestAdminService.refundDeposit(id);
+    await this.auditLogService.record({
+      category: 'deposit_refunded',
+      message: `Refunded deposit for rescue request ${id}`,
+      details: { rescueRequestId: id },
+      actorId: req.user.userId,
+    });
     return { message: 'Refund initiated' };
   }
 
@@ -158,13 +170,25 @@ export class RescueRequestController {
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
   async resolveDispute(
+    @Req() req: AuthenticatedRequest,
     @Param('id') id: string,
     @Body() dto: ResolveDisputeDto,
   ) {
-    return this.disputeService.resolveDispute(
+    const result = await this.disputeService.resolveDispute(
       id,
       dto.resolutionNote,
       dto.balanceAdjustmentPercent,
     );
+    await this.auditLogService.record({
+      category: 'dispute_resolved',
+      message: `Resolved dispute for rescue request ${id}`,
+      details: {
+        rescueRequestId: id,
+        resolutionNote: dto.resolutionNote,
+        balanceAdjustmentPercent: dto.balanceAdjustmentPercent,
+      },
+      actorId: req.user.userId,
+    });
+    return result;
   }
 }

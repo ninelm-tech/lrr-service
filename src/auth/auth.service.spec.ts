@@ -3,6 +3,8 @@ import { JwtService } from '@nestjs/jwt';
 import { AuthService } from './auth.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { OtpService } from '../otp/otp.service';
+import { AuditLogService } from '../audit-log/audit-log.service';
+import { createAuditLogServiceMock } from '../audit-log/testing/audit-log.mock';
 
 describe('AuthService', () => {
   let service: AuthService;
@@ -15,6 +17,7 @@ describe('AuthService', () => {
     verifyCode: jest.Mock;
     findValidTokenRow: jest.Mock;
   };
+  let auditLogService: ReturnType<typeof createAuditLogServiceMock>;
 
   beforeEach(async () => {
     prisma = {
@@ -26,6 +29,7 @@ describe('AuthService', () => {
       verifyCode: jest.fn(),
       findValidTokenRow: jest.fn(),
     };
+    auditLogService = createAuditLogServiceMock();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -33,6 +37,7 @@ describe('AuthService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: JwtService, useValue: { sign: jest.fn() } },
         { provide: OtpService, useValue: otpService },
+        { provide: AuditLogService, useValue: auditLogService },
       ],
     }).compile();
 
@@ -157,6 +162,32 @@ describe('AuthService', () => {
 
         expect(prisma.user.update).not.toHaveBeenCalled();
         expect(result.otpRequired).toBe(false);
+      });
+
+      it('records an audit log entry, since no proof of ownership was checked', async () => {
+        prisma.user.findUnique.mockResolvedValue({
+          id: 'u-1',
+          passwordHash: 'old-hash',
+        });
+
+        await service.requestPasswordReset('ada@example.com', 'newpassword1');
+
+        expect(auditLogService.record).toHaveBeenCalledWith({
+          category: 'password_reset_no_otp',
+          message: 'Password reset without OTP verification',
+          actorId: 'u-1',
+        });
+      });
+
+      it('does not record an audit entry when no account matches — nothing happened', async () => {
+        prisma.user.findUnique.mockResolvedValue(null);
+
+        await service.requestPasswordReset(
+          'nobody@example.com',
+          'newpassword1',
+        );
+
+        expect(auditLogService.record).not.toHaveBeenCalled();
       });
 
       it('no-ops when the account has no portal password', async () => {

@@ -11,6 +11,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { UserRole } from '@prisma/client';
 import { normalizePhone } from '../common/phone.util';
 import { OtpService } from '../otp/otp.service';
+import { AuditLogService } from '../audit-log/audit-log.service';
 
 export interface JwtPayload {
   sub: string;
@@ -34,6 +35,7 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
     private readonly otpService: OtpService,
+    private readonly auditLogService: AuditLogService,
   ) {}
 
   /**
@@ -318,6 +320,14 @@ export class AuthService {
           'requestPasswordReset: password reset with no OTP verification (otpPasswordResetEnabled=false)',
           { userId: user.id },
         );
+        // Self-service: the actor IS the account being reset — there's no
+        // separate admin here, just proof of ownership this app doesn't
+        // yet verify.
+        await this.auditLogService.record({
+          category: 'password_reset_no_otp',
+          message: 'Password reset without OTP verification',
+          actorId: user.id,
+        });
       }
       return {
         message: 'Password updated. You can now log in.',

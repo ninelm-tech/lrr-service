@@ -8,6 +8,7 @@ import { AuthModule } from '../auth/auth.module';
 // forwardRef both ways: PaymentModule already imports this module, and
 // payouts now go through PaymentLedgerService.
 import { PaymentModule } from '../payment/payment.module';
+import { AuditLogModule } from '../audit-log/audit-log.module';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { PaymentModule } from '../payment/payment.module';
     PaystackModule,
     TwilioModule,
     AuthModule,
+    AuditLogModule,
   ],
   controllers: [PayoutController],
   providers: [PayoutService],

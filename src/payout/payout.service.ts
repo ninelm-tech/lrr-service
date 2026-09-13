@@ -68,6 +68,14 @@ export class PayoutService {
    * index), which two admins double-clicking Retry would both hit — only
    * one wins, the other's call is a safe no-op.
    *
+   * The row passed in is one ATTEMPT, not the whole payout — a job can have
+   * an old FAILED row sitting in the list right alongside a newer SUCCEEDED
+   * sibling, from a normal retry that inserted a fresh attempt which later
+   * succeeded. That older row's own status says nothing about whether the
+   * job has already been paid, so this checks the real final state — does
+   * ANY row for this request+type already say SUCCEEDED —
+   * before touching Paystack at all.
+   *
    * Returns the LATEST attempt for this request after retrying — not
    * necessarily the same row passed in, since a retry of a FAILED payout
    * creates a fresh sibling rather than reusing it. Reporting the original
@@ -90,6 +98,12 @@ export class PayoutService {
       // guard rather than a trusted assumption.
       throw new BadRequestException('Payout has no operator on record.');
     }
+    const succeeded = await this.findSucceededPayout(payment.rescueRequestId);
+    if (succeeded) {
+      throw new BadRequestException(
+        `This payout already succeeded (payment ${succeeded.id}) — retrying would risk paying the operator twice.`,
+      );
+    }
 
     await this.attemptPayout(
       payment.rescueRequestId,
@@ -99,6 +113,19 @@ export class PayoutService {
     return this.prisma.payment.findFirst({
       where: { rescueRequestId: payment.rescueRequestId, type: 'PAYOUT' },
       orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  /** Any row for this request+type that already says SUCCEEDED, if one exists. */
+  private async findSucceededPayout(
+    rescueRequestId: string,
+  ): Promise<Payment | null> {
+    return this.prisma.payment.findFirst({
+      where: {
+        rescueRequestId,
+        type: PaymentType.PAYOUT,
+        status: PaymentStatus.SUCCEEDED,
+      },
     });
   }
 
@@ -113,9 +140,17 @@ export class PayoutService {
    * and the in-flight index already guarantees only one row can be live at
    * a time, so reusing the reference is the safe choice, not the risky one.
    *
-   * Returns null only when this attempt must not proceed — the row is
-   * still SUBMITTED (already at Paystack, no reply yet), or another caller
-   * won the claim. **A null means do not call Paystack.**
+   * SUCCEEDED is folded into the same lookup as the in-flight statuses, not
+   * because a succeeded row is in flight, but so this is the ONE place that
+   * decides whether a fresh attempt may ever start — retryPayout pre-checks
+   * this too, for a clearer error message, but this is the real guard: it
+   * also covers createAndProcessPayout's automatic path, which has no
+   * caller-side check at all.
+   *
+   * Returns null only when this attempt must not proceed — the payout has
+   * already succeeded, the row is still SUBMITTED (already at Paystack, no
+   * reply yet), or another caller won the claim. **A null means do not call
+   * Paystack.**
    */
   private async claimPayoutPayment(
     rescueRequestId: string,
@@ -131,6 +166,7 @@ export class PayoutService {
             PaymentStatus.PENDING,
             PaymentStatus.SUBMITTED,
             PaymentStatus.BLOCKED,
+            PaymentStatus.SUCCEEDED,
           ],
         },
       },

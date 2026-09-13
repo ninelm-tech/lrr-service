@@ -508,3 +508,33 @@ model Payment {
   @@index([status, verifyAfter])
   @@index([operatorId])
 }
+
+/// A durable record of security-sensitive, financial, or otherwise
+/// consequential actions — the kind Sentry alerts on but that shouldn't
+/// only live there, since Sentry isn't something everyone checks and it
+/// ages out. `category` is a plain string rather than an enum on purpose:
+/// new categories are just a new string at the call site, not a migration.
+model AuditLog {
+  id String @id @default(cuid())
+
+  category String
+  message  String
+  /// Structured context specific to the category (ids, amounts, the
+  /// changed fields) — never secrets or full payment card/bank details.
+  details  Json?
+
+  /// Who did it, when there's a human actor. Null for system-detected
+  /// anomalies (e.g. an unrecognized webhook) — nobody "did" those.
+  actorId String?
+
+  createdAt DateTime @default(now())
+
+  /// Set once a human has looked at this entry and judged it handled.
+  /// Bookkeeping only — reviewing an entry never changes anything else in
+  /// the system (contrast with the reconciliation feature this replaced,
+  /// which asserted money had moved; this only asserts someone looked).
+  reviewedAt DateTime?
+  reviewedBy String?
+
+  @@index([category, createdAt])
+}

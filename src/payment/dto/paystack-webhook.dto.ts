@@ -19,7 +19,7 @@ export interface PaystackWebhookData {
   /** Paystack's numeric id — the transaction id on a charge, the refund id on a refund. */
   id?: number;
 
-  /** Charges only. Kobo. */
+  /** Kobo. Present on both charges and transfers. */
   amount?: number;
   fees?: number;
   metadata?: { type?: string } | null;
