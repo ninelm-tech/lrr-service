@@ -19,18 +19,6 @@ import { TwilioService } from '../integrations/twilio/twilio.service';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { formatJobRef } from '../rescue-request/domain/rescue-request-formatting';
 
-/**
- * The two block reasons we cause ourselves. Nothing was ever sent to
- * Paystack, so the attempt can legitimately resume on the SAME row — see
- * claimPayoutPayment. The other two (AWAITING_OTP, NEEDS_CUSTOMER_DETAILS)
- * mean the money movement already exists provider-side and must never be
- * re-submitted.
- */
-const OUR_OWN_BLOCKS: PaymentBlockReason[] = [
-  PaymentBlockReason.NO_BANK_DETAILS,
-  PaymentBlockReason.INSUFFICIENT_BALANCE,
-];
-
 /** The states retryPayout may act on — the money movement never landed. */
 const RETRYABLE_STATUSES: PaymentStatus[] = [
   PaymentStatus.FAILED,
@@ -118,13 +106,16 @@ export class PayoutService {
    * The ledger row for this attempt, claimed and ready to submit.
    *
    * A retry reuses whatever its previous attempt left in flight rather than
-   * inserting a sibling: the in-flight partial unique index permits only one,
-   * and for the two blocks we cause ourselves the row never reached Paystack,
-   * so returning it to SUBMITTED is safe and keeps the reference stable.
+   * inserting a sibling: the in-flight partial unique index permits only
+   * one. A BLOCKED row always resubmits with the SAME reference, regardless
+   * of why it was blocked — Paystack rejects a reused reference as a
+   * duplicate rather than moving money twice (see isDuplicateReference),
+   * and the in-flight index already guarantees only one row can be live at
+   * a time, so reusing the reference is the safe choice, not the risky one.
    *
-   * Returns null when this attempt must not proceed — the row is already at
-   * Paystack (SUBMITTED, or BLOCKED awaiting a human there), or another
-   * caller won the claim. **A null means do not call Paystack.**
+   * Returns null only when this attempt must not proceed — the row is
+   * still SUBMITTED (already at Paystack, no reply yet), or another caller
+   * won the claim. **A null means do not call Paystack.**
    */
   private async claimPayoutPayment(
     rescueRequestId: string,
@@ -176,11 +167,7 @@ export class PayoutService {
         : null;
     }
 
-    if (
-      existing.status === PaymentStatus.BLOCKED &&
-      existing.blockReason &&
-      OUR_OWN_BLOCKS.includes(existing.blockReason)
-    ) {
+    if (existing.status === PaymentStatus.BLOCKED) {
       return (await this.paymentLedger.unblock(existing.id, new Date()))
         ? existing
         : null;

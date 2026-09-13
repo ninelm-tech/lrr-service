@@ -14,7 +14,7 @@
 - `disputeAlertPhoneNumber` set in Platform Settings, and access to that number's WhatsApp — it now receives dispute alerts, low-rating alerts, *and* stalled-confirmation alerts
 - A real (or test-mode) Paystack card for payment steps
 - Access to the Paystack dashboard for the same mode (test/live) the environment under test actually uses — several steps below only pass if the money movement shows up there, not just in our own UI
-- An admin/staff bearer token for one direct API call in §14 (there's no dashboard button for it yet) — the same token your admin dashboard session already holds; grab it from your browser's dev tools (Storage) or however your team normally makes authenticated calls against the API
+- A SUPER_ADMIN bearer token for one direct API call in §14 (there's no dashboard button for it yet, and this endpoint moves platform money out so it's SUPER_ADMIN-only, same as payouts) — grab it from your browser's dev tools (Storage) while logged in as a SUPER_ADMIN, or however your team normally makes authenticated calls against the API
 
 ---
 
@@ -297,7 +297,7 @@ There's no dashboard button for this yet — it's a direct API call only. Don't 
 **Setup:** Pay a deposit (§2.6), then cancel the request from the admin dashboard (§12.3, the "after deposit" case). This leaves a request that's `Cancelled` with a successfully paid deposit — the exact "deposit arrived after the request was already cancelled" case this feature exists for.
 
 - [ ] **14.1 — Trigger the refund**
-  Using your admin bearer token, call `POST /rescue-requests/:id/refund-deposit` (no body) with the cancelled request's id from the setup above.
+  Using your SUPER_ADMIN bearer token, call `POST /rescue-requests/:id/refund-deposit` (no body) with the cancelled request's id from the setup above. An ADMIN-role token gets a 403 here — this is now SUPER_ADMIN-only, same as payouts.
   **Expected:** Returns `{"message": "Refund initiated"}`. **In the Paystack dashboard, find the original deposit's transaction and confirm a refund for the full amount now exists against it**, eventually showing `Processed`.
 
 - [ ] **14.2 — Refund cannot be double-triggered**

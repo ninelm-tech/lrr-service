@@ -447,6 +447,33 @@ describe('PayoutService', () => {
       expect(paymentLedger.create).not.toHaveBeenCalled();
     });
 
+    it('retries a BLOCKED/AWAITING_OTP payout by resuming the same row — retry must reach Paystack whenever the button is shown', async () => {
+      prisma.payment.findUnique.mockResolvedValue(
+        payoutPayment('BLOCKED', { blockReason: 'AWAITING_OTP' }),
+      );
+      prisma.payment.findFirst.mockResolvedValue(
+        payoutPayment('BLOCKED', { blockReason: 'AWAITING_OTP' }),
+      );
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1',
+        paystackRecipientCode: 'RCP_x',
+      });
+      paystack.checkBalance.mockResolvedValue(1_000_000);
+      paystack.initiateTransfer.mockResolvedValue({
+        outcome: 'ok',
+        data: { transfer_code: 'TRF_retry', status: 'pending' },
+      });
+
+      await service.retryPayout('pay-1');
+
+      expect(paymentLedger.unblock).toHaveBeenCalledWith(
+        'pay-1',
+        expect.any(Date),
+      );
+      expect(paymentLedger.create).not.toHaveBeenCalled();
+      expect(paystack.initiateTransfer).toHaveBeenCalledTimes(1);
+    });
+
     it('returns the LATEST attempt for the request, not the stale row passed in', async () => {
       prisma.payment.findUnique.mockResolvedValue(payoutPayment('FAILED'));
       prisma.payment.findFirst

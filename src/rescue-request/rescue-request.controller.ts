@@ -120,10 +120,13 @@ export class RescueRequestController {
   /**
    * Admin-triggered refund for a deposit that arrived after its request was
    * already cancelled. Always refunds the full deposit amount.
+   *
+   * SUPER_ADMIN only — like payouts, this moves platform money out to a
+   * customer, not just a payment link the customer acts on.
    */
   @Post(':id/refund-deposit')
   @UseGuards(RolesGuard)
-  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @Roles(UserRole.SUPER_ADMIN)
   async refundDeposit(@Param('id') id: string) {
     await this.rescueRequestAdminService.refundDeposit(id);
     return { message: 'Refund initiated' };
