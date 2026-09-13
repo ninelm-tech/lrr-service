@@ -18,8 +18,8 @@ import { formatVehicleType } from './domain/vehicle-truck-mapping';
 import { formatJobRef } from './domain/rescue-request-formatting';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { DispatchService } from './dispatch.service';
-// scheduleRatingTimeout closes a real two-way dependency with this service
-// (this needs scheduleRatingTimeout; WhatsAppCustomerFlowService needs
+// A real two-way dependency with this service
+// (WhatsAppCustomerFlowService needs
 // markJobCompleted for its CONFIRM branch) — forwardRef required on both sides.
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 
@@ -259,10 +259,6 @@ export class PaymentEventsService {
       state: WhatsAppFlowState.WAITING_FOR_RATING,
       rescueRequestId: rescueRequest.id,
     });
-    this.customerFlowService.scheduleRatingTimeout(
-      customerId,
-      rescueRequest.id,
-    );
 
     // Notify operator — release the vehicle, then prompt to rate the motorist
     //
@@ -288,10 +284,6 @@ export class PaymentEventsService {
         state: WhatsAppFlowState.WAITING_FOR_RATING,
         rescueRequestId: rescueRequest.id,
       });
-      this.customerFlowService.scheduleRatingTimeout(
-        opUser.id,
-        rescueRequest.id,
-      );
     }
 
     if (rescueRequest.assignedOperatorId) {

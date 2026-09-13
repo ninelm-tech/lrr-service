@@ -1,6 +1,11 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
-import { WhatsAppFlowState, WhatsAppSession } from './whatsapp-session.types';
+import { WhatsAppSession as WhatsAppSessionRow } from '@prisma/client';
+import {
+  IssueType,
+  WhatsAppFlowState,
+  WhatsAppSession,
+} from './whatsapp-session.types';
 
 /**
  * DB-backed WhatsApp session store, keyed by userId.
@@ -9,6 +14,18 @@ import { WhatsAppFlowState, WhatsAppSession } from './whatsapp-session.types';
  * for resolving that to a User (creating one if needed) BEFORE calling this store.
  * That way the session table has no redundant phone number column.
  */
+/**
+ * A rating prompt goes stale rather than being cleared by a timer. Nothing
+ * outbound happens at the deadline — the prompt simply stops applying — so
+ * this is derived on read instead of scheduled. One place, so no reader can
+ * forget it.
+ *
+ * `updatedAt` is the prompt time because setting WAITING_FOR_RATING is the
+ * last write to the row; a later unrelated write would extend the window,
+ * which is acceptable for quiet cleanup that blocks nothing.
+ */
+const RATING_PROMPT_TTL_MS = 10 * 60 * 1000;
+
 @Injectable()
 export class WhatsAppSessionStore {
   constructor(private readonly prisma: PrismaService) {}
@@ -74,18 +91,34 @@ export class WhatsAppSessionStore {
     return count;
   }
 
-  private rowToSession(row: any): WhatsAppSession {
+  private rowToSession(row: WhatsAppSessionRow): WhatsAppSession {
+    const rawState = row.state as WhatsAppFlowState;
+    const ratingExpired =
+      rawState === WhatsAppFlowState.WAITING_FOR_RATING &&
+      Date.now() - new Date(row.updatedAt).getTime() > RATING_PROMPT_TTL_MS;
+
     return {
       userId: row.userId,
-      state: row.state as WhatsAppFlowState,
+      state: ratingExpired ? WhatsAppFlowState.IDLE : rawState,
       latitude: row.latitude != null ? Number(row.latitude) : undefined,
       longitude: row.longitude != null ? Number(row.longitude) : undefined,
-      issueType: row.issueType ?? undefined,
+      // These two are String columns holding a narrower domain type. Nothing
+      // but this app writes them, so the cast is safe — but it is a cast, and
+      // the previous `any` on this parameter was hiding that.
+      issueType: (row.issueType as IssueType | null) ?? undefined,
       vehicleType: row.vehicleType ?? undefined,
       destination: row.destination ?? undefined,
-      rescueRequestId: row.rescueRequestId ?? undefined,
+      // The timer this replaces cleared BOTH state and rescueRequestId.
+      // Returning IDLE while still carrying the finished job's id would
+      // leave later code acting on a request the session no longer has any
+      // business touching — a subtler version of the stale-state bugs this
+      // work exists to remove.
+      rescueRequestId: ratingExpired
+        ? undefined
+        : (row.rescueRequestId ?? undefined),
       depositReference: row.depositReference ?? undefined,
-      relayTarget: row.relayTarget ?? undefined,
+      relayTarget:
+        (row.relayTarget as 'OPERATOR' | 'CUSTOMER' | null) ?? undefined,
       updatedAt: row.updatedAt,
     };
   }

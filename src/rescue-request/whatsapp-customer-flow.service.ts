@@ -11,7 +11,6 @@ import { toWhatsAppAddress } from '../common/phone.util';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { IssueType, WhatsAppFlowState } from './state/whatsapp-session.types';
 import { PrismaService } from '../prisma/prisma.service';
-import { scheduleSafely } from '../common/safe-timer';
 import { DEPOSIT_WINDOW_MS } from './deposit.constants';
 import {
   RescueRequestStatus,
@@ -43,7 +42,7 @@ import { RatingService } from '../rating/rating.service';
 import { DispatchService } from './dispatch.service';
 import { DisputeService } from './dispute.service';
 // markJobCompleted (CONFIRM path) closes a real two-way dependency with this
-// service — PaymentEventsService needs scheduleRatingTimeout in return.
+// service.
 import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 
@@ -52,8 +51,6 @@ const MAX_MEDIA_ITEMS = 5;
 
 @Injectable()
 export class WhatsAppCustomerFlowService {
-  private readonly RATING_TIMEOUT_MS = 10 * 60 * 1000;
-
   constructor(
     private readonly prisma: PrismaService,
     private readonly twilioService: TwilioService,
@@ -74,33 +71,6 @@ export class WhatsAppCustomerFlowService {
     private readonly sessionStore: WhatsAppSessionStore,
     private readonly sharedService: RescueRequestSharedService,
   ) {}
-
-  /**
-   * If a rating prompt goes unanswered, silently clear that party's session
-   * back to IDLE after RATING_TIMEOUT_MS — ratings don't block anything, so
-   * this is quiet cleanup, not a hard deadline. Checks the session is still
-   * WAITING_FOR_RATING for the SAME rescueRequestId before clearing, so it
-   * can't clobber a state the party has since moved past (already rated, or
-   * started a fresh SOS).
-   */
-  scheduleRatingTimeout(userId: string, rescueRequestId: string) {
-    scheduleSafely(
-      async () => {
-        const fresh = await this.sessionStore.getOrCreate(userId);
-        if (
-          fresh.state === WhatsAppFlowState.WAITING_FOR_RATING &&
-          fresh.rescueRequestId === rescueRequestId
-        ) {
-          await this.sessionStore.update(userId, {
-            state: WhatsAppFlowState.IDLE,
-            rescueRequestId: undefined,
-          });
-        }
-      },
-      this.RATING_TIMEOUT_MS,
-      'rating-timeout',
-    );
-  }
 
   /**
    * Customer-side WhatsApp state machine. Called by WhatsAppInboundService
