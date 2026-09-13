@@ -394,10 +394,6 @@ model WhatsAppSession {
   // Payment reference (deposit)
   depositReference String?
 
-  // Dispatch tracking
-  dispatchRound      Int    @default(0)
-  offeredOperatorIds String @default("[]") // JSON array of operator IDs already tried
-
   // Masked chat relay — 'OPERATOR' on the customer's own session means "I'm
   // relaying to my operator"; 'CUSTOMER' on the operator's own session means
   // "I'm relaying to my customer". Null means not in a relay.

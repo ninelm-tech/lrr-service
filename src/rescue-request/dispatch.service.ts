@@ -569,9 +569,11 @@ export class DispatchService {
 
     const config = await this.platformConfigService.getConfig();
 
-    const session = await this.sessionStore.getOrCreate(customerId);
-    const alreadyOffered: string[] = session.offeredOperatorIds ?? [];
-    const round = session.dispatchRound ?? 0;
+    // Dispatch progression lives on the request, not the customer's session:
+    // a session is per-person, so a customer with two requests would have had
+    // them share one round and one exclusion list.
+    const alreadyOffered: string[] = rescueRequest.offeredOperatorIds;
+    const round = rescueRequest.dispatchRound;
 
     const lat = Number(rescueRequest.latitude);
     const lon = Number(rescueRequest.longitude);
@@ -672,7 +674,10 @@ export class DispatchService {
       //
       // Once an operator has been asked, they have been asked. The radius
       // expansion below is what finds new people.
-      await this.sessionStore.update(customerId, { dispatchRound: newRound });
+      await this.prisma.rescueRequest.update({
+        where: { id: rescueRequestId },
+        data: { dispatchRound: newRound },
+      });
 
       if (newRound >= MAX_ROUNDS_BEFORE_AUTO_CANCEL) {
         // Tried long enough — auto-cancel the request and notify everyone
@@ -785,10 +790,13 @@ export class DispatchService {
       })),
     });
 
-    // Track offered operators in session
-    await this.sessionStore.update(customerId, {
-      offeredOperatorIds: [...alreadyOffered, ...batchOperatorIds],
-      dispatchRound: round,
+    // `push` appends in the database. Reading the array and writing a spread
+    // would lose entries whenever two dispatch paths append concurrently —
+    // the automatic round and an admin's manual offer, for instance — and
+    // the lost operators would then be offered the same job again.
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequestId },
+      data: { offeredOperatorIds: { push: batchOperatorIds } },
     });
 
     const vehicleLabel = rescueRequest.vehicleType
@@ -1055,10 +1063,7 @@ export class DispatchService {
 
     // Deliberately does NOT touch existing offers — operators still inside
     // their window keep them. Expanding adds people; it never un-asks anyone.
-    const session = await this.sessionStore.getOrCreate(
-      rescueRequest.customerId,
-    );
-    const currentRadius = (session.dispatchRound ?? 0) * RADIUS_EXPANSION_KM;
+    const currentRadius = rescueRequest.dispatchRound * RADIUS_EXPANSION_KM;
     const expandedRadius = currentRadius + RADIUS_EXPANSION_KM;
 
     void this.startDispatch(
@@ -1122,29 +1127,33 @@ export class DispatchService {
       throw new BadRequestException('Bidding has closed for this request');
     }
 
-    // Read before the create: the offer must carry the round it belongs to,
-    // and the session is still that round's authority until the dispatch
-    // state moves onto the request itself.
-    const session = await this.sessionStore.getOrCreate(
-      rescueRequest.customerId,
-    );
+    // Creating the offer and recording that this operator was offered must
+    // commit together. A crash between them leaves the two disagreeing about
+    // who has been asked, and the next automatic round re-offers the same
+    // job to an operator the admin already contacted.
+    await this.prisma.$transaction(async (tx) => {
+      const { dispatchRound } = await tx.rescueRequest.findUniqueOrThrow({
+        where: { id: rescueRequestId },
+        select: { dispatchRound: true },
+      });
 
-    await this.prisma.dispatchOffer.create({
-      data: {
-        rescueRequestId,
-        operatorId,
-        expiresAt,
-        batchId,
-        dispatchRound: session.dispatchRound ?? 0,
-      },
-    });
+      await tx.dispatchOffer.create({
+        data: {
+          rescueRequestId,
+          operatorId,
+          expiresAt,
+          batchId,
+          dispatchRound,
+        },
+      });
 
-    // Append, never replace — every other call site that touches
-    // offeredOperatorIds spreads the existing list first (see e.g.
-    // startDispatch's batch-tracking update); replacing it here would let
-    // operators from earlier rounds become eligible for re-offering again.
-    await this.sessionStore.update(rescueRequest.customerId, {
-      offeredOperatorIds: [...(session.offeredOperatorIds ?? []), operatorId],
+      // `push` rather than a read-modify-write: an automatic round appending
+      // concurrently must not silently drop this operator, which would let
+      // them be offered the same job twice.
+      await tx.rescueRequest.update({
+        where: { id: rescueRequestId },
+        data: { offeredOperatorIds: { push: [operatorId] } },
+      });
     });
 
     const lat = Number(rescueRequest.latitude);
@@ -1195,7 +1204,7 @@ export class DispatchService {
       throw error;
     }
 
-    const currentRadius = (session.dispatchRound ?? 0) * RADIUS_EXPANSION_KM;
+    const currentRadius = rescueRequest.dispatchRound * RADIUS_EXPANSION_KM;
     const timer = setTimeout(
       () =>
         void this.resolveBatch(
@@ -1420,21 +1429,12 @@ export class DispatchService {
       orderBy: { createdAt: 'desc' },
     });
 
-    const customerIds = [...new Set(requests.map((r) => r.customerId))];
-    const sessions = await this.prisma.whatsAppSession.findMany({
-      where: { userId: { in: customerIds } },
-      select: { userId: true, dispatchRound: true },
-    });
-    const roundByCustomerId = new Map(
-      sessions.map((s) => [s.userId, s.dispatchRound]),
-    );
-
     return requests.map((r) => ({
       id: r.id,
       status: r.status,
       vehicleType: r.vehicleType ?? undefined,
       destination: r.destination ?? undefined,
-      round: roundByCustomerId.get(r.customerId) ?? 0,
+      round: r.dispatchRound,
       createdAt: r.createdAt,
       quoteCollectionDeadline: r.quoteCollectionDeadline ?? undefined,
       offers: r.dispatchOffers.map((o) => ({

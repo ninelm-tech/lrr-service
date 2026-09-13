@@ -300,8 +300,6 @@ export class WhatsAppCustomerFlowService {
         issueType: undefined,
         rescueRequestId: undefined,
         depositReference: undefined,
-        dispatchRound: 0,
-        offeredOperatorIds: [],
       });
 
       return this.reply(
@@ -687,10 +685,12 @@ export class WhatsAppCustomerFlowService {
       data: { status: RescueRequestStatus.DISPATCHING },
     });
 
+    // No dispatch state to reset here any more. It lives on the RescueRequest,
+    // which starts at round 0 with an empty exclusion list — so a customer's
+    // second request can no longer inherit the first's, which is precisely
+    // why these resets existed on the per-person session.
     await this.sessionStore.update(userId, {
       state: WhatsAppFlowState.REQUEST_CONFIRMED,
-      dispatchRound: 0,
-      offeredOperatorIds: [],
     });
 
     const greet = customer.name ? `Hi ${customer.name.split(' ')[0]}! ` : '';

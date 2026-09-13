@@ -95,6 +95,6 @@ export async function createSession(
   overrides: Record<string, unknown> = {},
 ) {
   return prisma.whatsAppSession.create({
-    data: { userId, state: 'IDLE', offeredOperatorIds: '[]', ...overrides },
+    data: { userId, state: 'IDLE', ...overrides },
   });
 }

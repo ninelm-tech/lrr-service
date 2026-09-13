@@ -36,8 +36,6 @@ describe('WhatsAppSessionStore', () => {
       destination: '123 Workshop Road',
       rescueRequestId: null,
       depositReference: null,
-      dispatchRound: 0,
-      offeredOperatorIds: '[]',
       updatedAt: new Date(),
     });
 
@@ -65,8 +63,6 @@ describe('WhatsAppSessionStore', () => {
       destination: null,
       rescueRequestId: 'req-1',
       depositReference: null,
-      dispatchRound: 0,
-      offeredOperatorIds: '[]',
       relayTarget: 'OPERATOR',
       updatedAt: new Date(),
     });

@@ -36,13 +36,11 @@ describe('DispatchService', () => {
     let boardService: DispatchService;
     let prisma: {
       rescueRequest: { findMany: jest.Mock };
-      whatsAppSession: { findMany: jest.Mock };
     };
 
     beforeEach(async () => {
       prisma = {
         rescueRequest: { findMany: jest.fn() },
-        whatsAppSession: { findMany: jest.fn() },
       };
 
       const module: TestingModule = await Test.createTestingModule({
@@ -69,6 +67,7 @@ describe('DispatchService', () => {
           destination: 'Lekki',
           createdAt: new Date('2026-08-12T10:00:00Z'),
           customerId: 'cust-1',
+          dispatchRound: 2,
           dispatchOffers: [
             {
               operatorId: 'op-1',
@@ -80,9 +79,6 @@ describe('DispatchService', () => {
             },
           ],
         },
-      ]);
-      prisma.whatsAppSession.findMany.mockResolvedValue([
-        { userId: 'cust-1', dispatchRound: 2 },
       ]);
 
       const result = await boardService.getDispatchBoard();
@@ -132,18 +128,21 @@ describe('DispatchService', () => {
           destination: null,
           createdAt: new Date(),
           customerId: 'cust-1',
+          dispatchRound: 0,
           dispatchOffers: [],
           quoteCollectionDeadline: deadline,
         },
       ]);
-      prisma.whatsAppSession.findMany.mockResolvedValue([]);
 
       const result = await boardService.getDispatchBoard();
 
       expect(result[0].quoteCollectionDeadline).toEqual(deadline);
     });
 
-    it('defaults round to 0 when no session is found for the customer', async () => {
+    it('reports each request’s own round, so one customer’s two requests do not share one', async () => {
+      // Previously the round came from the customer's WhatsApp session, keyed
+      // by customerId — so two concurrent requests from the same person were
+      // shown the same round, whichever they were actually on.
       prisma.rescueRequest.findMany.mockResolvedValue([
         {
           id: 'req-1',
@@ -152,14 +151,24 @@ describe('DispatchService', () => {
           destination: null,
           createdAt: new Date(),
           customerId: 'cust-1',
+          dispatchRound: 0,
+          dispatchOffers: [],
+        },
+        {
+          id: 'req-2',
+          status: 'DISPATCHING',
+          vehicleType: null,
+          destination: null,
+          createdAt: new Date(),
+          customerId: 'cust-1',
+          dispatchRound: 3,
           dispatchOffers: [],
         },
       ]);
-      prisma.whatsAppSession.findMany.mockResolvedValue([]);
 
       const result = await boardService.getDispatchBoard();
 
-      expect(result[0].round).toBe(0);
+      expect(result.map((r) => r.round)).toEqual([0, 3]);
     });
   });
 
@@ -639,8 +648,8 @@ describe('DispatchService', () => {
         status: 'DISPATCHING',
         customerId: 'cust-1',
         quoteCollectionDeadline: deadline,
+        dispatchRound: 1,
       });
-      sessionStore.getOrCreate.mockResolvedValue({ dispatchRound: 1 });
       const startDispatchSpy = jest
         .spyOn(radiusService as any, 'startDispatch')
         .mockResolvedValue(undefined);
@@ -658,8 +667,8 @@ describe('DispatchService', () => {
         id: 'req-1',
         status: 'DISPATCHING',
         customerId: 'cust-1',
+        dispatchRound: 1,
       });
-      sessionStore.getOrCreate.mockResolvedValue({ dispatchRound: 1 });
 
       const startDispatchSpy = jest
         .spyOn(radiusService as any, 'startDispatch')
@@ -682,8 +691,8 @@ describe('DispatchService', () => {
         id: 'req-1',
         status: 'DISPATCHING',
         customerId: 'cust-1',
+        dispatchRound: 1,
       });
-      sessionStore.getOrCreate.mockResolvedValue({ dispatchRound: 1 });
       jest
         .spyOn(radiusService as any, 'startDispatch')
         .mockResolvedValue(undefined);
@@ -707,10 +716,15 @@ describe('DispatchService', () => {
   describe('manualOfferToOperator', () => {
     let manualService: DispatchService;
     let prisma: {
-      rescueRequest: { findUnique: jest.Mock };
+      rescueRequest: {
+        findUnique: jest.Mock;
+        findUniqueOrThrow: jest.Mock;
+        update: jest.Mock;
+      };
       operator: { findUnique: jest.Mock };
       dispatchOffer: { create: jest.Mock; updateMany: jest.Mock };
       requestMedia: { findMany: jest.Mock };
+      $transaction: jest.Mock;
     };
     let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
     let twilioService: {
@@ -729,16 +743,20 @@ describe('DispatchService', () => {
     beforeEach(async () => {
       delete process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
       prisma = {
-        rescueRequest: { findUnique: jest.fn() },
+        rescueRequest: {
+          findUnique: jest.fn(),
+          findUniqueOrThrow: jest.fn().mockResolvedValue({ dispatchRound: 1 }),
+          update: jest.fn(),
+        },
         operator: { findUnique: jest.fn() },
         dispatchOffer: { create: jest.fn(), updateMany: jest.fn() },
         requestMedia: { findMany: jest.fn().mockResolvedValue([]) },
+        // The offer and the offeredOperatorIds append now commit together, so
+        // the callback runs against this same mock as its transaction client.
+        $transaction: jest.fn((fn: (tx: unknown) => unknown) => fn(prisma)),
       };
       sessionStore = {
-        getOrCreate: jest.fn().mockResolvedValue({
-          offeredOperatorIds: ['op-already-tried'],
-          dispatchRound: 1,
-        }),
+        getOrCreate: jest.fn().mockResolvedValue({}),
         update: jest.fn(),
       };
       twilioService = {
@@ -981,9 +999,15 @@ describe('DispatchService', () => {
         expect.stringContaining('2349012345678'),
         expect.stringContaining('NEW RESCUE JOB'),
       );
-      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
-        offeredOperatorIds: ['op-already-tried', 'op-1'],
+      // Appended on the REQUEST, with `push` rather than a read-modify-write:
+      // an automatic round appending at the same moment must not drop this
+      // operator, or the admin's pick gets offered the same job twice.
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { offeredOperatorIds: { push: ['op-1'] } },
       });
+      // And it commits with the offer, not after it.
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
       // One timer, keyed to this batch rather than to the request.
       const keys = [...(manualService as any).batchTimers.keys()] as string[];
       expect(keys).toHaveLength(1);
@@ -1047,6 +1071,8 @@ describe('DispatchService', () => {
           destination: 'Lekki',
           latitude: 6.5,
           longitude: 3.4,
+          // round 1 → accumulated radius of 1 * RADIUS_EXPANSION_KM (2)
+          dispatchRound: 1,
         });
         prisma.operator.findUnique.mockResolvedValue({
           id: 'op-1',
@@ -1166,7 +1192,7 @@ describe('DispatchService', () => {
   describe('startDispatch — batch operator notification', () => {
     let batchService: DispatchService;
     let prisma: {
-      rescueRequest: { findUnique: jest.Mock };
+      rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
       user: { findUnique: jest.Mock };
       operator: { count: jest.Mock };
       dispatchOffer: { createMany: jest.Mock };
@@ -1212,7 +1238,11 @@ describe('DispatchService', () => {
             destination: 'Lekki',
             latitude: 6.5,
             longitude: 3.4,
+            // Dispatch progression is read from the request now, not the session.
+            dispatchRound: 0,
+            offeredOperatorIds: [],
           }),
+          update: jest.fn(),
         },
         user: {
           findUnique: jest
@@ -1224,9 +1254,7 @@ describe('DispatchService', () => {
         requestMedia: { findMany: jest.fn().mockResolvedValue([]) },
       };
       sessionStore = {
-        getOrCreate: jest
-          .fn()
-          .mockResolvedValue({ offeredOperatorIds: [], dispatchRound: 0 }),
+        getOrCreate: jest.fn().mockResolvedValue({}),
         update: jest.fn(),
       };
       operatorService = {

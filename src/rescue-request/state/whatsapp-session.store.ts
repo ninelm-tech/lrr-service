@@ -19,7 +19,6 @@ export class WhatsAppSessionStore {
       create: {
         userId,
         state: WhatsAppFlowState.IDLE,
-        offeredOperatorIds: '[]',
       },
       update: {}, // just fetch if already exists
     });
@@ -45,11 +44,6 @@ export class WhatsAppSessionStore {
       data.rescueRequestId = updates.rescueRequestId;
     if (updates.depositReference !== undefined)
       data.depositReference = updates.depositReference;
-    if (updates.dispatchRound !== undefined)
-      data.dispatchRound = updates.dispatchRound;
-    if (updates.offeredOperatorIds !== undefined) {
-      data.offeredOperatorIds = JSON.stringify(updates.offeredOperatorIds);
-    }
     if (updates.relayTarget !== undefined)
       data.relayTarget = updates.relayTarget;
 
@@ -91,10 +85,6 @@ export class WhatsAppSessionStore {
       destination: row.destination ?? undefined,
       rescueRequestId: row.rescueRequestId ?? undefined,
       depositReference: row.depositReference ?? undefined,
-      dispatchRound: row.dispatchRound ?? 0,
-      offeredOperatorIds: row.offeredOperatorIds
-        ? JSON.parse(row.offeredOperatorIds)
-        : [],
       relayTarget: row.relayTarget ?? undefined,
       updatedAt: row.updatedAt,
     };
