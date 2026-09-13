@@ -15,6 +15,7 @@ import { PlatformConfigService } from '../platform-config/platform-config.servic
 import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestStatus } from '@prisma/client';
 import { toWhatsAppAddress } from '../common/phone.util';
+import { DEPOSIT_WINDOW_MS } from './deposit.constants';
 import {
   RescueRequestListResponseDto,
   RescueRequestListItemDto,
@@ -190,6 +191,11 @@ export class RescueRequestAdminService {
         depositAmount,
         balanceAmount,
         depositReference: reference,
+        // Same statement as the transition — see the matching claim in
+        // WhatsAppCustomerFlowService.handleQuoteSelected. WAITING_FOR_DEPOSIT
+        // without a deadline is a row no reconciler check can ever match.
+        depositWindowExpiresAt: new Date(Date.now() + DEPOSIT_WINDOW_MS),
+        depositRemindersSent: 0,
       },
       include: { customer: true, assignedOperator: true },
     });
@@ -207,14 +213,6 @@ export class RescueRequestAdminService {
       operatorPhone,
       `🚗 You've been assigned a job (₦${(dto.priceKobo / 100).toLocaleString()}). Waiting for the customer to confirm payment.`,
     );
-
-    this.sharedService.scheduleDepositWindow({
-      rescueRequestId: id,
-      customerId: request.customerId,
-      customerPhone,
-      operatorPhone,
-      paymentUrl: paymentResponse.data.authorization_url,
-    });
 
     return { data: this.mapToDetailDto(updated) };
   }

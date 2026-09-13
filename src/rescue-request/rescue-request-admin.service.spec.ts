@@ -446,19 +446,23 @@ describe('RescueRequestAdminService', () => {
       expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
     });
 
-    it('schedules the deposit window via the shared service', async () => {
+    it('opens the deposit window in the same write that starts it', async () => {
       await assignService.assignOperator('req-1', {
         operatorId: 'op-1',
         priceKobo: 100_000,
       });
 
-      expect(sharedService.scheduleDepositWindow).toHaveBeenCalledWith({
-        rescueRequestId: 'req-1',
-        customerId: 'cust-1',
-        customerPhone: expect.any(String),
-        operatorPhone: expect.any(String),
-        paymentUrl: 'https://paystack.test/pay/xyz',
-      });
+      // One write, not two. A request that reaches WAITING_FOR_DEPOSIT
+      // without a deadline is invisible to DepositExpiryCheck — it would
+      // hold its operator forever — so the deadline may never be a
+      // follow-up statement that a crash can skip.
+      expect(prisma.rescueRequest.update).toHaveBeenCalledTimes(1);
+      const [{ data }] = prisma.rescueRequest.update.mock.calls[0] as [
+        { data: Record<string, unknown> },
+      ];
+      expect(data.status).toBe('WAITING_FOR_DEPOSIT');
+      expect(data.depositWindowExpiresAt).toBeInstanceOf(Date);
+      expect(data.depositRemindersSent).toBe(0);
     });
   });
 

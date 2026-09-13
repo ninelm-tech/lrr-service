@@ -12,6 +12,7 @@ import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { IssueType, WhatsAppFlowState } from './state/whatsapp-session.types';
 import { PrismaService } from '../prisma/prisma.service';
 import { scheduleSafely } from '../common/safe-timer';
+import { DEPOSIT_WINDOW_MS } from './deposit.constants';
 import {
   RescueRequestStatus,
   VehicleType,
@@ -906,7 +907,14 @@ export class WhatsAppCustomerFlowService {
     // Atomic claim — only proceeds if the request is still DISPATCHING.
     const claimed = await this.prisma.rescueRequest.updateMany({
       where: { id: rescueRequestId, status: RescueRequestStatus.DISPATCHING },
-      data: { status: RescueRequestStatus.WAITING_FOR_DEPOSIT },
+      data: {
+        status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
+        // Same statement as the transition. A request cannot exist in
+        // WAITING_FOR_DEPOSIT without a deadline, so there is no window in
+        // which a crash can produce a row no check will ever match.
+        depositWindowExpiresAt: new Date(Date.now() + DEPOSIT_WINDOW_MS),
+        depositRemindersSent: 0,
+      },
     });
     if (claimed.count === 0) {
       return this.reply(`Sorry, this request has already moved on.`);
@@ -1006,14 +1014,6 @@ export class WhatsAppCustomerFlowService {
       phoneNumber,
       `🚗 *Operator selected!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *5 minutes*:\n\n👉 ${paymentResponse.data.authorization_url}\n\nYour operator is confirmed once you pay. Reply CANCEL to cancel (no charge).`,
     );
-
-    this.sharedService.scheduleDepositWindow({
-      rescueRequestId,
-      customerId: userId,
-      customerPhone: phoneNumber,
-      operatorPhone: toWhatsAppAddress(operator.phoneNumber),
-      paymentUrl: paymentResponse.data.authorization_url,
-    });
 
     return this.xmlOk();
   }
