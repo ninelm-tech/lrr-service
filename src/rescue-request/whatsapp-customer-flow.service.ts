@@ -45,6 +45,7 @@ import { DisputeService } from './dispute.service';
 // service.
 import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
+import { PaymentLedgerService } from '../payment/payment-ledger.service';
 
 const DEPOSIT_AMOUNT_KOBO = 500000; // ₦5,000
 const MAX_MEDIA_ITEMS = 5;
@@ -70,6 +71,7 @@ export class WhatsAppCustomerFlowService {
     private readonly paymentEventsService: PaymentEventsService,
     private readonly sessionStore: WhatsAppSessionStore,
     private readonly sharedService: RescueRequestSharedService,
+    private readonly paymentLedger: PaymentLedgerService,
   ) {}
 
   /**
@@ -700,9 +702,27 @@ export class WhatsAppCustomerFlowService {
       },
     });
 
-    const reference = this.paystackService.generateReference('DEP');
+    // 1. The row is committed before anything leaves, so a crash here cannot
+    //    produce a payment nothing knows about.
+    const payment = await this.paymentLedger.create({
+      rescueRequestId: rescueRequest.id,
+      type: 'DEPOSIT',
+      amount: amountKobo,
+    });
+
+    // 2. Claim BEFORE the call, which also pushes verifyAfter out so nothing
+    //    verifies a request still in flight. Only the winner calls Paystack.
+    if (
+      !(await this.paymentLedger.claimForSubmission(payment.id, new Date()))
+    ) {
+      return this.reply(
+        `We're setting up your payment — you'll get a link shortly.`,
+      );
+    }
+    const reference = this.paymentLedger.referenceFor(payment);
     const email = customer.email || `${phoneNumber.replace(/\D/g, '')}@lrr.ng`;
 
+    // 3. Call Paystack.
     const paymentResponse = await this.paystackService.initializePayment({
       email,
       amount: amountKobo,
@@ -715,19 +735,37 @@ export class WhatsAppCustomerFlowService {
       },
     });
 
-    if (!paymentResponse.status) {
-      console.error('Failed to initialize Paystack payment:', paymentResponse);
+    // 4. An ambiguous failure may have created a transaction we never saw, so
+    //    it stays SUBMITTED with checkoutUrl null — the pair that tells
+    //    recovery no link ever reached the customer. Only a definitive
+    //    rejection fails the row.
+    if (paymentResponse.outcome === 'ambiguous') {
+      console.error('Paystack initialize was inconclusive:', paymentResponse);
+      return this.reply(
+        `We're still setting up your payment — hold on a moment.`,
+      );
+    }
+    if (paymentResponse.outcome === 'rejected') {
+      await this.paymentLedger.recordRejection(
+        payment.id,
+        paymentResponse.message ?? 'initialize rejected',
+      );
       return this.reply(
         `Sorry, we couldn't create a payment link. Please try again.`,
       );
     }
 
+    // 5. Persist the URL BEFORE sending it. Once this commits, recovery must
+    //    never fail this attempt — the customer may act on the link.
+    const checkoutUrl = paymentResponse.data.authorization_url;
+    await this.prisma.payment.update({
+      where: { id: payment.id },
+      data: { checkoutUrl },
+    });
+
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequest.id },
-      data: {
-        depositReference: reference,
-        depositPaymentUrl: paymentResponse.data.authorization_url,
-      },
+      data: { depositReference: reference, depositPaymentUrl: checkoutUrl },
     });
 
     await this.sessionStore.update(customer.id, {
@@ -745,7 +783,7 @@ export class WhatsAppCustomerFlowService {
       : `💰 *One-time fee: ₦50,000* (paid in full now)\n`;
 
     return this.reply(
-      `Issue: ${formatIssueType(issueType)}${note}\n\n${costBreakdown}\n⚠️ *ACTION NEEDED* — tap the link below to pay ${isStandardDeposit ? '₦5,000 deposit' : '₦50,000'} and confirm your rescue:\n\n👉 ${paymentResponse.data.authorization_url}\n\n⏱ Pay within 30 minutes or the request is cancelled.`,
+      `Issue: ${formatIssueType(issueType)}${note}\n\n${costBreakdown}\n⚠️ *ACTION NEEDED* — tap the link below to pay ${isStandardDeposit ? '₦5,000 deposit' : '₦50,000'} and confirm your rescue:\n\n👉 ${checkoutUrl}\n\n⏱ Pay within 30 minutes or the request is cancelled.`,
     );
   }
 
@@ -956,7 +994,20 @@ export class WhatsAppCustomerFlowService {
     });
 
     const operator = selectedOffer.operator;
-    const reference = this.paystackService.generateReference('DEP');
+    // The protocol, as in initiateDeposit: commit, claim, call, classify.
+    const payment = await this.paymentLedger.create({
+      rescueRequestId,
+      type: 'DEPOSIT',
+      amount: depositAmount,
+    });
+    if (
+      !(await this.paymentLedger.claimForSubmission(payment.id, new Date()))
+    ) {
+      return this.reply(
+        `We're setting up your payment — you'll get a link shortly.`,
+      );
+    }
+    const reference = this.paymentLedger.referenceFor(payment);
     const email =
       rescueRequest.customer.email ??
       `${phoneNumber.replace(/\D/g, '')}@lrr.ng`;
@@ -973,19 +1024,30 @@ export class WhatsAppCustomerFlowService {
       },
     });
 
-    if (!paymentResponse.status) {
-      console.error('Failed to create deposit payment link:', paymentResponse);
+    if (paymentResponse.outcome === 'ambiguous') {
+      console.error('Paystack initialize was inconclusive:', paymentResponse);
+      return this.reply(
+        `We're still setting up your payment — hold on a moment.`,
+      );
+    }
+    if (paymentResponse.outcome === 'rejected') {
+      await this.paymentLedger.recordRejection(
+        payment.id,
+        paymentResponse.message ?? 'initialize rejected',
+      );
       return this.reply(
         `⚠️ We couldn't generate a payment link. Our team has been alerted. Reply CANCEL to cancel.`,
       );
     }
 
+    const checkoutUrl = paymentResponse.data.authorization_url;
+    await this.prisma.payment.update({
+      where: { id: payment.id },
+      data: { checkoutUrl },
+    });
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequestId },
-      data: {
-        depositReference: reference,
-        depositPaymentUrl: paymentResponse.data.authorization_url,
-      },
+      data: { depositReference: reference, depositPaymentUrl: checkoutUrl },
     });
 
     const depositNaira = (depositAmount / 100).toLocaleString();
@@ -993,7 +1055,7 @@ export class WhatsAppCustomerFlowService {
 
     void this.twilioService.sendWhatsAppMessage(
       phoneNumber,
-      `🚗 *Operator selected!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *5 minutes*:\n\n👉 ${paymentResponse.data.authorization_url}\n\nYour operator is confirmed once you pay. Reply CANCEL to cancel (no charge).`,
+      `🚗 *Operator selected!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *5 minutes*:\n\n👉 ${checkoutUrl}\n\nYour operator is confirmed once you pay. Reply CANCEL to cancel (no charge).`,
     );
 
     return this.xmlOk();

@@ -2,6 +2,8 @@ import { Test, TestingModule } from '@nestjs/testing';
 import * as Sentry from '@sentry/node';
 import { PaymentEventsService } from './payment-events.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { PaymentLedgerService } from '../payment/payment-ledger.service';
+import { createPaymentLedgerMock } from '../payment/testing/payment-ledger.mock';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PayoutService } from '../payout/payout.service';
@@ -26,6 +28,7 @@ describe('PaymentEventsService', () => {
       findUniqueOrThrow: jest.Mock;
     };
     dispatchOffer: { updateMany: jest.Mock };
+    payment: { update: jest.Mock };
   };
   let payoutServiceMock: { createAndProcessPayout: jest.Mock };
   let sessionStore: { update: jest.Mock };
@@ -61,6 +64,7 @@ describe('PaymentEventsService', () => {
         findUniqueOrThrow: jest.fn(),
       },
       dispatchOffer: { updateMany: jest.fn() },
+      payment: { update: jest.fn() },
     };
     payoutServiceMock = { createAndProcessPayout: jest.fn() };
     sessionStore = { update: jest.fn() };
@@ -79,6 +83,10 @@ describe('PaymentEventsService', () => {
       providers: [
         PaymentEventsService,
         { provide: PrismaService, useValue: prisma },
+        {
+          provide: PaymentLedgerService,
+          useValue: createPaymentLedgerMock(),
+        },
         { provide: PaystackService, useValue: {} },
         { provide: TwilioService, useValue: twilioService },
         { provide: PayoutService, useValue: payoutServiceMock },
@@ -296,10 +304,13 @@ describe('PaymentEventsService', () => {
       });
       prisma.rescueRequest.update.mockResolvedValue({});
       const paystackService = {
-        generateReference: jest.fn().mockReturnValue('BAL-1'),
         initializePayment: jest.fn().mockResolvedValue({
-          status: true,
-          data: { authorization_url: 'https://pay.example/1' },
+          outcome: 'ok',
+          data: {
+            authorization_url: 'https://pay.example/1',
+            access_code: 'acc_1',
+            reference: 'BAL_pay-1',
+          },
         }),
       };
       (service as any).paystackService = paystackService;

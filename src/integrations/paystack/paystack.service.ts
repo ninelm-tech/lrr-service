@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { PaystackInitializeResult } from './dto/paystack-outcome.dto';
 
 interface InitializePaymentParams {
   email: string;
@@ -46,28 +47,50 @@ export class PaystackService {
   }
 
   /**
-   * Initialize a payment and get a payment link
+   * Initialize a payment and get a checkout link.
+   *
+   * Classifies its failure rather than returning a bare boolean: a 5xx or a
+   * dropped connection may have created a transaction under this reference
+   * that we never learned about, and treating that as a rejection would let
+   * a retry issue a second one. See PaystackOutcome.
    */
   async initializePayment(
     params: InitializePaymentParams,
-  ): Promise<PaystackInitializeResponse> {
-    const response = await fetch(`${this.baseUrl}/transaction/initialize`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.secretKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        email: params.email,
-        amount: params.amount,
-        reference: params.reference,
-        metadata: params.metadata,
-      }),
-    });
+  ): Promise<PaystackInitializeResult> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/transaction/initialize`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.secretKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          email: params.email,
+          amount: params.amount,
+          reference: params.reference,
+          metadata: params.metadata,
+        }),
+      });
+    } catch (error) {
+      // Never a rejection: the request may have landed.
+      return { outcome: 'ambiguous', message: (error as Error).message };
+    }
 
-    const data = await response.json();
+    const data = (await response
+      .json()
+      .catch(() => ({}))) as PaystackInitializeResponse & { code?: string };
     console.log('Paystack initialize response:', data);
-    return data as PaystackInitializeResponse;
+
+    if (!data.status || !data.data) {
+      // Only a 4xx with a provider code is definitive. A 5xx tells us nothing
+      // about whether the transaction was created.
+      if (response.status >= 500) {
+        return { outcome: 'ambiguous', message: data.message };
+      }
+      return { outcome: 'rejected', code: data.code, message: data.message };
+    }
+    return { outcome: 'ok', data: data.data };
   }
 
   /**

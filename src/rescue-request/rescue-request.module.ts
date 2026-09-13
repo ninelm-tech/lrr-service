@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
 import { DisputeService } from './dispute.service';
 import { PaymentEventsService } from './payment-events.service';
@@ -19,6 +19,9 @@ import { WhatsAppInboundService } from './whatsapp-inbound.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { PrismaModule } from '../prisma/prisma.module';
+// forwardRef both ways: PaymentModule already depends on this module for
+// the webhook side effects, and this module now needs PaymentLedgerService.
+import { PaymentModule } from '../payment/payment.module';
 import { RescueRequestController } from './rescue-request.controller';
 import { PaystackModule } from '../integrations/paystack/paystack.module';
 import { TwilioModule } from '../integrations/twilio/twilio.module';
@@ -32,6 +35,7 @@ import { AuthGuard } from '../auth/auth.guard';
 
 @Module({
   imports: [
+    forwardRef(() => PaymentModule),
     PrismaModule,
     PaystackModule,
     TwilioModule,

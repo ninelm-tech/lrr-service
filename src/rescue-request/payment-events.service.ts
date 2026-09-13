@@ -12,11 +12,13 @@ import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PayoutService } from '../payout/payout.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
-import { RescueRequestStatus } from '@prisma/client';
+import { Prisma, RescueRequestStatus } from '@prisma/client';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { formatVehicleType } from './domain/vehicle-truck-mapping';
 import { formatJobRef } from './domain/rescue-request-formatting';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
+import { PaymentLedgerService } from '../payment/payment-ledger.service';
+import { BalancePaymentTarget } from './dto/balance-payment-target.dto';
 import { DispatchService } from './dispatch.service';
 // A real two-way dependency with this service
 // (WhatsAppCustomerFlowService needs
@@ -35,6 +37,7 @@ export class PaymentEventsService {
     private readonly dispatchService: DispatchService,
     @Inject(forwardRef(() => WhatsAppCustomerFlowService))
     private readonly customerFlowService: WhatsAppCustomerFlowService,
+    private readonly paymentLedger: PaymentLedgerService,
   ) {}
 
   async handleDepositPaymentConfirmed(reference: string) {
@@ -336,7 +339,7 @@ export class PaymentEventsService {
     }
   }
 
-  async sendBalancePaymentLink(rescueRequest: any) {
+  async sendBalancePaymentLink(rescueRequest: BalancePaymentTarget) {
     const customerPhone = rescueRequest.customer.phoneNumber;
     if (!customerPhone) return;
 
@@ -353,7 +356,46 @@ export class PaymentEventsService {
       return;
     }
 
-    const reference = this.paystackService.generateReference('BAL');
+    // The same protocol as the deposit paths: commit, claim, call, classify.
+    //
+    // The insert can be refused by the in-flight unique index when a balance
+    // payment already exists for this request — reachable via dispute
+    // resolution, which sends a settlement link for a request that may
+    // already have had one. Resolving that stale attempt is a design question
+    // the payment model does not answer yet (the settled amount differs, so
+    // the old link is wrong, but a SUBMITTED row must never be failed
+    // blindly). Until it does: never throw out of here. Throwing would fail
+    // the caller's dispute resolution AFTER it has already written the
+    // settled amount. Alert instead, so a human issues the link.
+    let payment;
+    try {
+      payment = await this.paymentLedger.create({
+        rescueRequestId: rescueRequest.id,
+        type: 'BALANCE',
+        amount: balanceAmount,
+      });
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        Sentry.captureMessage(
+          'Balance link skipped — a balance payment is already in flight',
+          {
+            level: 'error',
+            extra: { rescueRequestId: rescueRequest.id, balanceAmount },
+          },
+        );
+        return;
+      }
+      throw error;
+    }
+    if (
+      !(await this.paymentLedger.claimForSubmission(payment.id, new Date()))
+    ) {
+      return; // another caller owns this one
+    }
+    const reference = this.paymentLedger.referenceFor(payment);
     const email =
       rescueRequest.customer.email ||
       `${customerPhone.replace(/\D/g, '')}@lrr.ng`;
@@ -370,11 +412,25 @@ export class PaymentEventsService {
       },
     });
 
-    if (!paymentResponse.status) {
-      console.error('Failed to create balance payment link:', paymentResponse);
+    if (paymentResponse.outcome === 'ambiguous') {
+      // Leaves the row SUBMITTED with checkoutUrl null — recovery's signal
+      // that no link ever reached the customer.
+      console.error('Paystack initialize was inconclusive:', paymentResponse);
+      return;
+    }
+    if (paymentResponse.outcome === 'rejected') {
+      await this.paymentLedger.recordRejection(
+        payment.id,
+        paymentResponse.message ?? 'initialize rejected',
+      );
       return;
     }
 
+    const checkoutUrl = paymentResponse.data.authorization_url;
+    await this.prisma.payment.update({
+      where: { id: payment.id },
+      data: { checkoutUrl },
+    });
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequest.id },
       data: { balanceReference: reference },
@@ -383,7 +439,7 @@ export class PaymentEventsService {
     const balanceNaira = (balanceAmount / 100).toLocaleString();
     await this.twilioService.sendWhatsAppMessage(
       customerPhone,
-      `✅ Your tow is complete!\n\n⚠️ *ACTION NEEDED* — tap the link below to pay the ₦${balanceNaira} balance:\n\n👉 ${paymentResponse.data.authorization_url}\n\nThank you for using Local Roadside Rescue 🚗`,
+      `✅ Your tow is complete!\n\n⚠️ *ACTION NEEDED* — tap the link below to pay the ₦${balanceNaira} balance:\n\n👉 ${checkoutUrl}\n\nThank you for using Local Roadside Rescue 🚗`,
     );
   }
 }

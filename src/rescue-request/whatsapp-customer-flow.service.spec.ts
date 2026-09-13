@@ -1,6 +1,8 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { PaymentLedgerService } from '../payment/payment-ledger.service';
+import { createPaymentLedgerMock } from '../payment/testing/payment-ledger.mock';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { S3Service } from '../integrations/s3/s3.service';
 import { GeocodingService } from '../integrations/geocoding/geocoding.service';
@@ -31,6 +33,10 @@ describe('WhatsAppCustomerFlowService', () => {
         providers: [
           WhatsAppCustomerFlowService,
           { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
           { provide: TwilioService, useValue: {} },
           { provide: S3Service, useValue: {} },
           {
@@ -157,6 +163,10 @@ describe('WhatsAppCustomerFlowService', () => {
         providers: [
           WhatsAppCustomerFlowService,
           { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
           { provide: TwilioService, useValue: twilioService },
           { provide: S3Service, useValue: {} },
           { provide: GeocodingService, useValue: {} },
@@ -263,6 +273,10 @@ describe('WhatsAppCustomerFlowService', () => {
         providers: [
           WhatsAppCustomerFlowService,
           { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
           {
             provide: TwilioService,
             useValue: { sendWhatsAppMessage: jest.fn() },
@@ -413,6 +427,10 @@ describe('WhatsAppCustomerFlowService', () => {
           WhatsAppCustomerFlowService,
           { provide: PrismaService, useValue: prisma },
           {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
+          {
             provide: TwilioService,
             useValue: { sendWhatsAppMessage: jest.fn() },
           },
@@ -489,6 +507,10 @@ describe('WhatsAppCustomerFlowService', () => {
         providers: [
           WhatsAppCustomerFlowService,
           { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
           { provide: TwilioService, useValue: twilioService },
           { provide: S3Service, useValue: {} },
           { provide: GeocodingService, useValue: {} },
@@ -664,6 +686,10 @@ describe('WhatsAppCustomerFlowService', () => {
         providers: [
           WhatsAppCustomerFlowService,
           { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
           {
             provide: TwilioService,
             useValue: { sendWhatsAppMessage: jest.fn() },

@@ -13,7 +13,7 @@ import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { PaymentEventsService } from './payment-events.service';
-import { RescueRequestStatus } from '@prisma/client';
+import { Prisma, RescueRequestStatus } from '@prisma/client';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { DEPOSIT_WINDOW_MS } from './deposit.constants';
 import {
@@ -26,6 +26,7 @@ import {
 } from './dto/rescue-request-response.dto';
 import { DispatchService } from './dispatch.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
+import { PaymentLedgerService } from '../payment/payment-ledger.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 
 @Injectable()
@@ -40,6 +41,7 @@ export class RescueRequestAdminService {
     private readonly dispatchService: DispatchService,
     private readonly sharedService: RescueRequestSharedService,
     private readonly sessionStore: WhatsAppSessionStore,
+    private readonly paymentLedger: PaymentLedgerService,
   ) {}
 
   async adminList(query: any) {
@@ -159,7 +161,40 @@ export class RescueRequestAdminService {
       },
     });
 
-    const reference = this.paystackService.generateReference('DEP');
+    // The in-flight partial unique index is the guard against a second
+    // deposit for the same request, and it refuses the insert rather than
+    // trusting the checks above — which read the request without claiming it,
+    // so two assignments can both get this far. Translate that refusal into
+    // the same offer rollback and clear message as any other failure here;
+    // without this the offer is orphaned SELECTED_PENDING_PAYMENT and the
+    // admin sees a raw database error.
+    let payment;
+    try {
+      payment = await this.paymentLedger.create({
+        rescueRequestId: id,
+        type: 'DEPOSIT',
+        amount: depositAmount,
+      });
+    } catch (error) {
+      await this.prisma.dispatchOffer.delete({ where: { id: offer.id } });
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        throw new BadRequestException(
+          `A deposit is already in flight for this request — check its status before assigning again`,
+        );
+      }
+      throw error;
+    }
+    if (
+      !(await this.paymentLedger.claimForSubmission(payment.id, new Date()))
+    ) {
+      throw new BadRequestException(
+        `A deposit is already being set up for this request`,
+      );
+    }
+    const reference = this.paymentLedger.referenceFor(payment);
     const email =
       request.customer.email ??
       `${request.customer.phoneNumber.replace(/\D/g, '')}@lrr.ng`;
@@ -174,13 +209,33 @@ export class RescueRequestAdminService {
         type: 'deposit',
       },
     });
-    if (!paymentResponse.status) {
+
+    if (paymentResponse.outcome !== 'ok') {
       // Roll back the offer so a retry isn't blocked by a stale row.
       await this.prisma.dispatchOffer.delete({ where: { id: offer.id } });
+
+      // Only a definitive rejection fails the payment. An ambiguous result
+      // leaves it SUBMITTED for verification — the admin is told not to
+      // retry, because a retry here would be a second transaction.
+      if (paymentResponse.outcome === 'rejected') {
+        await this.paymentLedger.recordRejection(
+          payment.id,
+          paymentResponse.message ?? 'initialize rejected',
+        );
+        throw new BadRequestException(
+          `Couldn't generate a payment link — please try again`,
+        );
+      }
       throw new BadRequestException(
-        `Couldn't generate a payment link — please try again`,
+        `Payment link status unknown — it is being verified. Do not retry yet.`,
       );
     }
+
+    const checkoutUrl = paymentResponse.data.authorization_url;
+    await this.prisma.payment.update({
+      where: { id: payment.id },
+      data: { checkoutUrl },
+    });
 
     const updated = await this.prisma.rescueRequest.update({
       where: { id },
@@ -191,7 +246,7 @@ export class RescueRequestAdminService {
         depositAmount,
         balanceAmount,
         depositReference: reference,
-        depositPaymentUrl: paymentResponse.data.authorization_url,
+        depositPaymentUrl: checkoutUrl,
         // Same statement as the transition — see the matching claim in
         // WhatsAppCustomerFlowService.handleQuoteSelected. WAITING_FOR_DEPOSIT
         // without a deadline is a row no reconciler check can ever match.
@@ -208,7 +263,7 @@ export class RescueRequestAdminService {
 
     void this.twilioService.sendWhatsAppMessage(
       customerPhone,
-      `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *30 minutes*:\n\n👉 ${paymentResponse.data.authorization_url}\n\nReply CANCEL to cancel (no charge).`,
+      `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *30 minutes*:\n\n👉 ${checkoutUrl}\n\nReply CANCEL to cancel (no charge).`,
     );
     void this.twilioService.sendWhatsAppMessage(
       operatorPhone,

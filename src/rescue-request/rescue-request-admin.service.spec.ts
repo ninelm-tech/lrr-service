@@ -2,6 +2,11 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { RescueRequestAdminService } from './rescue-request-admin.service';
 import { DispatchService } from './dispatch.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { PaymentLedgerService } from '../payment/payment-ledger.service';
+import {
+  createPaymentLedgerMock,
+  PaymentLedgerMock,
+} from '../payment/testing/payment-ledger.mock';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
@@ -32,6 +37,10 @@ describe('RescueRequestAdminService', () => {
         providers: [
           RescueRequestAdminService,
           { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
           { provide: PaystackService, useValue: {} },
           { provide: TwilioService, useValue: {} },
           { provide: PlatformConfigService, useValue: platformConfigService },
@@ -211,6 +220,10 @@ describe('RescueRequestAdminService', () => {
         providers: [
           RescueRequestAdminService,
           { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
           { provide: PaystackService, useValue: {} },
           { provide: TwilioService, useValue: {} },
           { provide: PlatformConfigService, useValue: {} },
@@ -278,9 +291,10 @@ describe('RescueRequestAdminService', () => {
         delete: jest.Mock;
         update: jest.Mock;
       };
+      payment: { update: jest.Mock };
     };
+    let paymentLedger: PaymentLedgerMock;
     let paystackService: {
-      generateReference: jest.Mock;
       initializePayment: jest.Mock;
     };
     let twilioService: { sendWhatsAppMessage: jest.Mock };
@@ -317,12 +331,17 @@ describe('RescueRequestAdminService', () => {
           delete: jest.fn(),
           update: jest.fn(),
         },
+        payment: { update: jest.fn() },
       };
+      paymentLedger = createPaymentLedgerMock();
       paystackService = {
-        generateReference: jest.fn().mockReturnValue('DEP_ref123'),
         initializePayment: jest.fn().mockResolvedValue({
-          status: true,
-          data: { authorization_url: 'https://paystack.test/pay/xyz' },
+          outcome: 'ok',
+          data: {
+            authorization_url: 'https://paystack.test/pay/xyz',
+            access_code: 'acc_1',
+            reference: 'DEP_pay-1',
+          },
         }),
       };
       twilioService = { sendWhatsAppMessage: jest.fn() };
@@ -340,6 +359,7 @@ describe('RescueRequestAdminService', () => {
         providers: [
           RescueRequestAdminService,
           { provide: PrismaService, useValue: prisma },
+          { provide: PaymentLedgerService, useValue: paymentLedger },
           { provide: PaystackService, useValue: paystackService },
           { provide: TwilioService, useValue: twilioService },
           { provide: PlatformConfigService, useValue: platformConfigService },
@@ -370,9 +390,17 @@ describe('RescueRequestAdminService', () => {
           quotedPrice: 100_000,
         }),
       });
+      // The reference is the ledger row's id, not a generated one, so a
+      // webhook can always find the payment it belongs to.
       expect(paystackService.initializePayment).toHaveBeenCalledWith(
-        expect.objectContaining({ amount: 22_000 }),
+        expect.objectContaining({ amount: 22_000, reference: 'DEP_pay-1' }),
       );
+      // Persisted before the link is sent — once the customer can act on it,
+      // recovery must never fail this attempt.
+      expect(prisma.payment.update).toHaveBeenCalledWith({
+        where: { id: 'pay-1' },
+        data: { checkoutUrl: 'https://paystack.test/pay/xyz' },
+      });
       expect(prisma.rescueRequest.update).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
@@ -430,8 +458,12 @@ describe('RescueRequestAdminService', () => {
       ).rejects.toThrow('Customer has no phone number on file');
     });
 
-    it('rolls back the created offer if the payment link fails to generate', async () => {
-      paystackService.initializePayment.mockResolvedValue({ status: false });
+    it('rolls back the created offer when Paystack definitively rejects the link', async () => {
+      paystackService.initializePayment.mockResolvedValue({
+        outcome: 'rejected',
+        code: 'invalid_params',
+        message: 'Invalid amount',
+      });
 
       await expect(
         assignService.assignOperator('req-1', {
@@ -444,6 +476,39 @@ describe('RescueRequestAdminService', () => {
         where: { id: 'offer-1' },
       });
       expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+      // Definitive: nothing landed, so FAILED is safe and a retry is legal.
+      expect(paymentLedger.recordRejection).toHaveBeenCalledWith(
+        'pay-1',
+        'Invalid amount',
+      );
+    });
+
+    it('does not fail the payment when the link result is ambiguous, and tells the admin not to retry', async () => {
+      // A 5xx or a timeout may still have created a transaction. Failing the
+      // row here would make a retry legal and bill the customer twice, so the
+      // row stays SUBMITTED for verification and only the offer rolls back.
+      paystackService.initializePayment.mockResolvedValue({
+        outcome: 'ambiguous',
+        message: 'gateway timeout',
+      });
+
+      await expect(
+        assignService.assignOperator('req-1', {
+          operatorId: 'op-1',
+          priceKobo: 100_000,
+        }),
+      ).rejects.toThrow('Do not retry yet');
+
+      expect(prisma.dispatchOffer.delete).toHaveBeenCalledWith({
+        where: { id: 'offer-1' },
+      });
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+      // No checkoutUrl: the pair (SUBMITTED, null) is what tells recovery no
+      // link ever reached the customer.
+      expect(prisma.payment.update).not.toHaveBeenCalled();
+      // The load-bearing one. FAILED here would make a retry legal against a
+      // transaction that may already exist at Paystack.
+      expect(paymentLedger.recordRejection).not.toHaveBeenCalled();
     });
 
     it('opens the deposit window in the same write that starts it', async () => {
@@ -491,6 +556,10 @@ describe('RescueRequestAdminService', () => {
         providers: [
           RescueRequestAdminService,
           { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
           { provide: PaystackService, useValue: paystackService },
           { provide: TwilioService, useValue: {} },
           { provide: PlatformConfigService, useValue: {} },
@@ -622,6 +691,10 @@ describe('RescueRequestAdminService', () => {
         providers: [
           RescueRequestAdminService,
           { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
           { provide: PaystackService, useValue: {} },
           { provide: TwilioService, useValue: {} },
           { provide: PlatformConfigService, useValue: {} },
@@ -687,6 +760,10 @@ describe('RescueRequestAdminService', () => {
         providers: [
           RescueRequestAdminService,
           { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
           { provide: PaystackService, useValue: {} },
           { provide: TwilioService, useValue: twilioService },
           { provide: PlatformConfigService, useValue: {} },
