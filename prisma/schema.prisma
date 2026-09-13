@@ -232,6 +232,17 @@ model RescueRequest {
 
   quoteCollectionDeadline DateTime?
 
+  // Durable scheduling — every deadline that used to live in a setTimeout is
+  // a column here, so the reconciler can find outstanding work after a
+  // restart. See docs/superpowers/specs/2026-09-12-durable-scheduling-design.md.
+  depositWindowExpiresAt  DateTime?
+  depositRemindersSent    Int       @default(0)
+  biddingClosedAt         DateTime?
+  quoteSelectionExpiresAt DateTime?
+  confirmationDueAt       DateTime?
+  dispatchRound           Int       @default(0)
+  offeredOperatorIds      String[]  @default([])
+
   dispatchOffers     DispatchOffer[]
   media              RequestMedia[]
   ratings            Rating[]
@@ -242,6 +253,10 @@ model RescueRequest {
   @@index([createdAt])
   @@index([depositReference])
   @@index([balanceReference])
+  @@index([depositWindowExpiresAt])
+  @@index([quoteCollectionDeadline])
+  @@index([quoteSelectionExpiresAt])
+  @@index([confirmationDueAt])
 }
 
 // Singleton row — platform-wide pricing configuration, admin-editable.
@@ -296,6 +311,11 @@ model DispatchOffer {
   expiresAt        DateTime
 
   batchId          String
+
+  // Which dispatch round this offer belongs to. Deliberately has no default:
+  // an offer created without a round could never be matched to the request's
+  // own round, and batch resolve would silently skip it.
+  dispatchRound    Int
 
   @@index([rescueRequestId])
   @@index([operatorId])

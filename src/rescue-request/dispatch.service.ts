@@ -781,6 +781,7 @@ export class DispatchService {
         operatorId: op.id,
         expiresAt,
         batchId,
+        dispatchRound: round,
       })),
     });
 
@@ -1121,17 +1122,27 @@ export class DispatchService {
       throw new BadRequestException('Bidding has closed for this request');
     }
 
+    // Read before the create: the offer must carry the round it belongs to,
+    // and the session is still that round's authority until the dispatch
+    // state moves onto the request itself.
+    const session = await this.sessionStore.getOrCreate(
+      rescueRequest.customerId,
+    );
+
     await this.prisma.dispatchOffer.create({
-      data: { rescueRequestId, operatorId, expiresAt, batchId },
+      data: {
+        rescueRequestId,
+        operatorId,
+        expiresAt,
+        batchId,
+        dispatchRound: session.dispatchRound ?? 0,
+      },
     });
 
     // Append, never replace — every other call site that touches
     // offeredOperatorIds spreads the existing list first (see e.g.
     // startDispatch's batch-tracking update); replacing it here would let
     // operators from earlier rounds become eligible for re-offering again.
-    const session = await this.sessionStore.getOrCreate(
-      rescueRequest.customerId,
-    );
     await this.sessionStore.update(rescueRequest.customerId, {
       offeredOperatorIds: [...(session.offeredOperatorIds ?? []), operatorId],
     });

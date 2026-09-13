@@ -81,6 +81,7 @@ export async function createOffer(
       rescueRequestId,
       operatorId,
       status: 'PENDING',
+      dispatchRound: 0,
       expiresAt: new Date(Date.now() + 10 * 60 * 1000),
       batchId: `batch-${unique()}`,
       ...overrides,

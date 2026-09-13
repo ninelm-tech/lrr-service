@@ -150,6 +150,11 @@ export class RescueRequestAdminService {
         respondedAt: new Date(),
         expiresAt: new Date(Date.now() + MANUAL_ASSIGN_WINDOW_MS),
         batchId,
+        // A direct admin assignment is not part of any bidding round, but the
+        // column is required. The request's own round is the truthful value:
+        // this offer is created SELECTED_PENDING_PAYMENT, never PENDING, so
+        // batch resolve never matches it and the round is bookkeeping only.
+        dispatchRound: request.dispatchRound,
       },
     });
 

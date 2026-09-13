@@ -233,6 +233,49 @@ can still choose its own round:
 Do this now rather than in a later task: without it, the offer-sweep tests
 migrated in Task 2 break for a reason unrelated to Task 2's change.
 
+- [ ] **Step 9b: Stamp a round at all three offer-creation sites**
+
+`DispatchOffer.dispatchRound` is required from this migration onward, so the
+production code stops compiling until every create supplies one. Deferring
+this to Task 5 would leave Tasks 1-4 unable to typecheck, so the tree could
+not be committed green — the fix belongs here.
+
+Use the round each site's *current* authority already holds; Task 5 changes
+where that authority lives, not what these writes mean. There are **three**
+sites, not the two Task 5 lists:
+
+`dispatch.service.ts`, `startDispatch`'s `createMany` — `round` is already in
+scope:
+
+```ts
+        batchId,
+        dispatchRound: round,
+```
+
+`dispatch.service.ts`, `manualOfferToOperator` — the session read that follows
+the create must be hoisted above it, so the round is known when the offer is
+written:
+
+```ts
+    const session = await this.sessionStore.getOrCreate(rescueRequest.customerId);
+
+    await this.prisma.dispatchOffer.create({
+      data: { rescueRequestId, operatorId, expiresAt, batchId,
+              dispatchRound: session.dispatchRound ?? 0 },
+    });
+```
+
+`rescue-request-admin.service.ts` (~line 145) — a direct admin assignment,
+which Task 5's list omits. It belongs to no bidding round, so the request's
+own round is the truthful value; the offer is created
+`SELECTED_PENDING_PAYMENT` rather than `PENDING`, so batch resolve never
+matches it and the round is bookkeeping only:
+
+```ts
+        batchId,
+        dispatchRound: request.dispatchRound,
+```
+
 - [ ] **Step 10: Run the full suite**
 
 Run: `yarn tsc --noEmit && yarn jest && yarn test:integration`
@@ -1256,9 +1299,13 @@ Task 7 moves this call inside `prepareNextRound`'s transaction, so the append
 commits with the offers it describes. Write it here as its own statement; the
 later task relocates it rather than changing its shape.
 
-- [ ] **Step 5: Stamp the round on every offer created**
+- [ ] **Step 5: Move each offer's round onto the request as its source**
 
-`DispatchOffer.dispatchRound` has no default, so both creation sites must supply it or fail to compile. In `startDispatch`'s `createMany`:
+Task 1 Step 9b already made all **three** creation sites compile — including
+`rescue-request-admin.service.ts`, which this step does not otherwise touch
+and which needs no further change: it already reads `request.dispatchRound`.
+What changes here is where the other two get their round from, and what else
+commits alongside the write. In `startDispatch`'s `createMany`:
 
 ```ts
       data: batch.map((op) => ({
