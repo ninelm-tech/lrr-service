@@ -54,3 +54,21 @@ export type PaystackTransferResult =
   | { outcome: 'ok'; data: { status: string; transfer_code: string } }
   | { outcome: 'rejected'; code?: string; message?: string }
   | { outcome: 'ambiguous'; message?: string };
+
+/**
+ * A refund's acceptance.
+ *
+ * Refunds are the most dangerous of the three to misclassify. Paystack's
+ * refund API accepts no `reference` of ours, so there is no duplicate-
+ * reference protection and no endpoint that takes an identifier we chose: a
+ * second POST simply issues a SECOND REFUND. An `ambiguous` result must
+ * therefore never become FAILED, because FAILED is what makes a second
+ * attempt legal.
+ *
+ * `merchant_note` — carrying the bare Payment.id — is the only identifier of
+ * ours that travels, and the only thing that makes recovery possible.
+ */
+export type PaystackRefundResult =
+  | { outcome: 'ok'; data: { id: number; status: string } }
+  | { outcome: 'rejected'; code?: string; message?: string }
+  | { outcome: 'ambiguous'; message?: string };

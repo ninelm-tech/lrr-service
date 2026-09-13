@@ -13,7 +13,7 @@ import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { PaymentEventsService } from './payment-events.service';
-import { Prisma, RescueRequestStatus } from '@prisma/client';
+import { PaymentStatus, Prisma, RescueRequestStatus } from '@prisma/client';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { DEPOSIT_WINDOW_MS } from './deposit.constants';
 import {
@@ -27,6 +27,7 @@ import {
 import { DispatchService } from './dispatch.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { PaymentLedgerService } from '../payment/payment-ledger.service';
+import { mapRefundStatus } from '../payment/domain/paystack-status';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 
 @Injectable()
@@ -299,50 +300,129 @@ export class RescueRequestAdminService {
       );
     }
 
-    let refund: { id: number; status: string };
+    // Which failures may release the claim back to FAILED is the whole
+    // safety question here. FAILED is retryable, and a refund retry is a
+    // SECOND REAL REFUND — there is no duplicate-reference protection on
+    // Paystack's refund API, and no endpoint that takes an identifier we
+    // chose. So the claim is released only where we know for certain that
+    // nothing was created: before the POST, or on a definitive rejection.
+    const request = await this.prisma.rescueRequest.findUniqueOrThrow({
+      where: { id },
+    });
+    if (!request.depositReference || !request.depositAmount) {
+      // Nothing was sent — releasing the claim is safe, and an admin needs
+      // to fix the data before this can succeed.
+      await this.releaseRefundClaim(id);
+      throw new BadRequestException(
+        `Cannot refund request ${id}: missing depositReference or depositAmount`,
+      );
+    }
+
+    let payment;
     try {
-      const request = await this.prisma.rescueRequest.findUniqueOrThrow({
-        where: { id },
+      payment = await this.paymentLedger.create({
+        rescueRequestId: id,
+        type: 'REFUND',
+        amount: request.depositAmount,
       });
-      if (!request.depositReference || !request.depositAmount) {
-        throw new Error(
-          `Cannot refund request ${id}: missing depositReference or depositAmount`,
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        // A refund attempt is already in flight. Deliberately does NOT
+        // release the claim: that earlier attempt may have created a refund
+        // at Paystack, so this must not become retryable.
+        throw new BadRequestException(
+          'A refund is already in progress for this request',
         );
       }
-      refund = await this.paystackService.refundTransaction(
-        request.depositReference,
-        request.depositAmount,
-      );
-    } catch (err) {
-      // The Paystack call itself never went through (or never confirmed) —
-      // safe to mark FAILED so an admin can retry via the same claim.
-      await this.prisma.rescueRequest.update({
-        where: { id },
-        data: { depositRefundStatus: 'FAILED' },
-      });
-      throw err;
+      await this.releaseRefundClaim(id);
+      throw error;
     }
+
+    if (
+      !(await this.paymentLedger.claimForSubmission(payment.id, new Date()))
+    ) {
+      throw new BadRequestException(
+        'A refund is already in progress for this request',
+      );
+    }
+
+    const result = await this.paystackService.refundTransaction({
+      transaction: request.depositReference,
+      amount: request.depositAmount,
+      // The BARE id, not the formatted reference — refunds have no reference,
+      // and this note is what recovery matches on.
+      merchantNote: payment.id,
+    });
+
+    if (result.outcome === 'ambiguous') {
+      // The row stays SUBMITTED and the claim stays PENDING (not retryable).
+      // Verification adopts whatever landed; a second POST would refund twice.
+      throw new BadRequestException(
+        `Refund status unknown — it is being verified. Do not retry yet.`,
+      );
+    }
+    if (result.outcome === 'rejected') {
+      const failureReason = result.message ?? 'refund rejected';
+      await this.paymentLedger.recordRejection(payment.id, failureReason);
+      await this.releaseRefundClaim(id);
+      throw new BadRequestException(`Refund failed: ${failureReason}`);
+    }
+
+    // providerRef first: it is how the refund webhook will find this row,
+    // since refunds carry no reference of ours.
+    await this.prisma.payment.update({
+      where: { id: payment.id },
+      data: { providerRef: `refund:${result.data.id}` },
+    });
 
     try {
       await this.prisma.rescueRequest.update({
         where: { id },
-        data: { depositRefundId: refund.id },
+        data: { depositRefundId: result.data.id },
       });
     } catch (err) {
-      // Paystack already confirmed the refund — the money has moved. Do NOT
-      // mark FAILED here: FAILED is retryable and a retry would trigger a
-      // second, real refund against an already-refunded transaction. Leave
-      // depositRefundStatus at PENDING (not retryable) and alert a human to
-      // reconcile the missing depositRefundId manually.
+      // The refund exists at Paystack. Do NOT release the claim: FAILED is
+      // retryable and a retry would refund a second time. Leave it PENDING
+      // and alert a human to reconcile the missing depositRefundId.
       Sentry.captureException(err, {
         extra: {
           rescueRequestId: id,
-          refundId: refund.id,
+          refundId: result.data.id,
           reason:
-            'deposit refund succeeded at Paystack but failed to persist depositRefundId',
+            'deposit refund created at Paystack but failed to persist depositRefundId',
         },
       });
     }
+
+    // As with transfers, the POST may not produce SUCCEEDED — `processed`
+    // included. Only BLOCKED and a definitive failure may come from here.
+    const mapped = mapRefundStatus(result.data.status);
+    if (mapped.status === PaymentStatus.BLOCKED) {
+      // Paystack has the refund and is waiting on customer details. It
+      // exists, so the claim stays PENDING rather than becoming retryable.
+      await this.paymentLedger.recordBlocked(payment.id, mapped.blockReason!);
+    } else if (mapped.status === PaymentStatus.FAILED) {
+      await this.paymentLedger.claimTerminal(payment.id, mapped);
+      await this.releaseRefundClaim(id);
+    }
+    // Everything else — including `processed` — stays SUBMITTED.
+  }
+
+  /**
+   * Return depositRefundStatus to FAILED so an admin can try again.
+   *
+   * Only ever called where nothing was created at Paystack. Calling it after
+   * a refund may exist turns "unknown" into "retry me", and the retry is a
+   * second real refund.
+   */
+  private async releaseRefundClaim(id: string): Promise<void> {
+    await this.prisma.rescueRequest.update({
+      where: { id },
+      data: { depositRefundStatus: 'FAILED' },
+    });
   }
 
   async updateStatus(id: string, dto: { status: string }) {

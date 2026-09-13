@@ -226,26 +226,82 @@ describe('PaystackService', () => {
   });
 
   describe('refundTransaction', () => {
-    it('POSTs to /refund with the transaction reference and amount, returns id and status', async () => {
-      const mockFetch = jest.fn().mockResolvedValue({
-        json: () =>
-          Promise.resolve({
-            status: true,
-            data: { id: 12345, status: 'pending' },
-          }),
-      });
-      global.fetch = mockFetch as any;
+    /**
+     * Typed rather than `as any`: the classification under test branches on
+     * `response.status`, and an untyped stub silently allows a mock that
+     * omits it — which would make every one of these tests pass for the
+     * wrong reason.
+     */
+    const stubFetch = (status: number, body: unknown) => {
+      const fn = jest
+        .fn()
+        .mockResolvedValue({ status, json: () => Promise.resolve(body) });
+      global.fetch = fn;
+      return fn;
+    };
 
-      const result = await service.refundTransaction('DEP_ref_1', 500000);
+    const refund = () =>
+      service.refundTransaction({
+        transaction: 'DEP_ref_1',
+        amount: 500000,
+        merchantNote: 'pay-abc',
+      });
+
+    it('POSTs the merchant_note — the only identifier of ours a refund carries', async () => {
+      const mockFetch = stubFetch(200, {
+        status: true,
+        data: { id: 12345, status: 'pending' },
+      });
+
+      const result = await refund();
 
       expect(mockFetch).toHaveBeenCalledWith(
         'https://api.paystack.co/refund',
         expect.objectContaining({
           method: 'POST',
-          body: JSON.stringify({ transaction: 'DEP_ref_1', amount: 500000 }),
+          body: JSON.stringify({
+            transaction: 'DEP_ref_1',
+            amount: 500000,
+            merchant_note: 'pay-abc',
+          }),
         }),
       );
-      expect(result).toEqual({ id: 12345, status: 'pending' });
+      expect(result).toEqual({
+        outcome: 'ok',
+        data: { id: 12345, status: 'pending' },
+      });
+    });
+
+    it('classifies a thrown network error as ambiguous — a retry would refund twice', async () => {
+      global.fetch = jest.fn().mockRejectedValue(new Error('socket hang up'));
+
+      expect(await refund()).toEqual({
+        outcome: 'ambiguous',
+        message: 'socket hang up',
+      });
+    });
+
+    it('classifies a 5xx as ambiguous', async () => {
+      stubFetch(503, { status: false, message: 'Service unavailable' });
+
+      expect(await refund()).toEqual({
+        outcome: 'ambiguous',
+        message: 'Service unavailable',
+      });
+    });
+
+    it('classifies a 4xx with a provider code as a definitive rejection', async () => {
+      stubFetch(400, {
+        status: false,
+        code: 'transaction_not_found',
+        message: 'Transaction not found',
+      });
+
+      expect(await refund()).toEqual({
+        outcome: 'rejected',
+        code: 'transaction_not_found',
+        message: 'Transaction not found',
+      });
     });
   });
 });

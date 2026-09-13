@@ -2,6 +2,7 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   PaystackInitializeResult,
+  PaystackRefundResult,
   PaystackTransferResult,
 } from './dto/paystack-outcome.dto';
 
@@ -446,22 +447,51 @@ export class PaystackService {
    * reference (our depositReference) — not a generic "reference". This only
    * INITIATES the refund; Paystack settles it asynchronously and confirms via
    * the refund.processed/refund.failed webhook (see PaymentService).
+   *
+   * `merchantNote` carries the bare Payment.id. It is the sole recovery
+   * handle: refunds accept no reference of ours, so if this response is lost
+   * the only way to find what landed is to list refunds for the transaction
+   * and match on this note. See *Refund recovery* in the design doc.
    */
-  async refundTransaction(
-    transaction: string,
-    amount: number,
-  ): Promise<{ id: number; status: string }> {
-    const response = await fetch(`${this.baseUrl}/refund`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.secretKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ transaction, amount }),
-    });
+  async refundTransaction(params: {
+    transaction: string;
+    amount: number;
+    merchantNote: string;
+  }): Promise<PaystackRefundResult> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/refund`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.secretKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          transaction: params.transaction,
+          amount: params.amount,
+          merchant_note: params.merchantNote,
+        }),
+      });
+    } catch (error) {
+      // The refund may have been created. Never a rejection — a retry here
+      // would refund the customer twice.
+      return { outcome: 'ambiguous', message: (error as Error).message };
+    }
 
-    const data = await response.json();
+    const data = (await response.json().catch(() => ({}))) as {
+      status?: boolean;
+      message?: string;
+      code?: string;
+      data?: { id: number; status: string };
+    };
     console.log('Paystack refund response:', data);
-    return data.data as { id: number; status: string };
+
+    if (!data.status || !data.data) {
+      if (response.status >= 500) {
+        return { outcome: 'ambiguous', message: data.message };
+      }
+      return { outcome: 'rejected', code: data.code, message: data.message };
+    }
+    return { outcome: 'ok', data: data.data };
   }
 }
