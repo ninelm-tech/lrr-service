@@ -8,6 +8,7 @@ import { ReconcilerService } from './reconciler/reconciler.service';
 import { RECONCILER_CHECKS } from './reconciler/reconciler-check.interface';
 import { OfferSweepCheck } from './reconciler/checks/offer-sweep.check';
 import { DepositExpiryCheck } from './reconciler/checks/deposit-expiry.check';
+import { DepositReminderCheck } from './reconciler/checks/deposit-reminder.check';
 import { WhatsAppOperatorFlowService } from './whatsapp-operator-flow.service';
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 import { WhatsAppInboundService } from './whatsapp-inbound.service';
@@ -50,6 +51,7 @@ import { AuthGuard } from '../auth/auth.guard';
     DispatchService,
     OfferSweepCheck,
     DepositExpiryCheck,
+    DepositReminderCheck,
     ReconcilerService,
     {
       // The checks the 15-second loop runs, in order. A check is registered
@@ -59,8 +61,9 @@ import { AuthGuard } from '../auth/auth.guard';
       useFactory: (
         offerSweep: OfferSweepCheck,
         depositExpiry: DepositExpiryCheck,
-      ) => [offerSweep, depositExpiry],
-      inject: [OfferSweepCheck, DepositExpiryCheck],
+        depositReminder: DepositReminderCheck,
+      ) => [offerSweep, depositExpiry, depositReminder],
+      inject: [OfferSweepCheck, DepositExpiryCheck, DepositReminderCheck],
     },
     WhatsAppOperatorFlowService,
     WhatsAppCustomerFlowService,

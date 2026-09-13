@@ -191,6 +191,7 @@ export class RescueRequestAdminService {
         depositAmount,
         balanceAmount,
         depositReference: reference,
+        depositPaymentUrl: paymentResponse.data.authorization_url,
         // Same statement as the transition — see the matching claim in
         // WhatsAppCustomerFlowService.handleQuoteSelected. WAITING_FOR_DEPOSIT
         // without a deadline is a row no reconciler check can ever match.

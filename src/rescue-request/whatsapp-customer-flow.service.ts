@@ -722,6 +722,11 @@ export class WhatsAppCustomerFlowService {
         longitude: session.longitude,
         issueType,
         depositAmount: amountKobo,
+        // Same statement as the status, as at every other entry into
+        // WAITING_FOR_DEPOSIT. Until now this path set no deadline at all, so
+        // nothing ever cancelled these requests despite the message below
+        // promising exactly that.
+        depositWindowExpiresAt: new Date(Date.now() + DEPOSIT_WINDOW_MS),
       },
     });
 
@@ -749,7 +754,10 @@ export class WhatsAppCustomerFlowService {
 
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequest.id },
-      data: { depositReference: reference },
+      data: {
+        depositReference: reference,
+        depositPaymentUrl: paymentResponse.data.authorization_url,
+      },
     });
 
     await this.sessionStore.update(customer.id, {
@@ -1004,7 +1012,10 @@ export class WhatsAppCustomerFlowService {
 
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequestId },
-      data: { depositReference: reference },
+      data: {
+        depositReference: reference,
+        depositPaymentUrl: paymentResponse.data.authorization_url,
+      },
     });
 
     const depositNaira = (depositAmount / 100).toLocaleString();
