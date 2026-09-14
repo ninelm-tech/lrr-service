@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import * as Sentry from '@sentry/node';
+import { AuditLog } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { RecordAuditLogInput } from './dto/record-audit-log-input.dto';
 
@@ -36,5 +37,18 @@ export class AuditLogService {
         extra: { category: input.category, message: input.message },
       });
     }
+  }
+
+  /**
+   * Marks an entry as looked at. Bookkeeping only — unlike the
+   * reconciliation feature this replaced, reviewing an entry never
+   * changes anything else in the system, it only records that a human
+   * saw it.
+   */
+  async review(id: string, reviewedBy: string): Promise<AuditLog> {
+    return this.prisma.auditLog.update({
+      where: { id },
+      data: { reviewedAt: new Date(), reviewedBy },
+    });
   }
 }

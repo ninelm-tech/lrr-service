@@ -9,11 +9,16 @@ jest.mock('@sentry/node', () => ({
 
 describe('AuditLogService', () => {
   let service: AuditLogService;
-  let prisma: { auditLog: { create: jest.Mock } };
+  let prisma: { auditLog: { create: jest.Mock; update: jest.Mock } };
 
   beforeEach(async () => {
     (Sentry.captureException as jest.Mock).mockClear();
-    prisma = { auditLog: { create: jest.fn().mockResolvedValue({}) } };
+    prisma = {
+      auditLog: {
+        create: jest.fn().mockResolvedValue({}),
+        update: jest.fn().mockResolvedValue({}),
+      },
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -70,5 +75,23 @@ describe('AuditLogService', () => {
       expect.any(Error),
       expect.objectContaining({ extra: { category: 'x', message: 'y' } }),
     );
+  });
+
+  describe('review', () => {
+    it('sets reviewedBy and a real reviewedAt Date on the entry', async () => {
+      await service.review('log-1', 'admin-1');
+
+      const [[call]] = prisma.auditLog.update.mock.calls as [
+        [
+          {
+            where: { id: string };
+            data: { reviewedBy: string; reviewedAt: unknown };
+          },
+        ],
+      ];
+      expect(call.where).toEqual({ id: 'log-1' });
+      expect(call.data.reviewedBy).toBe('admin-1');
+      expect(call.data.reviewedAt).toBeInstanceOf(Date);
+    });
   });
 });

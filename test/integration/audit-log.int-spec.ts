@@ -71,4 +71,24 @@ describe('AuditLogService (integration)', () => {
 
     expect(await prisma.auditLog.count()).toBe(0);
   });
+
+  describe('review', () => {
+    it('sets reviewedAt and reviewedBy, leaving everything else untouched', async () => {
+      await service.record({
+        category: 'payout_retried',
+        message: 'Retried payout pay-1',
+        actorId: 'admin-1',
+      });
+      const before = await prisma.auditLog.findFirstOrThrow();
+
+      const after = await service.review(before.id, 'admin-2');
+
+      expect(after.reviewedAt).not.toBeNull();
+      expect(after.reviewedBy).toBe('admin-2');
+      // Reviewing is bookkeeping only — the original actor and category
+      // are untouched, unlike the reconciliation feature this replaced.
+      expect(after.actorId).toBe('admin-1');
+      expect(after.category).toBe('payout_retried');
+    });
+  });
 });
