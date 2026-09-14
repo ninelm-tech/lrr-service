@@ -1,7 +1,7 @@
 # LRR Full System Test Plan
 
-**Date:** 2026-09-10 · **Last updated:** 2026-09-13 (updated for the payment-model rewrite: §10's statuses now match the Payment ledger, added Paystack-dashboard verification steps to §2/§9/§10, added §14 admin-triggered refund and §15 Paystack customer identity)
-**Scope:** Every customer/operator/staff-facing flow currently implemented, on staging. Manual, WhatsApp + admin dashboard driven — the automated Jest suite (332 unit + 146 integration tests, `lrr-service`) already covers unit-level logic and real-database behaviour; this plan verifies the real, end-to-end experience a real user would have, including the one thing the automated suite cannot: that money actually moves at Paystack, not just in our own database.
+**Date:** 2026-09-10 · **Last updated:** 2026-09-13 (added §10.5 — retry refused once a sibling attempt already succeeded — and §16, the new Audit Log)
+**Scope:** Every customer/operator/staff-facing flow currently implemented, on staging. Manual, WhatsApp + admin dashboard driven — the automated Jest suite (356 unit + 152 integration tests, `lrr-service`) already covers unit-level logic and real-database behaviour; this plan verifies the real, end-to-end experience a real user would have, including the one thing the automated suite cannot: that money actually moves at Paystack, not just in our own database.
 
 **How to use this:** Work top to bottom. Each numbered case has Setup → Steps → Expected Result. Check the box when the actual result matches. If it doesn't, stop, note what actually happened, and file it rather than continuing past a failure in that flow — later cases often assume the earlier ones worked.
 
@@ -211,6 +211,10 @@
   Find a payout tied to a request that was disputed (from §8).
   **Expected:** The Payouts tab shows a "Disputed" or "Dispute Resolved" badge next to that job.
 
+- [ ] **10.5 — Retry is refused once a sibling attempt already succeeded**
+  Find (or create) a job with more than one payout row — e.g. a `Failed` attempt followed by a `Success` one for the same job (10.3's flow naturally produces this: the original `Blocked` row and the row Retry created).
+  **Expected:** The **older, non-succeeded row never shows a Retry button** — instead it reads "Paid via a different attempt." This holds even if you filter the list down to just that older row's status. **Check the audit log (§16) for a `payout_retried` entry** if you did trigger a retry attempt against it directly via the API — it should show the refusal, not a second transfer.
+
 ---
 
 ## 11. Rating & Low-Rating Flagging — new this pass
@@ -317,6 +321,44 @@ This isn't a user-visible flow — it's a data-integrity property that only the 
 - [ ] **15.1 — Guest pays, registers a real email, pays again — still one customer**
   As a fresh motorist with no email on file, complete a deposit payment (§2.6). Then register a portal account for that same phone number using a real email address. Then start a second request and pay its deposit too.
   **Expected:** In the **Paystack dashboard's Customers list**, search by phone number and by the real email just registered. Only **one** customer record exists for this person. Its email on file is the auto-generated `<digits>@lrr.ng` address from the *first* payment, not the real email registered afterward — that's expected, not a bug: the identity is frozen on first payment and Paystack has no way to update a customer's email later.
+
+---
+
+## 16. Audit Log
+
+A durable, SUPER_ADMIN-only record of security-sensitive and financial admin actions — the kind that used to only page someone via Sentry. Each check below is "do X, then confirm an entry shows up for it," not a flow of its own.
+
+- [ ] **16.1 — Staff creation is logged**
+  Create a new staff account (`POST /auth/staff`, or wherever your admin UI exposes it).
+  **Expected:** A new `Audit Log` entry appears with category `Staff Created`, the message names the role and email, and the actor is the SUPER_ADMIN who created it.
+
+- [ ] **16.2 — Deposit refund is logged**
+  Trigger §14.1 (admin-triggered refund).
+  **Expected:** An entry appears with category `Deposit Refunded`, details include the rescue request id, actor is whoever called the endpoint.
+
+- [ ] **16.3 — Payout retry is logged, including the outcome**
+  Retry a payout (§10.3).
+  **Expected:** An entry appears with category `Payout Retried`; expand its details and confirm `resultStatus` matches what the Payouts tab actually shows afterward (e.g. `SUBMITTED` or `SUCCEEDED`), not just that a retry happened.
+
+- [ ] **16.4 — Platform settings change is logged with the actual changed values**
+  Change the service fee % or deposit % in Platform Settings.
+  **Expected:** An entry appears with category `Platform Settings Updated`; expanding details shows the new values you actually set, not a generic "settings changed" message.
+
+- [ ] **16.5 — Dispute resolution is logged**
+  Resolve a dispute (§8.3).
+  **Expected:** An entry appears with category `Dispute Resolved`, details include the resolution note and settlement percentage you entered.
+
+- [ ] **16.6 — Filtering by category narrows the list**
+  Pick a category from the dropdown filter (e.g. "Payout Retried").
+  **Expected:** Only entries of that category show. Clearing the filter brings back everything.
+
+- [ ] **16.7 — Marking an entry reviewed is purely bookkeeping**
+  Click "Mark Reviewed" on any unreviewed entry.
+  **Expected:** Its badge changes to "Reviewed" and the button disappears. Nothing else about the entry (category, message, actor, details) changes, and nothing elsewhere in the system is affected — this is a "someone looked at it" note, not an action.
+
+- [ ] **16.8 — ADMIN cannot reach the audit log**
+  Log in as an `ADMIN` (not `SUPER_ADMIN`) and try to open `/audit-log` directly by URL.
+  **Expected:** Redirected away — the link isn't even in their nav menu, and the page itself refuses them.
 
 ---
 
