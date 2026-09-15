@@ -784,6 +784,28 @@ describe('RescueRequestAdminService', () => {
         'Transaction not found',
       );
     });
+
+    describe('getDepositAmount', () => {
+      it("returns the request's deposit amount", async () => {
+        prisma.rescueRequest.findUnique.mockResolvedValue({
+          depositAmount: 500000,
+        });
+
+        const result = await service.getDepositAmount('req-1');
+
+        expect(prisma.rescueRequest.findUnique).toHaveBeenCalledWith({
+          where: { id: 'req-1' },
+          select: { depositAmount: true },
+        });
+        expect(result).toBe(500000);
+      });
+
+      it('returns null when the request does not exist', async () => {
+        prisma.rescueRequest.findUnique.mockResolvedValue(null);
+
+        expect(await service.getDepositAmount('missing')).toBeNull();
+      });
+    });
   });
 
   describe('adminList — dispute field mapping', () => {

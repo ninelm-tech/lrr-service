@@ -313,7 +313,7 @@ describe('DisputeService', () => {
       });
       prisma.rescueRequest.update.mockResolvedValue({});
 
-      await service.resolveDispute(
+      const result = await service.resolveDispute(
         rescueRequestId,
         'operator was right, no change',
       );
@@ -330,6 +330,13 @@ describe('DisputeService', () => {
       expect(paymentEventsService.sendBalancePaymentLink).toHaveBeenCalledWith(
         expect.objectContaining({ balanceAmount: 45000 }),
       );
+      // Callers (the audit log entry) need both figures to show a
+      // before/after — not just the update call's args.
+      expect(result).toEqual({
+        resolved: true,
+        originalBalance: 45000,
+        settledBalance: 45000,
+      });
     });
 
     it('resolves with a 60% adjustment: settled balance is 60% of the original, both amounts stored', async () => {
@@ -343,7 +350,7 @@ describe('DisputeService', () => {
       });
       prisma.rescueRequest.update.mockResolvedValue({});
 
-      await service.resolveDispute(
+      const result = await service.resolveDispute(
         rescueRequestId,
         'tow took too long, 60% agreed',
         60,
@@ -361,6 +368,11 @@ describe('DisputeService', () => {
       expect(paymentEventsService.sendBalancePaymentLink).toHaveBeenCalledWith(
         expect.objectContaining({ balanceAmount: 27000 }),
       );
+      expect(result).toEqual({
+        resolved: true,
+        originalBalance: 45000,
+        settledBalance: 27000,
+      });
     });
 
     it('notifies the operator that the settlement link was sent, best-effort on Twilio failure', async () => {
@@ -379,7 +391,11 @@ describe('DisputeService', () => {
 
       await expect(
         service.resolveDispute(rescueRequestId, 'note'),
-      ).resolves.toEqual({ resolved: true });
+      ).resolves.toEqual({
+        resolved: true,
+        originalBalance: 45000,
+        settledBalance: 45000,
+      });
 
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
         expect.stringContaining(operatorPhone),

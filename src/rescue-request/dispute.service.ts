@@ -187,7 +187,11 @@ export class DisputeService {
     rescueRequestId: string,
     resolutionNote: string,
     balanceAdjustmentPercent = 100,
-  ): Promise<{ resolved: boolean }> {
+  ): Promise<{
+    resolved: boolean;
+    originalBalance?: number;
+    settledBalance?: number;
+  }> {
     if (
       !Number.isInteger(balanceAdjustmentPercent) ||
       balanceAdjustmentPercent < 1 ||
@@ -249,6 +253,6 @@ export class DisputeService {
       console.error('Failed to notify operator of dispute resolution:', error);
     }
 
-    return { resolved: true };
+    return { resolved: true, originalBalance, settledBalance };
   }
 }

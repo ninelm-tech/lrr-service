@@ -414,6 +414,20 @@ export class RescueRequestAdminService {
     // Everything else — including `processed` — stays SUBMITTED.
   }
 
+  /**
+   * Read-only lookup for the caller's own audit-log entry — kept separate
+   * from `refundDeposit`'s return value (`void`) rather than widening it, so
+   * the many existing `resolves.toBeUndefined()` assertions on that method
+   * stay valid.
+   */
+  async getDepositAmount(id: string): Promise<number | null> {
+    const request = await this.prisma.rescueRequest.findUnique({
+      where: { id },
+      select: { depositAmount: true },
+    });
+    return request?.depositAmount ?? null;
+  }
+
   async updateStatus(id: string, dto: { status: string }) {
     const status = dto.status as RescueRequestStatus;
     if (!Object.values(RescueRequestStatus).includes(status)) {

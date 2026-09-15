@@ -80,14 +80,19 @@ export class PayoutController {
 
   @Post(':id/retry')
   async retry(@Req() req: AuthenticatedRequest, @Param('id') id: string) {
+    const before = await this.prisma.payment.findUnique({
+      where: { id },
+      select: { status: true },
+    });
     const payment = await this.payoutService.retryPayout(id);
     await this.auditLogService.record({
       category: 'payout_retried',
       message: `Retried payout ${id}`,
       details: {
         paymentId: id,
-        resultStatus: payment?.status ?? null,
         resultPaymentId: payment?.id ?? null,
+        before: { status: before?.status ?? null },
+        after: { status: payment?.status ?? null },
       },
       actorId: req.user.userId,
     });

@@ -10,14 +10,21 @@ const req = { user: { userId: 'admin-1' } } as never;
 
 describe('PayoutController', () => {
   let controller: PayoutController;
-  let prisma: { payment: { findMany: jest.Mock } };
+  let prisma: {
+    payment: { findMany: jest.Mock; findUnique: jest.Mock };
+  };
   let payoutService: { retryPayout: jest.Mock };
   let auditLogService: ReturnType<typeof createAuditLogServiceMock>;
 
   beforeEach(async () => {
     // Default: no succeeded rows anywhere, so the second (succeeded-lookup)
     // findMany call returns empty unless a test overrides it.
-    prisma = { payment: { findMany: jest.fn().mockResolvedValue([]) } };
+    prisma = {
+      payment: {
+        findMany: jest.fn().mockResolvedValue([]),
+        findUnique: jest.fn().mockResolvedValue(null),
+      },
+    };
     payoutService = { retryPayout: jest.fn() };
     auditLogService = createAuditLogServiceMock();
 
@@ -253,7 +260,8 @@ describe('PayoutController', () => {
       expect(result.message).toContain('could not be read');
     });
 
-    it('records an audit log entry with the acting admin and the outcome', async () => {
+    it('records an audit log entry with the acting admin, and the before/after status', async () => {
+      prisma.payment.findUnique.mockResolvedValue({ status: 'FAILED' });
       payoutService.retryPayout.mockResolvedValue({
         id: 'pay-2',
         status: 'SUBMITTED',
@@ -263,19 +271,25 @@ describe('PayoutController', () => {
 
       await controller.retry(req, 'pay-1');
 
+      expect(prisma.payment.findUnique).toHaveBeenCalledWith({
+        where: { id: 'pay-1' },
+        select: { status: true },
+      });
       expect(auditLogService.record).toHaveBeenCalledWith({
         category: 'payout_retried',
         message: 'Retried payout pay-1',
         details: {
           paymentId: 'pay-1',
-          resultStatus: 'SUBMITTED',
           resultPaymentId: 'pay-2',
+          before: { status: 'FAILED' },
+          after: { status: 'SUBMITTED' },
         },
         actorId: 'admin-1',
       });
     });
 
-    it('records a null result in the audit log when the payment could not be read', async () => {
+    it('records nulls in the audit log when neither the original nor the result payment could be read', async () => {
+      prisma.payment.findUnique.mockResolvedValue(null);
       payoutService.retryPayout.mockResolvedValue(null);
 
       await controller.retry(req, 'pay-1');
@@ -284,8 +298,9 @@ describe('PayoutController', () => {
         expect.objectContaining({
           details: {
             paymentId: 'pay-1',
-            resultStatus: null,
             resultPaymentId: null,
+            before: { status: null },
+            after: { status: null },
           },
         }),
       );

@@ -134,11 +134,17 @@ export class RescueRequestController {
     @Req() req: AuthenticatedRequest,
     @Param('id') id: string,
   ) {
+    const depositAmount =
+      await this.rescueRequestAdminService.getDepositAmount(id);
     await this.rescueRequestAdminService.refundDeposit(id);
     await this.auditLogService.record({
       category: 'deposit_refunded',
       message: `Refunded deposit for rescue request ${id}`,
-      details: { rescueRequestId: id },
+      details: {
+        rescueRequestId: id,
+        before: { refunded: false },
+        after: { refunded: true, amount: depositAmount },
+      },
       actorId: req.user.userId,
     });
     return { message: 'Refund initiated' };
@@ -186,6 +192,8 @@ export class RescueRequestController {
         rescueRequestId: id,
         resolutionNote: dto.resolutionNote,
         balanceAdjustmentPercent: dto.balanceAdjustmentPercent,
+        before: { balanceAmount: result.originalBalance },
+        after: { balanceAmount: result.settledBalance },
       },
       actorId: req.user.userId,
     });

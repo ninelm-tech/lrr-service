@@ -11,6 +11,7 @@ describe('AuditLogController', () => {
   let controller: AuditLogController;
   let prisma: {
     auditLog: { findMany: jest.Mock; count: jest.Mock };
+    user: { findMany: jest.Mock };
   };
   let auditLogService: ReturnType<typeof createAuditLogServiceMock>;
 
@@ -19,6 +20,9 @@ describe('AuditLogController', () => {
       auditLog: {
         findMany: jest.fn().mockResolvedValue([]),
         count: jest.fn().mockResolvedValue(0),
+      },
+      user: {
+        findMany: jest.fn().mockResolvedValue([]),
       },
     };
     auditLogService = createAuditLogServiceMock();
@@ -37,7 +41,9 @@ describe('AuditLogController', () => {
 
   describe('list', () => {
     it('orders newest first, and reports total/page/limit in meta', async () => {
-      prisma.auditLog.findMany.mockResolvedValue([{ id: 'log-1' }]);
+      prisma.auditLog.findMany.mockResolvedValue([
+        { id: 'log-1', actorId: null },
+      ]);
       prisma.auditLog.count.mockResolvedValue(1);
 
       const result = await controller.list(undefined, undefined, undefined);
@@ -49,9 +55,58 @@ describe('AuditLogController', () => {
         take: 25,
       });
       expect(result).toEqual({
-        data: [{ id: 'log-1' }],
+        data: [{ id: 'log-1', actorId: null, actorName: null }],
         meta: { total: 1, page: 1, limit: 25 },
       });
+    });
+
+    it('resolves an actor id to their name via a live join', async () => {
+      prisma.auditLog.findMany.mockResolvedValue([
+        { id: 'log-1', actorId: 'admin-1' },
+      ]);
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'admin-1', name: 'Ada Admin' },
+      ]);
+
+      const result = await controller.list(undefined, undefined, undefined);
+
+      expect(prisma.user.findMany).toHaveBeenCalledWith({
+        where: { id: { in: ['admin-1'] } },
+        select: { id: true, name: true },
+      });
+      expect(result.data[0]).toMatchObject({ actorName: 'Ada Admin' });
+    });
+
+    it('falls back to the raw actor id when that user has no name on file', async () => {
+      prisma.auditLog.findMany.mockResolvedValue([
+        { id: 'log-1', actorId: 'admin-1' },
+      ]);
+      prisma.user.findMany.mockResolvedValue([{ id: 'admin-1', name: null }]);
+
+      const result = await controller.list(undefined, undefined, undefined);
+
+      expect(result.data[0]).toMatchObject({ actorName: 'admin-1' });
+    });
+
+    it('falls back to the raw actor id when no matching user row exists at all', async () => {
+      prisma.auditLog.findMany.mockResolvedValue([
+        { id: 'log-1', actorId: 'admin-1' },
+      ]);
+      prisma.user.findMany.mockResolvedValue([]);
+
+      const result = await controller.list(undefined, undefined, undefined);
+
+      expect(result.data[0]).toMatchObject({ actorName: 'admin-1' });
+    });
+
+    it('does not query User at all when every entry is system-originated', async () => {
+      prisma.auditLog.findMany.mockResolvedValue([
+        { id: 'log-1', actorId: null },
+      ]);
+
+      await controller.list(undefined, undefined, undefined);
+
+      expect(prisma.user.findMany).not.toHaveBeenCalled();
     });
 
     it('filters by category when given', async () => {
