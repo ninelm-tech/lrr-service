@@ -10,7 +10,12 @@ import { toWhatsAppAddress } from '../common/phone.util';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { PrismaService } from '../prisma/prisma.service';
-import { Prisma, RescueRequestStatus, VehicleType } from '@prisma/client';
+import {
+  IssueType,
+  Prisma,
+  RescueRequestStatus,
+  VehicleType,
+} from '@prisma/client';
 import {
   getEligibleTruckClasses,
   formatVehicleType,
@@ -18,6 +23,7 @@ import {
 import { estimateEtaMinutes, rankQuotes } from './domain/quote-ranking';
 import {
   formatJobRef,
+  formatIssueType,
   buildMediaLinksSection,
 } from './domain/rescue-request-formatting';
 import { TwilioService } from '../integrations/twilio/twilio.service';
@@ -26,6 +32,7 @@ import { PlatformConfigService } from '../platform-config/platform-config.servic
 import { DispatchBoardRowDto } from './dto/rescue-request-response.dto';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { PendingOffer } from './dto/pending-offer.dto';
+import { QUOTE_SELECTION_WINDOW_MS } from './dispatch.constants';
 
 // ── Dispatch config ────────────────────────────────────────────────────────────
 const MAX_FAILED_ROUNDS_BEFORE_ALERT = Number(
@@ -97,6 +104,8 @@ export class DispatchService {
       destination: string;
       /** '' or 'Distance: X km\n' — trailing newline included, absent when there's nothing to show (manualOfferToOperator). */
       distanceLine: string;
+      /** '' or 'Issue: X\n' — trailing newline included, informational only. Freeform path only, see below. */
+      issueLine: string;
       location: string;
       /** '' or the '\n\n📎 Photos/Video/Audio:\n...' block from buildMediaLinksSection — used as-is. */
       mediaSection: string;
@@ -126,6 +135,13 @@ export class DispatchService {
         [variables.distanceLine.trim(), variables.etaLine.trim()]
           .filter(Boolean)
           .join('\n') || 'Distance: N/A';
+      // issueLine is intentionally NOT included here. The live `new_rescue_job`
+      // Content Template declares exactly 7 variables (see the comment
+      // above) — sending an 8th undeclared key fails the whole send with
+      // Twilio 21656, it does not degrade gracefully. Wire it in here only
+      // after the template itself has been updated/resubmitted to Meta to
+      // declare an 8th variable; until then it only reaches the freeform
+      // fallback message below.
       const templateVariables: Record<string, string> = {
         '1': variables.jobRef,
         '2': variables.vehicle,
@@ -153,7 +169,7 @@ export class DispatchService {
       // the message, the wording/order is what's already familiar to operators.
       await this.twilioService.sendWhatsAppMessage(
         to,
-        `🚨 *NEW RESCUE JOB* — Job #${variables.jobRef}\n\nVehicle: ${variables.vehicle}\nDestination: ${variables.destination}\n${variables.distanceLine}Location: ${variables.location}${variables.mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\n${variables.etaLine}Reply *NO* to decline.\nYou have ${variables.window} to respond.\n\n📌 If you have more than one job open at once, reply "${variables.jobRef} 25000" instead of just the price, so we know which job you mean.`,
+        `🚨 *NEW RESCUE JOB* — Job #${variables.jobRef}\n\nVehicle: ${variables.vehicle}\nDestination: ${variables.destination}\n${variables.issueLine}${variables.distanceLine}Location: ${variables.location}${variables.mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\n${variables.etaLine}Reply *NO* to decline.\nYou have ${variables.window} to respond.\n\n📌 If you have more than one job open at once, reply "${variables.jobRef} 25000" instead of just the price, so we know which job you mean.`,
       );
     }
   }
@@ -570,6 +586,7 @@ export class DispatchService {
       id: string;
       vehicleType: string | null;
       destination: string | null;
+      issueType: string | null;
       latitude: unknown;
       longitude: unknown;
     },
@@ -637,6 +654,9 @@ export class DispatchService {
       ? formatVehicleType(rescueRequest.vehicleType as VehicleType)
       : 'Unknown';
     const destinationLabel = rescueRequest.destination ?? 'Not specified';
+    const issueLine = rescueRequest.issueType
+      ? `Issue: ${formatIssueType(rescueRequest.issueType as IssueType)}\n`
+      : '';
 
     const mediaItems = await tx.requestMedia
       .findMany({ where: { rescueRequestId } })
@@ -659,6 +679,7 @@ export class DispatchService {
       vehicle: vehicleLabel,
       destination: destinationLabel,
       distanceLine: `Distance: ${op.distance.toFixed(1)} km\n`,
+      issueLine,
       location: locationSection,
       mediaSection,
       etaLine: `Est. ETA: ~${estimateEtaMinutes(op.distance)} min based on your registered location.\n`,
@@ -1086,6 +1107,9 @@ export class DispatchService {
       ? formatVehicleType(rescueRequest.vehicleType)
       : 'Unknown';
     const destinationLabel = rescueRequest.destination ?? 'Not specified';
+    const issueLine = rescueRequest.issueType
+      ? `Issue: ${formatIssueType(rescueRequest.issueType)}\n`
+      : '';
 
     const mediaItems = await this.prisma.requestMedia
       .findMany({
@@ -1108,6 +1132,7 @@ export class DispatchService {
         vehicle: vehicleLabel,
         destination: destinationLabel,
         distanceLine: '', // not computed for a manual single-operator offer
+        issueLine,
         location: locationSection,
         mediaSection,
         etaLine: '', // not computed for a manual single-operator offer
@@ -1140,6 +1165,12 @@ export class DispatchService {
       include: { customer: true },
     });
     if (!rescueRequest) return;
+    // A cancellation can land between the reconciler tick that triggered this
+    // call and this send — cancellation only closes out PENDING offers, so a
+    // QUOTED one (and this call) can otherwise outlive it. Re-check status
+    // right before the customer-facing send rather than trusting the
+    // caller's now-possibly-stale read.
+    if (rescueRequest.status !== RescueRequestStatus.DISPATCHING) return;
 
     const quotedOffers = await this.prisma.dispatchOffer.findMany({
       where: { rescueRequestId, status: 'QUOTED' },
@@ -1183,9 +1214,10 @@ export class DispatchService {
 
     const customerPhone = rescueRequest.customer.phoneNumber;
     if (customerPhone) {
+      const quoteSelectionMinutes = QUOTE_SELECTION_WINDOW_MS / 60_000;
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
-        `🚗 *Operator quotes received!*\n\n${lines.join('\n')}\n\n⚠️ *ACTION NEEDED* — reply with the number of your choice (e.g. "1") to select an operator.`,
+        `🚗 *Operator quotes received!*\n⏰ You have ${quoteSelectionMinutes} minutes to choose before this request is cancelled.\n\n${lines.join('\n')}\n\n⚠️ *ACTION NEEDED* — reply with the number of your choice (e.g. "1") to select an operator.`,
       );
     }
 

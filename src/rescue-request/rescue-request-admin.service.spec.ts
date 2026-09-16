@@ -875,10 +875,17 @@ describe('RescueRequestAdminService', () => {
   });
 
   describe('cancel', () => {
+    type DispatchOfferUpdateManyArgs = {
+      where: { rescueRequestId: string; status: string };
+      data: { status: string; respondedAt: Date };
+    };
+
     let service: RescueRequestAdminService;
     let prisma: {
       rescueRequest: { update: jest.Mock };
-      dispatchOffer: { updateMany: jest.Mock };
+      dispatchOffer: {
+        updateMany: jest.Mock<void, [DispatchOfferUpdateManyArgs]>;
+      };
     };
     let twilioService: { sendWhatsAppMessage: jest.Mock };
     let sessionStore: { clear: jest.Mock };
@@ -886,7 +893,9 @@ describe('RescueRequestAdminService', () => {
     beforeEach(async () => {
       prisma = {
         rescueRequest: { update: jest.fn() },
-        dispatchOffer: { updateMany: jest.fn() },
+        dispatchOffer: {
+          updateMany: jest.fn<void, [DispatchOfferUpdateManyArgs]>(),
+        },
       };
       twilioService = { sendWhatsAppMessage: jest.fn() };
       sessionStore = { clear: jest.fn() };
@@ -958,6 +967,116 @@ describe('RescueRequestAdminService', () => {
         where: { rescueRequestId: 'req-1', status: 'PENDING' },
         data: { status: 'TIMED_OUT', respondedAt: expect.any(Date) },
       });
+    });
+
+    it("closes out other operators' already-QUOTED offers too, not just PENDING — otherwise a leftover QUOTED row can still reach the customer after cancellation", async () => {
+      prisma.rescueRequest.update.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        status: 'CANCELLED',
+        customer: { id: 'cust-1', phoneNumber: '+2348012345678' },
+        media: [],
+        dispatchOffers: [],
+        payments: [],
+      });
+
+      await service.cancel('req-1', {});
+
+      const [, quotedCall] = prisma.dispatchOffer.updateMany.mock.calls;
+      expect(quotedCall[0].where).toEqual({
+        rescueRequestId: 'req-1',
+        status: 'QUOTED',
+      });
+      expect(quotedCall[0].data.status).toBe('NOT_SELECTED');
+      expect(quotedCall[0].data.respondedAt).toBeInstanceOf(Date);
+    });
+  });
+
+  describe('updateStatus', () => {
+    type DispatchOfferUpdateManyArgs = {
+      where: { rescueRequestId: string; status: string };
+      data: { status: string; respondedAt: Date };
+    };
+
+    let service: RescueRequestAdminService;
+    let prisma: {
+      rescueRequest: { update: jest.Mock };
+      dispatchOffer: {
+        updateMany: jest.Mock<void, [DispatchOfferUpdateManyArgs]>;
+      };
+    };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: { update: jest.fn() },
+        dispatchOffer: {
+          updateMany: jest.fn<void, [DispatchOfferUpdateManyArgs]>(),
+        },
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestAdminService,
+          { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          { provide: PaystackService, useValue: {} },
+          {
+            provide: TwilioService,
+            useValue: { sendWhatsAppMessage: jest.fn() },
+          },
+          { provide: PlatformConfigService, useValue: {} },
+          {
+            provide: PaymentEventsService,
+            useValue: { markJobCompleted: jest.fn() },
+          },
+          { provide: DispatchService, useValue: {} },
+          {
+            provide: RescueRequestSharedService,
+            useValue: { endRelayForEndedRequest: jest.fn() },
+          },
+          { provide: WhatsAppSessionStore, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<RescueRequestAdminService>(
+        RescueRequestAdminService,
+      );
+    });
+
+    it('closes out both PENDING and QUOTED offers when moving a request to CANCELLED', async () => {
+      prisma.rescueRequest.update.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        status: 'CANCELLED',
+        customer: { id: 'cust-1', phoneNumber: '+2348012345678' },
+        media: [],
+        dispatchOffers: [],
+        payments: [],
+      });
+
+      await service.updateStatus('req-1', { status: 'CANCELLED' });
+
+      const [pendingCall, quotedCall] =
+        prisma.dispatchOffer.updateMany.mock.calls;
+      expect(pendingCall[0].where).toEqual({
+        rescueRequestId: 'req-1',
+        status: 'PENDING',
+      });
+      expect(pendingCall[0].data.status).toBe('TIMED_OUT');
+      expect(pendingCall[0].data.respondedAt).toBeInstanceOf(Date);
+      expect(quotedCall[0].where).toEqual({
+        rescueRequestId: 'req-1',
+        status: 'QUOTED',
+      });
+      expect(quotedCall[0].data.status).toBe('NOT_SELECTED');
+      expect(quotedCall[0].data.respondedAt).toBeInstanceOf(Date);
     });
   });
 });

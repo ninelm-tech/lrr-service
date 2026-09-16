@@ -322,6 +322,14 @@ export class WhatsAppCustomerFlowService {
           where: { rescueRequestId: requestIdToCancel, status: 'PENDING' },
           data: { status: 'TIMED_OUT', respondedAt: new Date() },
         });
+        // Also close out any already-QUOTED offer — left as QUOTED, it
+        // outlives this cancellation and deliverQuoteShortlist would
+        // otherwise still find it on a later reconciler tick and send the
+        // customer a "pick a quote" message for a request they just cancelled.
+        await this.prisma.dispatchOffer.updateMany({
+          where: { rescueRequestId: requestIdToCancel, status: 'QUOTED' },
+          data: { status: 'NOT_SELECTED', respondedAt: new Date() },
+        });
         // Clearing this customer's session below drops their own relay, but
         // the operator's sits on a separate row and would survive.
         await this.sharedService.endRelayForEndedRequest(requestIdToCancel);
@@ -412,6 +420,28 @@ export class WhatsAppCustomerFlowService {
         );
       }
 
+      // The RescueRequest isn't created yet — issue type (asked next) is
+      // informational-only and never gates dispatch, but it must reach the
+      // operator's job offer, so it has to be on the row before dispatch
+      // ever starts. destination is carried in session until then.
+      await this.sessionStore.update(userId, {
+        destination,
+        state: WhatsAppFlowState.WAITING_FOR_ISSUE_TYPE,
+      });
+      return this.reply(
+        `📍 Got it!\n\nWhat's wrong with the vehicle?\n\n1️⃣ Breakdown\n2️⃣ Accident\n3️⃣ Flat tyre\n4️⃣ Fuel`,
+      );
+    }
+
+    // ── Step 3a: Waiting for issue type ────────────────────────────────────
+    if (session.state === WhatsAppFlowState.WAITING_FOR_ISSUE_TYPE) {
+      const issueType = this.mapIssueType(message);
+      if (!issueType) {
+        return this.reply(
+          `Please reply with a number 1-4 to select what's wrong:\n\n1️⃣ Breakdown\n2️⃣ Accident\n3️⃣ Flat tyre\n4️⃣ Fuel`,
+        );
+      }
+
       const customer =
         await this.sharedService.findOrCreateCustomer(phoneNumber);
       const rescueRequest = await this.prisma.rescueRequest.create({
@@ -421,12 +451,12 @@ export class WhatsAppCustomerFlowService {
           latitude: session.latitude,
           longitude: session.longitude,
           vehicleType: session.vehicleType as VehicleType,
-          destination,
+          destination: session.destination,
+          issueType,
         },
       });
 
       await this.sessionStore.update(userId, {
-        destination,
         rescueRequestId: rescueRequest.id,
         state: WhatsAppFlowState.WAITING_FOR_MEDIA,
       });

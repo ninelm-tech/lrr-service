@@ -13,6 +13,12 @@ export interface PendingOffer {
   destination: string;
   /** '' or 'Distance: X km\n' — trailing newline included. */
   distanceLine: string;
+  /**
+   * '' or 'Issue: X\n' — trailing newline included, informational only
+   * (never used to filter or route dispatch). Freeform-send only for now —
+   * see the comment on sendDispatchOfferMessage's templateVariables map.
+   */
+  issueLine: string;
   location: string;
   /** '' or the '\n\n📎 Photos/Video/Audio:\n...' block. */
   mediaSection: string;

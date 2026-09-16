@@ -999,6 +999,33 @@ describe('DispatchService', () => {
       expect(prisma.$transaction).toHaveBeenCalledTimes(1);
     });
 
+    it('includes the issue type in the freeform message when the request has one', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
+        issueType: 'FLAT_TYRE',
+      });
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1',
+        status: 'ACTIVE',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2349012345678',
+      });
+      prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
+
+      await manualService.manualOfferToOperator('req-1', 'op-1');
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.stringContaining('Issue: Flat Tyre'),
+      );
+    });
+
     it('adds its batch alongside an in-flight one instead of replacing it', async () => {
       // Previously this called supersedeActiveRound, which cancelled the
       // pending offers so only one round was ever live. Now both batches
@@ -1339,6 +1366,59 @@ describe('DispatchService', () => {
       ]);
     });
 
+    it('still sends exactly seven template variables even when the request has an issueType — issueLine must not leak into the template path until the Content Template itself declares an 8th slot', async () => {
+      process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID = 'HXtest789';
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
+        dispatchRound: 0,
+        offeredOperatorIds: [],
+        quoteCollectionDeadline: null,
+        biddingClosedAt: null,
+        issueType: 'FLAT_TYRE',
+      });
+
+      await batchService.startDispatch('req-1', 'cust-1');
+
+      const vars = twilioService.sendWhatsAppTemplateMessage.mock.calls[0][2];
+      expect(Object.keys(vars).sort()).toEqual([
+        '1',
+        '2',
+        '3',
+        '4',
+        '5',
+        '6',
+        '7',
+      ]);
+    });
+
+    it('includes the issue type in the freeform message when the request has one', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
+        dispatchRound: 0,
+        offeredOperatorIds: [],
+        quoteCollectionDeadline: null,
+        biddingClosedAt: null,
+        issueType: 'FLAT_TYRE',
+      });
+
+      await batchService.startDispatch('req-1', 'cust-1');
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.stringContaining('Issue: Flat Tyre'),
+      );
+    });
+
     it('no variable contains a newline, tab, 4+ consecutive spaces, or is empty — all are Twilio 21656 triggers', async () => {
       process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID = 'HXtest789';
       const prevApiBaseUrl = process.env.API_BASE_URL;
@@ -1426,6 +1506,91 @@ describe('DispatchService', () => {
         expect.any(String),
         expect.stringContaining('automatically cancelled'),
       );
+    });
+  });
+
+  describe('deliverQuoteShortlist', () => {
+    let service: DispatchService;
+    let prisma: {
+      rescueRequest: { findUnique: jest.Mock };
+      dispatchOffer: { findMany: jest.Mock };
+    };
+    let operatorService: { calculateDistance: jest.Mock };
+    let platformConfigService: { getConfig: jest.Mock };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
+    let sessionStore: { update: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: {
+          findUnique: jest.fn().mockResolvedValue({
+            id: 'req-1',
+            status: 'DISPATCHING',
+            latitude: 6.5,
+            longitude: 3.4,
+            customer: { phoneNumber: '+2348000000000' },
+          }),
+        },
+        dispatchOffer: {
+          findMany: jest.fn().mockResolvedValue([
+            {
+              id: 'offer-1',
+              operatorId: 'op-1',
+              quotedPrice: 1000000,
+              operator: {
+                businessName: 'Acme Towing',
+                latitude: 6.5,
+                longitude: 3.4,
+              },
+            },
+          ]),
+        },
+      };
+      operatorService = { calculateDistance: jest.fn().mockReturnValue(0) };
+      platformConfigService = {
+        getConfig: jest.fn().mockResolvedValue({ serviceFeePercent: 10 }),
+      };
+      twilioService = { sendWhatsAppMessage: jest.fn() };
+      sessionStore = { update: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          DispatchService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: OperatorService, useValue: operatorService },
+          { provide: PlatformConfigService, useValue: platformConfigService },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<DispatchService>(DispatchService);
+    });
+
+    it('leads the message with the 5-minute countdown, derived from QUOTE_SELECTION_WINDOW_MS', async () => {
+      await service.deliverQuoteShortlist('req-1', 'cust-1');
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        '+2348000000000',
+        '🚗 *Operator quotes received!*\n⏰ You have 5 minutes to choose before this request is cancelled.\n\n1️⃣ ₦11,000 · ETA 0 min · Acme Towing\n\n⚠️ *ACTION NEEDED* — reply with the number of your choice (e.g. "1") to select an operator.',
+      );
+    });
+
+    it('does not send anything when the request is no longer DISPATCHING (e.g. already cancelled) — closes the race where a stale QUOTED offer outlives a cancellation', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'CANCELLED',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: '+2348000000000' },
+      });
+
+      await service.deliverQuoteShortlist('req-1', 'cust-1');
+
+      expect(prisma.dispatchOffer.findMany).not.toHaveBeenCalled();
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+      expect(sessionStore.update).not.toHaveBeenCalled();
     });
   });
 });

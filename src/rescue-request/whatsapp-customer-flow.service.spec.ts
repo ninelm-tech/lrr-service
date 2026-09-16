@@ -17,7 +17,10 @@ import { DisputeService } from './dispute.service';
 import { PaymentEventsService } from './payment-events.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
-import { WhatsAppFlowState } from './state/whatsapp-session.types';
+import {
+  WhatsAppFlowState,
+  WhatsAppSession,
+} from './state/whatsapp-session.types';
 
 describe('WhatsAppCustomerFlowService', () => {
   describe('handleRatingReply', () => {
@@ -328,13 +331,11 @@ describe('WhatsAppCustomerFlowService', () => {
       );
 
       expect(geocodingService.reverseGeocode).not.toHaveBeenCalled();
-      expect(prisma.rescueRequest.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({
-            destination: 'Mechanic Village, Ojodu',
-          }),
-        }),
-      );
+      expect(prisma.rescueRequest.create).not.toHaveBeenCalled();
+      expect(sessionStore.update).toHaveBeenCalledWith(userId, {
+        destination: 'Mechanic Village, Ojodu',
+        state: WhatsAppFlowState.WAITING_FOR_ISSUE_TYPE,
+      });
     });
 
     it('reverse-geocodes a bare "current location" pin with no Address field', async () => {
@@ -355,13 +356,10 @@ describe('WhatsAppCustomerFlowService', () => {
       );
 
       expect(geocodingService.reverseGeocode).toHaveBeenCalledWith(6.6, 3.5);
-      expect(prisma.rescueRequest.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({
-            destination: '14 Adeniyi Jones Ave, Ikeja, Lagos',
-          }),
-        }),
-      );
+      expect(sessionStore.update).toHaveBeenCalledWith(userId, {
+        destination: '14 Adeniyi Jones Ave, Ikeja, Lagos',
+        state: WhatsAppFlowState.WAITING_FOR_ISSUE_TYPE,
+      });
     });
 
     it('falls back to raw coordinates when a pin is shared but geocoding fails', async () => {
@@ -379,15 +377,14 @@ describe('WhatsAppCustomerFlowService', () => {
         {},
       );
 
-      expect(prisma.rescueRequest.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({ destination: '6.6, 3.5' }),
-        }),
-      );
+      expect(sessionStore.update).toHaveBeenCalledWith(userId, {
+        destination: '6.6, 3.5',
+        state: WhatsAppFlowState.WAITING_FOR_ISSUE_TYPE,
+      });
     });
 
     it('still accepts typed text destinations unchanged', async () => {
-      await destService.handleCustomerMessage(
+      const result = await destService.handleCustomerMessage(
         phoneNumber,
         userId,
         'mainland towing yard',
@@ -400,13 +397,11 @@ describe('WhatsAppCustomerFlowService', () => {
       );
 
       expect(geocodingService.reverseGeocode).not.toHaveBeenCalled();
-      expect(prisma.rescueRequest.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({
-            destination: 'Mainland Towing Yard',
-          }),
-        }),
-      );
+      expect(sessionStore.update).toHaveBeenCalledWith(userId, {
+        destination: 'Mainland Towing Yard',
+        state: WhatsAppFlowState.WAITING_FOR_ISSUE_TYPE,
+      });
+      expect(result).toContain("What's wrong");
     });
 
     it('prompts again when neither text nor a pin is provided', async () => {
@@ -423,7 +418,140 @@ describe('WhatsAppCustomerFlowService', () => {
       );
 
       expect(prisma.rescueRequest.create).not.toHaveBeenCalled();
+      expect(sessionStore.update).not.toHaveBeenCalled();
       expect(result).toContain('type where you');
+    });
+  });
+
+  describe('WAITING_FOR_ISSUE_TYPE', () => {
+    let issueService: WhatsAppCustomerFlowService;
+    let prisma: {
+      rescueRequest: { create: jest.Mock };
+    };
+    let sessionStore: { update: jest.Mock };
+    let sharedService: { findOrCreateCustomer: jest.Mock };
+    const phoneNumber = '+2348012345678';
+    const userId = 'user-1';
+    const baseSession: WhatsAppSession = {
+      userId,
+      state: WhatsAppFlowState.WAITING_FOR_ISSUE_TYPE,
+      latitude: 6.5,
+      longitude: 3.4,
+      vehicleType: 'SEDAN',
+      destination: 'Mainland Towing Yard',
+      updatedAt: new Date(),
+    };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: { create: jest.fn().mockResolvedValue({ id: 'req-1' }) },
+      };
+      sessionStore = { update: jest.fn() };
+      sharedService = {
+        findOrCreateCustomer: jest.fn().mockResolvedValue({ id: 'cust-1' }),
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppCustomerFlowService,
+          { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          {
+            provide: TwilioService,
+            useValue: { sendWhatsAppMessage: jest.fn() },
+          },
+          { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PaystackService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: RescueRequestSharedService, useValue: sharedService },
+        ],
+      }).compile();
+
+      issueService = module.get<WhatsAppCustomerFlowService>(
+        WhatsAppCustomerFlowService,
+      );
+    });
+
+    it('reprompts on an unrecognized reply, without creating the request', async () => {
+      const result = await issueService.handleCustomerMessage(
+        phoneNumber,
+        userId,
+        'huh',
+        'huh',
+        undefined,
+        undefined,
+        undefined,
+        baseSession,
+        {},
+      );
+
+      expect(prisma.rescueRequest.create).not.toHaveBeenCalled();
+      expect(result).toContain('1-4');
+    });
+
+    it('creates the request with issueType and the destination carried over from session, then asks for media', async () => {
+      const result = await issueService.handleCustomerMessage(
+        phoneNumber,
+        userId,
+        '3',
+        '3',
+        undefined,
+        undefined,
+        undefined,
+        baseSession,
+        {},
+      );
+
+      expect(prisma.rescueRequest.create).toHaveBeenCalledWith({
+        data: {
+          customerId: 'cust-1',
+          status: 'WAITING_FOR_MEDIA',
+          latitude: 6.5,
+          longitude: 3.4,
+          vehicleType: 'SEDAN',
+          destination: 'Mainland Towing Yard',
+          issueType: 'FLAT_TYRE',
+        },
+      });
+      expect(sessionStore.update).toHaveBeenCalledWith(userId, {
+        rescueRequestId: 'req-1',
+        state: WhatsAppFlowState.WAITING_FOR_MEDIA,
+      });
+      expect(result).toContain('photo or video');
+    });
+
+    it('also accepts the word reply, not just the number', async () => {
+      await issueService.handleCustomerMessage(
+        phoneNumber,
+        userId,
+        'accident',
+        'accident',
+        undefined,
+        undefined,
+        undefined,
+        baseSession,
+        {},
+      );
+
+      expect(prisma.rescueRequest.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ issueType: 'ACCIDENT' }),
+        }),
+      );
     });
   });
 
@@ -821,6 +949,110 @@ describe('WhatsAppCustomerFlowService', () => {
       expect(paymentEventsService.markJobCompleted).toHaveBeenCalledWith(
         'req-1',
       );
+    });
+  });
+
+  describe('CANCEL active request', () => {
+    type DispatchOfferUpdateManyArgs = {
+      where: { rescueRequestId: string; status: string };
+      data: { status: string; respondedAt: Date };
+    };
+
+    let service: WhatsAppCustomerFlowService;
+    let prisma: {
+      rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
+      dispatchOffer: {
+        updateMany: jest.Mock<void, [DispatchOfferUpdateManyArgs]>;
+      };
+    };
+    let sessionStore: { clear: jest.Mock };
+    let sharedService: { endRelayForEndedRequest: jest.Mock };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: {
+          findUnique: jest.fn().mockResolvedValue({
+            id: 'req-1',
+            status: 'DISPATCHING',
+            assignedOperator: null,
+          }),
+          update: jest.fn(),
+        },
+        dispatchOffer: {
+          updateMany: jest.fn<void, [DispatchOfferUpdateManyArgs]>(),
+        },
+      };
+      sessionStore = { clear: jest.fn() };
+      sharedService = { endRelayForEndedRequest: jest.fn() };
+      twilioService = { sendWhatsAppMessage: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppCustomerFlowService,
+          { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PaystackService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: RescueRequestSharedService, useValue: sharedService },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppCustomerFlowService>(
+        WhatsAppCustomerFlowService,
+      );
+    });
+
+    it('closes out QUOTED offers on cancel too, not just PENDING ones — otherwise a leftover QUOTED row can still reach the customer after they cancelled', async () => {
+      const session: WhatsAppSession = {
+        userId: 'cust-1',
+        state: WhatsAppFlowState.IDLE,
+        rescueRequestId: 'req-1',
+        updatedAt: new Date(),
+      };
+
+      await service.handleCustomerMessage(
+        '+2348012345678',
+        'cust-1',
+        'cancel',
+        'cancel',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {},
+      );
+
+      const [pendingCall, quotedCall] =
+        prisma.dispatchOffer.updateMany.mock.calls;
+      expect(pendingCall[0].where).toEqual({
+        rescueRequestId: 'req-1',
+        status: 'PENDING',
+      });
+      expect(pendingCall[0].data.status).toBe('TIMED_OUT');
+      expect(pendingCall[0].data.respondedAt).toBeInstanceOf(Date);
+      expect(quotedCall[0].where).toEqual({
+        rescueRequestId: 'req-1',
+        status: 'QUOTED',
+      });
+      expect(quotedCall[0].data.status).toBe('NOT_SELECTED');
+      expect(quotedCall[0].data.respondedAt).toBeInstanceOf(Date);
     });
   });
 });

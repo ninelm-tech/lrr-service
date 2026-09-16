@@ -459,6 +459,12 @@ export class RescueRequestAdminService {
         where: { rescueRequestId: id, status: 'PENDING' },
         data: { status: 'TIMED_OUT', respondedAt: new Date() },
       });
+      // Also close out any already-QUOTED offer — see the identical comment
+      // in cancel() below for why leaving it QUOTED is unsafe.
+      await this.prisma.dispatchOffer.updateMany({
+        where: { rescueRequestId: id, status: 'QUOTED' },
+        data: { status: 'NOT_SELECTED', respondedAt: new Date() },
+      });
     }
     return { data: this.mapToDetailDto(updated) };
   }
@@ -483,6 +489,14 @@ export class RescueRequestAdminService {
     await this.prisma.dispatchOffer.updateMany({
       where: { rescueRequestId: id, status: 'PENDING' },
       data: { status: 'TIMED_OUT', respondedAt: new Date() },
+    });
+    // Also close out any already-QUOTED offer — left QUOTED, it outlives
+    // this cancellation and deliverQuoteShortlist would otherwise still
+    // find it on a later reconciler tick and send the customer a "pick a
+    // quote" message for a request they just cancelled.
+    await this.prisma.dispatchOffer.updateMany({
+      where: { rescueRequestId: id, status: 'QUOTED' },
+      data: { status: 'NOT_SELECTED', respondedAt: new Date() },
     });
 
     // An open chat relay outlives session state and would leave both
