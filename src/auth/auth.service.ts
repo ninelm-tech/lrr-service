@@ -15,7 +15,7 @@ import { AuditLogService } from '../audit-log/audit-log.service';
 
 export interface JwtPayload {
   sub: string;
-  email: string;
+  email: string | null;
   role: UserRole;
 }
 
@@ -23,7 +23,7 @@ export interface AuthResponse {
   accessToken: string;
   user: {
     id: string;
-    email: string;
+    email: string | null;
     name: string | null;
     role: UserRole;
   };
@@ -56,7 +56,11 @@ export class AuthService {
   /**
    * Generate JWT token
    */
-  generateToken(user: { id: string; email: string; role: UserRole }): string {
+  generateToken(user: {
+    id: string;
+    email: string | null;
+    role: UserRole;
+  }): string {
     const payload: JwtPayload = {
       sub: user.id,
       email: user.email,
@@ -94,7 +98,7 @@ export class AuthService {
 
     const accessToken = this.generateToken({
       id: user.id,
-      email: user.email!,
+      email: user.email,
       role: user.role,
     });
 
@@ -102,7 +106,7 @@ export class AuthService {
       accessToken,
       user: {
         id: user.id,
-        email: user.email!,
+        email: user.email,
         name: user.name,
         role: user.role,
       },
@@ -125,7 +129,7 @@ export class AuthService {
     temporaryPassword: string;
   }): Promise<{
     id: string;
-    email: string;
+    email: string | null;
     name: string | null;
     role: UserRole;
   }> {
@@ -149,7 +153,7 @@ export class AuthService {
 
     return {
       id: user.id,
-      email: user.email!,
+      email: user.email,
       name: user.name,
       role: user.role,
     };
@@ -197,7 +201,7 @@ export class AuthService {
           accessToken,
           user: {
             id: updated.id,
-            email: updated.email!,
+            email: updated.email,
             name: updated.name,
             role: updated.role,
           },
@@ -254,7 +258,7 @@ export class AuthService {
       accessToken,
       user: {
         id: user.id,
-        email: user.email!,
+        email: user.email,
         name: user.name,
         role: user.role,
       },
