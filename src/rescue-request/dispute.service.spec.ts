@@ -12,6 +12,7 @@ describe('DisputeService', () => {
   let service: DisputeService;
   let prisma: {
     rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
+    payment: { findFirst: jest.Mock };
   };
   let twilioService: {
     sendWhatsAppMessage: jest.Mock;
@@ -31,6 +32,7 @@ describe('DisputeService', () => {
     delete process.env.TWILIO_DISPUTE_TEMPLATE_SID;
     prisma = {
       rescueRequest: { findUnique: jest.fn(), update: jest.fn() },
+      payment: { findFirst: jest.fn().mockResolvedValue(null) },
     };
     twilioService = {
       sendWhatsAppMessage: jest.fn(),
@@ -300,6 +302,26 @@ describe('DisputeService', () => {
         paymentEventsService.sendBalancePaymentLink,
       ).not.toHaveBeenCalled();
       expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+
+    it('rejects when the balance was already paid in full — a reopened dispute must not collect a second payment', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: rescueRequestId,
+        disputed: true,
+        disputeResolvedAt: null,
+        balanceAmount: 45000,
+        customer: { phoneNumber: customerPhone },
+        assignedOperator: { phoneNumber: operatorPhone },
+      });
+      prisma.payment.findFirst.mockResolvedValue({ id: 'pay-1' });
+
+      await expect(
+        service.resolveDispute(rescueRequestId, 'note', 10),
+      ).rejects.toThrow('already been paid in full');
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+      expect(
+        paymentEventsService.sendBalancePaymentLink,
+      ).not.toHaveBeenCalled();
     });
 
     it('resolves with no adjustment: settled balance equals the original, snapshot still written', async () => {

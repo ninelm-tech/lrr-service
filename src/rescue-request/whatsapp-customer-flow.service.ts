@@ -173,26 +173,11 @@ export class WhatsAppCustomerFlowService {
     if (session.state === WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM) {
       if (message === 'confirm') {
         if (session.rescueRequestId) {
-          // Defense in depth: a session can end up stale (pointed at a
-          // request that's already CANCELLED/COMPLETED) for reasons other
-          // than the specific admin-cancel bug this used to hit — self-heal
-          // here rather than assuming every failure means "still disputed."
-          const current = await this.prisma.rescueRequest.findUnique({
-            where: { id: session.rescueRequestId },
-            select: { status: true, disputeResolvedAt: true },
-          });
-          if (
-            current?.status === RescueRequestStatus.CANCELLED ||
-            current?.status === RescueRequestStatus.COMPLETED
-          ) {
-            await this.sessionStore.update(userId, {
-              state: WhatsAppFlowState.IDLE,
-              rescueRequestId: undefined,
-            });
-            return this.reply(
-              `This request has already ended. Send SOS if you need assistance again.`,
-            );
-          }
+          const check = await this.checkRequestStillOpen(
+            userId,
+            session.rescueRequestId,
+          );
+          if (check.ended) return check.twiml;
 
           try {
             await this.paymentEventsService.markJobCompleted(
@@ -209,7 +194,7 @@ export class WhatsAppCustomerFlowService {
             // settlement link; this CONFIRM must not send a second one).
             if (err instanceof BadRequestException) {
               return this.reply(
-                current?.disputeResolvedAt
+                check.disputeResolvedAt
                   ? `Your dispute has been resolved — please use the payment link we already sent to complete payment.`
                   : `This request is still under dispute review — our team will follow up before you can confirm completion.`,
               );
@@ -221,6 +206,19 @@ export class WhatsAppCustomerFlowService {
       }
       if (message === 'dispute') {
         if (session.rescueRequestId) {
+          // Same self-heal as CONFIRM, above: without it, a delayed or
+          // duplicated WhatsApp delivery of DISPUTE can land after the
+          // request already ended (paid in full, cancelled) and reopen it —
+          // raiseDispute() has no status check of its own, and a staff
+          // member resolving that reopened dispute would send a brand-new
+          // balance payment link for a request that was already settled,
+          // charging the customer a second time.
+          const check = await this.checkRequestStillOpen(
+            userId,
+            session.rescueRequestId,
+          );
+          if (check.ended) return check.twiml;
+
           await this.disputeService.raiseDispute(
             session.rescueRequestId,
             phoneNumber,
@@ -1118,6 +1116,43 @@ export class WhatsAppCustomerFlowService {
       fuel: 'FUEL',
     };
     return map[message];
+  }
+
+  /**
+   * Guards the CONFIRM/DISPUTE branch against a stale AWAITING_COMPLETION_CONFIRM
+   * session pointed at a request that already ended (paid in full,
+   * cancelled) — self-heals the session and returns the TwiML to reply
+   * with immediately. `disputeResolvedAt` is returned alongside for
+   * CONFIRM's own unrelated use (phrasing its "still disputed" message);
+   * it plays no part in the ended check itself.
+   */
+  private async checkRequestStillOpen(
+    userId: string,
+    rescueRequestId: string,
+  ): Promise<
+    | { ended: true; twiml: string }
+    | { ended: false; disputeResolvedAt: Date | null }
+  > {
+    const current = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      select: { status: true, disputeResolvedAt: true },
+    });
+    if (
+      current?.status === RescueRequestStatus.CANCELLED ||
+      current?.status === RescueRequestStatus.COMPLETED
+    ) {
+      await this.sessionStore.update(userId, {
+        state: WhatsAppFlowState.IDLE,
+        rescueRequestId: undefined,
+      });
+      return {
+        ended: true,
+        twiml: this.reply(
+          `This request has already ended. Send SOS if you need assistance again.`,
+        ),
+      };
+    }
+    return { ended: false, disputeResolvedAt: current?.disputeResolvedAt ?? null };
   }
 
   private reply(message: string): string {

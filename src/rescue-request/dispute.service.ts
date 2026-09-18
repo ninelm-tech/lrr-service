@@ -5,7 +5,11 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { RescueRequestStatus } from '@prisma/client';
+import {
+  PaymentStatus,
+  PaymentType,
+  RescueRequestStatus,
+} from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
@@ -215,6 +219,27 @@ export class DisputeService {
     if (rescueRequest.disputeResolvedAt) {
       // Already resolved — safe to call again, no-op.
       return { resolved: true };
+    }
+
+    // A dispute can be reopened (see raiseDispute's isReopen branch) after
+    // its balance was already collected in full — this endpoint is only
+    // meant to adjust an UNPAID balance before it's charged. Sending a new
+    // settlement link on top of one already paid would charge the customer
+    // a second time, which is exactly what happened before this check
+    // existed. If a refund is owed here, issue it directly rather than
+    // through dispute resolution.
+    const alreadyPaid = await this.prisma.payment.findFirst({
+      where: {
+        rescueRequestId,
+        type: PaymentType.BALANCE,
+        status: PaymentStatus.SUCCEEDED,
+      },
+      select: { id: true },
+    });
+    if (alreadyPaid) {
+      throw new BadRequestException(
+        'This request\'s balance has already been paid in full — resolving the dispute again would collect a second payment. Issue a refund directly instead.',
+      );
     }
 
     const originalBalance = rescueRequest.balanceAmount ?? 0;

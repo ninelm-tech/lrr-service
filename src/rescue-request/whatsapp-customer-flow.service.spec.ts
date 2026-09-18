@@ -826,11 +826,13 @@ describe('WhatsAppCustomerFlowService', () => {
     let prisma: { rescueRequest: { findUnique: jest.Mock } };
     let sessionStore: { update: jest.Mock };
     let paymentEventsService: { markJobCompleted: jest.Mock };
+    let disputeService: { raiseDispute: jest.Mock };
 
     beforeEach(async () => {
       prisma = { rescueRequest: { findUnique: jest.fn() } };
       sessionStore = { update: jest.fn() };
       paymentEventsService = { markJobCompleted: jest.fn() };
+      disputeService = { raiseDispute: jest.fn() };
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
@@ -855,7 +857,7 @@ describe('WhatsAppCustomerFlowService', () => {
           { provide: PlatformConfigService, useValue: {} },
           { provide: OperatorService, useValue: {} },
           { provide: DispatchService, useValue: {} },
-          { provide: DisputeService, useValue: {} },
+          { provide: DisputeService, useValue: disputeService },
           { provide: PaymentEventsService, useValue: paymentEventsService },
           { provide: WhatsAppSessionStore, useValue: sessionStore },
           { provide: RescueRequestSharedService, useValue: {} },
@@ -948,6 +950,91 @@ describe('WhatsAppCustomerFlowService', () => {
 
       expect(paymentEventsService.markJobCompleted).toHaveBeenCalledWith(
         'req-1',
+      );
+    });
+
+    it('DISPUTE self-heals a stale session pointed at a CANCELLED request instead of reopening the dispute', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        status: 'CANCELLED',
+        disputeResolvedAt: null,
+      });
+      const session = {
+        state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
+        rescueRequestId: 'req-1',
+      } as any;
+
+      const result = await service.handleCustomerMessage(
+        '+2348012345678',
+        'cust-1',
+        'dispute',
+        'dispute',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {},
+      );
+
+      expect(disputeService.raiseDispute).not.toHaveBeenCalled();
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
+        state: WhatsAppFlowState.IDLE,
+        rescueRequestId: undefined,
+      });
+      expect(result).toContain('already ended');
+    });
+
+    it('DISPUTE self-heals a stale session pointed at a COMPLETED request — this is the exact gap that let a paid-in-full request be re-disputed and double-charged', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        status: 'COMPLETED',
+        disputeResolvedAt: null,
+      });
+      const session = {
+        state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
+        rescueRequestId: 'req-1',
+      } as any;
+
+      const result = await service.handleCustomerMessage(
+        '+2348012345678',
+        'cust-1',
+        'dispute',
+        'dispute',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {},
+      );
+
+      expect(disputeService.raiseDispute).not.toHaveBeenCalled();
+      expect(result).toContain('already ended');
+    });
+
+    it('DISPUTE proceeds normally when the request is still active', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        status: 'ARRIVED',
+        disputeResolvedAt: null,
+      });
+      const session = {
+        state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
+        rescueRequestId: 'req-1',
+      } as any;
+
+      await service.handleCustomerMessage(
+        '+2348012345678',
+        'cust-1',
+        'dispute',
+        'dispute',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {},
+      );
+
+      expect(disputeService.raiseDispute).toHaveBeenCalledWith(
+        'req-1',
+        '+2348012345678',
+        'cust-1',
       );
     });
   });
