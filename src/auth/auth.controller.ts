@@ -9,6 +9,7 @@ import {
   Query,
   BadRequestException,
 } from '@nestjs/common';
+import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { UserRole } from '@prisma/client';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
@@ -22,6 +23,10 @@ import { SendLoginCodeDto, VerifyLoginCodeDto } from './dto/login-otp.dto';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import type { AuthenticatedRequest } from './authenticated-request.interface';
 import { normalizePhone } from '../common/phone.util';
+import {
+  SMS_TRIGGER_THROTTLE_LIMIT,
+  SMS_TRIGGER_THROTTLE_TTL_MS,
+} from '../common/sms-throttle.constants';
 
 export class UpdateProfileDto {
   name?: string;
@@ -131,7 +136,18 @@ export class AuthController {
    * Request a phone+OTP login code (OPERATOR only — see
    * OtpService.sendLoginCode). Response is always the same generic shape,
    * never reveals whether an account was found or is eligible.
+   *
+   * Unauthenticated by design (it's the login entry point) and accepts any
+   * phone number — per-IP throttled on top of OtpService's per-phone-number
+   * cap. See common/sms-throttle.constants.ts.
    */
+  @UseGuards(ThrottlerGuard)
+  @Throttle({
+    default: {
+      limit: SMS_TRIGGER_THROTTLE_LIMIT,
+      ttl: SMS_TRIGGER_THROTTLE_TTL_MS,
+    },
+  })
   @Post('login/otp/send')
   async sendLoginCode(@Body() dto: SendLoginCodeDto) {
     return this.authService.sendLoginCode(normalizePhone(dto.phoneNumber));

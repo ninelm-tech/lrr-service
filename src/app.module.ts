@@ -21,6 +21,11 @@ import { SentryInterceptor } from './common/sentry.interceptor';
     ConfigModule.forRoot({
       isGlobal: true,
     }),
+    // ThrottlerModule's storage/tracker infrastructure (a @Global()
+    // registration, per @nestjs/throttler) is registered in OtpModule, not
+    // here — see the comment there for why. Nothing is throttled by default;
+    // OtpModule and AuthModule apply ThrottlerGuard locally to their two
+    // SMS-triggering routes only.
     IntegrationsModule,
     PrismaModule,
     AuthModule,

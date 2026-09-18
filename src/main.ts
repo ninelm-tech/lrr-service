@@ -3,13 +3,35 @@ import 'dotenv/config';
 import './instrument';
 import * as Sentry from '@sentry/node';
 import { NestFactory } from '@nestjs/core';
+import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
   // rawBody: true preserves the exact request bytes on req.rawBody alongside
   // the parsed body — required to verify the Paystack webhook HMAC signature,
   // which is computed over Paystack's original bytes, not a re-serialized copy.
-  const app = await NestFactory.create(AppModule, { rawBody: true });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    rawBody: true,
+  });
+
+  // This service runs on AWS ECS Fargate behind an ALB, with the ALB as the
+  // single reverse-proxy hop directly in front of this task (no CDN/extra
+  // proxy layer in between, as is typical for a backend API that isn't
+  // serving public/cacheable content). Trusting exactly 1 hop makes Express's
+  // req.ip — which @nestjs/throttler's default per-IP throttling (see
+  // OtpModule/AuthModule ThrottlerGuard usage) relies on — read the real
+  // client IP from the X-Forwarded-For header the ALB sets, rather than the
+  // ALB's own IP for every request. `true` is deliberately avoided: it trusts
+  // the entire X-Forwarded-For chain, which would let a malicious client
+  // spoof their own IP by prepending fake entries to that header.
+  //
+  // CAVEAT: the "1" here is inferred from the known deployment topology
+  // (client -> ALB -> this ECS task), not verified from code. If an
+  // additional proxy layer (e.g. CloudFront) sits between the ALB and this
+  // service, this value needs to increase accordingly — confirm the actual
+  // hop count with whoever owns the infrastructure before relying on this
+  // for rate-limiting/logging correctness.
+  app.set('trust proxy', 1);
 
   const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
 
