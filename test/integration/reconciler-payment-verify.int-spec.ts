@@ -367,9 +367,13 @@ describe('PaymentVerifyCheck (integration)', () => {
       expect((await reload(payment.id)).status).toBe('FAILED');
     });
 
-    it('never fails a collection whose URL the customer may hold — resends and waits', async () => {
+    it('never fails a BALANCE collection whose URL the customer may hold — resends and waits', async () => {
+      // BALANCE, not DEPOSIT: BALANCE has no other reminder mechanism, so
+      // this check is its only nudge. DEPOSIT is covered separately below —
+      // deposit-reminder.check.ts owns that reminder on its own ladder, and
+      // this check resending it too was firing duplicate messages.
       const { request } = await seedRequest();
-      const payment = await submittedPayment('DEPOSIT', request.id, {
+      const payment = await submittedPayment('BALANCE', request.id, {
         checkoutUrl: 'https://paystack.test/pay/x',
       });
       paystack.verifyTransaction.mockResolvedValue({
@@ -389,6 +393,27 @@ describe('PaymentVerifyCheck (integration)', () => {
         expect.any(String),
         expect.stringContaining('https://paystack.test/pay/x'),
       );
+    });
+
+    it('never fails a DEPOSIT collection either, but never resends — deposit-reminder.check.ts owns that reminder', async () => {
+      const { request } = await seedRequest();
+      const payment = await submittedPayment('DEPOSIT', request.id, {
+        checkoutUrl: 'https://paystack.test/pay/x',
+      });
+      paystack.verifyTransaction.mockResolvedValue({
+        outcome: 'ok',
+        data: { status: 'abandoned', id: 1, amount: 500_000 },
+      });
+      const before = await reload(payment.id);
+
+      await check.run(future());
+
+      const after = await reload(payment.id);
+      expect(after.status).toBe('SUBMITTED');
+      expect(after.verifyAfter.getTime()).toBeGreaterThan(
+        before.verifyAfter.getTime(),
+      );
+      expect(twilio.sendWhatsAppMessage).not.toHaveBeenCalled();
     });
 
     it('backs off on an ambiguous verify rather than guessing', async () => {
