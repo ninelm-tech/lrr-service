@@ -1,6 +1,11 @@
 import { Injectable } from '@nestjs/common';
 import * as Sentry from '@sentry/node';
-import { Payment, PaymentStatus, PaymentType } from '@prisma/client';
+import {
+  Payment,
+  PaymentStatus,
+  PaymentType,
+  RescueRequestStatus,
+} from '@prisma/client';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { PaystackService } from '../../../integrations/paystack/paystack.service';
 import { TwilioService } from '../../../integrations/twilio/twilio.service';
@@ -349,10 +354,38 @@ export class PaymentVerifyCheck implements ReconcilerCheck {
       return;
     }
 
-    // They may still hold the link. Re-send it and wait. NEVER fail this
-    // branch — they could pay a link written off, leaving money received
-    // against a dead row.
-    await this.resendCheckoutLink(payment);
+    // Keep polling either way. Paystack won't reissue a URL for this
+    // reference, so if the customer completes payment after their request
+    // closed, we still need the poll (or the webhook, whichever arrives
+    // first) to catch it and flag it for refund. NEVER fail this branch —
+    // they could pay a link written off, leaving money received against a
+    // dead row.
+    //
+    // What's NOT unconditional is telling them to pay.
+    //
+    // DEPOSIT never resends from here: deposit-reminder.check.ts already
+    // owns the customer-facing reminder, on the correct 25/15/5-minutes-left
+    // ladder tied to depositWindowExpiresAt. Resending here too was pure
+    // duplication on an unrelated schedule (this check's own exponential
+    // backoff from createdAt) — the source of near-duplicate messages
+    // minutes apart during a perfectly normal, still-open window, and of
+    // messages that kept going for hours after the window (and the request)
+    // had already closed, since this schedule doesn't know about either.
+    //
+    // BALANCE has no equivalent ladder, so it keeps this as its only
+    // reminder — but only while the request hasn't been CANCELLED. `cancel()`
+    // has no status guard (see rescue-request-admin.service.ts), so a
+    // COMPLETED request with a pending balance can be cancelled too, and
+    // paying now wouldn't un-cancel it any more than a dead deposit would.
+    if (payment.type === PaymentType.BALANCE) {
+      const request = await this.prisma.rescueRequest.findUnique({
+        where: { id: payment.rescueRequestId },
+        select: { status: true },
+      });
+      if (request?.status !== RescueRequestStatus.CANCELLED) {
+        await this.resendCheckoutLink(payment);
+      }
+    }
     await this.paymentLedger.backOff(payment.id, now);
   }
 
