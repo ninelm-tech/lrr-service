@@ -42,13 +42,12 @@ export class OtpService {
       where: { phoneNumber },
     });
 
-    if (!existingUser) {
-      return { required: false, available: true };
-    }
-    if (existingUser.role !== UserRole.CUSTOMER) {
+    if (existingUser && existingUser.role !== UserRole.CUSTOMER) {
       return { required: false, available: false };
     }
 
+    // Brand-new phone (fresh operator signup) or an existing CUSTOMER
+    // (upgrade path) — both now verify ownership before proceeding.
     await this.sendCodeToPhone(phoneNumber, 'verification code');
     return { required: true };
   }

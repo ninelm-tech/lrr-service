@@ -41,13 +41,18 @@ describe('OtpService', () => {
   });
 
   describe('sendCode', () => {
-    it('responds required:false, available:true and sends nothing for a fresh number', async () => {
+    it('sends a code and responds required:true for a brand-new phone (no account yet)', async () => {
       prisma.user.findUnique.mockResolvedValue(null);
+      prisma.phoneVerification.findMany.mockResolvedValue([]);
+      prisma.phoneVerification.create.mockResolvedValue({ id: 'pv-1' });
 
       const result = await service.sendCode('+2348012345678');
 
-      expect(result).toEqual({ required: false, available: true });
-      expect(termiiService.sendSms).not.toHaveBeenCalled();
+      expect(result).toEqual({ required: true });
+      expect(termiiService.sendSms).toHaveBeenCalledWith(
+        expect.stringContaining('+2348012345678'),
+        expect.stringContaining('verification code'),
+      );
     });
 
     it('responds required:false, available:false for an existing OPERATOR/ADMIN number, sends nothing', async () => {
