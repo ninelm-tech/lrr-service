@@ -1152,7 +1152,10 @@ export class WhatsAppCustomerFlowService {
         ),
       };
     }
-    return { ended: false, disputeResolvedAt: current?.disputeResolvedAt ?? null };
+    return {
+      ended: false,
+      disputeResolvedAt: current?.disputeResolvedAt ?? null,
+    };
   }
 
   private reply(message: string): string {

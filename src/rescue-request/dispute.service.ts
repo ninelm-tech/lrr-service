@@ -238,7 +238,7 @@ export class DisputeService {
     });
     if (alreadyPaid) {
       throw new BadRequestException(
-        'This request\'s balance has already been paid in full — resolving the dispute again would collect a second payment. Issue a refund directly instead.',
+        "This request's balance has already been paid in full — resolving the dispute again would collect a second payment. Issue a refund directly instead.",
       );
     }
 
