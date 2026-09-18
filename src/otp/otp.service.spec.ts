@@ -1,7 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { OtpService } from './otp.service';
 import { PrismaService } from '../prisma/prisma.service';
-import { TwilioService } from '../integrations/twilio/twilio.service';
+import { TermiiService } from '../integrations/termii/termii.service';
 import { UserRole } from '@prisma/client';
 
 describe('OtpService', () => {
@@ -15,7 +15,7 @@ describe('OtpService', () => {
       update: jest.Mock;
     };
   };
-  let twilioService: { sendWhatsAppMessage: jest.Mock };
+  let termiiService: { sendSms: jest.Mock };
 
   beforeEach(async () => {
     prisma = {
@@ -27,13 +27,13 @@ describe('OtpService', () => {
         update: jest.fn(),
       },
     };
-    twilioService = { sendWhatsAppMessage: jest.fn() };
+    termiiService = { sendSms: jest.fn() };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         OtpService,
         { provide: PrismaService, useValue: prisma },
-        { provide: TwilioService, useValue: twilioService },
+        { provide: TermiiService, useValue: termiiService },
       ],
     }).compile();
 
@@ -47,7 +47,7 @@ describe('OtpService', () => {
       const result = await service.sendCode('+2348012345678');
 
       expect(result).toEqual({ required: false, available: true });
-      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+      expect(termiiService.sendSms).not.toHaveBeenCalled();
     });
 
     it('responds required:false, available:false for an existing OPERATOR/ADMIN number, sends nothing', async () => {
@@ -59,7 +59,7 @@ describe('OtpService', () => {
       const result = await service.sendCode('+2348012345678');
 
       expect(result).toEqual({ required: false, available: false });
-      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+      expect(termiiService.sendSms).not.toHaveBeenCalled();
     });
 
     it('sends a code and responds required:true for an existing CUSTOMER number', async () => {
@@ -73,7 +73,7 @@ describe('OtpService', () => {
       const result = await service.sendCode('+2348012345678');
 
       expect(result).toEqual({ required: true });
-      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+      expect(termiiService.sendSms).toHaveBeenCalledWith(
         expect.stringContaining('+2348012345678'),
         expect.stringContaining('verification code'),
       );
@@ -89,7 +89,7 @@ describe('OtpService', () => {
       ]); // sent seconds ago
 
       await expect(service.sendCode('+2348012345678')).rejects.toThrow('wait');
-      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+      expect(termiiService.sendSms).not.toHaveBeenCalled();
     });
 
     it('rejects when the per-window send cap is hit', async () => {
@@ -107,7 +107,7 @@ describe('OtpService', () => {
       await expect(service.sendCode('+2348012345678')).rejects.toThrow(
         'Too many',
       );
-      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+      expect(termiiService.sendSms).not.toHaveBeenCalled();
     });
   });
 
@@ -118,7 +118,7 @@ describe('OtpService', () => {
       const result = await service.sendPasswordResetCode('+2348012345678');
 
       expect(result).toEqual({ required: false });
-      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+      expect(termiiService.sendSms).not.toHaveBeenCalled();
     });
 
     it('responds required:false and sends nothing when the account has no portal password', async () => {
@@ -131,7 +131,7 @@ describe('OtpService', () => {
       const result = await service.sendPasswordResetCode('+2348012345678');
 
       expect(result).toEqual({ required: false });
-      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+      expect(termiiService.sendSms).not.toHaveBeenCalled();
     });
 
     it('sends a code for any role that has a portal password, not just CUSTOMER', async () => {
@@ -146,7 +146,7 @@ describe('OtpService', () => {
       const result = await service.sendPasswordResetCode('+2348012345678');
 
       expect(result).toEqual({ required: true });
-      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+      expect(termiiService.sendSms).toHaveBeenCalledWith(
         expect.stringContaining('+2348012345678'),
         expect.stringContaining('password reset code'),
       );
@@ -165,7 +165,7 @@ describe('OtpService', () => {
       await expect(
         service.sendPasswordResetCode('+2348012345678'),
       ).rejects.toThrow('wait');
-      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+      expect(termiiService.sendSms).not.toHaveBeenCalled();
     });
   });
 

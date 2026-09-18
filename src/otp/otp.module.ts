@@ -1,10 +1,10 @@
 import { Module } from '@nestjs/common';
 import { OtpService } from './otp.service';
 import { OtpController } from './otp.controller';
-import { TwilioModule } from '../integrations/twilio/twilio.module';
+import { TermiiModule } from '../integrations/termii/termii.module';
 
 @Module({
-  imports: [TwilioModule],
+  imports: [TermiiModule],
   providers: [OtpService],
   controllers: [OtpController],
   exports: [OtpService],

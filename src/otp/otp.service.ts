@@ -1,8 +1,7 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
-import { TwilioService } from '../integrations/twilio/twilio.service';
-import { toWhatsAppAddress } from '../common/phone.util';
+import { TermiiService } from '../integrations/termii/termii.service';
 import { UserRole } from '@prisma/client';
 
 const CODE_TTL_MS = 10 * 60 * 1000;
@@ -28,7 +27,7 @@ function generateToken(): string {
 export class OtpService {
   constructor(
     private readonly prisma: PrismaService,
-    private readonly twilioService: TwilioService,
+    private readonly termiiService: TermiiService,
   ) {}
 
   /** Exposed only so tests can compute a matching codeHash without duplicating the hash fn. */
@@ -109,8 +108,8 @@ export class OtpService {
       },
     });
 
-    await this.twilioService.sendWhatsAppMessage(
-      toWhatsAppAddress(phoneNumber),
+    await this.termiiService.sendSms(
+      phoneNumber,
       `Your LRR ${label} is ${code}. It expires in 10 minutes.`,
     );
   }
