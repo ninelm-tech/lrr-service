@@ -66,15 +66,6 @@ export interface OperatorStatsWithRating extends OperatorStats {
 
 @Injectable()
 export class OperatorService {
-  // Flip to true once the WhatsApp OTP Authentication template is approved
-  // by Meta. Until then, sending the OTP code fails on any real (non-
-  // sandbox) number, so this stays off — an existing customer's number
-  // gets the same hard block as any other duplicate-account attempt,
-  // exactly the behavior before this feature existed. No silent bypass:
-  // turning this off never skips verification, it disables the upgrade
-  // path entirely.
-  private readonly otpUpgradeEnabled = false;
-
   constructor(
     private readonly prisma: PrismaService,
     private readonly paystackService: PaystackService,
@@ -111,12 +102,9 @@ export class OperatorService {
     const existingByPhone = await this.prisma.user.findUnique({
       where: { phoneNumber: personalPhone },
     });
-    // email is required on CreateOperatorDto today — always a real string
-    // here. If email ever becomes optional, this lookup must be skipped
-    // when absent rather than passed through.
-    const existingByEmail = await this.prisma.user.findUnique({
-      where: { email: data.email },
-    });
+    const existingByEmail = data.email
+      ? await this.prisma.user.findUnique({ where: { email: data.email } })
+      : null;
 
     if (existingByEmail && existingByEmail.id !== existingByPhone?.id) {
       logger.warn('operator.create: email already registered', {
@@ -132,20 +120,14 @@ export class OperatorService {
     // genuine duplicate-account attempt, not a legitimate ownership case.
     let upgradeUserId: string | null = null;
     let upgradeTokenRowId: string | null = null;
+    let freshSignupTokenRowId: string | null = null;
 
     if (existingByPhone) {
-      if (
-        existingByPhone.role !== UserRole.CUSTOMER ||
-        !this.otpUpgradeEnabled
-      ) {
-        logger.warn(
-          'operator.create: phone already registered to a non-customer account or upgrade path disabled',
-          {
-            existingUserId: existingByPhone.id,
-            role: existingByPhone.role,
-            otpUpgradeEnabled: this.otpUpgradeEnabled,
-          },
-        );
+      if (existingByPhone.role !== UserRole.CUSTOMER) {
+        logger.warn('operator.create: phone already registered to a non-customer account', {
+          existingUserId: existingByPhone.id,
+          role: existingByPhone.role,
+        });
         throw new ConflictException('Email or phone number already registered');
       }
 
@@ -165,6 +147,24 @@ export class OperatorService {
       }
       upgradeUserId = existingByPhone.id;
       upgradeTokenRowId = tokenRow.id;
+    } else {
+      // Fresh signup — verification is now mandatory here too, not just for
+      // upgrades. Deliberately BadRequestException (400), not the upgrade
+      // branch's ConflictException (409): the upgrade branch's message is
+      // shared with the "phone belongs to someone else" conflict above it in
+      // the same block; a fresh signup has no such shared context, and
+      // "you skipped verification" is a plain bad request, not a conflict.
+      if (!data.phoneVerificationToken) {
+        throw new BadRequestException('Verify your phone number first.');
+      }
+      const tokenRow = await this.otpService.findValidTokenRow(
+        personalPhone,
+        data.phoneVerificationToken,
+      );
+      if (!tokenRow) {
+        throw new BadRequestException('Verify your phone number first.');
+      }
+      freshSignupTokenRowId = tokenRow.id;
     }
 
     // The personal and business numbers are checked against BOTH tables:
@@ -208,24 +208,22 @@ export class OperatorService {
       let user;
 
       if (upgradeUserId) {
-        // Re-check inside the transaction — close the gap if state changed
-        // between the pre-check above and this write.
-        const freshTokenRow = await tx.phoneVerification.findUnique({
-          where: { id: upgradeTokenRowId! },
+        const claimed = await tx.phoneVerification.updateMany({
+          where: {
+            id: upgradeTokenRowId!,
+            consumedAt: null,
+            tokenExpiresAt: { gt: new Date() },
+          },
+          data: { consumedAt: new Date() },
         });
-        if (
-          !freshTokenRow ||
-          freshTokenRow.consumedAt ||
-          !freshTokenRow.tokenExpiresAt ||
-          freshTokenRow.tokenExpiresAt < new Date()
-        ) {
+        if (claimed.count !== 1) {
           throw new ConflictException(
             'This number belongs to an existing account — verify your number first.',
           );
         }
-        const stillFree = await tx.user.findUnique({
-          where: { email: data.email },
-        });
+        const stillFree = data.email
+          ? await tx.user.findUnique({ where: { email: data.email } })
+          : null;
         if (stillFree && stillFree.id !== upgradeUserId) {
           throw new ConflictException(
             'Email or phone number already registered',
@@ -241,12 +239,20 @@ export class OperatorService {
             role: UserRole.OPERATOR,
           },
         });
-
-        await tx.phoneVerification.update({
-          where: { id: upgradeTokenRowId! },
+      } else {
+        // Same atomic-claim pattern as the upgrade branch above.
+        const claimed = await tx.phoneVerification.updateMany({
+          where: {
+            id: freshSignupTokenRowId!,
+            consumedAt: null,
+            tokenExpiresAt: { gt: new Date() },
+          },
           data: { consumedAt: new Date() },
         });
-      } else {
+        if (claimed.count !== 1) {
+          throw new BadRequestException('Verify your phone number first.');
+        }
+
         user = await tx.user.create({
           data: {
             email: data.email,

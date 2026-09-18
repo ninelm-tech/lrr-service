@@ -25,7 +25,7 @@ describe('OperatorService', () => {
       update: jest.Mock;
     };
     operatorMember: { create: jest.Mock };
-    phoneVerification: { update: jest.Mock };
+    phoneVerification: { updateMany: jest.Mock };
     $transaction: jest.Mock;
   };
   let paystackMock: {
@@ -56,7 +56,7 @@ describe('OperatorService', () => {
         update: jest.fn(),
       },
       operatorMember: { create: jest.fn() },
-      phoneVerification: { update: jest.fn() },
+      phoneVerification: { updateMany: jest.fn() },
       $transaction: jest.fn(),
     };
     paystackMock = {
@@ -261,6 +261,7 @@ describe('OperatorService', () => {
       latitude: 6.5,
       longitude: 3.4,
       truckClasses: [TruckClass.LOW_BED],
+      phoneVerificationToken: 'valid-token',
     });
 
     it('throws BadRequestException when truckClasses is missing', async () => {
@@ -296,6 +297,7 @@ describe('OperatorService', () => {
       prisma.user.findFirst.mockResolvedValue({
         id: 'existing-customer',
       }); // business phone vs User check
+      otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-fresh' }); // fresh signup now requires a token too
 
       await expect(service.create(dto)).rejects.toThrow(
         'This business phone number is already registered as a customer account. Use a different number for your business line.',
@@ -304,21 +306,97 @@ describe('OperatorService', () => {
     });
 
     describe('existing-customer upgrade path', () => {
-      it('fresh number: unchanged normal signup', async () => {
+      it('fresh number: requires and atomically claims a phone-verification token, same as the upgrade path', async () => {
         prisma.user.findUnique.mockResolvedValue(null); // existingByPhone, existingByEmail
         prisma.operator.findUnique.mockResolvedValue(null);
         prisma.user.findFirst.mockResolvedValue(null);
+        otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-fresh' });
         prisma.$transaction.mockImplementation(async (fn: any) => fn(prisma));
+        (prisma.phoneVerification as any).updateMany = jest
+          .fn()
+          .mockResolvedValue({ count: 1 });
         prisma.user.create.mockResolvedValue({ id: 'u-new' });
-        prisma.operator.create.mockResolvedValue({
-          id: 'op-new',
-        });
+        prisma.operator.create.mockResolvedValue({ id: 'op-new' });
         prisma.operatorMember.create.mockResolvedValue({});
 
         await service.create(baseDto());
 
         expect(prisma.user.create).toHaveBeenCalled();
-        expect(otpService.findValidTokenRow).not.toHaveBeenCalled();
+        expect(otpService.findValidTokenRow).toHaveBeenCalledWith(
+          baseDto().phoneNumber,
+          'valid-token',
+        );
+        expect(prisma.phoneVerification.updateMany).toHaveBeenCalledWith({
+          where: { id: 'pv-fresh', consumedAt: null, tokenExpiresAt: { gt: expect.any(Date) } },
+          data: { consumedAt: expect.any(Date) },
+        });
+      });
+
+      it('fresh number: two concurrent submissions with the same token — the second finds the claim already taken', async () => {
+        prisma.user.findUnique.mockResolvedValue(null);
+        prisma.operator.findUnique.mockResolvedValue(null);
+        prisma.user.findFirst.mockResolvedValue(null);
+        otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-fresh' });
+        prisma.$transaction.mockImplementation(async (fn: any) => fn(prisma));
+        // Simulates the row a first, already-committed concurrent call already claimed.
+        (prisma.phoneVerification as any).updateMany = jest
+          .fn()
+          .mockResolvedValue({ count: 0 });
+
+        await expect(service.create(baseDto())).rejects.toThrow(
+          'Verify your phone number first.',
+        );
+        expect(prisma.user.create).not.toHaveBeenCalled();
+      });
+
+      it('fresh number without a token: rejected before the transaction starts', async () => {
+        prisma.user.findUnique.mockResolvedValue(null);
+        prisma.operator.findUnique.mockResolvedValue(null);
+        prisma.user.findFirst.mockResolvedValue(null);
+        const dto = baseDto();
+        delete (dto as any).phoneVerificationToken;
+
+        await expect(service.create(dto)).rejects.toThrow(
+          'Verify your phone number first.',
+        );
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+      });
+
+      it('fresh number with an invalid/expired token: rejected before the transaction starts', async () => {
+        prisma.user.findUnique.mockResolvedValue(null);
+        prisma.operator.findUnique.mockResolvedValue(null);
+        prisma.user.findFirst.mockResolvedValue(null);
+        otpService.findValidTokenRow.mockResolvedValue(null);
+
+        await expect(service.create(baseDto())).rejects.toThrow(
+          'Verify your phone number first.',
+        );
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+      });
+
+      it('signup with no email: skips the email-duplicate lookup entirely and succeeds', async () => {
+        const dto = baseDto();
+        delete (dto as any).email;
+        prisma.user.findUnique.mockImplementation(({ where }: any) => {
+          if (where.email) throw new Error('email lookup must not run when email is absent');
+          return Promise.resolve(null); // phone lookup
+        });
+        prisma.operator.findUnique.mockResolvedValue(null);
+        prisma.user.findFirst.mockResolvedValue(null);
+        otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-fresh' });
+        prisma.$transaction.mockImplementation(async (fn: any) => fn(prisma));
+        (prisma.phoneVerification as any).updateMany = jest
+          .fn()
+          .mockResolvedValue({ count: 1 });
+        prisma.user.create.mockResolvedValue({ id: 'u-new' });
+        prisma.operator.create.mockResolvedValue({ id: 'op-new' });
+        prisma.operatorMember.create.mockResolvedValue({});
+
+        await service.create(dto);
+
+        expect(prisma.user.create).toHaveBeenCalledWith(
+          expect.objectContaining({ data: expect.objectContaining({ email: undefined }) }),
+        );
       });
 
       it('email belongs to a different existing user than the phone match: conflict, not misattributed', async () => {
@@ -335,8 +413,7 @@ describe('OperatorService', () => {
         expect(prisma.$transaction).not.toHaveBeenCalled();
       });
 
-      it('existing customer with a valid token: reuses the User row transactionally, consumes the token', async () => {
-        (service as any).otpUpgradeEnabled = true; // OTP Authentication template approved
+      it('existing customer with a valid token: reuses the User row transactionally, atomically claims the token', async () => {
         const dto = { ...baseDto(), phoneVerificationToken: 'valid-token' };
         prisma.user.findUnique.mockImplementation(({ where }: any) => {
           if (where.phoneNumber)
@@ -359,13 +436,9 @@ describe('OperatorService', () => {
           id: 'pv-1',
         });
         prisma.$transaction.mockImplementation(async (fn: any) => fn(prisma));
-        (prisma.phoneVerification as any).findUnique = jest
+        (prisma.phoneVerification as any).updateMany = jest
           .fn()
-          .mockResolvedValue({
-            id: 'pv-1',
-            consumedAt: null,
-            tokenExpiresAt: new Date(Date.now() + 60_000),
-          });
+          .mockResolvedValue({ count: 1 });
         prisma.user.update.mockResolvedValue({
           id: 'existing-customer',
         });
@@ -373,7 +446,6 @@ describe('OperatorService', () => {
           id: 'op-new',
         });
         prisma.operatorMember.create.mockResolvedValue({});
-        prisma.phoneVerification.update.mockResolvedValue({});
 
         await service.create(dto);
 
@@ -384,14 +456,41 @@ describe('OperatorService', () => {
             data: expect.objectContaining({ role: 'OPERATOR' }),
           }),
         );
-        expect(prisma.phoneVerification.update).toHaveBeenCalledWith({
-          where: { id: 'pv-1' },
+        expect(prisma.phoneVerification.updateMany).toHaveBeenCalledWith({
+          where: { id: 'pv-1', consumedAt: null, tokenExpiresAt: { gt: expect.any(Date) } },
           data: { consumedAt: expect.any(Date) },
         });
       });
 
+      it('existing customer: two concurrent upgrade submissions with the same token — the second finds the claim already taken', async () => {
+        const dto = { ...baseDto(), phoneVerificationToken: 'valid-token' };
+        prisma.user.findUnique.mockImplementation(({ where }: any) => {
+          if (where.phoneNumber)
+            return Promise.resolve({
+              id: 'existing-customer',
+              role: 'CUSTOMER',
+              phoneNumber: dto.phoneNumber,
+              email: 'old@example.com',
+            });
+          if (where.email) return Promise.resolve({ id: 'existing-customer', role: 'CUSTOMER' });
+          return Promise.resolve(null);
+        });
+        prisma.operator.findUnique.mockResolvedValue(null);
+        prisma.user.findFirst.mockResolvedValue(null);
+        otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-1' });
+        prisma.$transaction.mockImplementation(async (fn: any) => fn(prisma));
+        // Simulates the row a first, already-committed concurrent submission already claimed.
+        (prisma.phoneVerification as any).updateMany = jest
+          .fn()
+          .mockResolvedValue({ count: 0 });
+
+        await expect(service.create(dto)).rejects.toThrow(
+          'This number belongs to an existing account — verify your number first.',
+        );
+        expect(prisma.user.update).not.toHaveBeenCalled();
+      });
+
       it('existing customer without a valid token: blocked with the specific error, transaction never starts', async () => {
-        (service as any).otpUpgradeEnabled = true; // OTP Authentication template approved
         const dto = baseDto();
         prisma.user.findUnique.mockImplementation(({ where }: any) => {
           if (where.phoneNumber)
@@ -405,25 +504,6 @@ describe('OperatorService', () => {
         otpService.findValidTokenRow.mockResolvedValue(null);
 
         await expect(service.create(dto)).rejects.toThrow('verify your number');
-        expect(prisma.$transaction).not.toHaveBeenCalled();
-      });
-
-      it('upgrade path disabled by default: existing customer blocked even with a valid token', async () => {
-        const dto = { ...baseDto(), phoneVerificationToken: 'valid-token' };
-        prisma.user.findUnique.mockImplementation(({ where }: any) => {
-          if (where.phoneNumber)
-            return Promise.resolve({
-              id: 'existing-customer',
-              role: 'CUSTOMER',
-              phoneNumber: dto.phoneNumber,
-            });
-          return Promise.resolve(null);
-        });
-
-        await expect(service.create(dto)).rejects.toThrow(
-          'Email or phone number already registered',
-        );
-        expect(otpService.findValidTokenRow).not.toHaveBeenCalled();
         expect(prisma.$transaction).not.toHaveBeenCalled();
       });
 
