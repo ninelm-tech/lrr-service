@@ -15,6 +15,7 @@ describe('AuthService', () => {
     sendPasswordResetCode: jest.Mock;
     verifyCode: jest.Mock;
     findValidTokenRow: jest.Mock;
+    sendLoginCode: jest.Mock;
   };
 
   beforeEach(async () => {
@@ -26,6 +27,7 @@ describe('AuthService', () => {
       sendPasswordResetCode: jest.fn(),
       verifyCode: jest.fn(),
       findValidTokenRow: jest.fn(),
+      sendLoginCode: jest.fn(),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -422,6 +424,120 @@ describe('AuthService', () => {
           'newpassword1',
         ),
       ).rejects.toThrow('expired');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('sendLoginCode', () => {
+    it('delegates to OtpService.sendLoginCode', async () => {
+      otpService.sendLoginCode.mockResolvedValue({ required: true });
+
+      const result = await service.sendLoginCode('+2348012345678');
+
+      expect(otpService.sendLoginCode).toHaveBeenCalledWith('+2348012345678');
+      expect(result).toEqual({ required: true });
+    });
+  });
+
+  describe('loginWithOtp', () => {
+    it('verifies the code, atomically claims it, and issues a token for an OPERATOR', async () => {
+      otpService.verifyCode.mockResolvedValue({ token: 'tok-1' });
+      otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-1' });
+      const tx = {
+        phoneVerification: {
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        },
+        user: {
+          findUnique: jest.fn().mockResolvedValue({
+            id: 'u-1',
+            email: null,
+            phoneNumber: '+2348012345678',
+            name: 'Jane',
+            role: 'OPERATOR',
+          }),
+        },
+      };
+      prisma.$transaction.mockImplementation((cb: any) => cb(tx));
+
+      const result = await service.loginWithOtp('+2348012345678', '123456');
+
+      expect(otpService.verifyCode).toHaveBeenCalledWith(
+        '+2348012345678',
+        '123456',
+      );
+      expect(tx.phoneVerification.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'pv-1',
+          consumedAt: null,
+          tokenExpiresAt: { gt: expect.any(Date) },
+        },
+        data: { consumedAt: expect.any(Date) },
+      });
+      expect(result.accessToken).toEqual(expect.any(String));
+      expect(result.user.role).toBe('OPERATOR');
+    });
+
+    it('rejects a CUSTOMER account even with a valid, unconsumed code', async () => {
+      otpService.verifyCode.mockResolvedValue({ token: 'tok-1' });
+      otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-1' });
+      const tx = {
+        phoneVerification: {
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        },
+        user: {
+          findUnique: jest.fn().mockResolvedValue({
+            id: 'u-1',
+            role: 'CUSTOMER',
+          }),
+        },
+      };
+      prisma.$transaction.mockImplementation((cb: any) => cb(tx));
+
+      await expect(
+        service.loginWithOtp('+2348012345678', '123456'),
+      ).rejects.toThrow('No account found for this number.');
+    });
+
+    it('rejects when the claim matches zero rows', async () => {
+      otpService.verifyCode.mockResolvedValue({ token: 'tok-1' });
+      otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-1' });
+      const tx = {
+        phoneVerification: {
+          updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+        },
+        user: { findUnique: jest.fn() },
+      };
+      prisma.$transaction.mockImplementation((cb: any) => cb(tx));
+
+      await expect(
+        service.loginWithOtp('+2348012345678', '123456'),
+      ).rejects.toThrow('Code expired — request a new one.');
+      expect(tx.user.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('rejects a second call with the same already-consumed code', async () => {
+      otpService.verifyCode.mockResolvedValue({ token: 'tok-1' });
+      otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-1' });
+      const tx = {
+        phoneVerification: {
+          updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+        },
+        user: { findUnique: jest.fn() },
+      };
+      prisma.$transaction.mockImplementation((cb: any) => cb(tx));
+
+      await expect(
+        service.loginWithOtp('+2348012345678', '123456'),
+      ).rejects.toThrow('Code expired — request a new one.');
+    });
+
+    it('rejects when no valid token row is found', async () => {
+      otpService.verifyCode.mockResolvedValue({ token: 'tok-1' });
+      otpService.findValidTokenRow.mockResolvedValue(null);
+
+      await expect(
+        service.loginWithOtp('+2348012345678', '123456'),
+      ).rejects.toThrow('Code expired — request a new one.');
       expect(prisma.$transaction).not.toHaveBeenCalled();
     });
   });

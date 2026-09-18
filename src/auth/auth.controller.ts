@@ -18,8 +18,10 @@ import { Roles } from './decorators/roles.decorator';
 import { CreateStaffDto } from './dto/create-staff.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
+import { SendLoginCodeDto, VerifyLoginCodeDto } from './dto/login-otp.dto';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import type { AuthenticatedRequest } from './authenticated-request.interface';
+import { normalizePhone } from '../common/phone.util';
 
 export class UpdateProfileDto {
   name?: string;
@@ -122,6 +124,28 @@ export class AuthController {
       dto.phoneNumber,
       dto.code,
       dto.newPassword,
+    );
+  }
+
+  /**
+   * Request a phone+OTP login code (OPERATOR only — see
+   * OtpService.sendLoginCode). Response is always the same generic shape,
+   * never reveals whether an account was found or is eligible.
+   */
+  @Post('login/otp/send')
+  async sendLoginCode(@Body() dto: SendLoginCodeDto) {
+    return this.authService.sendLoginCode(normalizePhone(dto.phoneNumber));
+  }
+
+  /**
+   * Verify a phone+OTP login code and issue a token. OPERATOR-only — see
+   * AuthService.loginWithOtp.
+   */
+  @Post('login/otp/verify')
+  async loginWithOtp(@Body() dto: VerifyLoginCodeDto) {
+    return this.authService.loginWithOtp(
+      normalizePhone(dto.phoneNumber),
+      dto.code,
     );
   }
 

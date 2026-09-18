@@ -396,6 +396,66 @@ export class AuthService {
     return { message: 'Password updated. You can now log in.' };
   }
 
+  // ══════════════════════════════════════════════════════
+  //  PHONE + OTP LOGIN (OPERATOR only)
+  // ══════════════════════════════════════════════════════
+
+  async sendLoginCode(phoneNumber: string): Promise<{ required: boolean }> {
+    return this.otpService.sendLoginCode(phoneNumber);
+  }
+
+  /**
+   * Phone + OTP login, restricted to OPERATOR (see OtpService.sendLoginCode's
+   * doc comment for why). Consumption is the claim, not a read-then-write —
+   * see resetPasswordWithCode for the same pattern and why it matters. The
+   * role is re-checked here, at the point access is actually granted, not
+   * only relied on at send time.
+   */
+  async loginWithOtp(phoneNumber: string, code: string): Promise<AuthResponse> {
+    const { token } = await this.otpService.verifyCode(phoneNumber, code);
+    const tokenRow = await this.otpService.findValidTokenRow(
+      phoneNumber,
+      token,
+    );
+    if (!tokenRow) {
+      throw new UnauthorizedException('Code expired — request a new one.');
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const claimed = await tx.phoneVerification.updateMany({
+        where: {
+          id: tokenRow.id,
+          consumedAt: null,
+          tokenExpiresAt: { gt: new Date() },
+        },
+        data: { consumedAt: new Date() },
+      });
+      if (claimed.count !== 1) {
+        throw new UnauthorizedException('Code expired — request a new one.');
+      }
+
+      const user = await tx.user.findUnique({ where: { phoneNumber } });
+      if (!user || user.role !== UserRole.OPERATOR) {
+        throw new UnauthorizedException('No account found for this number.');
+      }
+
+      const accessToken = this.generateToken({
+        id: user.id,
+        email: user.email,
+        role: user.role,
+      });
+      return {
+        accessToken,
+        user: {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          role: user.role,
+        },
+      };
+    });
+  }
+
   /**
    * Update the authenticated user's own profile.
    * Email and phone are checked for uniqueness; phone is normalised to E.164
