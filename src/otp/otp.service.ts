@@ -73,6 +73,35 @@ export class OtpService {
     return { required: true };
   }
 
+  /**
+   * OTP-based login — unlike sendCode (upgrade/signup verification) and
+   * sendPasswordResetCode (any role with a portal password), eligibility here
+   * is role === OPERATOR only: this route trades a password for a single SMS
+   * code, a strictly weaker factor than what CUSTOMER/ADMIN/SUPER_ADMIN
+   * accounts assume. The response never reveals whether the number is
+   * unknown, ineligible, or genuinely sent — same account-enumeration
+   * defense as sendPasswordResetCode's generic messaging, applied to the
+   * return value itself since this endpoint has no separate message field.
+   */
+  async sendLoginCode(phoneNumber: string): Promise<{ required: boolean }> {
+    const existingUser = await this.prisma.user.findUnique({
+      where: { phoneNumber },
+    });
+    if (existingUser?.role === UserRole.OPERATOR) {
+      try {
+        await this.sendCodeToPhone(phoneNumber, 'login code');
+      } catch (error) {
+        if (!(error instanceof BadRequestException)) throw error;
+        // Swallow the rate-limit error too — letting it escape would leak
+        // "this phone is a real, eligible OPERATOR account" via a side
+        // channel (error vs. no error) even though the response body is
+        // already uniform. The caller sees the same generic outcome either
+        // way: sent, rate-limited, or ineligible are indistinguishable.
+      }
+    }
+    return { required: true };
+  }
+
   private async sendCodeToPhone(
     phoneNumber: string,
     label: string,

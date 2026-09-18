@@ -174,6 +174,61 @@ describe('OtpService', () => {
     });
   });
 
+  describe('sendLoginCode', () => {
+    it('responds required:true and sends nothing for an unknown phone', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+
+      const result = await service.sendLoginCode('+2348012345678');
+
+      expect(result).toEqual({ required: true });
+      expect(termiiService.sendSms).not.toHaveBeenCalled();
+    });
+
+    it('responds required:true and sends nothing for a non-OPERATOR account — same response either way', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'u-1',
+        role: UserRole.CUSTOMER,
+      });
+
+      const result = await service.sendLoginCode('+2348012345678');
+
+      expect(result).toEqual({ required: true });
+      expect(termiiService.sendSms).not.toHaveBeenCalled();
+    });
+
+    it('sends a code for an OPERATOR account', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'u-1',
+        role: UserRole.OPERATOR,
+      });
+      prisma.phoneVerification.findMany.mockResolvedValue([]);
+      prisma.phoneVerification.create.mockResolvedValue({ id: 'pv-1' });
+
+      const result = await service.sendLoginCode('+2348012345678');
+
+      expect(result).toEqual({ required: true });
+      expect(termiiService.sendSms).toHaveBeenCalledWith(
+        expect.stringContaining('+2348012345678'),
+        expect.stringContaining('login code'),
+      );
+    });
+
+    it('responds required:true (not a rejection) for an OPERATOR account hitting the resend cooldown — no enumeration signal via thrown errors', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'u-1',
+        role: UserRole.OPERATOR,
+      });
+      prisma.phoneVerification.findMany.mockResolvedValue([
+        { createdAt: new Date() }, // sent seconds ago — still within cooldown
+      ]);
+
+      const result = await service.sendLoginCode('+2348012345678');
+
+      expect(result).toEqual({ required: true });
+      expect(termiiService.sendSms).not.toHaveBeenCalled();
+    });
+  });
+
   describe('verifyCode', () => {
     it('issues a token on a correct, unexpired code', async () => {
       prisma.phoneVerification.findFirst.mockResolvedValue({
