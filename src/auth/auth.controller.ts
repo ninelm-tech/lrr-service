@@ -33,7 +33,7 @@ export class ChangePasswordDto {
 }
 
 export class LoginDto {
-  email: string;
+  identifier: string; // email or phone number
   password: string;
 }
 
@@ -57,11 +57,11 @@ export class AuthController {
   ) {}
 
   /**
-   * Login with email and password
+   * Login with an identifier (email or phone number) and password
    */
   @Post('login')
   async login(@Body() dto: LoginDto) {
-    return this.authService.login(dto.email, dto.password);
+    return this.authService.login(dto.identifier, dto.password);
   }
 
   /**

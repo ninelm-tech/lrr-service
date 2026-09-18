@@ -68,15 +68,33 @@ export class AuthService {
   }
 
   /**
-   * Login with email and password
+   * Login with an identifier (email or phone number) and password
    */
-  async login(email: string, password: string): Promise<AuthResponse> {
-    const user = await this.prisma.user.findUnique({
-      where: { email },
+  async login(identifier: string, password: string): Promise<AuthResponse> {
+    let user = await this.prisma.user.findUnique({
+      where: { email: identifier },
     });
+    if (!user) {
+      // identifier may be a phone number typed in local format (0801...)
+      // rather than the E.164 form phoneNumber is stored in — normalize
+      // before the lookup, same as every other phone-accepting entry point
+      // (registerCustomer, operator.service.ts, the OTP login routes below).
+      // Not every identifier IS a phone number — it could be a mistyped
+      // email — so a normalization failure just means "not a phone either";
+      // fall through to the same invalid-credentials rejection below rather
+      // than letting normalizePhone's thrown Error escape unhandled.
+      try {
+        const normalizedPhone = normalizePhone(identifier);
+        user = await this.prisma.user.findUnique({
+          where: { phoneNumber: normalizedPhone },
+        });
+      } catch {
+        user = null;
+      }
+    }
 
     if (!user || !user.passwordHash) {
-      logger.warn('login: no account for this email', { email });
+      logger.warn('login: no account for this identifier', { identifier });
       throw new UnauthorizedException('Invalid email or password');
     }
 

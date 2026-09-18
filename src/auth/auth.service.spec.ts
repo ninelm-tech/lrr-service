@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { JwtService } from '@nestjs/jwt';
+import * as bcrypt from 'bcrypt';
 import { AuthService } from './auth.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { OtpService } from '../otp/otp.service';
@@ -31,7 +32,10 @@ describe('AuthService', () => {
       providers: [
         AuthService,
         { provide: PrismaService, useValue: prisma },
-        { provide: JwtService, useValue: { sign: jest.fn() } },
+        {
+          provide: JwtService,
+          useValue: { sign: jest.fn().mockReturnValue('mock-jwt-token') },
+        },
         { provide: OtpService, useValue: otpService },
       ],
     }).compile();
@@ -89,6 +93,105 @@ describe('AuthService', () => {
           temporaryPassword: 'temp12345',
         }),
       ).rejects.toThrow('Email already registered');
+    });
+  });
+
+  describe('login', () => {
+    it('succeeds via email', async () => {
+      prisma.user.findUnique.mockResolvedValueOnce({
+        id: 'u-1',
+        email: 'ada@example.com',
+        phoneNumber: null,
+        passwordHash: await bcrypt.hash('correct-password', 10),
+        name: 'Ada',
+        role: 'OPERATOR',
+      });
+
+      const result = await service.login('ada@example.com', 'correct-password');
+
+      expect(prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { email: 'ada@example.com' },
+      });
+      expect(result.accessToken).toEqual(expect.any(String));
+      expect(result.user).toEqual({
+        id: 'u-1',
+        email: 'ada@example.com',
+        name: 'Ada',
+        role: 'OPERATOR',
+      });
+    });
+
+    it('succeeds via phone when the identifier is not a registered email', async () => {
+      prisma.user.findUnique
+        .mockResolvedValueOnce(null) // email lookup misses
+        .mockResolvedValueOnce({
+          id: 'u-1',
+          email: null,
+          phoneNumber: '+2348012345678',
+          passwordHash: await bcrypt.hash('correct-password', 10),
+          name: 'Ada',
+          role: 'OPERATOR',
+        });
+
+      const result = await service.login('+2348012345678', 'correct-password');
+
+      expect(prisma.user.findUnique).toHaveBeenNthCalledWith(2, {
+        where: { phoneNumber: '+2348012345678' },
+      });
+      expect(result.user.email).toBeNull();
+    });
+
+    it('succeeds via phone typed in local format (0801...) — the stored value is E.164', async () => {
+      prisma.user.findUnique
+        .mockResolvedValueOnce(null) // email lookup misses
+        .mockResolvedValueOnce({
+          id: 'u-1',
+          email: null,
+          phoneNumber: '+2348012345678',
+          passwordHash: await bcrypt.hash('correct-password', 10),
+          name: 'Ada',
+          role: 'OPERATOR',
+        });
+
+      const result = await service.login('08012345678', 'correct-password');
+
+      expect(prisma.user.findUnique).toHaveBeenNthCalledWith(2, {
+        where: { phoneNumber: '+2348012345678' },
+      });
+      expect(result.user.role).toBe('OPERATOR');
+    });
+
+    it('rejects cleanly (no crash) when the identifier is neither a known email nor a valid phone shape', async () => {
+      prisma.user.findUnique.mockResolvedValueOnce(null); // email lookup misses
+
+      await expect(
+        service.login('not-an-email-or-phone', 'whatever'),
+      ).rejects.toThrow('Invalid email or password');
+      // Only the email lookup ran — normalizePhone threw before a second
+      // findUnique could be attempted, and that throw was caught, not
+      // left to escape as an unhandled 500.
+      expect(prisma.user.findUnique).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects a wrong password on either identifier', async () => {
+      prisma.user.findUnique.mockResolvedValueOnce({
+        id: 'u-1',
+        email: 'ada@example.com',
+        passwordHash: await bcrypt.hash('correct-password', 10),
+        role: 'OPERATOR',
+      });
+
+      await expect(
+        service.login('ada@example.com', 'wrong-password'),
+      ).rejects.toThrow('Invalid email or password');
+    });
+
+    it('rejects when no account matches either lookup', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.login('nobody@example.com', 'whatever'),
+      ).rejects.toThrow('Invalid email or password');
     });
   });
 
