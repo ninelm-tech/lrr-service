@@ -1,6 +1,7 @@
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as Sentry from '@sentry/node';
+import { TermiiSendSmsResponse } from './dto/send-sms-response.dto';
 
 @Injectable()
 export class TermiiService {
@@ -36,7 +37,7 @@ export class TermiiService {
         }),
       });
 
-      const data = await response.json();
+      const data = (await response.json()) as TermiiSendSmsResponse;
       if (!response.ok) {
         console.error('Termii sendSms failed:', {
           status: response.status,

@@ -91,7 +91,7 @@ describe('AuthService', () => {
         service.createStaff({
           email: 'taken@example.com',
           name: 'X',
-          role: 'ADMIN' as any,
+          role: 'ADMIN',
           temporaryPassword: 'temp12345',
         }),
       ).rejects.toThrow('Email already registered');
@@ -348,7 +348,9 @@ describe('AuthService', () => {
           update: jest.fn(),
         },
       };
-      prisma.$transaction.mockImplementation((cb: any) => cb(tx));
+      prisma.$transaction.mockImplementation(
+        (cb: (client: typeof tx) => unknown) => cb(tx),
+      );
 
       const result = await service.resetPasswordWithCode(
         '+2348012345678',
@@ -380,7 +382,9 @@ describe('AuthService', () => {
         },
         user: { findUnique: jest.fn(), update: jest.fn() },
       };
-      prisma.$transaction.mockImplementation((cb: any) => cb(tx));
+      prisma.$transaction.mockImplementation(
+        (cb: (client: typeof tx) => unknown) => cb(tx),
+      );
 
       await expect(
         service.resetPasswordWithCode(
@@ -402,7 +406,9 @@ describe('AuthService', () => {
         },
         user: { findUnique: jest.fn(), update: jest.fn() },
       };
-      prisma.$transaction.mockImplementation((cb: any) => cb(tx));
+      prisma.$transaction.mockImplementation(
+        (cb: (client: typeof tx) => unknown) => cb(tx),
+      );
 
       await expect(
         service.resetPasswordWithCode(
@@ -457,7 +463,9 @@ describe('AuthService', () => {
           }),
         },
       };
-      prisma.$transaction.mockImplementation((cb: any) => cb(tx));
+      prisma.$transaction.mockImplementation(
+        (cb: (client: typeof tx) => unknown) => cb(tx),
+      );
 
       const result = await service.loginWithOtp('+2348012345678', '123456');
 
@@ -491,7 +499,9 @@ describe('AuthService', () => {
           }),
         },
       };
-      prisma.$transaction.mockImplementation((cb: any) => cb(tx));
+      prisma.$transaction.mockImplementation(
+        (cb: (client: typeof tx) => unknown) => cb(tx),
+      );
 
       await expect(
         service.loginWithOtp('+2348012345678', '123456'),
@@ -507,7 +517,9 @@ describe('AuthService', () => {
         },
         user: { findUnique: jest.fn() },
       };
-      prisma.$transaction.mockImplementation((cb: any) => cb(tx));
+      prisma.$transaction.mockImplementation(
+        (cb: (client: typeof tx) => unknown) => cb(tx),
+      );
 
       await expect(
         service.loginWithOtp('+2348012345678', '123456'),
@@ -524,7 +536,9 @@ describe('AuthService', () => {
         },
         user: { findUnique: jest.fn() },
       };
-      prisma.$transaction.mockImplementation((cb: any) => cb(tx));
+      prisma.$transaction.mockImplementation(
+        (cb: (client: typeof tx) => unknown) => cb(tx),
+      );
 
       await expect(
         service.loginWithOtp('+2348012345678', '123456'),

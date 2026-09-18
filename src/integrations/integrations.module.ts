@@ -6,7 +6,13 @@ import { GeocodingModule } from './geocoding/geocoding.module';
 import { TermiiModule } from './termii/termii.module';
 
 @Module({
-  imports: [TwilioModule, PaystackModule, S3Module, GeocodingModule, TermiiModule],
+  imports: [
+    TwilioModule,
+    PaystackModule,
+    S3Module,
+    GeocodingModule,
+    TermiiModule,
+  ],
   exports: [GeocodingModule],
 })
 export class IntegrationsModule {}

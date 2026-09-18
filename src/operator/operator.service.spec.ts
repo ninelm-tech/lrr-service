@@ -266,7 +266,7 @@ describe('OperatorService', () => {
 
     it('throws BadRequestException when truckClasses is missing', async () => {
       const dto = baseDto();
-      delete (dto as any).truckClasses;
+      delete (dto as Partial<CreateOperatorDto>).truckClasses;
 
       await expect(service.create(dto)).rejects.toThrow(BadRequestException);
     });
@@ -311,8 +311,10 @@ describe('OperatorService', () => {
         prisma.operator.findUnique.mockResolvedValue(null);
         prisma.user.findFirst.mockResolvedValue(null);
         otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-fresh' });
-        prisma.$transaction.mockImplementation(async (fn: any) => fn(prisma));
-        (prisma.phoneVerification as any).updateMany = jest
+        prisma.$transaction.mockImplementation(
+          (fn: (client: typeof prisma) => unknown) => fn(prisma),
+        );
+        prisma.phoneVerification.updateMany = jest
           .fn()
           .mockResolvedValue({ count: 1 });
         prisma.user.create.mockResolvedValue({ id: 'u-new' });
@@ -327,7 +329,11 @@ describe('OperatorService', () => {
           'valid-token',
         );
         expect(prisma.phoneVerification.updateMany).toHaveBeenCalledWith({
-          where: { id: 'pv-fresh', consumedAt: null, tokenExpiresAt: { gt: expect.any(Date) } },
+          where: {
+            id: 'pv-fresh',
+            consumedAt: null,
+            tokenExpiresAt: { gt: expect.any(Date) },
+          },
           data: { consumedAt: expect.any(Date) },
         });
       });
@@ -337,9 +343,11 @@ describe('OperatorService', () => {
         prisma.operator.findUnique.mockResolvedValue(null);
         prisma.user.findFirst.mockResolvedValue(null);
         otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-fresh' });
-        prisma.$transaction.mockImplementation(async (fn: any) => fn(prisma));
+        prisma.$transaction.mockImplementation(
+          (fn: (client: typeof prisma) => unknown) => fn(prisma),
+        );
         // Simulates the row a first, already-committed concurrent call already claimed.
-        (prisma.phoneVerification as any).updateMany = jest
+        prisma.phoneVerification.updateMany = jest
           .fn()
           .mockResolvedValue({ count: 0 });
 
@@ -354,7 +362,7 @@ describe('OperatorService', () => {
         prisma.operator.findUnique.mockResolvedValue(null);
         prisma.user.findFirst.mockResolvedValue(null);
         const dto = baseDto();
-        delete (dto as any).phoneVerificationToken;
+        delete (dto as Partial<CreateOperatorDto>).phoneVerificationToken;
 
         await expect(service.create(dto)).rejects.toThrow(
           'Verify your phone number first.',
@@ -376,16 +384,21 @@ describe('OperatorService', () => {
 
       it('signup with no email: skips the email-duplicate lookup entirely and succeeds', async () => {
         const dto = baseDto();
-        delete (dto as any).email;
-        prisma.user.findUnique.mockImplementation(({ where }: any) => {
-          if (where.email) throw new Error('email lookup must not run when email is absent');
-          return Promise.resolve(null); // phone lookup
-        });
+        delete (dto as Partial<CreateOperatorDto>).email;
+        prisma.user.findUnique.mockImplementation(
+          ({ where }: { where: Record<string, unknown> }) => {
+            if (where.email)
+              throw new Error('email lookup must not run when email is absent');
+            return Promise.resolve(null); // phone lookup
+          },
+        );
         prisma.operator.findUnique.mockResolvedValue(null);
         prisma.user.findFirst.mockResolvedValue(null);
         otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-fresh' });
-        prisma.$transaction.mockImplementation(async (fn: any) => fn(prisma));
-        (prisma.phoneVerification as any).updateMany = jest
+        prisma.$transaction.mockImplementation(
+          (fn: (client: typeof prisma) => unknown) => fn(prisma),
+        );
+        prisma.phoneVerification.updateMany = jest
           .fn()
           .mockResolvedValue({ count: 1 });
         prisma.user.create.mockResolvedValue({ id: 'u-new' });
@@ -395,17 +408,21 @@ describe('OperatorService', () => {
         await service.create(dto);
 
         expect(prisma.user.create).toHaveBeenCalledWith(
-          expect.objectContaining({ data: expect.objectContaining({ email: undefined }) }),
+          expect.objectContaining({
+            data: expect.objectContaining({ email: undefined }),
+          }),
         );
       });
 
       it('email belongs to a different existing user than the phone match: conflict, not misattributed', async () => {
         const dto = baseDto();
-        prisma.user.findUnique.mockImplementation(({ where }: any) => {
-          if (where.phoneNumber) return Promise.resolve(null); // no phone match
-          if (where.email) return Promise.resolve({ id: 'other-user' }); // different account owns this email
-          return Promise.resolve(null);
-        });
+        prisma.user.findUnique.mockImplementation(
+          ({ where }: { where: Record<string, unknown> }) => {
+            if (where.phoneNumber) return Promise.resolve(null); // no phone match
+            if (where.email) return Promise.resolve({ id: 'other-user' }); // different account owns this email
+            return Promise.resolve(null);
+          },
+        );
 
         await expect(service.create(dto)).rejects.toThrow(
           'Email or phone number already registered',
@@ -415,28 +432,32 @@ describe('OperatorService', () => {
 
       it('existing customer with a valid token: reuses the User row transactionally, atomically claims the token', async () => {
         const dto = { ...baseDto(), phoneVerificationToken: 'valid-token' };
-        prisma.user.findUnique.mockImplementation(({ where }: any) => {
-          if (where.phoneNumber)
-            return Promise.resolve({
-              id: 'existing-customer',
-              role: 'CUSTOMER',
-              phoneNumber: dto.phoneNumber,
-              email: 'old@example.com',
-            });
-          if (where.email)
-            return Promise.resolve({
-              id: 'existing-customer',
-              role: 'CUSTOMER',
-            }); // same account — not a conflict
-          return Promise.resolve(null);
-        });
+        prisma.user.findUnique.mockImplementation(
+          ({ where }: { where: Record<string, unknown> }) => {
+            if (where.phoneNumber)
+              return Promise.resolve({
+                id: 'existing-customer',
+                role: 'CUSTOMER',
+                phoneNumber: dto.phoneNumber,
+                email: 'old@example.com',
+              });
+            if (where.email)
+              return Promise.resolve({
+                id: 'existing-customer',
+                role: 'CUSTOMER',
+              }); // same account — not a conflict
+            return Promise.resolve(null);
+          },
+        );
         prisma.operator.findUnique.mockResolvedValue(null);
         prisma.user.findFirst.mockResolvedValue(null);
         otpService.findValidTokenRow.mockResolvedValue({
           id: 'pv-1',
         });
-        prisma.$transaction.mockImplementation(async (fn: any) => fn(prisma));
-        (prisma.phoneVerification as any).updateMany = jest
+        prisma.$transaction.mockImplementation(
+          (fn: (client: typeof prisma) => unknown) => fn(prisma),
+        );
+        prisma.phoneVerification.updateMany = jest
           .fn()
           .mockResolvedValue({ count: 1 });
         prisma.user.update.mockResolvedValue({
@@ -457,30 +478,42 @@ describe('OperatorService', () => {
           }),
         );
         expect(prisma.phoneVerification.updateMany).toHaveBeenCalledWith({
-          where: { id: 'pv-1', consumedAt: null, tokenExpiresAt: { gt: expect.any(Date) } },
+          where: {
+            id: 'pv-1',
+            consumedAt: null,
+            tokenExpiresAt: { gt: expect.any(Date) },
+          },
           data: { consumedAt: expect.any(Date) },
         });
       });
 
       it('existing customer: two concurrent upgrade submissions with the same token — the second finds the claim already taken', async () => {
         const dto = { ...baseDto(), phoneVerificationToken: 'valid-token' };
-        prisma.user.findUnique.mockImplementation(({ where }: any) => {
-          if (where.phoneNumber)
-            return Promise.resolve({
-              id: 'existing-customer',
-              role: 'CUSTOMER',
-              phoneNumber: dto.phoneNumber,
-              email: 'old@example.com',
-            });
-          if (where.email) return Promise.resolve({ id: 'existing-customer', role: 'CUSTOMER' });
-          return Promise.resolve(null);
-        });
+        prisma.user.findUnique.mockImplementation(
+          ({ where }: { where: Record<string, unknown> }) => {
+            if (where.phoneNumber)
+              return Promise.resolve({
+                id: 'existing-customer',
+                role: 'CUSTOMER',
+                phoneNumber: dto.phoneNumber,
+                email: 'old@example.com',
+              });
+            if (where.email)
+              return Promise.resolve({
+                id: 'existing-customer',
+                role: 'CUSTOMER',
+              });
+            return Promise.resolve(null);
+          },
+        );
         prisma.operator.findUnique.mockResolvedValue(null);
         prisma.user.findFirst.mockResolvedValue(null);
         otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-1' });
-        prisma.$transaction.mockImplementation(async (fn: any) => fn(prisma));
+        prisma.$transaction.mockImplementation(
+          (fn: (client: typeof prisma) => unknown) => fn(prisma),
+        );
         // Simulates the row a first, already-committed concurrent submission already claimed.
-        (prisma.phoneVerification as any).updateMany = jest
+        prisma.phoneVerification.updateMany = jest
           .fn()
           .mockResolvedValue({ count: 0 });
 
@@ -492,15 +525,17 @@ describe('OperatorService', () => {
 
       it('existing customer without a valid token: blocked with the specific error, transaction never starts', async () => {
         const dto = baseDto();
-        prisma.user.findUnique.mockImplementation(({ where }: any) => {
-          if (where.phoneNumber)
-            return Promise.resolve({
-              id: 'existing-customer',
-              role: 'CUSTOMER',
-              phoneNumber: dto.phoneNumber,
-            });
-          return Promise.resolve(null);
-        });
+        prisma.user.findUnique.mockImplementation(
+          ({ where }: { where: Record<string, unknown> }) => {
+            if (where.phoneNumber)
+              return Promise.resolve({
+                id: 'existing-customer',
+                role: 'CUSTOMER',
+                phoneNumber: dto.phoneNumber,
+              });
+            return Promise.resolve(null);
+          },
+        );
         otpService.findValidTokenRow.mockResolvedValue(null);
 
         await expect(service.create(dto)).rejects.toThrow('verify your number');
@@ -509,15 +544,17 @@ describe('OperatorService', () => {
 
       it('existing operator/admin on that phone: hard block, no OTP path', async () => {
         const dto = baseDto();
-        prisma.user.findUnique.mockImplementation(({ where }: any) => {
-          if (where.phoneNumber)
-            return Promise.resolve({
-              id: 'existing-op',
-              role: 'OPERATOR',
-              phoneNumber: dto.phoneNumber,
-            });
-          return Promise.resolve(null);
-        });
+        prisma.user.findUnique.mockImplementation(
+          ({ where }: { where: Record<string, unknown> }) => {
+            if (where.phoneNumber)
+              return Promise.resolve({
+                id: 'existing-op',
+                role: 'OPERATOR',
+                phoneNumber: dto.phoneNumber,
+              });
+            return Promise.resolve(null);
+          },
+        );
 
         await expect(service.create(dto)).rejects.toThrow(
           'Email or phone number already registered',

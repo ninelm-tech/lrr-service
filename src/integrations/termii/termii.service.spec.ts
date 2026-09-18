@@ -8,7 +8,10 @@ describe('TermiiService', () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         TermiiService,
-        { provide: ConfigService, useValue: { get: (key: string) => config[key] } },
+        {
+          provide: ConfigService,
+          useValue: { get: (key: string) => config[key] },
+        },
       ],
     }).compile();
     return module.get<TermiiService>(TermiiService);
@@ -27,17 +30,22 @@ describe('TermiiService', () => {
       });
       const fetchMock = jest.fn().mockResolvedValue({
         ok: true,
-        json: async () => ({ message_id: 'msg-1' }),
+        json: () => Promise.resolve({ message_id: 'msg-1' }),
       });
       global.fetch = fetchMock as any;
 
-      await service.sendSms('+2348012345678', 'Your LRR verification code is 123456.');
+      await service.sendSms(
+        '+2348012345678',
+        'Your LRR verification code is 123456.',
+      );
 
       expect(fetchMock).toHaveBeenCalledWith(
         'https://v3.api.termii.com/api/sms/send',
         expect.objectContaining({
           method: 'POST',
-          body: expect.stringContaining('Your LRR verification code is 123456.'),
+          body: expect.stringContaining(
+            'Your LRR verification code is 123456.',
+          ),
         }),
       );
       const [, options] = fetchMock.mock.calls[0];
@@ -59,12 +67,12 @@ describe('TermiiService', () => {
       });
       global.fetch = jest.fn().mockResolvedValue({
         ok: false,
-        json: async () => ({ message: 'Insufficient balance' }),
+        json: () => Promise.resolve({ message: 'Insufficient balance' }),
       }) as any;
 
-      await expect(
-        service.sendSms('+2348012345678', 'code'),
-      ).rejects.toThrow(InternalServerErrorException);
+      await expect(service.sendSms('+2348012345678', 'code')).rejects.toThrow(
+        InternalServerErrorException,
+      );
     });
   });
 });

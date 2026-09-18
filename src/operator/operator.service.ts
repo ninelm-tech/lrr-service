@@ -124,10 +124,13 @@ export class OperatorService {
 
     if (existingByPhone) {
       if (existingByPhone.role !== UserRole.CUSTOMER) {
-        logger.warn('operator.create: phone already registered to a non-customer account', {
-          existingUserId: existingByPhone.id,
-          role: existingByPhone.role,
-        });
+        logger.warn(
+          'operator.create: phone already registered to a non-customer account',
+          {
+            existingUserId: existingByPhone.id,
+            role: existingByPhone.role,
+          },
+        );
         throw new ConflictException('Email or phone number already registered');
       }
 
