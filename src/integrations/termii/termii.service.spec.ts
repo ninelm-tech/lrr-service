@@ -14,10 +14,8 @@ describe('TermiiService', () => {
     return module.get<TermiiService>(TermiiService);
   }
 
-  it('throws on construction when TERMII_API_KEY is missing', async () => {
-    await expect(buildService({})).rejects.toThrow(
-      'Termii configuration is incomplete',
-    );
+  it('does not throw on construction when TERMII_API_KEY is missing — matches TwilioService leniency', async () => {
+    await expect(buildService({})).resolves.toBeDefined();
   });
 
   describe('sendSms', () => {

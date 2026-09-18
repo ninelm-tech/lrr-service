@@ -9,11 +9,7 @@ export class TermiiService {
   private readonly baseUrl: string;
 
   constructor(private readonly configService: ConfigService) {
-    const apiKey = this.configService.get<string>('TERMII_API_KEY');
-    if (!apiKey) {
-      throw new Error('Termii configuration is incomplete: missing TERMII_API_KEY');
-    }
-    this.apiKey = apiKey;
+    this.apiKey = this.configService.get<string>('TERMII_API_KEY') || '';
     this.senderId = this.configService.get<string>('TERMII_SENDER_ID') || 'LRR';
     this.baseUrl =
       this.configService.get<string>('TERMII_BASE_URL') ||
