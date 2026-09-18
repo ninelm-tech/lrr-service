@@ -11,7 +11,6 @@ import { PrismaService } from '../prisma/prisma.service';
 import { UserRole } from '@prisma/client';
 import { normalizePhone } from '../common/phone.util';
 import { OtpService } from '../otp/otp.service';
-import { AuditLogService } from '../audit-log/audit-log.service';
 
 export interface JwtPayload {
   sub: string;
@@ -35,7 +34,6 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
     private readonly otpService: OtpService,
-    private readonly auditLogService: AuditLogService,
   ) {}
 
   /**
@@ -269,27 +267,19 @@ export class AuthService {
   //  FORGOT PASSWORD
   // ══════════════════════════════════════════════════════
 
-  // Flip to true once the WhatsApp OTP Authentication template is approved
-  // by Meta. Until then, requestPasswordReset resets the password directly
-  // off identifier + newPassword alone — no proof of ownership. That's a
-  // deliberate, explicitly-accepted interim state (not an oversight): once
-  // this flips, the same call only sends a code, and the password itself
-  // only changes via resetPasswordWithCode after that code is verified.
-  private readonly otpPasswordResetEnabled = false;
-
   /**
    * Resolves the account by email first, then phone number — two separate
-   * lookups, never a combined OR, so the decision never depends on which
-   * row Prisma happens to match first (same convention as operator.service.ts).
+   * lookups, never a combined OR (same convention as operator.service.ts).
+   * The phone lookup normalizes first (same reasoning as AuthService.login,
+   * Task 8): this pre-existing method (2026-08-19) had the identical gap —
+   * a locally-formatted phone (0801...) never matched the E.164-stored
+   * value, silently falling through to "no account" every time. Same file,
+   * same bug class as Task 8's fix, folded in here rather than left stale
+   * next to the corrected version.
    * The response message never reveals whether an account was found or
-   * eligible — only `otpRequired` tells the caller whether a second step
-   * (resetPasswordWithCode) is needed.
-   *
-   * - otpPasswordResetEnabled === false: resets the password immediately,
-   *   right here, using newPassword — no verification of any kind.
-   * - otpPasswordResetEnabled === true: newPassword is ignored; a code is
-   *   sent to the account's registered phone number instead, and the
-   *   caller must follow up with resetPasswordWithCode to actually apply it.
+   * eligible — only `otpRequired` (always true) tells the caller a code was
+   * (maybe) sent; requestPasswordReset never changes a password directly —
+   * only resetPasswordWithCode does, after that code is verified.
    */
   async requestPasswordReset(
     identifier: string,
@@ -305,38 +295,18 @@ export class AuthService {
       );
     }
 
-    const byEmail = await this.prisma.user.findUnique({
+    let user = await this.prisma.user.findUnique({
       where: { email: identifier },
     });
-    const user =
-      byEmail ??
-      (await this.prisma.user.findUnique({
-        where: { phoneNumber: identifier },
-      }));
-
-    if (!this.otpPasswordResetEnabled) {
-      if (user && user.passwordHash) {
-        await this.prisma.user.update({
-          where: { id: user.id },
-          data: { passwordHash: await this.hashPassword(newPassword) },
+    if (!user) {
+      try {
+        const normalizedPhone = normalizePhone(identifier);
+        user = await this.prisma.user.findUnique({
+          where: { phoneNumber: normalizedPhone },
         });
-        logger.warn(
-          'requestPasswordReset: password reset with no OTP verification (otpPasswordResetEnabled=false)',
-          { userId: user.id },
-        );
-        // Self-service: the actor IS the account being reset — there's no
-        // separate admin here, just proof of ownership this app doesn't
-        // yet verify.
-        await this.auditLogService.record({
-          category: 'password_reset_no_otp',
-          message: 'Password reset without OTP verification',
-          actorId: user.id,
-        });
+      } catch {
+        user = null;
       }
-      return {
-        message: 'Password updated. You can now log in.',
-        otpRequired: false,
-      };
     }
 
     const genericMessage = {
@@ -353,13 +323,11 @@ export class AuthService {
   }
 
   /**
-   * Verifies the code, then in one transaction consumes its token and
-   * updates the password — mirrors the transaction pattern in
-   * operator.service.ts's upgrade path (re-check the token row inside the
-   * transaction to close the gap between verifyCode and this write). Only
-   * reachable in practice once otpPasswordResetEnabled is true — requestPasswordReset
-   * never sends a code while it's off, so verifyCode below always fails
-   * "not found" for any code a caller might guess.
+   * Verifies the code, then atomically claims its token and updates the
+   * password in one transaction. Consumption is the claim itself — an
+   * `updateMany` whose WHERE is the eligibility check — not a separate read
+   * followed by a write, which would let two concurrent submissions of the
+   * same code both pass a "not yet consumed" check before either commits.
    */
   async resetPasswordWithCode(
     phoneNumber: string,
@@ -383,17 +351,15 @@ export class AuthService {
     const passwordHash = await this.hashPassword(newPassword);
 
     await this.prisma.$transaction(async (tx) => {
-      // Re-check inside the transaction — close the gap if the token was
-      // consumed between the pre-check above and this write.
-      const freshTokenRow = await tx.phoneVerification.findUnique({
-        where: { id: tokenRow.id },
+      const claimed = await tx.phoneVerification.updateMany({
+        where: {
+          id: tokenRow.id,
+          consumedAt: null,
+          tokenExpiresAt: { gt: new Date() },
+        },
+        data: { consumedAt: new Date() },
       });
-      if (
-        !freshTokenRow ||
-        freshTokenRow.consumedAt ||
-        !freshTokenRow.tokenExpiresAt ||
-        freshTokenRow.tokenExpiresAt < new Date()
-      ) {
+      if (claimed.count !== 1) {
         throw new BadRequestException('Code expired — request a new one.');
       }
 
@@ -402,10 +368,6 @@ export class AuthService {
         throw new BadRequestException('No account found for this number.');
       }
 
-      await tx.phoneVerification.update({
-        where: { id: tokenRow.id },
-        data: { consumedAt: new Date() },
-      });
       await tx.user.update({
         where: { id: user.id },
         data: { passwordHash },
