@@ -958,10 +958,12 @@ describe('WhatsAppCustomerFlowService', () => {
         status: 'CANCELLED',
         disputeResolvedAt: null,
       });
-      const session = {
+      const session: WhatsAppSession = {
+        userId: 'cust-1',
         state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
         rescueRequestId: 'req-1',
-      } as any;
+        updatedAt: new Date(),
+      };
 
       const result = await service.handleCustomerMessage(
         '+2348012345678',
@@ -988,10 +990,12 @@ describe('WhatsAppCustomerFlowService', () => {
         status: 'COMPLETED',
         disputeResolvedAt: null,
       });
-      const session = {
+      const session: WhatsAppSession = {
+        userId: 'cust-1',
         state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
         rescueRequestId: 'req-1',
-      } as any;
+        updatedAt: new Date(),
+      };
 
       const result = await service.handleCustomerMessage(
         '+2348012345678',
@@ -1014,10 +1018,12 @@ describe('WhatsAppCustomerFlowService', () => {
         status: 'ARRIVED',
         disputeResolvedAt: null,
       });
-      const session = {
+      const session: WhatsAppSession = {
+        userId: 'cust-1',
         state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
         rescueRequestId: 'req-1',
-      } as any;
+        updatedAt: new Date(),
+      };
 
       await service.handleCustomerMessage(
         '+2348012345678',
