@@ -106,19 +106,20 @@ DELETE /operators/:id
 **Corrected from an earlier draft of this spec, on three points raised in
 review:**
 
-1. **The guard must not be a separate read before the write.** A plain
-   "check, then update" leaves a window where a new `RescueRequest` or
-   `Payment` can be created between the two — by a customer messaging
-   WhatsApp, a webhook, anything — and the anonymizing write would then
-   proceed against state that's no longer true. This codebase's answer to
-   exactly this shape of problem is already established everywhere else
-   (payout retry, refund, dispute resolution): **the guard has to be the
-   query** — a single conditional `updateMany` whose `WHERE` encodes the
-   guard, so Postgres evaluates eligibility and writes atomically. An
-   earlier draft of this spec called the two-step version acceptable on the
-   reasoning that "a SUPER_ADMIN clicking delete twice" is the only race —
-   that reasoning was wrong; the real race is with unrelated processes, not
-   with the admin's own second click.
+1. **Every destructive guard uses lock → read → write, in one transaction.**
+   A plain "check, then update" leaves a window where a new child row can be
+   created between the two. But putting relational conditions such as
+   `rescueRequests: { none: ... }` inside the locking `updateMany` is not a
+   sound fix either: under PostgreSQL `READ COMMITTED`, EvalPlanQual reliably
+   rechecks predicates on the parent row it waited to lock, but relational
+   subqueries may still reflect the statement's earlier snapshot. The fixed
+   shape is: (1) lock the parent with an `updateMany` whose `WHERE` contains
+   only parent columns (`id`, `deletedAt`, and, for users, `role`); (2) while
+   holding that lock, read child-table eligibility with separate queries;
+   (3) perform the irreversible anonymizing update. Every writer that can
+   change those child-table answers must first lock the same parent row, so
+   it either commits before the guard's fresh reads or waits until deletion
+   finishes. This lock ordering is the concurrency contract for the feature.
 2. **Deletion and its audit entry must commit together.** `AuditLogService
    .record()` deliberately never throws, everywhere else in this codebase,
    so that a logging hiccup can never break the action being audited
@@ -145,39 +146,60 @@ review:**
 ```ts
 async deleteUser(id: string, actorId: string): Promise<void> {
   const s3KeysToDelete = await this.prisma.$transaction(async (tx) => {
-    const claimed = await tx.user.updateMany({
+    const locked = await tx.user.updateMany({
       where: {
         id,
         deletedAt: null,
         role: { in: [UserRole.CUSTOMER, UserRole.OPERATOR] },
-        rescueRequests: {
-          none: {
-            OR: [
-              { status: { notIn: [RescueRequestStatus.COMPLETED, RescueRequestStatus.CANCELLED] } },
-              { disputed: true, disputeResolvedAt: null },
-              // A request can be CANCELLED (satisfying the line above) while
-              // its REFUND payment is still stuck — e.g. BLOCKED on
-              // NEEDS_CUSTOMER_DETAILS, waiting on bank info from exactly
-              // the person about to be anonymized. Terminal request status
-              // alone doesn't mean the money side is settled.
-              { payments: { some: { status: { in: [PaymentStatus.PENDING, PaymentStatus.SUBMITTED, PaymentStatus.BLOCKED] } } } },
-            ],
-          },
-        },
       },
+      data: { updatedAt: new Date() },
+    });
+    if (locked.count === 0) {
+      await this.explainUserLockFailure(tx, id); // always throws
+    }
+
+    const blockingRequests = await tx.rescueRequest.findMany({
+      where: {
+        customerId: id,
+        OR: [
+          { status: { notIn: [RescueRequestStatus.COMPLETED, RescueRequestStatus.CANCELLED] } },
+          { disputed: true, disputeResolvedAt: null },
+          {
+            payments: {
+              some: {
+                type: { in: [PaymentType.DEPOSIT, PaymentType.BALANCE, PaymentType.REFUND] },
+                status: { in: [PaymentStatus.PENDING, PaymentStatus.SUBMITTED, PaymentStatus.BLOCKED] },
+              },
+            },
+          },
+        ],
+      },
+      select: { id: true },
+    });
+    if (blockingRequests.length > 0) {
+      throw new BadRequestException(
+        `Cannot delete: ${blockingRequests.length} request(s) still active, with an unresolved dispute, or with a payment still processing`,
+      );
+    }
+
+    const ownedOperators = await tx.operatorMember.findMany({
+      where: { userId: id, role: OperatorMemberRole.OWNER, operator: { deletedAt: null } },
+      select: { operatorId: true },
+    });
+    if (ownedOperators.length > 0) {
+      throw new BadRequestException(
+        `Cannot delete: this user owns ${ownedOperators.length} active operator business(es) — transfer ownership or delete the business first`,
+      );
+    }
+
+    await tx.user.update({
+      where: { id },
       data: {
-        name: 'Deleted User',
-        email: null,
-        phoneNumber: null,
-        passwordHash: null,
-        paystackCustomerCode: null,
-        paystackCustomerEmail: null,
-        deletedAt: new Date(),
+        name: 'Deleted User', email: null, phoneNumber: null,
+        passwordHash: null, paystackCustomerCode: null,
+        paystackCustomerEmail: null, deletedAt: new Date(),
       },
     });
-    if (claimed.count === 0) {
-      await this.explainUserDeleteFailure(tx, id); // always throws — see below
-    }
 
     // Scrub what's identifying on this customer's own requests — none of
     // it is financial-record data (Background). The guard above already
@@ -245,31 +267,18 @@ async deleteUser(id: string, actorId: string): Promise<void> {
   }
 }
 
-/** Always throws — a courtesy re-read purely to build a precise error message, same shape as every other guard in this codebase (e.g. `refundDeposit`'s comment on why its own pre-check isn't the real guard). */
-private async explainUserDeleteFailure(tx: Prisma.TransactionClient, id: string): Promise<never> {
+/** The lock can fail only on parent-row facts; child guards run after it succeeds. */
+private async explainUserLockFailure(tx: Prisma.TransactionClient, id: string): Promise<never> {
   const user = await tx.user.findUnique({
     where: { id },
-    include: {
-      rescueRequests: {
-        where: {
-          OR: [
-            { status: { notIn: [RescueRequestStatus.COMPLETED, RescueRequestStatus.CANCELLED] } },
-            { disputed: true, disputeResolvedAt: null },
-            { payments: { some: { status: { in: [PaymentStatus.PENDING, PaymentStatus.SUBMITTED, PaymentStatus.BLOCKED] } } } },
-          ],
-        },
-        select: { id: true },
-      },
-    },
+    select: { role: true, deletedAt: true },
   });
   if (!user) throw new NotFoundException('User not found');
   if (user.deletedAt) throw new BadRequestException('This account has already been deleted');
   if (![UserRole.CUSTOMER, UserRole.OPERATOR].includes(user.role)) {
     throw new BadRequestException('Only customer and operator accounts can be deleted through this endpoint');
   }
-  throw new BadRequestException(
-    `Cannot delete: ${user.rescueRequests.length} request(s) still active, with an unresolved dispute, or with a payment still processing`,
-  );
+  throw new BadRequestException('This account cannot be deleted');
 }
 ```
 
@@ -284,22 +293,57 @@ separately deleted:
 ```ts
 async deleteOperator(id: string, actorId: string): Promise<void> {
   await this.prisma.$transaction(async (tx) => {
-    const claimed = await tx.operator.updateMany({
+    const locked = await tx.operator.updateMany({
+      where: { id, deletedAt: null },
+      data: { updatedAt: new Date() },
+    });
+    if (locked.count === 0) {
+      const operator = await tx.operator.findUnique({
+        where: { id },
+        select: { deletedAt: true },
+      });
+      if (!operator) throw new NotFoundException('Operator not found');
+      throw new BadRequestException('This operator has already been deleted');
+    }
+
+    const blockingRequests = await tx.rescueRequest.findMany({
       where: {
-        id,
-        deletedAt: null,
-        rescueRequests: {
-          none: {
-            OR: [
-              { status: { notIn: [RescueRequestStatus.COMPLETED, RescueRequestStatus.CANCELLED] } },
-              { disputed: true, disputeResolvedAt: null },
-            ],
-          },
-        },
+        assignedOperatorId: id,
+        OR: [
+          { status: { notIn: [RescueRequestStatus.COMPLETED, RescueRequestStatus.CANCELLED] } },
+          { disputed: true, disputeResolvedAt: null },
+        ],
+      },
+      select: { id: true },
+    });
+    if (blockingRequests.length > 0) {
+      throw new BadRequestException(
+        `Cannot delete: ${blockingRequests.length} request(s) still active or disputed`,
+      );
+    }
+
+    // Attempt terminality is not obligation settlement. FAILED and REVERSED
+    // payout attempts are retryable with a new sibling row, so deletion is
+    // allowed only once every completed assigned request has a SUCCEEDED
+    // payout attempt.
+    const unsettledPayouts = await tx.rescueRequest.findMany({
+      where: {
+        assignedOperatorId: id,
+        status: RescueRequestStatus.COMPLETED,
         payments: {
-          none: { status: { in: [PaymentStatus.PENDING, PaymentStatus.SUBMITTED, PaymentStatus.BLOCKED] } },
+          none: { type: PaymentType.PAYOUT, status: PaymentStatus.SUCCEEDED },
         },
       },
+      select: { id: true },
+    });
+    if (unsettledPayouts.length > 0) {
+      throw new BadRequestException(
+        `Cannot delete: ${unsettledPayouts.length} completed request(s) still have an unsettled payout`,
+      );
+    }
+
+    await tx.operator.update({
+      where: { id },
       data: {
         businessName: 'Deleted Operator',
         contactName: 'Deleted Operator',
@@ -315,9 +359,6 @@ async deleteOperator(id: string, actorId: string): Promise<void> {
         deletedAt: new Date(),
       },
     });
-    if (claimed.count === 0) {
-      await this.explainOperatorDeleteFailure(tx, id); // always throws
-    }
 
     await tx.rescueRequest.updateMany({
       where: { assignedOperatorId: id },
@@ -338,9 +379,10 @@ async deleteOperator(id: string, actorId: string): Promise<void> {
 }
 ```
 
-(`explainOperatorDeleteFailure` mirrors `explainUserDeleteFailure` above,
-minus the role check, plus the `Payment` status check from the original
-guard description.)
+The plain parent lock is intentionally separate from both child reads. The
+request-assignment and payout-creation paths described below lock this same
+`Operator` row before their own writes, making the post-lock reads stable for
+the rest of the deletion transaction.
 
 `S3Service` (`src/integrations/s3/s3.service.ts`) has no delete method
 today — only `uploadMedia`/`getSignedUrl`. This spec needs one added:
@@ -371,10 +413,10 @@ That remains a real, disclosed limit of what "delete" means here.
 
 #### The atomic guard still doesn't close the race with a brand-new child row
 
-`updateMany`'s `WHERE ... NOT EXISTS (...)` is atomic against already
-*committed* data, but it does nothing about a **concurrent, not-yet-committed**
-sibling transaction. Traced the actual creation path to check whether this is
-real: there is exactly one live place a `RescueRequest` gets created for a
+The deletion-side parent lock makes its later reads stable only if every
+writer that can change those answers takes the same lock first. Traced the
+actual creation path to check whether this is real: there is exactly one live
+place a `RescueRequest` gets created for a
 customer — `WhatsAppCustomerFlowService`, `whatsapp-customer-flow.service.ts:417`
 — and it does this:
 
@@ -410,9 +452,9 @@ change.** This is standard Postgres behavior, not a new mechanism: when an
 evaluates that row, and a second concurrent `UPDATE` targeting the *same*
 row blocks until the first commits, then re-checks its own `WHERE` against
 the now-current data before deciding whether to proceed. The deletion
-guard's `updateMany` already does this by targeting `id`. Creation needs to
-do the same, as the first statement in a transaction that then creates the
-request:
+deletion transaction does this with its plain parent-row `updateMany`.
+Creation needs to target the same row, as the first write in a transaction
+that then creates the request:
 
 ```ts
 // whatsapp-customer-flow.service.ts — destination-collection step,
@@ -589,7 +631,10 @@ async create(input: {
     // Same lock-as-mutex idiom as Section 2a's creation-side fix — targets
     // the same row deleteOperator's/deleteUser's own updateMany writes to,
     // so Postgres serializes the two regardless of which commits first.
-    if (input.type === PaymentType.PAYOUT && input.operatorId) {
+    if (input.type === PaymentType.PAYOUT) {
+      if (!input.operatorId) {
+        throw new BadRequestException('A PAYOUT payment must have an operatorId.');
+      }
       const stillActive = await client.operator.updateMany({
         where: { id: input.operatorId, deletedAt: null },
         data: { updatedAt: new Date() },
@@ -714,21 +759,12 @@ a separate pre-check:
  */
 async lockActiveMembership(
   tx: Prisma.TransactionClient,
-  userId: string,
+  actingUser: { userId: string; role: string },
   operatorId: string,
 ): Promise<void> {
-  const membership = await tx.operatorMember.findFirst({
-    where: { userId, operatorId },
-  });
-  if (!membership) {
-    throw new ForbiddenException('Not a member of this operator.');
-  }
-
-  // Two separate locks, not one — the membership read above is only a
-  // snapshot; these are what actually serialize against concurrent
-  // deletion, same idiom as every other lock in this spec.
+  // Fixed order: User, then Operator. Every caller uses this order.
   const userStillActive = await tx.user.updateMany({
-    where: { id: userId, deletedAt: null },
+    where: { id: actingUser.userId, deletedAt: null },
     data: { updatedAt: new Date() },
   });
   if (userStillActive.count === 0) {
@@ -742,6 +778,18 @@ async lockActiveMembership(
   if (operatorStillActive.count === 0) {
     throw new ForbiddenException('This operator has been deleted.');
   }
+
+  // Read membership only after both locks are held. Reading it first is
+  // racy against addMember/removeMember; those mutations also lock this
+  // Operator row before changing membership rows.
+  if (![UserRole.ADMIN, UserRole.SUPER_ADMIN].includes(actingUser.role as UserRole)) {
+    const membership = await tx.operatorMember.findFirst({
+      where: { userId: actingUser.userId, operatorId },
+    });
+    if (!membership) {
+      throw new ForbiddenException('Not a member of this operator.');
+    }
+  }
 }
 ```
 
@@ -749,11 +797,79 @@ Whichever of `lockActiveMembership`'s two locks or the matching deletion's
 own `updateMany` commits first — `deleteUser`'s targets the same `User` row
 by `id`, `deleteOperator`'s the same `Operator` row by `id` — wins outright,
 same guarantee as every other lock in this spec, now covering both parents
-instead of just one. Migrating
+instead of just one. The membership read deliberately comes last: an earlier
+draft read it before either lock, allowing a concurrent `removeMember` to
+invalidate the authorization before the protected mutation committed.
+`addMember` and `removeMember` must themselves lock the same Operator row
+before changing membership rows. The role-bearing signature also preserves
+the existing ADMIN/SUPER_ADMIN bypass; those roles may manage an operator
+without owning an `OperatorMember` row. Migrating
 `assertCanManageOperator`/`respondToOffer` (and `assertIsMemberOrAdmin` if
 applicable) to wrap their mutation in a transaction and call this first is
 implementation-plan work, not written out here — the method contract and
 which call sites need it is what this design fixes.
+
+### 2d. Fifth pass: assignment, disputes, and both quote channels participate in the locks
+
+The operator deletion guard reads `RescueRequest.assignedOperatorId` only
+after locking the Operator row. That read is stable only if every writer of
+`assignedOperatorId` locks the same Operator first. There are exactly two
+writers: `RescueRequestAdminService.assignOperator` and
+`WhatsAppCustomerFlowService.handleQuoteSelected`. `respondToOffer` does not
+set this field, so protecting only the offer claim leaves the real race open.
+
+The lock cannot be added only around the final assignment write. In the real
+admin flow, the selected offer and deposit Payment are created and Paystack is
+called before `assignedOperatorId` is currently persisted; in the WhatsApp
+flow, the request is moved to `WAITING_FOR_DEPOSIT` before the Operator lock.
+Both orders are invalid: the first calls an external payment provider before
+the assignment exists, and the second can leave a dead-end request if the
+later lock fails.
+
+Both assignment paths therefore use one short database transaction. Because
+deposit creation also locks the request's customer, they follow the global
+parent order User then Operator; the Operator lock is:
+
+```ts
+const operatorStillActive = await tx.operator.updateMany({
+  where: { id: operatorId, deletedAt: null },
+  data: { updatedAt: new Date() },
+});
+```
+
+For manual admin assignment, that transaction locks the customer User then
+the Operator, claims the
+request, creates the selected offer, creates the PENDING deposit Payment on
+the transaction client, and persists assignment/status/pricing/deadline. For
+WhatsApp quote selection, the same transaction contains the User lock,
+Operator lock, DISPATCHING claim, assignment/status/pricing/deadline, all selected/
+not-selected/timed-out offer transitions, and the PENDING deposit Payment.
+Only after commit may either path claim the Payment for submission and call
+Paystack. Thus no HTTP call occurs while holding the Operator lock, but no
+HTTP call occurs before durable assignment either.
+
+This closes both orderings: if assignment commits first, deletion acquires the
+lock afterward and its fresh request read blocks deletion; if deletion commits
+first, assignment's `deletedAt: null` lock matches zero rows and assignment
+aborts. The admin endpoint throws a precise `BadRequestException`; the
+WhatsApp flow tells the customer the operator is no longer available and
+alerts Sentry. A failed Operator lock rolls the entire selection transaction
+back, so there is no knowingly stranded `WAITING_FOR_DEPOSIT` state.
+
+`DispatchService.processQuoteOrDecline` remains the public, channel-agnostic
+operation used by dashboard and WhatsApp. The conditional offer write moves
+to a private `claimOfferInTx`. The dashboard wrapper calls
+`lockActiveMembership` then the helper; the WhatsApp/public wrapper locks the
+offer's Operator row directly then calls the same helper. Protecting only
+`respondToOffer` would silently leave the WhatsApp channel outside the
+protocol.
+
+Dispute opening/reopening is another child write read by both deletion
+guards. `DisputeService.raiseDispute` performs one short transaction with a
+fixed lock order: request customer User first, assigned Operator second (when
+present), then set or reopen the dispute. All notifications and session
+updates remain after commit. This prevents either deletion from passing its
+fresh dispute read immediately before a concurrent dispute is opened.
 
 ### 3. Effect on existing read paths
 
@@ -976,29 +1092,27 @@ own.
 
 ## Testing
 
-Mocked-Prisma tests in this codebase can't observe real `NULL`/conditional-
-`WHERE` semantics, so these assert call shape and simulate query results,
-matching this repo's existing convention. Because the guard is now the
-`updateMany`'s `WHERE` rather than a separate read, "blocks on X" below
-means: simulate `count: 0` and assert the specific error
-`explainUserDeleteFailure`/`explainOperatorDeleteFailure` produces from that
-state — not that some earlier read rejected first.
+Mocked-Prisma tests in this codebase can't observe real row-lock blocking, so
+unit tests assert the three-step query shape and simulate each result: a plain
+parent `updateMany` lock, separate child-table reads after that lock succeeds,
+then the irreversible update. Integration tests against PostgreSQL cover the
+actual serialization behavior. No relational condition belongs in a locking
+`updateMany`'s `WHERE`.
 
-- **`deleteUser` rejects a non-customer, non-operator role outright** —
-  target has `role: ADMIN` (or `SUPER_ADMIN`/`PRODUCT`) → `updateMany`
-  matches zero rows, the explain-read reports the role, rejected before
-  anything about requests/disputes is even considered. **This is the
-  regression that matters most** — an earlier draft had no role check at
-  all.
-- **`deleteUser` guard blocks on an active request** — any status other than
-  `COMPLETED`/`CANCELLED` → `count: 0`, explain-read reports the count of
-  still-active/disputed requests.
+- **`deleteUser` locks with parent columns only** — `id`, `deletedAt`, and
+  allowed `role`; no `rescueRequests`, `payments`, or memberships relation is
+  present in the lock query.
+- **`deleteUser` rejects a non-customer, non-operator role outright** — target
+  has `role: ADMIN` (or `SUPER_ADMIN`/`PRODUCT`) → the parent lock matches zero
+  rows and the parent-only explanation read reports the role.
+- **`deleteUser` guard blocks on an active request** — the parent lock returns
+  `count: 1`, then the fresh child read finds any status other than
+  `COMPLETED`/`CANCELLED` and aborts before anonymization.
 - **`deleteUser` guard blocks on an unresolved dispute on an otherwise-
   completed request** — `status: COMPLETED, disputed: true,
   disputeResolvedAt: null` → rejected. A status-only check would miss this.
 - **`deleteUser` rejects an already-deleted account** — `deletedAt` already
-  set → `count: 0`, explain-read reports "already deleted" rather than
-  re-running the request check.
+  set → the parent lock returns `count: 0`; child reads never run.
 - **`deleteUser` succeeds and anonymizes** — eligible role, no active
   requests, no open disputes → `name/email/phoneNumber/passwordHash/
   paystackCustomerCode/paystackCustomerEmail` cleared, `deletedAt` set.
@@ -1028,11 +1142,12 @@ state — not that some earlier read rejected first.
   so Postgres rejects the insert for real), and assert the `User` row's
   `deletedAt` is still `null` and its `name` unchanged afterward — the
   earlier `updateMany` in the same transaction must have rolled back too.
-- **`deleteOperator` guard blocks on a non-terminal payout** — a `Payment`
-  row in `PENDING`/`SUBMITTED`/`BLOCKED` for that operator → rejected,
-  message names which.
-- **`deleteOperator` guard does not block on terminal payouts** —
-  `SUCCEEDED`/`FAILED`/`REVERSED` don't count as blocking.
+- **`deleteOperator` blocks on an unsettled payout entitlement** — any
+  COMPLETED assigned request with no SUCCEEDED PAYOUT sibling is blocking,
+  including no attempt yet and attempts ending FAILED or REVERSED.
+- **A terminal failed attempt is not settlement** — FAILED/REVERSED remains
+  blocking because the payment model permits a fresh retry row. An older
+  failed attempt stops blocking only when a SUCCEEDED sibling exists.
 - **`deleteOperator` succeeds and anonymizes** — sets `status: SUSPENDED`,
   `isAvailable: false`, clears bank fields including
   `paystackRecipientCode`, sets `deletedAt`.
@@ -1076,11 +1191,10 @@ state — not that some earlier read rejected first.
   `rescueRequest.create` runs. **This is the regression that matters
   most** — an earlier draft's guard was atomic only against already-
   committed data, not a concurrent in-flight sibling transaction.
-- **Deletion aborts when a request was created between the guard's last
-  known-good state and its own commit** — the mirror image of the above:
-  creation's transaction commits first (row now has an active request),
-  then deletion's `updateMany` — unblocked and re-evaluating its `WHERE`
-  against current data — must see the new request and return `count: 0`.
+- **Deletion aborts when request creation wins the parent lock first** — once
+  creation commits, deletion acquires the same User lock and its subsequent
+  fresh child read sees the new active request. This test must not expect a
+  relational condition in deletion's lock query.
 - **`RetryMediaDeletionCheck` clears a `PendingMediaDeletion` row once its
   S3 object deletes successfully.**
 - **`RetryMediaDeletionCheck` leaves a row in place when its S3 delete
@@ -1127,14 +1241,24 @@ state — not that some earlier read rejected first.
   calls (the payout lock-check, or the deletion guard) commits first
   determines the other's outcome, mirroring the creation-vs-deletion test
   already specified above for customers.
+- **Both quote channels participate in the Operator lock** — dashboard uses
+  `lockActiveMembership`; WhatsApp/public `processQuoteOrDecline` locks the
+  offer's Operator directly; both call the same transactional claim helper.
+- **Assignment persists before Paystack** — admin and WhatsApp tests assert
+  the request claim, Operator lock, assignment/pricing, offer transitions,
+  and PENDING deposit Payment commit together before any provider call.
+- **Dispute opening/reopening participates in both deletion locks** — lock
+  order is customer User then assigned Operator, the dispute write commits in
+  that transaction, and notifications occur afterward.
 - **`deleteUser` nulls both `customerDisputeStatement` and
   `operatorDisputeStatement`** on the customer's requests, not just their
   own statement.
 - **`deleteOperator` nulls both `operatorDisputeStatement` and
   `customerDisputeStatement`** on the operator's assigned requests, not
   just their own statement.
-- **`lockActiveMembership` throws when no membership row exists** — before
-  either lock is even attempted.
+- **`lockActiveMembership` throws when no membership row exists** — only after
+  both parent locks succeed. Assert the fixed order User → Operator →
+  membership read; reading membership first recreates the remove-member race.
 - **`lockActiveMembership` throws when the acting user has been deleted**
   — the membership row and `Operator` are both intact, but `user
   .updateMany`'s own guard (`deletedAt: null`) matches zero rows. **This
@@ -1147,6 +1271,9 @@ state — not that some earlier read rejected first.
   `operator.updateMany`'s own guard matches zero rows.
 - **`lockActiveMembership` succeeds and returns for an active membership**
   — no exception, both `updateMany` calls return `count: 1`.
+- **`lockActiveMembership` preserves the admin bypass** — after locking the
+  acting User and target Operator, ADMIN/SUPER_ADMIN succeeds without an
+  `OperatorMember` row; ordinary OPERATOR users still require membership.
 - **A concurrent `deleteUser` and a mutation correctly serialize** —
   integration-level, real database: start a transaction that calls
   `lockActiveMembership` then pauses before committing, run `deleteUser`
@@ -1156,3 +1283,18 @@ state — not that some earlier read rejected first.
 - **A concurrent `deleteOperator` and a mutation correctly serialize** —
   same shape as above, but racing `deleteOperator` against the operator
   lock instead of the user lock.
+- **Both `assignedOperatorId` writers lock the selected Operator** — unit
+  tests for `assignOperator` and `handleQuoteSelected` simulate lock
+  `count: 0` and assert no `RescueRequest` assignment update occurs.
+- **A concurrent assignment and `deleteOperator` correctly serialize** —
+  integration-level, real database: assignment-first makes deletion's fresh
+  request read reject; deletion-first makes assignment's Operator lock reject.
+- **Real PostgreSQL race matrix** — deterministic two-client integration
+  tests cover both commit orders for deleteUser versus request creation,
+  deleteUser versus customer Payment creation, deleteOperator versus
+  assignment, and deleteOperator versus PAYOUT creation. Promise barriers,
+  not sleeps, control lock acquisition; every test asserts final persisted
+  rows as well as the rejected operation.
+- **Integration cleanup includes `PendingMediaDeletion`** — add it explicitly
+  to `truncateAll()` because it has no foreign key and is not removed by
+  cascading truncation of the existing tables.
