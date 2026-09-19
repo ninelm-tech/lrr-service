@@ -764,7 +764,9 @@ export class RescueRequestAdminService {
         include: {
           customer: { select: { id: true, phoneNumber: true } },
           assignedOperator: { select: { id: true, businessName: true } },
-          payments: { select: { id: true, type: true, status: true } },
+          payments: {
+            select: { id: true, type: true, status: true, createdAt: true },
+          },
         },
         orderBy: { createdAt: 'desc' },
       }),
@@ -778,7 +780,18 @@ export class RescueRequestAdminService {
       latitude: item.latitude ? Number(item.latitude) : undefined,
       longitude: item.longitude ? Number(item.longitude) : undefined,
       depositPaid: hasSucceededPayment(item.payments, PaymentType.DEPOSIT),
+      depositReference: this.latestPaymentReference(
+        item.payments,
+        PaymentType.DEPOSIT,
+      ),
+      depositAmount: item.depositAmount ?? undefined,
       balancePaid: hasSucceededPayment(item.payments, PaymentType.BALANCE),
+      balanceReference: this.latestPaymentReference(
+        item.payments,
+        PaymentType.BALANCE,
+      ),
+      balanceAmount: item.balanceAmount ?? undefined,
+      ...this.deriveRequestAmounts(item),
       depositRefundStatus: deriveRefundStatus(item.status, item.payments),
       customer: {
         id: item.customer.id,
@@ -830,6 +843,7 @@ export class RescueRequestAdminService {
             createdAt: m.createdAt,
           }))
         : undefined;
+    const amounts = this.deriveRequestAmounts(raw);
 
     return {
       id: raw.id,
@@ -842,17 +856,18 @@ export class RescueRequestAdminService {
       latitude: raw.latitude ? Number(raw.latitude) : undefined,
       longitude: raw.longitude ? Number(raw.longitude) : undefined,
       depositPaid: hasSucceededPayment(raw.payments, PaymentType.DEPOSIT),
-      depositAmount: raw.depositAmount,
+      depositAmount: raw.depositAmount ?? undefined,
       depositReference: this.latestPaymentReference(
         raw.payments,
         PaymentType.DEPOSIT,
       ),
       balancePaid: hasSucceededPayment(raw.payments, PaymentType.BALANCE),
-      balanceAmount: raw.balanceAmount,
+      balanceAmount: raw.balanceAmount ?? undefined,
       balanceReference: this.latestPaymentReference(
         raw.payments,
         PaymentType.BALANCE,
       ),
+      ...amounts,
       customer: {
         id: raw.customer.id,
         phoneNumber: raw.customer.phoneNumber,
@@ -890,6 +905,34 @@ export class RescueRequestAdminService {
     };
   }
 
+  private deriveRequestAmounts(raw: {
+    depositAmount?: number | null;
+    balanceAmount?: number | null;
+    serviceFeeAmount?: number | null;
+    disputeOriginalBalanceAmount?: number | null;
+  }): {
+    totalAmount?: number;
+    acceptedQuoteAmount?: number;
+  } {
+    const hasSplit =
+      raw.depositAmount !== null &&
+      raw.depositAmount !== undefined &&
+      raw.balanceAmount !== null &&
+      raw.balanceAmount !== undefined;
+    if (!hasSplit) return {};
+
+    const totalAmount = raw.depositAmount! + raw.balanceAmount!;
+    const acceptedQuoteBalance =
+      raw.disputeOriginalBalanceAmount ?? raw.balanceAmount!;
+    return {
+      totalAmount,
+      acceptedQuoteAmount:
+        raw.serviceFeeAmount !== null && raw.serviceFeeAmount !== undefined
+          ? raw.depositAmount! + acceptedQuoteBalance - raw.serviceFeeAmount
+          : undefined,
+    };
+  }
+
   /**
    * The reference field this DTO exposes is now derived, not stored: the
    * SUCCEEDED attempt if one exists, else whichever attempt is most recent
@@ -900,14 +943,22 @@ export class RescueRequestAdminService {
     payments: Pick<Payment, 'id' | 'type' | 'status' | 'createdAt'>[],
     type: PaymentType,
   ): string | undefined {
+    const chosen = this.latestPayment(payments, type);
+    return chosen ? this.paymentLedger.referenceFor(chosen) : undefined;
+  }
+
+  private latestPayment(
+    payments: Pick<Payment, 'id' | 'type' | 'status' | 'createdAt'>[],
+    type: PaymentType,
+  ): Pick<Payment, 'id' | 'type' | 'status' | 'createdAt'> | undefined {
     const candidates = payments.filter((p) => p.type === type);
     if (candidates.length === 0) return undefined;
-    const chosen =
+    return (
       candidates.find((p) => p.status === PaymentStatus.SUCCEEDED) ??
       candidates.reduce((latest, p) =>
         p.createdAt > latest.createdAt ? p : latest,
-      );
-    return this.paymentLedger.referenceFor(chosen);
+      )
+    );
   }
 
   /**

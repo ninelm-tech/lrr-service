@@ -117,25 +117,31 @@ describe('WhatsAppCustomerFlowService', () => {
     });
 
     it('re-prompts and does not create a rating for invalid input', async () => {
-      await ratingTestService.handleRatingReply(
+      const response = await ratingTestService.handleRatingReply(
         'cust-1',
         'banana',
         'req-1',
         'MOTORIST_TO_OPERATOR',
       );
 
+      expect(response).toContain(
+        'rate your experience with the operator for Job #REQ-1',
+      );
       expect(ratingServiceMock.create).not.toHaveBeenCalled();
       expect(sessionStore.update).not.toHaveBeenCalled();
     });
 
     it('re-prompts and does not create a rating for an out-of-range number', async () => {
-      await ratingTestService.handleRatingReply(
-        'cust-1',
+      const response = await ratingTestService.handleRatingReply(
+        'op-user-1',
         '7',
         'req-1',
-        'MOTORIST_TO_OPERATOR',
+        'OPERATOR_TO_MOTORIST',
       );
 
+      expect(response).toContain(
+        'rate your experience with the customer for Job #REQ-1',
+      );
       expect(ratingServiceMock.create).not.toHaveBeenCalled();
       expect(sessionStore.update).not.toHaveBeenCalled();
     });

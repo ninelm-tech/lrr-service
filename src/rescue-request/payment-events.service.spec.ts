@@ -240,6 +240,19 @@ describe('PaymentEventsService', () => {
       );
     });
 
+    it('identifies the completed job and rated party in both rating prompts', async () => {
+      await service.confirmBalance(paymentFor('req-1'));
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        '+2348012345678',
+        expect.stringContaining('Swift Towing on Job #REQ-1'),
+      );
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        'whatsapp:+2349012345678',
+        expect.stringContaining('the customer on Job #REQ-1'),
+      );
+    });
+
     it('tells a customer who already has portal credentials to log in instead', async () => {
       prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
         ...BALANCE_REQUEST_FIXTURE,

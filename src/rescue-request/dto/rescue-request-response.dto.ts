@@ -38,7 +38,13 @@ export class RescueRequestListItemDto {
   latitude?: number;
   longitude?: number;
   depositPaid: boolean;
+  depositReference?: string;
+  depositAmount?: number;
   balancePaid: boolean;
+  balanceReference?: string;
+  balanceAmount?: number;
+  totalAmount?: number;
+  acceptedQuoteAmount?: number;
   depositRefundStatus: 'NONE' | 'ELIGIBLE' | 'PENDING' | 'COMPLETED' | 'FAILED';
   customer: CustomerSummaryDto;
   assignedOperator?: OperatorSummaryDto;
@@ -97,6 +103,8 @@ export class RescueRequestDetailDto {
   balancePaid: boolean;
   balanceAmount?: number;
   balanceReference?: string;
+  totalAmount?: number;
+  acceptedQuoteAmount?: number;
   customer: CustomerDetailDto;
   assignedOperator?: OperatorDetailDto;
   disputed: boolean;

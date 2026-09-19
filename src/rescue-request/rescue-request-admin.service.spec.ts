@@ -445,7 +445,17 @@ describe('RescueRequestAdminService', () => {
           destination: null,
           latitude: null,
           longitude: null,
-          payments: [{ id: 'pay-1', type: 'DEPOSIT', status: 'SUCCEEDED' }],
+          depositAmount: 22_000,
+          balanceAmount: 88_000,
+          serviceFeeAmount: 10_000,
+          payments: [
+            {
+              id: 'pay-1',
+              type: 'DEPOSIT',
+              status: 'SUCCEEDED',
+              createdAt: new Date('2026-09-19T12:00:00Z'),
+            },
+          ],
           customer: { id: 'cust-1', phoneNumber: '+2341' },
           assignedOperator: null,
           createdAt: new Date(),
@@ -458,8 +468,52 @@ describe('RescueRequestAdminService', () => {
 
       expect(result.data[0].depositPaid).toBe(true);
       expect(result.data[0].balancePaid).toBe(false);
+      expect(result.data[0]).toEqual(
+        expect.objectContaining({
+          depositAmount: 22_000,
+          depositReference: 'DEP_pay-1',
+          balanceAmount: 88_000,
+          balanceReference: undefined,
+          totalAmount: 110_000,
+          acceptedQuoteAmount: 100_000,
+        }),
+      );
       // CANCELLED + a succeeded deposit + no refund attempt yet = ELIGIBLE.
       expect(result.data[0].depositRefundStatus).toBe('ELIGIBLE');
+    });
+
+    it('preserves the accepted quote after a dispute reduces the balance', async () => {
+      prisma.rescueRequest.findMany.mockResolvedValue([
+        {
+          id: 'req-disputed',
+          status: 'IN_DISPUTE',
+          issueType: 'BREAKDOWN',
+          latitude: null,
+          longitude: null,
+          depositAmount: 22_000,
+          balanceAmount: 44_000,
+          disputeOriginalBalanceAmount: 88_000,
+          serviceFeeAmount: 10_000,
+          payments: [],
+          customer: { id: 'cust-1', phoneNumber: '+2341' },
+          assignedOperator: null,
+          disputed: true,
+          disputeRaisedAt: new Date(),
+          disputeResolvedAt: new Date(),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ]);
+      prisma.rescueRequest.count.mockResolvedValue(1);
+
+      const result = await service.adminList({});
+
+      expect(result.data[0]).toEqual(
+        expect.objectContaining({
+          totalAmount: 66_000,
+          acceptedQuoteAmount: 100_000,
+        }),
+      );
     });
 
     it('combines depositPaid and balancePaid filters instead of one overwriting the other', async () => {
