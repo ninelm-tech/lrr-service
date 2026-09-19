@@ -8,6 +8,7 @@ import { PlatformConfigService } from '../platform-config/platform-config.servic
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { ConfigModule } from '@nestjs/config';
+import { OperatorMembershipService } from '../operator/operator-membership.service';
 
 /**
  * Batch timers are keyed `requestId:batchId`, so a test can't clear one by
@@ -47,6 +48,7 @@ describe('DispatchService', () => {
           { provide: PlatformConfigService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
+          { provide: OperatorMembershipService, useValue: {} },
         ],
       }).compile();
 
@@ -202,6 +204,7 @@ describe('DispatchService', () => {
           { provide: PlatformConfigService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
+          { provide: OperatorMembershipService, useValue: {} },
         ],
       }).compile();
       const service = module.get<DispatchService>(DispatchService);
@@ -312,6 +315,7 @@ describe('DispatchService', () => {
           },
           { provide: WhatsAppSessionStore, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
+          { provide: OperatorMembershipService, useValue: {} },
         ],
       }).compile();
 
@@ -567,6 +571,7 @@ describe('DispatchService', () => {
           { provide: PlatformConfigService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: sessionStore },
           { provide: RescueRequestSharedService, useValue: {} },
+          { provide: OperatorMembershipService, useValue: {} },
         ],
       }).compile();
 
@@ -765,6 +770,7 @@ describe('DispatchService', () => {
           { provide: PlatformConfigService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: sessionStore },
           { provide: RescueRequestSharedService, useValue: sharedService },
+          { provide: OperatorMembershipService, useValue: {} },
         ],
       }).compile();
 
@@ -1300,6 +1306,7 @@ describe('DispatchService', () => {
           { provide: PlatformConfigService, useValue: platformConfigService },
           { provide: WhatsAppSessionStore, useValue: sessionStore },
           { provide: RescueRequestSharedService, useValue: sharedService },
+          { provide: OperatorMembershipService, useValue: {} },
         ],
       }).compile();
 
@@ -1562,6 +1569,7 @@ describe('DispatchService', () => {
           { provide: PlatformConfigService, useValue: platformConfigService },
           { provide: WhatsAppSessionStore, useValue: sessionStore },
           { provide: RescueRequestSharedService, useValue: {} },
+          { provide: OperatorMembershipService, useValue: {} },
         ],
       }).compile();
 
@@ -1597,14 +1605,18 @@ describe('DispatchService', () => {
   describe('listMyPendingOffers — media filtering', () => {
     let service: DispatchService;
     let prisma: {
-      operatorMember: { findMany: jest.Mock };
       dispatchOffer: { findMany: jest.Mock };
+    };
+    let operatorMembershipService: {
+      findActiveOperatorIdsForUser: jest.Mock;
     };
 
     beforeEach(async () => {
       prisma = {
-        operatorMember: { findMany: jest.fn() },
         dispatchOffer: { findMany: jest.fn() },
+      };
+      operatorMembershipService = {
+        findActiveOperatorIdsForUser: jest.fn(),
       };
 
       const module: TestingModule = await Test.createTestingModule({
@@ -1616,6 +1628,10 @@ describe('DispatchService', () => {
           { provide: PlatformConfigService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
+          {
+            provide: OperatorMembershipService,
+            useValue: operatorMembershipService,
+          },
         ],
       }).compile();
 
@@ -1623,12 +1639,16 @@ describe('DispatchService', () => {
     });
 
     it('only queries INITIAL-context media for the pending-offers list', async () => {
-      prisma.operatorMember.findMany.mockResolvedValue([
-        { operatorId: 'op-1' },
+      operatorMembershipService.findActiveOperatorIdsForUser.mockResolvedValue([
+        'op-1',
       ]);
       prisma.dispatchOffer.findMany.mockResolvedValue([]);
 
       await service.listMyPendingOffers('op-user-1');
+
+      expect(
+        operatorMembershipService.findActiveOperatorIdsForUser,
+      ).toHaveBeenCalledWith('op-user-1');
 
       expect(prisma.dispatchOffer.findMany).toHaveBeenCalledWith(
         expect.objectContaining({

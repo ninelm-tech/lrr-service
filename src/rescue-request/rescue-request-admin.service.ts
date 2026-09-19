@@ -34,6 +34,7 @@ import { DispatchService } from './dispatch.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { PaymentLedgerService } from '../payment/payment-ledger.service';
 import { PaystackCustomerService } from '../payment/paystack-customer.service';
+import { OperatorMembershipService } from '../operator/operator-membership.service';
 import { mapRefundStatus } from '../payment/domain/paystack-status';
 import {
   deriveRefundStatus,
@@ -56,6 +57,7 @@ export class RescueRequestAdminService {
     private readonly sessionStore: WhatsAppSessionStore,
     private readonly paymentLedger: PaymentLedgerService,
     private readonly paystackCustomerService: PaystackCustomerService,
+    private readonly operatorMembershipService: OperatorMembershipService,
   ) {}
 
   async adminList(query: any) {
@@ -522,14 +524,11 @@ export class RescueRequestAdminService {
   }
 
   async operatorList(userId: string, query: any) {
-    const memberships = await this.prisma.operatorMember.findMany({
-      where: { userId },
-      select: { operatorId: true },
-    });
-    if (memberships.length === 0)
+    const operatorIds =
+      await this.operatorMembershipService.findActiveOperatorIdsForUser(userId);
+    if (operatorIds.length === 0)
       return { data: [], meta: { page: 1, limit: 20, total: 0 } };
 
-    const operatorIds = memberships.map((m) => m.operatorId);
     const where: any = { assignedOperatorId: { in: operatorIds } };
     const { status, page = 1, limit = 20 } = query;
     if (status) where.status = status;
@@ -538,11 +537,8 @@ export class RescueRequestAdminService {
   }
 
   async operatorDetail(userId: string, id: string) {
-    const memberships = await this.prisma.operatorMember.findMany({
-      where: { userId },
-      select: { operatorId: true },
-    });
-    const operatorIds = memberships.map((m) => m.operatorId);
+    const operatorIds =
+      await this.operatorMembershipService.findActiveOperatorIdsForUser(userId);
 
     const raw = await this.prisma.rescueRequest.findUnique({
       where: { id },
@@ -623,11 +619,10 @@ export class RescueRequestAdminService {
     }
 
     if (role === 'OPERATOR') {
-      const memberships = await this.prisma.operatorMember.findMany({
-        where: { userId: user.userId },
-        select: { operatorId: true },
-      });
-      const operatorIds = memberships.map((m) => m.operatorId);
+      const operatorIds =
+        await this.operatorMembershipService.findActiveOperatorIdsForUser(
+          user.userId,
+        );
       if (operatorIds.length === 0)
         return { data: [], meta: { page: 1, limit, total: 0 } };
       whereClause.assignedOperatorId = { in: operatorIds };
@@ -710,11 +705,10 @@ export class RescueRequestAdminService {
     }
 
     if (role === 'OPERATOR') {
-      const memberships = await this.prisma.operatorMember.findMany({
-        where: { userId },
-        select: { operatorId: true },
-      });
-      const operatorIds = memberships.map((m) => m.operatorId);
+      const operatorIds =
+        await this.operatorMembershipService.findActiveOperatorIdsForUser(
+          userId,
+        );
       if (!operatorIds.includes(raw.assignedOperatorId!)) {
         throw new UnauthorizedException(
           'You do not have access to this rescue request',

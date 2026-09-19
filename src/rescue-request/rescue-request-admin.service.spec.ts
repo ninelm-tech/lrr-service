@@ -15,6 +15,7 @@ import { PlatformConfigService } from '../platform-config/platform-config.servic
 import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
+import { OperatorMembershipService } from '../operator/operator-membership.service';
 import { Prisma } from '@prisma/client';
 
 describe('RescueRequestAdminService', () => {
@@ -22,16 +23,20 @@ describe('RescueRequestAdminService', () => {
     let detailService: RescueRequestAdminService;
     let prisma: {
       rescueRequest: { findUnique: jest.Mock };
-      operatorMember: { findMany: jest.Mock };
     };
     let platformConfigService: { getConfig: jest.Mock };
+    let operatorMembershipService: {
+      findActiveOperatorIdsForUser: jest.Mock;
+    };
 
     beforeEach(async () => {
       prisma = {
         rescueRequest: { findUnique: jest.fn() },
-        operatorMember: { findMany: jest.fn() },
       };
       platformConfigService = { getConfig: jest.fn() };
+      operatorMembershipService = {
+        findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
+      };
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
@@ -52,6 +57,10 @@ describe('RescueRequestAdminService', () => {
           { provide: DispatchService, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
+          {
+            provide: OperatorMembershipService,
+            useValue: operatorMembershipService,
+          },
         ],
       }).compile();
 
@@ -166,8 +175,8 @@ describe('RescueRequestAdminService', () => {
           email: null,
         },
       });
-      prisma.operatorMember.findMany.mockResolvedValue([
-        { operatorId: 'op-1' },
+      operatorMembershipService.findActiveOperatorIdsForUser.mockResolvedValue([
+        'op-1',
       ]);
 
       const result = await detailService.detailForUser(
@@ -212,9 +221,11 @@ describe('RescueRequestAdminService', () => {
     let detailService: RescueRequestAdminService;
     let prisma: {
       rescueRequest: { findUnique: jest.Mock };
-      operatorMember: { findMany: jest.Mock };
     };
     let platformConfigService: { getConfig: jest.Mock };
+    let operatorMembershipService: {
+      findActiveOperatorIdsForUser: jest.Mock;
+    };
     const originalApiBaseUrl = process.env.API_BASE_URL;
 
     beforeEach(async () => {
@@ -223,9 +234,11 @@ describe('RescueRequestAdminService', () => {
       process.env.API_BASE_URL = 'https://api.example.com';
       prisma = {
         rescueRequest: { findUnique: jest.fn() },
-        operatorMember: { findMany: jest.fn() },
       };
       platformConfigService = { getConfig: jest.fn() };
+      operatorMembershipService = {
+        findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
+      };
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
@@ -246,6 +259,10 @@ describe('RescueRequestAdminService', () => {
           { provide: DispatchService, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
+          {
+            provide: OperatorMembershipService,
+            useValue: operatorMembershipService,
+          },
         ],
       }).compile();
 
@@ -323,8 +340,8 @@ describe('RescueRequestAdminService', () => {
 
     it('OPERATOR (with access to this job) does not receive media at all', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue(rawWithMedia);
-      prisma.operatorMember.findMany.mockResolvedValue([
-        { operatorId: 'op-1' },
+      operatorMembershipService.findActiveOperatorIdsForUser.mockResolvedValue([
+        'op-1',
       ]);
 
       const result = await detailService.detailForUser(
@@ -376,6 +393,7 @@ describe('RescueRequestAdminService', () => {
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
+          { provide: OperatorMembershipService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
         ],
       }).compile();
@@ -548,6 +566,7 @@ describe('RescueRequestAdminService', () => {
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: dispatchService },
           { provide: RescueRequestSharedService, useValue: sharedService },
+          { provide: OperatorMembershipService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
         ],
       }).compile();
@@ -754,6 +773,7 @@ describe('RescueRequestAdminService', () => {
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
+          { provide: OperatorMembershipService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
         ],
       }).compile();
@@ -977,6 +997,7 @@ describe('RescueRequestAdminService', () => {
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
+          { provide: OperatorMembershipService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
         ],
       }).compile();
@@ -1060,6 +1081,7 @@ describe('RescueRequestAdminService', () => {
             provide: RescueRequestSharedService,
             useValue: { endRelayForEndedRequest: jest.fn() },
           },
+          { provide: OperatorMembershipService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: sessionStore },
         ],
       }).compile();
@@ -1180,6 +1202,7 @@ describe('RescueRequestAdminService', () => {
             provide: RescueRequestSharedService,
             useValue: { endRelayForEndedRequest: jest.fn() },
           },
+          { provide: OperatorMembershipService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: {} },
         ],
       }).compile();

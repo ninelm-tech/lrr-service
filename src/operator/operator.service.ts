@@ -600,7 +600,11 @@ export class OperatorService {
 
   async findByUserId(userId: string) {
     const membership = await this.prisma.operatorMember.findFirst({
-      where: { userId },
+      where: {
+        userId,
+        operator: { deletedAt: null },
+        user: { deletedAt: null },
+      },
       include: {
         operator: { include: { members: { include: { user: true } } } },
       },

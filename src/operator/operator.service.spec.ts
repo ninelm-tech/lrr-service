@@ -24,7 +24,7 @@ describe('OperatorService', () => {
       create: jest.Mock;
       update: jest.Mock;
     };
-    operatorMember: { create: jest.Mock };
+    operatorMember: { create: jest.Mock; findFirst: jest.Mock };
     phoneVerification: { updateMany: jest.Mock };
     $transaction: jest.Mock;
   };
@@ -55,7 +55,7 @@ describe('OperatorService', () => {
         create: jest.fn(),
         update: jest.fn(),
       },
-      operatorMember: { create: jest.fn() },
+      operatorMember: { create: jest.fn(), findFirst: jest.fn() },
       phoneVerification: { updateMany: jest.fn() },
       $transaction: jest.fn(),
     };
@@ -79,6 +79,24 @@ describe('OperatorService', () => {
 
   it('should be defined', () => {
     expect(service).toBeDefined();
+  });
+
+  describe('findByUserId', () => {
+    it('excludes a deleted operator or a deleted acting user', async () => {
+      prisma.operatorMember.findFirst.mockResolvedValue(null);
+
+      await service.findByUserId('user-1');
+
+      expect(prisma.operatorMember.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            userId: 'user-1',
+            operator: { deletedAt: null },
+            user: { deletedAt: null },
+          },
+        }),
+      );
+    });
   });
 
   describe('saveBankDetails', () => {

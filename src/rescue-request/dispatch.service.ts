@@ -29,6 +29,7 @@ import {
 } from './domain/rescue-request-formatting';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { OperatorService } from '../operator/operator.service';
+import { OperatorMembershipService } from '../operator/operator-membership.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { DispatchBoardRowDto } from './dto/rescue-request-response.dto';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
@@ -84,6 +85,7 @@ export class DispatchService {
     private readonly platformConfigService: PlatformConfigService,
     private readonly sessionStore: WhatsAppSessionStore,
     private readonly sharedService: RescueRequestSharedService,
+    private readonly operatorMembershipService: OperatorMembershipService,
   ) {}
 
   /**
@@ -1234,15 +1236,13 @@ export class DispatchService {
 
   /** List PENDING dispatch offers for all operators this user belongs to. */
   async listMyPendingOffers(userId: string) {
-    const memberships = await this.prisma.operatorMember.findMany({
-      where: { userId },
-      select: { operatorId: true },
-    });
-    if (memberships.length === 0) return { data: [] };
+    const operatorIds =
+      await this.operatorMembershipService.findActiveOperatorIdsForUser(userId);
+    if (operatorIds.length === 0) return { data: [] };
 
     const offers = await this.prisma.dispatchOffer.findMany({
       where: {
-        operatorId: { in: memberships.map((m) => m.operatorId) },
+        operatorId: { in: operatorIds },
         status: 'PENDING',
         expiresAt: { gte: new Date() },
       },
