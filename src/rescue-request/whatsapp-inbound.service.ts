@@ -77,7 +77,7 @@ export class WhatsAppInboundService {
         message,
         rawMessage,
         session,
-        operatorRecord,
+        { ...operatorRecord, phoneNumber: operatorRecord.phoneNumber! },
         body,
       );
     }

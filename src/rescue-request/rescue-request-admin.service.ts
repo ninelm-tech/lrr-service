@@ -301,7 +301,7 @@ export class RescueRequestAdminService {
     });
 
     const customerPhone = toWhatsAppAddress(request.customer.phoneNumber);
-    const operatorPhone = toWhatsAppAddress(operator.phoneNumber);
+    const operatorPhone = toWhatsAppAddress(operator.phoneNumber!);
     const depositNaira = (depositAmount / 100).toLocaleString();
     const balanceNaira = (balanceAmount / 100).toLocaleString();
 

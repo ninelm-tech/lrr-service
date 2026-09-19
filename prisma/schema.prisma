@@ -133,7 +133,7 @@ model Operator {
 
   businessName String
   contactName  String
-  phoneNumber  String  @unique
+  phoneNumber  String? @unique
   email        String?
 
   address   String

@@ -7,6 +7,11 @@ describe('AccountDeletionService.deleteUser', () => {
   let service: AccountDeletionService;
   let tx: {
     user: { updateMany: jest.Mock; findUnique: jest.Mock; update: jest.Mock };
+    operator: {
+      updateMany: jest.Mock;
+      findUnique: jest.Mock;
+      update: jest.Mock;
+    };
     rescueRequest: { findMany: jest.Mock; updateMany: jest.Mock };
     operatorMember: { findMany: jest.Mock };
     requestMedia: { findMany: jest.Mock; deleteMany: jest.Mock };
@@ -22,6 +27,11 @@ describe('AccountDeletionService.deleteUser', () => {
   beforeEach(async () => {
     tx = {
       user: {
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findUnique: jest.fn(),
+        update: jest.fn(),
+      },
+      operator: {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         findUnique: jest.fn(),
         update: jest.fn(),
@@ -210,5 +220,122 @@ describe('AccountDeletionService.deleteUser', () => {
       service.deleteUser('user-1', 'admin-1'),
     ).resolves.toBeUndefined();
     expect(prisma.pendingMediaDeletion.delete).not.toHaveBeenCalled();
+  });
+
+  describe('deleteOperator', () => {
+    it('locks only operator columns before reading request guards', async () => {
+      await service.deleteOperator('op-1', 'admin-1');
+
+      expect(tx.operator.updateMany).toHaveBeenCalledWith({
+        where: { id: 'op-1', deletedAt: null },
+        data: { updatedAt: expect.any(Date) },
+      });
+      expect(tx.operator.updateMany.mock.invocationCallOrder[0]).toBeLessThan(
+        tx.rescueRequest.findMany.mock.invocationCallOrder[0],
+      );
+    });
+
+    it.each([
+      [null, 'Operator not found'],
+      [{ deletedAt: new Date() }, 'already been deleted'],
+    ])('explains a failed operator lock for %p', async (operator, message) => {
+      tx.operator.updateMany.mockResolvedValue({ count: 0 });
+      tx.operator.findUnique.mockResolvedValue(operator);
+
+      await expect(service.deleteOperator('op-1', 'admin-1')).rejects.toThrow(
+        message,
+      );
+      expect(tx.rescueRequest.findMany).not.toHaveBeenCalled();
+    });
+
+    it('blocks active or unresolved-dispute requests', async () => {
+      tx.rescueRequest.findMany.mockResolvedValueOnce([{ id: 'req-1' }]);
+
+      await expect(service.deleteOperator('op-1', 'admin-1')).rejects.toThrow(
+        '1 request(s) still active or disputed',
+      );
+      expect(tx.operator.update).not.toHaveBeenCalled();
+    });
+
+    it('blocks completed jobs without a successful payout sibling', async () => {
+      tx.rescueRequest.findMany
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{ id: 'req-1' }]);
+
+      await expect(service.deleteOperator('op-1', 'admin-1')).rejects.toThrow(
+        '1 completed request(s) still have an unsettled payout',
+      );
+      expect(tx.rescueRequest.findMany).toHaveBeenNthCalledWith(2, {
+        where: {
+          assignedOperatorId: 'op-1',
+          status: 'COMPLETED',
+          payments: { none: { type: 'PAYOUT', status: 'SUCCEEDED' } },
+        },
+        select: { id: true },
+      });
+      expect(tx.operator.update).not.toHaveBeenCalled();
+    });
+
+    it('anonymizes the operator, scrubs statements, and queues only operator media', async () => {
+      tx.requestMedia.findMany.mockResolvedValue([
+        { id: 'media-1', s3Key: 'operator-key' },
+      ]);
+
+      await service.deleteOperator('op-1', 'admin-1');
+
+      expect(tx.operator.update).toHaveBeenCalledWith({
+        where: { id: 'op-1' },
+        data: expect.objectContaining({
+          businessName: 'Deleted Operator',
+          contactName: 'Deleted Operator',
+          phoneNumber: null,
+          email: null,
+          address: '',
+          paystackRecipientCode: null,
+          status: 'SUSPENDED',
+          isAvailable: false,
+          deletedAt: expect.any(Date),
+        }),
+      });
+      expect(tx.rescueRequest.updateMany).toHaveBeenCalledWith({
+        where: { assignedOperatorId: 'op-1' },
+        data: {
+          operatorDisputeStatement: null,
+          customerDisputeStatement: null,
+        },
+      });
+      expect(tx.requestMedia.findMany).toHaveBeenCalledWith({
+        where: {
+          rescueRequest: { assignedOperatorId: 'op-1' },
+          uploadedByRole: 'OPERATOR',
+        },
+        select: { id: true, s3Key: true },
+      });
+      expect(tx.pendingMediaDeletion.createMany).toHaveBeenCalledWith({
+        data: [{ s3Key: 'operator-key' }],
+        skipDuplicates: true,
+      });
+      expect(tx.auditLog.create).toHaveBeenCalledWith({
+        data: {
+          category: 'account_deleted',
+          message: 'Operator op-1 deleted',
+          actorId: 'admin-1',
+          details: { targetType: 'Operator', targetId: 'op-1' },
+        },
+      });
+      expect(s3Service.deleteObject).toHaveBeenCalledWith('operator-key');
+    });
+
+    it('keeps the operator-media outbox row when S3 fails', async () => {
+      tx.requestMedia.findMany.mockResolvedValue([
+        { id: 'media-1', s3Key: 'operator-key' },
+      ]);
+      s3Service.deleteObject.mockRejectedValue(new Error('S3 down'));
+
+      await expect(
+        service.deleteOperator('op-1', 'admin-1'),
+      ).resolves.toBeUndefined();
+      expect(prisma.pendingMediaDeletion.delete).not.toHaveBeenCalled();
+    });
   });
 });

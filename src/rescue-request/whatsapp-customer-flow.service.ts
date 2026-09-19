@@ -136,7 +136,7 @@ export class WhatsAppCustomerFlowService {
         return this.reply(`No operator is assigned to your request yet.`);
       }
       const opUser = await this.sharedService.findOrCreateCustomer(
-        rescueRequest.assignedOperator.phoneNumber,
+        rescueRequest.assignedOperator.phoneNumber!,
       );
       await this.sessionStore.update(userId, { relayTarget: 'OPERATOR' });
       await this.sessionStore.update(opUser.id, {
@@ -144,7 +144,7 @@ export class WhatsAppCustomerFlowService {
         rescueRequestId: session.rescueRequestId,
       });
       await this.twilioService.sendWhatsAppMessage(
-        toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
+        toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber!),
         `You're now connected with your customer. Messages will be relayed. Reply END CHAT anytime to stop.`,
       );
       return this.reply(
@@ -377,7 +377,7 @@ export class WhatsAppCustomerFlowService {
           existing.assignedOperator
         ) {
           await this.twilioService.sendWhatsAppMessage(
-            toWhatsAppAddress(existing.assignedOperator.phoneNumber),
+            toWhatsAppAddress(existing.assignedOperator.phoneNumber!),
             `❌ ${formatJobRef(existing.id)} is no longer available — the customer cancelled before paying. Watch out for new offers!`,
           );
         }
@@ -1126,7 +1126,7 @@ export class WhatsAppCustomerFlowService {
         .filter((o) => o.id !== selectedOffer.id)
         .map((o) =>
           this.twilioService.sendWhatsAppMessage(
-            toWhatsAppAddress(o.operator.phoneNumber),
+            toWhatsAppAddress(o.operator.phoneNumber!),
             `Sorry, the customer chose another quote — thanks for bidding!`,
           ),
         ),

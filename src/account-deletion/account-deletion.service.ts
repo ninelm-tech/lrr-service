@@ -6,6 +6,7 @@ import {
 import * as Sentry from '@sentry/node';
 import {
   OperatorMemberRole,
+  OperatorStatus,
   PaymentStatus,
   PaymentType,
   RescueRequestStatus,
@@ -162,6 +163,136 @@ export class AccountDeletionService {
           error,
         );
         Sentry.captureException(error, { extra: { s3Key: key, userId: id } });
+      }
+    }
+  }
+
+  async deleteOperator(id: string, actorId: string): Promise<void> {
+    const s3KeysToDelete = await this.prisma.$transaction(async (tx) => {
+      const locked = await tx.operator.updateMany({
+        where: { id, deletedAt: null },
+        data: { updatedAt: new Date() },
+      });
+      if (locked.count === 0) {
+        const operator = await tx.operator.findUnique({
+          where: { id },
+          select: { deletedAt: true },
+        });
+        if (!operator) throw new NotFoundException('Operator not found');
+        throw new BadRequestException('This operator has already been deleted');
+      }
+
+      const blockingRequests = await tx.rescueRequest.findMany({
+        where: {
+          assignedOperatorId: id,
+          OR: [
+            {
+              status: {
+                notIn: [
+                  RescueRequestStatus.COMPLETED,
+                  RescueRequestStatus.CANCELLED,
+                ],
+              },
+            },
+            { disputed: true, disputeResolvedAt: null },
+          ],
+        },
+        select: { id: true },
+      });
+      if (blockingRequests.length > 0) {
+        throw new BadRequestException(
+          `Cannot delete: ${blockingRequests.length} request(s) still active or disputed`,
+        );
+      }
+
+      const unsettledPayouts = await tx.rescueRequest.findMany({
+        where: {
+          assignedOperatorId: id,
+          status: RescueRequestStatus.COMPLETED,
+          payments: {
+            none: {
+              type: PaymentType.PAYOUT,
+              status: PaymentStatus.SUCCEEDED,
+            },
+          },
+        },
+        select: { id: true },
+      });
+      if (unsettledPayouts.length > 0) {
+        throw new BadRequestException(
+          `Cannot delete: ${unsettledPayouts.length} completed request(s) still have an unsettled payout`,
+        );
+      }
+
+      await tx.operator.update({
+        where: { id },
+        data: {
+          businessName: 'Deleted Operator',
+          contactName: 'Deleted Operator',
+          phoneNumber: null,
+          email: null,
+          address: '',
+          bankName: null,
+          accountName: null,
+          accountNumberLast4: null,
+          paystackRecipientCode: null,
+          status: OperatorStatus.SUSPENDED,
+          isAvailable: false,
+          deletedAt: new Date(),
+        },
+      });
+
+      await tx.rescueRequest.updateMany({
+        where: { assignedOperatorId: id },
+        data: {
+          operatorDisputeStatement: null,
+          customerDisputeStatement: null,
+        },
+      });
+
+      const media = await tx.requestMedia.findMany({
+        where: {
+          rescueRequest: { assignedOperatorId: id },
+          uploadedByRole: UserRole.OPERATOR,
+        },
+        select: { id: true, s3Key: true },
+      });
+      if (media.length > 0) {
+        await tx.pendingMediaDeletion.createMany({
+          data: media.map(({ s3Key }) => ({ s3Key })),
+          skipDuplicates: true,
+        });
+      }
+      await tx.requestMedia.deleteMany({
+        where: { id: { in: media.map(({ id: mediaId }) => mediaId) } },
+      });
+
+      await tx.auditLog.create({
+        data: {
+          category: 'account_deleted',
+          message: `Operator ${id} deleted`,
+          actorId,
+          details: { targetType: 'Operator', targetId: id },
+        },
+      });
+
+      return media.map(({ s3Key }) => s3Key);
+    });
+
+    for (const key of s3KeysToDelete) {
+      try {
+        await this.s3Service.deleteObject(key);
+        await this.prisma.pendingMediaDeletion.delete({
+          where: { s3Key: key },
+        });
+      } catch (error) {
+        console.error(
+          `Failed to delete media object ${key} after deleting operator ${id}:`,
+          error,
+        );
+        Sentry.captureException(error, {
+          extra: { s3Key: key, operatorId: id },
+        });
       }
     }
   }

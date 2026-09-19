@@ -97,7 +97,7 @@ export class QuoteSelectionTimeoutCheck implements ReconcilerCheck {
       await Promise.all(
         claimed.operatorPhones.map((phone) =>
           this.twilioService.sendWhatsAppMessage(
-            toWhatsAppAddress(phone),
+            toWhatsAppAddress(phone!),
             `⏰ ${formatJobRef(rescueRequestId)} is no longer available — the customer didn't choose a quote in time. Watch for new offers!`,
           ),
         ),

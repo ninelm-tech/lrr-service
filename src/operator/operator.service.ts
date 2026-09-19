@@ -428,7 +428,7 @@ export class OperatorService {
       return {
         id: op.id,
         businessName: op.businessName,
-        phoneNumber: op.phoneNumber,
+        phoneNumber: op.phoneNumber!,
         latitude: Number(op.latitude),
         longitude: Number(op.longitude),
         serviceRadius: op.serviceRadius,
@@ -571,7 +571,7 @@ export class OperatorService {
       return {
         operatorId: op.id,
         businessName: op.businessName,
-        phoneNumber: op.phoneNumber,
+        phoneNumber: op.phoneNumber!,
         status: op.status,
         stats: {
           ...this.computeStats(offersByOperator.get(op.id) ?? []),

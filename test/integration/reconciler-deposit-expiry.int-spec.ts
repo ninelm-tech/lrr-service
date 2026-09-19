@@ -126,7 +126,7 @@ describe('DepositExpiryCheck (integration)', () => {
 
   it('closes an open chat relay on both sides', async () => {
     const { customer, request, operator } = await awaitingDeposit(past());
-    const operatorUser = await createCustomer(prisma, operator.phoneNumber);
+    const operatorUser = await createCustomer(prisma, operator.phoneNumber!);
     await createSession(prisma, customer.id, {
       state: 'OPERATOR_FOUND_WAITING_PAYMENT',
       rescueRequestId: request.id,

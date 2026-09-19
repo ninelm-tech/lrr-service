@@ -127,7 +127,7 @@ export class PaymentEventsService {
     if (operator) {
       // Operator: job is now live — send customer location + details
       const opUser = await this.sharedService.findOrCreateCustomer(
-        operator.phoneNumber,
+        operator.phoneNumber!,
       );
       await this.sessionStore.update(opUser.id, {
         state: WhatsAppFlowState.OPERATOR_ON_JOB,
@@ -140,7 +140,7 @@ export class PaymentEventsService {
         lon,
       );
       await this.twilioService.sendWhatsAppMessage(
-        toWhatsAppAddress(operator.phoneNumber),
+        toWhatsAppAddress(operator.phoneNumber!),
         `💰 *Payment confirmed — job is live!* — ${formatJobRef(rescueRequest.id)}\n\nCustomer: ${customerPhone}\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType) : 'Unknown'}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
       );
     } else {

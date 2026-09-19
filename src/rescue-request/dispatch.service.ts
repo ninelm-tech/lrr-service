@@ -413,7 +413,7 @@ export class DispatchService {
     // allSettled for the batch offer.
     const results = await Promise.allSettled(
       stillPending.map((offer) => {
-        const to = toWhatsAppAddress(offer.operator.phoneNumber);
+        const to = toWhatsAppAddress(offer.operator.phoneNumber!);
         if (templateSid) {
           // Two declared variables. Values are sanitized and given non-empty
           // fallbacks for the same reason the dispatch-offer template does:
@@ -1169,7 +1169,7 @@ export class DispatchService {
     );
 
     try {
-      await this.sendDispatchOfferMessage(operator.phoneNumber, {
+      await this.sendDispatchOfferMessage(operator.phoneNumber!, {
         jobRef: formatJobRef(rescueRequestId).replace('Job #', ''),
         vehicle: vehicleLabel,
         destination: destinationLabel,

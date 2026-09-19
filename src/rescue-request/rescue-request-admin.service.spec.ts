@@ -393,8 +393,13 @@ describe('RescueRequestAdminService', () => {
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
-          { provide: OperatorMembershipService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
+          {
+            provide: OperatorMembershipService,
+            useValue: {
+              findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
+            },
+          },
         ],
       }).compile();
 
@@ -583,8 +588,13 @@ describe('RescueRequestAdminService', () => {
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: dispatchService },
           { provide: RescueRequestSharedService, useValue: sharedService },
-          { provide: OperatorMembershipService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
+          {
+            provide: OperatorMembershipService,
+            useValue: {
+              findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
+            },
+          },
         ],
       }).compile();
 
@@ -842,8 +852,13 @@ describe('RescueRequestAdminService', () => {
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
-          { provide: OperatorMembershipService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
+          {
+            provide: OperatorMembershipService,
+            useValue: {
+              findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
+            },
+          },
         ],
       }).compile();
 
@@ -1066,8 +1081,13 @@ describe('RescueRequestAdminService', () => {
           { provide: PaymentEventsService, useValue: {} },
           { provide: DispatchService, useValue: {} },
           { provide: RescueRequestSharedService, useValue: {} },
-          { provide: OperatorMembershipService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
+          {
+            provide: OperatorMembershipService,
+            useValue: {
+              findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
+            },
+          },
         ],
       }).compile();
 
@@ -1150,8 +1170,13 @@ describe('RescueRequestAdminService', () => {
             provide: RescueRequestSharedService,
             useValue: { endRelayForEndedRequest: jest.fn() },
           },
-          { provide: OperatorMembershipService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: sessionStore },
+          {
+            provide: OperatorMembershipService,
+            useValue: {
+              findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
+            },
+          },
         ],
       }).compile();
 
@@ -1271,8 +1296,13 @@ describe('RescueRequestAdminService', () => {
             provide: RescueRequestSharedService,
             useValue: { endRelayForEndedRequest: jest.fn() },
           },
-          { provide: OperatorMembershipService, useValue: {} },
           { provide: WhatsAppSessionStore, useValue: {} },
+          {
+            provide: OperatorMembershipService,
+            useValue: {
+              findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
+            },
+          },
         ],
       }).compile();
 

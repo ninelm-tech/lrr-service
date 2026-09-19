@@ -286,9 +286,9 @@ export class PayoutService {
         // `operator` is null when the row is missing entirely (a data
         // integrity problem, not a missing-bank-details one) — the payout
         // is still correctly blocked above, there's just nobody to message.
-        if (isNewBlock && operator) {
+        if (isNewBlock && operator?.phoneNumber) {
           await this.notifyOperatorBankDetailsNeeded(
-            operator,
+            { ...operator, phoneNumber: operator.phoneNumber },
             amount,
             rescueRequestId,
           );
@@ -424,9 +424,9 @@ export class PayoutService {
     const operator = await this.prisma.operator.findUnique({
       where: { id: payment.operatorId },
     });
-    if (operator) {
+    if (operator?.phoneNumber) {
       await this.notifyOperatorPaid(
-        operator,
+        { ...operator, phoneNumber: operator.phoneNumber },
         payment.amount,
         payment.rescueRequestId,
       );
