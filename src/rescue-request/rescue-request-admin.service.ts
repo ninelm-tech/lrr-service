@@ -843,7 +843,14 @@ export class RescueRequestAdminService {
             createdAt: m.createdAt,
           }))
         : undefined;
-    const amounts = this.deriveRequestAmounts(raw);
+    const amounts = this.deriveRequestAmounts(
+      raw as {
+        depositAmount?: number | null;
+        balanceAmount?: number | null;
+        serviceFeeAmount?: number | null;
+        disputeOriginalBalanceAmount?: number | null;
+      },
+    );
 
     return {
       id: raw.id,
