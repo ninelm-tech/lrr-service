@@ -227,9 +227,17 @@ describe('Deposit submission protocol (integration)', () => {
     expect(await prisma.payment.count()).toBe(1);
     // The blocked retry must not have reached Paystack at all.
     expect(initializePayment).toHaveBeenCalledTimes(1);
-    // ...and must not leave the offer it created behind. A stale
-    // SELECTED_PENDING_PAYMENT row would show the request as assigned to an
-    // operator who was never actually engaged.
-    expect(await prisma.dispatchOffer.count()).toBe(0);
+    // Exactly 1, not 0: assignOperator now creates the SELECTED_PENDING_PAYMENT
+    // offer durably inside the same transaction as the assignment claim,
+    // before Paystack is ever called (account-deletion plan Task 9b — offer
+    // creation moved earlier so no HTTP call happens before durable
+    // assignment). An ambiguous Paystack response doesn't undo that
+    // assignment, only the deposit-link status is unknown — same as the
+    // Payment row above, this offer is deliberately left in place for
+    // DepositExpiryCheck to eventually resolve, not rolled back here. The
+    // blocked retry's own attempted offer IS correctly rolled back (it's
+    // inside the same transaction as the P2002-failing payment insert), so
+    // the count stays at 1 rather than growing to 2.
+    expect(await prisma.dispatchOffer.count()).toBe(1);
   });
 });
