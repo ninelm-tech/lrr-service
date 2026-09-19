@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import {
   Payment,
   PaymentBlockReason,
@@ -29,7 +29,18 @@ import {
 export class PaymentLedgerService {
   constructor(private readonly prisma: PrismaService) {}
 
-  /** Step 1 — committed before anything leaves. */
+  /**
+   * Step 1 — committed before anything leaves.
+   *
+   * Also locks against a deleted party before inserting: a PAYOUT locks its
+   * Operator row, everything else locks the request's customer User row.
+   * Both use the same lock-as-mutex idiom as the account-deletion guards
+   * (`updateMany` with `deletedAt: null` in the WHERE) so this contends for
+   * the exact row `deleteOperator`/`deleteUser` writes to — whichever
+   * commits first wins. The lock-check and the insert run in one
+   * transaction (opened here when the caller passed no `tx`), or the lock
+   * is just a stale read.
+   */
   async create(input: {
     rescueRequestId: string;
     type: PaymentType;
@@ -37,15 +48,58 @@ export class PaymentLedgerService {
     operatorId?: string;
     tx?: Prisma.TransactionClient;
   }): Promise<Payment> {
-    const client = input.tx ?? this.prisma;
-    return client.payment.create({
-      data: {
-        rescueRequestId: input.rescueRequestId,
-        type: input.type,
-        amount: input.amount,
-        operatorId: input.operatorId ?? null,
-      },
-    });
+    const run = async (
+      client: Prisma.TransactionClient | PrismaService,
+    ): Promise<Payment> => {
+      if (input.type === PaymentType.PAYOUT) {
+        // Branch purely on `type`, not `type && operatorId` — the AND form
+        // let a malformed PAYOUT call with no operatorId fall through to
+        // the customer branch below (checking the wrong party's deletedAt
+        // entirely) and then insert a payout row with operatorId: null.
+        if (!input.operatorId) {
+          throw new BadRequestException(
+            'A PAYOUT payment must have an operatorId.',
+          );
+        }
+        const stillActive = await client.operator.updateMany({
+          where: { id: input.operatorId, deletedAt: null },
+          data: { updatedAt: new Date() },
+        });
+        if (stillActive.count === 0) {
+          throw new BadRequestException(
+            'Cannot create a payout: this operator has been deleted.',
+          );
+        }
+      } else {
+        const rescueRequest = await client.rescueRequest.findUnique({
+          where: { id: input.rescueRequestId },
+          select: { customerId: true },
+        });
+        if (rescueRequest) {
+          const stillActive = await client.user.updateMany({
+            where: { id: rescueRequest.customerId, deletedAt: null },
+            data: { updatedAt: new Date() },
+          });
+          if (stillActive.count === 0) {
+            throw new BadRequestException(
+              'Cannot create this payment: the customer has been deleted.',
+            );
+          }
+        }
+      }
+
+      return client.payment.create({
+        data: {
+          rescueRequestId: input.rescueRequestId,
+          type: input.type,
+          amount: input.amount,
+          operatorId: input.operatorId ?? null,
+        },
+      });
+    };
+
+    if (input.tx) return run(input.tx);
+    return this.prisma.$transaction((tx) => run(tx));
   }
 
   /**
