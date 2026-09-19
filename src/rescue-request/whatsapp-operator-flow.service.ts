@@ -81,9 +81,44 @@ export class WhatsAppOperatorFlowService {
     // keyword-shaped reply here must not be mistaken for a price quote or
     // command.
     if (session.state === WhatsAppFlowState.AWAITING_DISPUTE_RESPONSE) {
-      if (session.rescueRequestId) {
+      const rescueRequestId = session.rescueRequestId;
+      const numMedia = Number(body.NumMedia ?? 0);
+
+      if (rescueRequestId && numMedia > 0) {
+        let existingCount = await this.prisma.requestMedia.count({
+          where: {
+            rescueRequestId,
+            context: MediaContext.DISPUTE,
+            uploadedByRole: UserRole.OPERATOR,
+          },
+        });
+        for (let i = 0; i < numMedia; i++) {
+          if (existingCount >= MAX_MEDIA_ITEMS) break;
+          const mediaUrl = body[`MediaUrl${i}`] as string | undefined;
+          const contentType = body[`MediaContentType${i}`] as
+            | string
+            | undefined;
+          if (!mediaUrl || !contentType) continue;
+          const saved = await this.customerFlowService.captureMediaAttachment(
+            rescueRequestId,
+            mediaUrl,
+            contentType,
+            MediaContext.DISPUTE,
+            UserRole.OPERATOR,
+          );
+          if (saved) existingCount++;
+        }
+      }
+
+      if (!rawMessage) {
+        return this.reply(
+          `📸 Got it — send more evidence, or reply with your explanation to finish.`,
+        );
+      }
+
+      if (rescueRequestId) {
         await this.prisma.rescueRequest.update({
-          where: { id: session.rescueRequestId },
+          where: { id: rescueRequestId },
           data: { operatorDisputeStatement: rawMessage },
         });
       }

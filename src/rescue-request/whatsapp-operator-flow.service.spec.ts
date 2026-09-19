@@ -793,4 +793,110 @@ describe('WhatsAppOperatorFlowService', () => {
       expect(prisma.rescueRequest.update).toHaveBeenCalled();
     });
   });
+
+  describe('handleOperatorMessage — dispute evidence', () => {
+    let service: WhatsAppOperatorFlowService;
+    let prisma: {
+      rescueRequest: { update: jest.Mock };
+      requestMedia: { count: jest.Mock };
+    };
+    let sessionStore: { update: jest.Mock };
+    let customerFlowService: { captureMediaAttachment: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: { update: jest.fn().mockResolvedValue({}) },
+        requestMedia: { count: jest.fn().mockResolvedValue(0) },
+      };
+      sessionStore = { update: jest.fn().mockResolvedValue(undefined) };
+      customerFlowService = {
+        captureMediaAttachment: jest.fn().mockResolvedValue(true),
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppOperatorFlowService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          {
+            provide: WhatsAppCustomerFlowService,
+            useValue: customerFlowService,
+          },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: PlatformConfigService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppOperatorFlowService>(
+        WhatsAppOperatorFlowService,
+      );
+    });
+
+    it('text-only statement ends the state exactly as before', async () => {
+      const session = {
+        state: WhatsAppFlowState.AWAITING_DISPUTE_RESPONSE,
+        rescueRequestId: 'req-1',
+      } as unknown as WhatsAppSession;
+      const operator = {
+        id: 'op-1',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2341111111111',
+      };
+
+      await service.handleOperatorMessage(
+        '+2341111111111',
+        'op-user-1',
+        'i arrived on time, customer was not there',
+        'i arrived on time, customer was not there',
+        session,
+        operator,
+        {},
+      );
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: {
+          operatorDisputeStatement: 'i arrived on time, customer was not there',
+        },
+      });
+    });
+
+    it('media with no text saves the attachment and stays in the same state', async () => {
+      const session = {
+        state: WhatsAppFlowState.AWAITING_DISPUTE_RESPONSE,
+        rescueRequestId: 'req-1',
+      } as unknown as WhatsAppSession;
+      const operator = {
+        id: 'op-1',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2341111111111',
+      };
+
+      const result = await service.handleOperatorMessage(
+        '+2341111111111',
+        'op-user-1',
+        '',
+        '',
+        session,
+        operator,
+        {
+          NumMedia: '1',
+          MediaUrl0: 'https://twilio.example/media/9',
+          MediaContentType0: 'image/jpeg',
+        },
+      );
+
+      expect(customerFlowService.captureMediaAttachment).toHaveBeenCalledWith(
+        'req-1',
+        'https://twilio.example/media/9',
+        'image/jpeg',
+        MediaContext.DISPUTE,
+        UserRole.OPERATOR,
+      );
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+      expect(result).toContain('Got it');
+    });
+  });
 });
