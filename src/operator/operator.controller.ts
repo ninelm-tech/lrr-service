@@ -21,6 +21,10 @@ import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
 
+interface AuthenticatedOperatorRequest {
+  user: { userId: string; role: string };
+}
+
 @Controller('operators')
 export class OperatorController {
   constructor(private readonly operatorService: OperatorService) {}
@@ -70,7 +74,7 @@ export class OperatorController {
    */
   @UseGuards(AuthGuard)
   @Get('me')
-  async getMyOperator(@Req() req: any) {
+  async getMyOperator(@Req() req: AuthenticatedOperatorRequest) {
     const operator = await this.operatorService.findByUserId(req.user.userId);
     if (!operator)
       throw new NotFoundException('No operator account found for this user');
@@ -107,7 +111,7 @@ export class OperatorController {
   @UseGuards(AuthGuard)
   @Patch(':id')
   async updateProfile(
-    @Req() req: any,
+    @Req() req: AuthenticatedOperatorRequest,
     @Param('id') id: string,
     @Body() dto: UpdateOperatorProfileDto,
   ) {
@@ -127,7 +131,7 @@ export class OperatorController {
   @UseGuards(AuthGuard)
   @Patch(':id/bank-details')
   async saveBankDetails(
-    @Req() req: any,
+    @Req() req: AuthenticatedOperatorRequest,
     @Param('id') id: string,
     @Body() dto: SaveBankDetailsDto,
   ) {
@@ -156,7 +160,10 @@ export class OperatorController {
    */
   @UseGuards(AuthGuard)
   @Delete(':id/bank-details')
-  async clearBankDetails(@Req() req: any, @Param('id') id: string) {
+  async clearBankDetails(
+    @Req() req: AuthenticatedOperatorRequest,
+    @Param('id') id: string,
+  ) {
     await this.operatorService.assertCanManageOperator(req.user, id);
     const operator = await this.operatorService.clearBankDetails(id, req.user);
     return { message: 'Payout bank details removed', data: operator };
@@ -185,7 +192,7 @@ export class OperatorController {
   @UseGuards(AuthGuard)
   @Patch(':id/availability')
   async setAvailability(
-    @Req() req: any,
+    @Req() req: AuthenticatedOperatorRequest,
     @Param('id') id: string,
     @Body('isAvailable') isAvailable: boolean,
   ) {
@@ -207,7 +214,10 @@ export class OperatorController {
 
   @UseGuards(AuthGuard)
   @Get(':id/members')
-  async listMembers(@Req() req: any, @Param('id') id: string) {
+  async listMembers(
+    @Req() req: AuthenticatedOperatorRequest,
+    @Param('id') id: string,
+  ) {
     await this.operatorService.assertIsMemberOrAdmin(req.user, id);
     const members = await this.operatorService.listMembers(id);
     return { data: members };
@@ -216,7 +226,7 @@ export class OperatorController {
   @UseGuards(AuthGuard)
   @Post(':id/members')
   async addMember(
-    @Req() req: any,
+    @Req() req: AuthenticatedOperatorRequest,
     @Param('id') id: string,
     @Body() body: { userId: string; role?: OperatorMemberRole },
   ) {
@@ -235,7 +245,7 @@ export class OperatorController {
   @UseGuards(AuthGuard)
   @Delete(':id/members/:memberId')
   async removeMember(
-    @Req() req: any,
+    @Req() req: AuthenticatedOperatorRequest,
     @Param('id') id: string,
     @Param('memberId') memberId: string,
   ) {

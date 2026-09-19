@@ -723,7 +723,10 @@ describe('PaymentVerifyCheck (integration)', () => {
   describe('cross-cutting', () => {
     it('excludes BLOCKED rows entirely — nothing this check can do moves them', async () => {
       const { request } = await seedRequest();
-      const payment = await submittedPayment('PAYOUT', request.id);
+      const operator = await createOperator(prisma);
+      const payment = await submittedPayment('PAYOUT', request.id, {
+        operatorId: operator.id,
+      });
       await ledger.recordBlocked(payment.id, 'AWAITING_OTP');
       await prisma.payment.update({
         where: { id: payment.id },
