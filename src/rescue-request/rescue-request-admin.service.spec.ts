@@ -479,12 +479,16 @@ describe('RescueRequestAdminService', () => {
   describe('assignOperator', () => {
     let assignService: RescueRequestAdminService;
     let prisma: {
-      operator: { findUnique: jest.Mock };
-      rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
+      $transaction: jest.Mock;
+      user: { updateMany: jest.Mock };
+      operator: { findUnique: jest.Mock; updateMany: jest.Mock };
+      rescueRequest: {
+        findUnique: jest.Mock;
+        update: jest.Mock;
+        updateMany: jest.Mock;
+      };
       dispatchOffer: {
         create: jest.Mock;
-        delete: jest.Mock;
-        update: jest.Mock;
       };
       payment: { update: jest.Mock };
     };
@@ -508,27 +512,40 @@ describe('RescueRequestAdminService', () => {
       status: 'DISPATCHING',
       customerId: 'cust-1',
       customer: { id: 'cust-1', phoneNumber: '+2348022222222', email: null },
+      assignedOperatorId: null,
+      dispatchRound: 1,
     };
 
     beforeEach(async () => {
       prisma = {
-        operator: { findUnique: jest.fn().mockResolvedValue(operator) },
+        $transaction: jest.fn(),
+        user: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        operator: {
+          findUnique: jest.fn().mockResolvedValue(operator),
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        },
         rescueRequest: {
           findUnique: jest.fn().mockResolvedValue(request),
-          update: jest.fn().mockImplementation(({ data }) => ({
-            ...request,
-            ...data,
-            assignedOperator: operator,
-            payments: [],
-          })),
+          update: jest
+            .fn()
+            .mockImplementation(
+              ({ data }: { data: Record<string, unknown> }) => ({
+                ...request,
+                ...data,
+                assignedOperator: operator,
+                payments: [],
+              }),
+            ),
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         },
         dispatchOffer: {
           create: jest.fn().mockResolvedValue({ id: 'offer-1' }),
-          delete: jest.fn(),
-          update: jest.fn(),
         },
         payment: { update: jest.fn() },
       };
+      prisma.$transaction.mockImplementation(
+        (callback: (tx: typeof prisma) => Promise<unknown>) => callback(prisma),
+      );
       paymentLedger = createPaymentLedgerMock();
       paystackService = {
         initializePayment: jest.fn().mockResolvedValue({
@@ -602,7 +619,7 @@ describe('RescueRequestAdminService', () => {
         where: { id: 'pay-1' },
         data: { checkoutUrl: 'https://paystack.test/pay/xyz' },
       });
-      expect(prisma.rescueRequest.update).toHaveBeenCalledWith(
+      expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
             assignedOperatorId: 'op-1',
@@ -613,6 +630,12 @@ describe('RescueRequestAdminService', () => {
           }),
         }),
       );
+      expect(paymentLedger.create).toHaveBeenCalledWith({
+        rescueRequestId: 'req-1',
+        type: 'DEPOSIT',
+        amount: 22_000,
+        tx: prisma,
+      });
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
         expect.any(String),
         expect.stringContaining('https://paystack.test/pay/xyz'),
@@ -659,7 +682,7 @@ describe('RescueRequestAdminService', () => {
       ).rejects.toThrow('Customer has no phone number on file');
     });
 
-    it('rolls back the created offer when Paystack definitively rejects the link', async () => {
+    it('keeps the committed assignment when Paystack definitively rejects the link', async () => {
       paystackService.initializePayment.mockResolvedValue({
         outcome: 'rejected',
         code: 'invalid_params',
@@ -673,9 +696,8 @@ describe('RescueRequestAdminService', () => {
         }),
       ).rejects.toThrow(`Couldn't generate a payment link`);
 
-      expect(prisma.dispatchOffer.delete).toHaveBeenCalledWith({
-        where: { id: 'offer-1' },
-      });
+      expect(prisma.dispatchOffer.create).toHaveBeenCalled();
+      expect(prisma.rescueRequest.updateMany).toHaveBeenCalled();
       expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
       // Definitive: nothing landed, so FAILED is safe and a retry is legal.
       expect(paymentLedger.recordRejection).toHaveBeenCalledWith(
@@ -687,7 +709,7 @@ describe('RescueRequestAdminService', () => {
     it('does not fail the payment when the link result is ambiguous, and tells the admin not to retry', async () => {
       // A 5xx or a timeout may still have created a transaction. Failing the
       // row here would make a retry legal and bill the customer twice, so the
-      // row stays SUBMITTED for verification and only the offer rolls back.
+      // row stays SUBMITTED for verification and the assignment stays durable.
       paystackService.initializePayment.mockResolvedValue({
         outcome: 'ambiguous',
         message: 'gateway timeout',
@@ -700,9 +722,8 @@ describe('RescueRequestAdminService', () => {
         }),
       ).rejects.toThrow('Do not retry yet');
 
-      expect(prisma.dispatchOffer.delete).toHaveBeenCalledWith({
-        where: { id: 'offer-1' },
-      });
+      expect(prisma.dispatchOffer.create).toHaveBeenCalled();
+      expect(prisma.rescueRequest.updateMany).toHaveBeenCalled();
       expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
       // No checkoutUrl: the pair (SUBMITTED, null) is what tells recovery no
       // link ever reached the customer.
@@ -722,13 +743,61 @@ describe('RescueRequestAdminService', () => {
       // without a deadline is invisible to DepositExpiryCheck — it would
       // hold its operator forever — so the deadline may never be a
       // follow-up statement that a crash can skip.
-      expect(prisma.rescueRequest.update).toHaveBeenCalledTimes(1);
-      const [{ data }] = prisma.rescueRequest.update.mock.calls[0] as [
+      expect(prisma.rescueRequest.updateMany).toHaveBeenCalledTimes(1);
+      const [{ data }] = prisma.rescueRequest.updateMany.mock.calls[0] as [
         { data: Record<string, unknown> },
       ];
       expect(data.status).toBe('WAITING_FOR_DEPOSIT');
       expect(data.depositWindowExpiresAt).toBeInstanceOf(Date);
       expect(data.depositRemindersSent).toBe(0);
+    });
+
+    it('aborts before assignment when the selected operator was deleted', async () => {
+      prisma.operator.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        assignService.assignOperator('req-1', {
+          operatorId: 'op-1',
+          priceKobo: 100_000,
+        }),
+      ).rejects.toThrow('account has been deleted');
+
+      expect(prisma.user.updateMany).toHaveBeenCalled();
+      expect(prisma.operator.updateMany).toHaveBeenCalled();
+      expect(prisma.rescueRequest.updateMany).not.toHaveBeenCalled();
+      expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();
+      expect(paymentLedger.create).not.toHaveBeenCalled();
+      expect(paystackService.initializePayment).not.toHaveBeenCalled();
+    });
+
+    it('does not call Paystack until the assignment transaction has committed', async () => {
+      let transactionFinished = false;
+      prisma.$transaction.mockImplementation(
+        async (callback: (tx: typeof prisma) => Promise<unknown>) => {
+          const result = await callback(prisma);
+          transactionFinished = true;
+          return result;
+        },
+      );
+      paystackService.initializePayment.mockImplementation(() => {
+        expect(transactionFinished).toBe(true);
+        return Promise.resolve({
+          outcome: 'ok',
+          data: {
+            authorization_url: 'https://paystack.test/pay/xyz',
+            access_code: 'acc_1',
+            reference: 'DEP_pay-1',
+          },
+        });
+      });
+
+      await assignService.assignOperator('req-1', {
+        operatorId: 'op-1',
+        priceKobo: 100_000,
+      });
+
+      expect(transactionFinished).toBe(true);
+      expect(paystackService.initializePayment).toHaveBeenCalledTimes(1);
     });
   });
 

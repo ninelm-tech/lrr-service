@@ -580,6 +580,203 @@ describe('WhatsAppCustomerFlowService', () => {
     });
   });
 
+  describe('WAITING_FOR_QUOTE_SELECTION', () => {
+    let service: WhatsAppCustomerFlowService;
+    let transactionFinished: boolean;
+    let prisma: {
+      $transaction: jest.Mock;
+      user: { updateMany: jest.Mock };
+      operator: { updateMany: jest.Mock };
+      rescueRequest: {
+        findUnique: jest.Mock;
+        updateMany: jest.Mock;
+        update: jest.Mock;
+      };
+      dispatchOffer: {
+        findMany: jest.Mock;
+        update: jest.Mock;
+        updateMany: jest.Mock;
+      };
+      payment: { update: jest.Mock };
+    };
+    let paymentLedger: ReturnType<typeof createPaymentLedgerMock>;
+    let paystackService: { initializePayment: jest.Mock };
+    let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
+
+    const session = {
+      state: WhatsAppFlowState.WAITING_FOR_QUOTE_SELECTION,
+      rescueRequestId: 'req-1',
+    } as WhatsAppSession;
+
+    beforeEach(async () => {
+      transactionFinished = false;
+      const operator = {
+        id: 'op-1',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2348011111111',
+        latitude: 6.5,
+        longitude: 3.4,
+      };
+      prisma = {
+        $transaction: jest.fn(),
+        user: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        operator: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        rescueRequest: {
+          findUnique: jest.fn().mockResolvedValue({
+            id: 'req-1',
+            customerId: 'cust-1',
+            status: 'DISPATCHING',
+            latitude: 6.51,
+            longitude: 3.41,
+            customer: { id: 'cust-1', phoneNumber: '+2348022222222' },
+          }),
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+          update: jest.fn(),
+        },
+        dispatchOffer: {
+          findMany: jest.fn().mockResolvedValue([
+            {
+              id: 'offer-1',
+              rescueRequestId: 'req-1',
+              operatorId: 'op-1',
+              status: 'QUOTED',
+              quotedPrice: 100_000,
+              operator,
+            },
+          ]),
+          update: jest.fn(),
+          updateMany: jest.fn(),
+        },
+        payment: { update: jest.fn() },
+      };
+      prisma.$transaction.mockImplementation(
+        async (callback: (tx: typeof prisma) => Promise<unknown>) => {
+          const result = await callback(prisma);
+          transactionFinished = true;
+          return result;
+        },
+      );
+      paymentLedger = createPaymentLedgerMock();
+      paystackService = {
+        initializePayment: jest.fn().mockImplementation(() => {
+          expect(transactionFinished).toBe(true);
+          return Promise.resolve({
+            outcome: 'ok',
+            data: {
+              authorization_url: 'https://paystack.test/pay/xyz',
+              access_code: 'acc-1',
+              reference: 'DEP_pay-1',
+            },
+          });
+        }),
+      };
+      sessionStore = {
+        getOrCreate: jest.fn().mockResolvedValue(session),
+        update: jest.fn(),
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppCustomerFlowService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaymentLedgerService, useValue: paymentLedger },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          {
+            provide: TwilioService,
+            useValue: { sendWhatsAppMessage: jest.fn() },
+          },
+          { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PaystackService, useValue: paystackService },
+          {
+            provide: PlatformConfigService,
+            useValue: {
+              getConfig: jest.fn().mockResolvedValue({
+                serviceFeePercent: 10,
+                depositPercent: 20,
+              }),
+            },
+          },
+          {
+            provide: OperatorService,
+            useValue: { calculateDistance: jest.fn().mockReturnValue(1) },
+          },
+          { provide: DispatchService, useValue: {} },
+          { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppCustomerFlowService>(
+        WhatsAppCustomerFlowService,
+      );
+    });
+
+    const selectFirstQuote = () =>
+      service.handleCustomerMessage(
+        '+2348022222222',
+        'cust-1',
+        '1',
+        '1',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {},
+      );
+
+    it('commits the assignment, offer transitions, and deposit before Paystack', async () => {
+      await selectFirstQuote();
+
+      expect(prisma.user.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: 'cust-1', deletedAt: null } }),
+      );
+      expect(prisma.operator.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: 'op-1', deletedAt: null } }),
+      );
+      expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'req-1', status: 'DISPATCHING' },
+          data: expect.objectContaining({
+            assignedOperatorId: 'op-1',
+            status: 'WAITING_FOR_DEPOSIT',
+            depositAmount: 22_000,
+          }),
+        }),
+      );
+      expect(prisma.dispatchOffer.update).toHaveBeenCalled();
+      expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledTimes(2);
+      expect(paymentLedger.create).toHaveBeenCalledWith({
+        rescueRequestId: 'req-1',
+        type: 'DEPOSIT',
+        amount: 22_000,
+        tx: prisma,
+      });
+      expect(transactionFinished).toBe(true);
+      expect(paystackService.initializePayment).toHaveBeenCalledTimes(1);
+    });
+
+    it('stops before assignment when the selected operator was deleted', async () => {
+      prisma.operator.updateMany.mockResolvedValue({ count: 0 });
+
+      const result = await selectFirstQuote();
+
+      expect(result).toContain('operator is no longer available');
+      expect(prisma.user.updateMany).toHaveBeenCalled();
+      expect(prisma.operator.updateMany).toHaveBeenCalled();
+      expect(prisma.rescueRequest.updateMany).not.toHaveBeenCalled();
+      expect(prisma.dispatchOffer.update).not.toHaveBeenCalled();
+      expect(paymentLedger.create).not.toHaveBeenCalled();
+      expect(paystackService.initializePayment).not.toHaveBeenCalled();
+    });
+  });
+
   describe('AWAITING_DISPUTE_REASON', () => {
     let service: WhatsAppCustomerFlowService;
     let prisma: { rescueRequest: { update: jest.Mock } };

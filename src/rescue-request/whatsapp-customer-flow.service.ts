@@ -1026,22 +1026,6 @@ export class WhatsAppCustomerFlowService {
       );
     }
 
-    // Atomic claim — only proceeds if the request is still DISPATCHING.
-    const claimed = await this.prisma.rescueRequest.updateMany({
-      where: { id: rescueRequestId, status: RescueRequestStatus.DISPATCHING },
-      data: {
-        status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
-        // Same statement as the transition. A request cannot exist in
-        // WAITING_FOR_DEPOSIT without a deadline, so there is no window in
-        // which a crash can produce a row no check will ever match.
-        depositWindowExpiresAt: new Date(Date.now() + DEPOSIT_WINDOW_MS),
-        depositRemindersSent: 0,
-      },
-    });
-    if (claimed.count === 0) {
-      return this.reply(`Sorry, this request has already moved on.`);
-    }
-
     const config = await this.platformConfigService.getConfig();
     const serviceFeeAmount = Math.round(
       (selected.quotedPrice * config.serviceFeePercent) / 100,
@@ -1050,38 +1034,91 @@ export class WhatsAppCustomerFlowService {
     const depositAmount = Math.round((total * config.depositPercent) / 100);
     const balanceAmount = total - depositAmount;
 
-    await this.prisma.rescueRequest.update({
-      where: { id: rescueRequestId },
-      data: {
-        serviceFeeAmount,
-        depositAmount,
-        balanceAmount,
-        assignedOperatorId: selected.operatorId,
-      },
-    });
-
     const selectedOffer = quotedOffers.find((o) => o.id === selected.offerId)!;
-    await this.prisma.dispatchOffer.update({
-      where: { id: selectedOffer.id },
-      data: { status: 'SELECTED_PENDING_PAYMENT', respondedAt: new Date() },
-    });
-    await this.prisma.dispatchOffer.updateMany({
-      where: {
-        rescueRequestId,
-        status: 'QUOTED',
-        id: { not: selectedOffer.id },
-      },
-      data: { status: 'NOT_SELECTED', respondedAt: new Date() },
-    });
-    // Operators who hadn't responded at all yet (never quoted, never
-    // declined) are NOT covered by the update above — it only matches
-    // QUOTED. Left PENDING, this job keeps counting as "open" for them
-    // (findOpenOffers) until their own offer's expiresAt eventually
-    // passes, well after the job has actually moved on and completed.
-    await this.prisma.dispatchOffer.updateMany({
-      where: { rescueRequestId, status: 'PENDING' },
-      data: { status: 'TIMED_OUT', respondedAt: new Date() },
-    });
+    let payment;
+    try {
+      payment = await this.prisma.$transaction(async (tx) => {
+        const customerStillActive = await tx.user.updateMany({
+          where: { id: rescueRequest.customerId, deletedAt: null },
+          data: { updatedAt: new Date() },
+        });
+        if (customerStillActive.count === 0) {
+          throw new BadRequestException('This customer has been deleted.');
+        }
+
+        const operatorStillActive = await tx.operator.updateMany({
+          where: { id: selected.operatorId, deletedAt: null },
+          data: { updatedAt: new Date() },
+        });
+        if (operatorStillActive.count === 0) {
+          throw new BadRequestException(
+            'The selected operator is no longer available.',
+          );
+        }
+
+        const claimed = await tx.rescueRequest.updateMany({
+          where: {
+            id: rescueRequestId,
+            status: RescueRequestStatus.DISPATCHING,
+          },
+          data: {
+            status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
+            serviceFeeAmount,
+            depositAmount,
+            balanceAmount,
+            assignedOperatorId: selected.operatorId,
+            depositWindowExpiresAt: new Date(Date.now() + DEPOSIT_WINDOW_MS),
+            depositRemindersSent: 0,
+          },
+        });
+        if (claimed.count === 0) {
+          throw new BadRequestException('This request has already moved on.');
+        }
+
+        await tx.dispatchOffer.update({
+          where: { id: selectedOffer.id },
+          data: {
+            status: 'SELECTED_PENDING_PAYMENT',
+            respondedAt: new Date(),
+          },
+        });
+        await tx.dispatchOffer.updateMany({
+          where: {
+            rescueRequestId,
+            status: 'QUOTED',
+            id: { not: selectedOffer.id },
+          },
+          data: { status: 'NOT_SELECTED', respondedAt: new Date() },
+        });
+        await tx.dispatchOffer.updateMany({
+          where: { rescueRequestId, status: 'PENDING' },
+          data: { status: 'TIMED_OUT', respondedAt: new Date() },
+        });
+
+        return this.paymentLedger.create({
+          rescueRequestId,
+          type: 'DEPOSIT',
+          amount: depositAmount,
+          tx,
+        });
+      });
+    } catch (error) {
+      if (
+        error instanceof BadRequestException &&
+        error.message.includes('operator')
+      ) {
+        Sentry.captureException(error, {
+          extra: { rescueRequestId, operatorId: selected.operatorId },
+        });
+        return this.reply(
+          `Sorry, that operator is no longer available. Please choose another quote.`,
+        );
+      }
+      if (error instanceof BadRequestException) {
+        return this.reply(`Sorry, this request has already moved on.`);
+      }
+      throw error;
+    }
 
     // Notify the operators who weren't picked.
     await Promise.all(
@@ -1101,11 +1138,6 @@ export class WhatsAppCustomerFlowService {
 
     const operator = selectedOffer.operator;
     // The protocol, as in initiateDeposit: commit, claim, call, classify.
-    const payment = await this.paymentLedger.create({
-      rescueRequestId,
-      type: 'DEPOSIT',
-      amount: depositAmount,
-    });
     if (
       !(await this.paymentLedger.claimForSubmission(payment.id, new Date()))
     ) {

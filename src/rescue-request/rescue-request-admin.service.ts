@@ -163,39 +163,73 @@ export class RescueRequestAdminService {
 
     const MANUAL_ASSIGN_WINDOW_MS = 30 * 60 * 1000;
     const batchId = crypto.randomUUID();
-    const offer = await this.prisma.dispatchOffer.create({
-      data: {
-        rescueRequestId: id,
-        operatorId: dto.operatorId,
-        status: 'SELECTED_PENDING_PAYMENT',
-        quotedPrice: dto.priceKobo,
-        respondedAt: new Date(),
-        expiresAt: new Date(Date.now() + MANUAL_ASSIGN_WINDOW_MS),
-        batchId,
-        // A direct admin assignment is not part of any bidding round, but the
-        // column is required. The request's own round is the truthful value:
-        // this offer is created SELECTED_PENDING_PAYMENT, never PENDING, so
-        // batch resolve never matches it and the round is bookkeeping only.
-        dispatchRound: request.dispatchRound,
-      },
-    });
-
-    // The in-flight partial unique index is the guard against a second
-    // deposit for the same request, and it refuses the insert rather than
-    // trusting the checks above — which read the request without claiming it,
-    // so two assignments can both get this far. Translate that refusal into
-    // the same offer rollback and clear message as any other failure here;
-    // without this the offer is orphaned SELECTED_PENDING_PAYMENT and the
-    // admin sees a raw database error.
-    let payment;
+    const depositWindowExpiresAt = new Date(Date.now() + DEPOSIT_WINDOW_MS);
+    let payment: Payment;
     try {
-      payment = await this.paymentLedger.create({
-        rescueRequestId: id,
-        type: 'DEPOSIT',
-        amount: depositAmount,
+      payment = await this.prisma.$transaction(async (tx) => {
+        const customerStillActive = await tx.user.updateMany({
+          where: { id: request.customerId, deletedAt: null },
+          data: { updatedAt: new Date() },
+        });
+        if (customerStillActive.count === 0) {
+          throw new BadRequestException(
+            'Cannot assign an operator: this customer has been deleted.',
+          );
+        }
+
+        const operatorStillActive = await tx.operator.updateMany({
+          where: { id: dto.operatorId, deletedAt: null },
+          data: { updatedAt: new Date() },
+        });
+        if (operatorStillActive.count === 0) {
+          throw new BadRequestException(
+            'Cannot assign this operator: the account has been deleted.',
+          );
+        }
+
+        const claimed = await tx.rescueRequest.updateMany({
+          where: {
+            id,
+            status: request.status,
+            assignedOperatorId: request.assignedOperatorId,
+          },
+          data: {
+            assignedOperatorId: dto.operatorId,
+            status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
+            serviceFeeAmount,
+            depositAmount,
+            balanceAmount,
+            depositWindowExpiresAt,
+            depositRemindersSent: 0,
+          },
+        });
+        if (claimed.count === 0) {
+          throw new BadRequestException(
+            'This request has already been assigned or moved on.',
+          );
+        }
+
+        await tx.dispatchOffer.create({
+          data: {
+            rescueRequestId: id,
+            operatorId: dto.operatorId,
+            status: 'SELECTED_PENDING_PAYMENT',
+            quotedPrice: dto.priceKobo,
+            respondedAt: new Date(),
+            expiresAt: new Date(Date.now() + MANUAL_ASSIGN_WINDOW_MS),
+            batchId,
+            dispatchRound: request.dispatchRound,
+          },
+        });
+
+        return this.paymentLedger.create({
+          rescueRequestId: id,
+          type: 'DEPOSIT',
+          amount: depositAmount,
+          tx,
+        });
       });
     } catch (error) {
-      await this.prisma.dispatchOffer.delete({ where: { id: offer.id } });
       if (
         error instanceof Prisma.PrismaClientKnownRequestError &&
         error.code === 'P2002'
@@ -231,9 +265,6 @@ export class RescueRequestAdminService {
     });
 
     if (paymentResponse.outcome !== 'ok') {
-      // Roll back the offer so a retry isn't blocked by a stale row.
-      await this.prisma.dispatchOffer.delete({ where: { id: offer.id } });
-
       // Only a definitive rejection fails the payment. An ambiguous result
       // leaves it SUBMITTED for verification — the admin is told not to
       // retry, because a retry here would be a second transaction.
@@ -260,17 +291,7 @@ export class RescueRequestAdminService {
     const updated = await this.prisma.rescueRequest.update({
       where: { id },
       data: {
-        assignedOperatorId: dto.operatorId,
-        status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
-        serviceFeeAmount,
-        depositAmount,
-        balanceAmount,
         depositPaymentUrl: checkoutUrl,
-        // Same statement as the transition — see the matching claim in
-        // WhatsAppCustomerFlowService.handleQuoteSelected. WAITING_FOR_DEPOSIT
-        // without a deadline is a row no reconciler check can ever match.
-        depositWindowExpiresAt: new Date(Date.now() + DEPOSIT_WINDOW_MS),
-        depositRemindersSent: 0,
       },
       include: {
         customer: true,
