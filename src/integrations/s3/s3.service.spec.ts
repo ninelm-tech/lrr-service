@@ -8,6 +8,11 @@ jest.mock('@aws-sdk/client-s3', () => ({
   S3Client: jest.fn().mockImplementation(() => ({ send: mockSend })),
   PutObjectCommand: jest.fn().mockImplementation((input) => ({ input })),
   GetObjectCommand: jest.fn().mockImplementation((input) => ({ input })),
+  DeleteObjectCommand: jest
+    .fn()
+    .mockImplementation((input: { Bucket: string; Key: string }) => ({
+      input,
+    })),
 }));
 
 jest.mock('@aws-sdk/s3-request-presigner', () => ({
@@ -70,5 +75,18 @@ describe('S3Service', () => {
       3600,
     );
     expect(url).toBe('https://signed-url.example.com/object');
+  });
+
+  it('sends a DeleteObjectCommand for the given key', async () => {
+    await service.deleteObject('rescue-requests/req-1/abc.jpg');
+
+    expect(mockSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.objectContaining({
+          Bucket: 'lrr-media-test',
+          Key: 'rescue-requests/req-1/abc.jpg',
+        }),
+      }),
+    );
   });
 });
