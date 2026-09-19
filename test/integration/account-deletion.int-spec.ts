@@ -80,4 +80,22 @@ describe('AccountDeletionService (integration)', () => {
       details: { targetType: 'User', targetId: user.id },
     });
   });
+
+  it('makes the account unfindable by AuthService.login afterward', async () => {
+    const user = await prisma.user.create({
+      data: {
+        email: 'test@example.com',
+        phoneNumber: '+2348011111111',
+        role: 'CUSTOMER',
+        passwordHash: 'x',
+      },
+    });
+
+    await service.deleteUser(user.id, 'admin-1');
+
+    const found = await prisma.user.findUnique({
+      where: { email: 'test@example.com' },
+    });
+    expect(found).toBeNull();
+  });
 });
