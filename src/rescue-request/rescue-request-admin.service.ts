@@ -29,6 +29,7 @@ import {
   DispatchOfferAdminDto,
   PaginationMetaDto,
 } from './dto/rescue-request-response.dto';
+import { RequestMediaDto } from '../media/dto/request-media.dto';
 import { DispatchService } from './dispatch.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { PaymentLedgerService } from '../payment/payment-ledger.service';
@@ -290,7 +291,7 @@ export class RescueRequestAdminService {
       `🚗 You've been assigned a job (₦${(dto.priceKobo / 100).toLocaleString()}). Waiting for the customer to confirm payment.`,
     );
 
-    return { data: this.mapToDetailDto(updated) };
+    return { data: this.mapToDetailDto(updated, true) };
   }
 
   /**
@@ -466,7 +467,7 @@ export class RescueRequestAdminService {
         data: { status: 'NOT_SELECTED', respondedAt: new Date() },
       });
     }
-    return { data: this.mapToDetailDto(updated) };
+    return { data: this.mapToDetailDto(updated, true) };
   }
 
   async cancel(id: string, dto: { reason?: string }) {
@@ -517,7 +518,7 @@ export class RescueRequestAdminService {
         `❌ Your rescue request has been cancelled${dto.reason ? `: ${dto.reason}` : '.'}\n\nSend SOS or HELP if you need assistance again.`,
       );
     }
-    return { data: this.mapToDetailDto(updated) };
+    return { data: this.mapToDetailDto(updated, true) };
   }
 
   async operatorList(userId: string, query: any) {
@@ -566,7 +567,7 @@ export class RescueRequestAdminService {
         'Rescue request not found or access denied',
       );
     }
-    return { data: this.mapToDetailDto(raw) };
+    return { data: this.mapToDetailDto(raw, false) };
   }
 
   async listForUser(user: any, query: any) {
@@ -670,7 +671,15 @@ export class RescueRequestAdminService {
             email: true,
           },
         },
-        media: { select: { id: true } },
+        media: {
+          select: {
+            id: true,
+            mediaType: true,
+            context: true,
+            uploadedByRole: true,
+            createdAt: true,
+          },
+        },
         dispatchOffers: {
           include: { operator: { select: { id: true, businessName: true } } },
           orderBy: { offeredAt: 'asc' },
@@ -697,7 +706,7 @@ export class RescueRequestAdminService {
           respondedAt: o.respondedAt ?? undefined,
         }),
       );
-      return { data: this.mapToDetailDto(raw, offers) };
+      return { data: this.mapToDetailDto(raw, true, offers) };
     }
 
     if (role === 'OPERATOR') {
@@ -711,7 +720,7 @@ export class RescueRequestAdminService {
           'You do not have access to this rescue request',
         );
       }
-      return { data: this.mapToDetailDto(raw) };
+      return { data: this.mapToDetailDto(raw, false) };
     }
 
     if (role === 'CUSTOMER') {
@@ -720,7 +729,7 @@ export class RescueRequestAdminService {
           'You do not have access to this rescue request',
         );
       }
-      return { data: this.mapToDetailDto(raw) };
+      return { data: this.mapToDetailDto(raw, false) };
     }
 
     throw new UnauthorizedException('Access denied');
@@ -779,15 +788,33 @@ export class RescueRequestAdminService {
 
   private mapToDetailDto(
     raw: any,
+    includeAllMedia: boolean,
     offers?: DispatchOfferAdminDto[],
   ): RescueRequestDetailDto {
     const apiBaseUrl = process.env.API_BASE_URL;
-    const mediaLinks: string[] =
-      raw.media && apiBaseUrl
-        ? raw.media.map(
-            (m: { id: string }) => `${apiBaseUrl}/api/v1/media/${m.id}`,
-          )
-        : [];
+    const allMedia = (raw.media ?? []) as {
+      id: string;
+      mediaType: string;
+      context: string;
+      uploadedByRole: string;
+      createdAt: Date;
+    }[];
+    const initialMedia = allMedia.filter((m) => m.context === 'INITIAL');
+    const mediaLinks: string[] = apiBaseUrl
+      ? initialMedia.map((m) => `${apiBaseUrl}/api/v1/media/${m.id}`)
+      : [];
+    const media: RequestMediaDto[] | undefined =
+      includeAllMedia && apiBaseUrl
+        ? allMedia.map((m) => ({
+            id: m.id,
+            url: `${apiBaseUrl}/api/v1/media/${m.id}`,
+            mediaType: m.mediaType as RequestMediaDto['mediaType'],
+            context: m.context as RequestMediaDto['context'],
+            uploadedByRole:
+              m.uploadedByRole as RequestMediaDto['uploadedByRole'],
+            createdAt: m.createdAt,
+          }))
+        : undefined;
 
     return {
       id: raw.id,
@@ -796,6 +823,7 @@ export class RescueRequestAdminService {
       vehicleType: raw.vehicleType ?? undefined,
       destination: raw.destination ?? undefined,
       mediaLinks,
+      media,
       latitude: raw.latitude ? Number(raw.latitude) : undefined,
       longitude: raw.longitude ? Number(raw.longitude) : undefined,
       depositPaid: hasSucceededPayment(raw.payments, PaymentType.DEPOSIT),

@@ -208,6 +208,145 @@ describe('RescueRequestAdminService', () => {
     });
   });
 
+  describe('detailForUser — media gating', () => {
+    let detailService: RescueRequestAdminService;
+    let prisma: {
+      rescueRequest: { findUnique: jest.Mock };
+      operatorMember: { findMany: jest.Mock };
+    };
+    let platformConfigService: { getConfig: jest.Mock };
+    const originalApiBaseUrl = process.env.API_BASE_URL;
+
+    beforeEach(async () => {
+      // mediaLinks/media both gate on this being set — mirrors production,
+      // where it always is; unset in the test environment otherwise.
+      process.env.API_BASE_URL = 'https://api.example.com';
+      prisma = {
+        rescueRequest: { findUnique: jest.fn() },
+        operatorMember: { findMany: jest.fn() },
+      };
+      platformConfigService = { getConfig: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestAdminService,
+          { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: {} },
+          { provide: PlatformConfigService, useValue: platformConfigService },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
+        ],
+      }).compile();
+
+      detailService = module.get<RescueRequestAdminService>(
+        RescueRequestAdminService,
+      );
+    });
+
+    afterEach(() => {
+      if (originalApiBaseUrl === undefined) delete process.env.API_BASE_URL;
+      else process.env.API_BASE_URL = originalApiBaseUrl;
+    });
+
+    const rawWithMedia = {
+      id: 'req-1',
+      status: 'COMPLETED',
+      issueType: undefined,
+      vehicleType: 'SEDAN',
+      destination: 'Mainland',
+      latitude: null,
+      longitude: null,
+      depositAmount: undefined,
+      balanceAmount: undefined,
+      payments: [],
+      createdAt: new Date('2026-09-18T00:00:00Z'),
+      updatedAt: new Date('2026-09-18T00:00:00Z'),
+      customer: {
+        id: 'cust-1',
+        phoneNumber: '+2348010000000',
+        email: null,
+        name: null,
+      },
+      customerId: 'cust-1',
+      assignedOperatorId: 'op-1',
+      assignedOperator: {
+        id: 'op-1',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2341111111111',
+        email: null,
+      },
+      dispatchOffers: [],
+      ratings: [],
+      media: [
+        {
+          id: 'm1',
+          mediaType: 'IMAGE',
+          context: 'INITIAL',
+          uploadedByRole: 'CUSTOMER',
+          createdAt: new Date('2026-09-18T00:00:00Z'),
+        },
+        {
+          id: 'm2',
+          mediaType: 'IMAGE',
+          context: 'DISPUTE',
+          uploadedByRole: 'OPERATOR',
+          createdAt: new Date('2026-09-18T00:00:00Z'),
+        },
+      ],
+    };
+
+    it('SUPER_ADMIN receives the full media array', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(rawWithMedia);
+      platformConfigService.getConfig.mockResolvedValue({
+        serviceFeePercent: 10,
+        depositPercent: 10,
+      });
+
+      const result = await detailService.detailForUser(
+        { role: 'SUPER_ADMIN', userId: 'admin-1' },
+        'req-1',
+      );
+
+      expect(result.data.media).toHaveLength(2);
+    });
+
+    it('OPERATOR (with access to this job) does not receive media at all', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(rawWithMedia);
+      prisma.operatorMember.findMany.mockResolvedValue([
+        { operatorId: 'op-1' },
+      ]);
+
+      const result = await detailService.detailForUser(
+        { role: 'OPERATOR', userId: 'op-user-1' },
+        'req-1',
+      );
+
+      expect(result.data.media).toBeUndefined();
+    });
+
+    it('CUSTOMER (the owner) does not receive media at all', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(rawWithMedia);
+
+      const result = await detailService.detailForUser(
+        { role: 'CUSTOMER', userId: 'cust-1' },
+        'req-1',
+      );
+
+      expect(result.data.media).toBeUndefined();
+    });
+  });
+
   describe('adminList', () => {
     let service: RescueRequestAdminService;
     let prisma: {

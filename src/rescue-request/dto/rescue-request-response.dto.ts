@@ -5,6 +5,7 @@ import {
   DispatchOfferStatus,
   RatingDirection,
 } from '@prisma/client';
+import { RequestMediaDto } from '../../media/dto/request-media.dto';
 
 export class CustomerSummaryDto {
   id: string;
@@ -87,6 +88,7 @@ export class RescueRequestDetailDto {
   vehicleType?: VehicleType;
   destination?: string;
   mediaLinks: string[];
+  media?: RequestMediaDto[];
   latitude?: number;
   longitude?: number;
   depositPaid: boolean;

@@ -12,6 +12,7 @@ import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   IssueType,
+  MediaContext,
   Prisma,
   RescueRequestStatus,
   VehicleType,
@@ -1254,7 +1255,10 @@ export class DispatchService {
             createdAt: true,
             vehicleType: true,
             destination: true,
-            media: { select: { id: true } },
+            media: {
+              where: { context: MediaContext.INITIAL },
+              select: { id: true },
+            },
           },
         },
       },

@@ -1593,4 +1593,57 @@ describe('DispatchService', () => {
       expect(sessionStore.update).not.toHaveBeenCalled();
     });
   });
+
+  describe('listMyPendingOffers — media filtering', () => {
+    let service: DispatchService;
+    let prisma: {
+      operatorMember: { findMany: jest.Mock };
+      dispatchOffer: { findMany: jest.Mock };
+    };
+
+    beforeEach(async () => {
+      prisma = {
+        operatorMember: { findMany: jest.fn() },
+        dispatchOffer: { findMany: jest.fn() },
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          DispatchService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<DispatchService>(DispatchService);
+    });
+
+    it('only queries INITIAL-context media for the pending-offers list', async () => {
+      prisma.operatorMember.findMany.mockResolvedValue([
+        { operatorId: 'op-1' },
+      ]);
+      prisma.dispatchOffer.findMany.mockResolvedValue([]);
+
+      await service.listMyPendingOffers('op-user-1');
+
+      expect(prisma.dispatchOffer.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          include: expect.objectContaining({
+            rescueRequest: expect.objectContaining({
+              select: expect.objectContaining({
+                media: {
+                  where: { context: 'INITIAL' },
+                  select: { id: true },
+                },
+              }),
+            }),
+          }),
+        }),
+      );
+    });
+  });
 });
