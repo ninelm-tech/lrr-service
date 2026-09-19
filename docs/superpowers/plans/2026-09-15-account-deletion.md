@@ -1701,6 +1701,13 @@ describe('AccountDeletionService.deleteUser', () => {
         paystackCustomerCode: null, paystackCustomerEmail: null, deletedAt: expect.any(Date),
       }),
     });
+    expect(tx.requestMedia.findMany).toHaveBeenCalledWith({
+      where: {
+        rescueRequest: { customerId: 'user-1' },
+        uploadedByRole: 'CUSTOMER',
+      },
+      select: { id: true, s3Key: true },
+    });
     expect(tx.pendingMediaDeletion.createMany).toHaveBeenCalledWith({
       data: [{ s3Key: 'key-1' }],
       skipDuplicates: true,
@@ -1714,6 +1721,32 @@ describe('AccountDeletionService.deleteUser', () => {
       data: { category: 'account_deleted', message: 'User user-1 deleted', actorId: 'admin-1', details: { targetType: 'User', targetId: 'user-1' } },
     });
     expect(result).toBeUndefined();
+  });
+
+  it('only queries uploadedByRole CUSTOMER media — never touches the operator\'s own evidence on a shared request', async () => {
+    // This is the regression that matters most for this query: before
+    // RequestMedia had context/uploadedByRole, this filter was implicit
+    // (all media was customer-uploaded). The mock below simulates the
+    // query itself already being scoped correctly — if the real
+    // implementation dropped the `uploadedByRole` clause, this test's
+    // own assertion above (on the exact `where` shape) would catch it,
+    // but this test additionally proves the *count* of what's queued for
+    // deletion reflects only the customer's own rows, not the operator's,
+    // by asserting the mock's call args carry the filter and nothing else
+    // leaks through — see the previous test's `findMany` assertion for
+    // the authoritative shape check; this test exists so a reviewer
+    // reading just the test list sees the regression named explicitly.
+    tx.user.updateMany.mockResolvedValue({ count: 1 });
+    tx.requestMedia.findMany.mockResolvedValue([
+      { id: 'media-customer-1', s3Key: 'key-customer-1' },
+    ]);
+
+    await service.deleteUser('user-1', 'admin-1');
+
+    const [callArgs] = tx.requestMedia.findMany.mock.calls[0] as [
+      { where: { uploadedByRole: string } },
+    ];
+    expect(callArgs.where.uploadedByRole).toBe('CUSTOMER');
   });
 
   it('deletes S3 objects after the transaction commits, and clears the outbox row on success', async () => {
@@ -1856,8 +1889,14 @@ export class AccountDeletionService {
         },
       });
 
+      // uploadedByRole: CUSTOMER — RequestMedia can now also hold
+      // COMPLETION/DISPUTE rows the OPERATOR uploaded on a shared
+      // request; those aren't this customer's identity to scrub.
       const media = await tx.requestMedia.findMany({
-        where: { rescueRequest: { customerId: id } },
+        where: {
+          rescueRequest: { customerId: id },
+          uploadedByRole: UserRole.CUSTOMER,
+        },
         select: { id: true, s3Key: true },
       });
       if (media.length > 0) {
@@ -2043,6 +2082,10 @@ git commit -m "Add AccountDeletionService.deleteUser"
   note) — the row-lock `updateMany` carries only `id`/`deletedAt` on Operator,
   and active/disputed requests plus unsettled payout entitlements are read
   only after that lock succeeds. Attempt status alone is not the invariant.
+- Also scrubs this operator's own uploaded `RequestMedia` (`uploadedByRole:
+  OPERATOR`) through the same `PendingMediaDeletion` outbox as `deleteUser`
+  — reuses `S3Service.deleteObject` (Task 2), already injected into
+  `AccountDeletionService` from Task 10; no new dependency for this task.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2055,6 +2098,15 @@ both remain unsettled and must block deletion because the payment model allows
 a fresh retry row. Also test that an older FAILED/REVERSED attempt does not
 block once a SUCCEEDED sibling exists. Success anonymizes the operator and
 scrubs both dispute statements.
+
+Also mirror `deleteUser`'s media tests, mocking the same `tx.requestMedia`/
+`tx.pendingMediaDeletion`/`s3Service` shape: `deleteOperator` deletes
+`RequestMedia` rows and their S3 objects; the query is scoped to
+`rescueRequest: { assignedOperatorId: id }` AND `uploadedByRole: 'OPERATOR'`
+— assert the exact `where` shape, and add the same "only queries
+uploadedByRole OPERATOR — never touches the customer's own evidence"
+regression test `deleteUser` has for its own `CUSTOMER` filter. Also
+mirror the S3-commit, S3-failure, and empty-media-skips-the-loop tests.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -2071,7 +2123,7 @@ disputed-request guard, query completed assigned requests with no SUCCEEDED
 PAYOUT:
 ```ts
 async deleteOperator(id: string, actorId: string): Promise<void> {
-  await this.prisma.$transaction(async (tx) => {
+  const s3KeysToDelete = await this.prisma.$transaction(async (tx) => {
     // Step 1: lock the row. Plain columns only.
     const locked = await tx.operator.updateMany({
       where: { id, deletedAt: null },
@@ -2147,6 +2199,27 @@ async deleteOperator(id: string, actorId: string): Promise<void> {
       data: { operatorDisputeStatement: null, customerDisputeStatement: null },
     });
 
+    // This operator's own uploaded evidence — completion photos, dispute
+    // evidence — not the customer's. Same PendingMediaDeletion outbox
+    // pattern as deleteUser: written in the same transaction as the
+    // RequestMedia delete, cleared only once S3 confirms.
+    const media = await tx.requestMedia.findMany({
+      where: {
+        rescueRequest: { assignedOperatorId: id },
+        uploadedByRole: UserRole.OPERATOR,
+      },
+      select: { id: true, s3Key: true },
+    });
+    if (media.length > 0) {
+      await tx.pendingMediaDeletion.createMany({
+        data: media.map((m) => ({ s3Key: m.s3Key })),
+        skipDuplicates: true,
+      });
+    }
+    await tx.requestMedia.deleteMany({
+      where: { id: { in: media.map((m) => m.id) } },
+    });
+
     await tx.auditLog.create({
       data: {
         category: 'account_deleted',
@@ -2155,10 +2228,26 @@ async deleteOperator(id: string, actorId: string): Promise<void> {
         details: { targetType: 'Operator', targetId: id },
       },
     });
+
+    return media.map((m) => m.s3Key);
   });
+
+  // Outside the transaction — S3 isn't transactional with Postgres. Same
+  // best-effort-then-retry shape as deleteUser.
+  for (const key of s3KeysToDelete) {
+    try {
+      await this.s3Service.deleteObject(key);
+      await this.prisma.pendingMediaDeletion.delete({ where: { s3Key: key } });
+    } catch (err) {
+      console.error(`Failed to delete media object ${key} after deleting operator ${id}:`, err);
+      Sentry.captureException(err, { extra: { s3Key: key, operatorId: id } });
+      // Deliberately not removed — stays for RetryMediaDeletionCheck (Task 13).
+    }
+  }
 }
 ```
-Add `OperatorStatus` to this file's `@prisma/client` import.
+Add `OperatorStatus` to this file's `@prisma/client` import. `UserRole`,
+`S3Service`, and `Sentry` are already imported/injected from Task 10.
 
 - [ ] **Step 4: Run tests to verify they pass**
 

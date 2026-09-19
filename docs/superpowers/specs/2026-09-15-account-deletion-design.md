@@ -1,6 +1,10 @@
 # Account Deletion — Design
 
-**Status:** Approved by user 2026-09-15.
+**Status:** Approved by user 2026-09-15. Patched 2026-09-19 for
+`RequestMedia`'s `context`/`uploadedByRole` fields (added by the
+completion-and-dispute-media-evidence plan, which shipped between this
+spec's approval and its implementation) — see the `deleteUser`/
+`deleteOperator` sections below for what changed.
 
 **Goal:** Let a SUPER_ADMIN delete a customer or operator account — anonymizing
 their identity data immediately — without breaking Nigeria's financial
@@ -205,8 +209,18 @@ async deleteUser(id: string, actorId: string): Promise<void> {
     // it is financial-record data (Background). The guard above already
     // requires every request to be COMPLETED/CANCELLED with no open
     // dispute, so nobody has a live, ongoing need for this any more.
+    //
+    // uploadedByRole: CUSTOMER — added 2026-09-19, after RequestMedia
+    // gained context/uploadedByRole (completion & dispute media evidence
+    // plan). Without this filter, deleting a customer would also delete
+    // the OPERATOR's own completion/dispute photos on a shared request —
+    // those aren't this customer's identity to scrub, and deleteOperator
+    // (below) now owns cleaning those up on its own trigger.
     const media = await tx.requestMedia.findMany({
-      where: { rescueRequest: { customerId: id } },
+      where: {
+        rescueRequest: { customerId: id },
+        uploadedByRole: UserRole.CUSTOMER,
+      },
       select: { id: true, s3Key: true },
     });
     // Durable outbox entry BEFORE the row disappears (Section 2a) — this
@@ -285,14 +299,25 @@ private async explainUserLockFailure(tx: Prisma.TransactionClient, id: string): 
 **`AccountDeletionService.deleteOperator`** — same shape, no role check
 needed (`Operator` is always a business, never a staff login). It scrubs
 both dispute statements on this operator's requests (not just the
-operator's own — see the note on `deleteUser`'s equivalent scrub above);
-the customer-side location/media scrub is untouched here, since that's
-identifying data about the *customer*, addressed only when that customer is
+operator's own — see the note on `deleteUser`'s equivalent scrub above).
+
+**Updated 2026-09-19, after `RequestMedia` gained `context`/
+`uploadedByRole`:** the original draft of this section left media
+entirely untouched here, reasoning that all `RequestMedia` was
+customer-uploaded and so was the customer's identity to scrub, not the
+operator's. That's no longer true — an operator now uploads their own
+completion evidence and can upload dispute evidence too, and those
+photos can show the operator's own face, vehicle, or plate (Background).
+`deleteOperator` now scrubs `RequestMedia` rows tagged
+`uploadedByRole: OPERATOR` on this operator's assigned requests, through
+the same `PendingMediaDeletion` outbox as `deleteUser`. Customer-uploaded
+media on the same requests is untouched here — still identifying data
+about the *customer*, still addressed only when that customer is
 separately deleted:
 
 ```ts
 async deleteOperator(id: string, actorId: string): Promise<void> {
-  await this.prisma.$transaction(async (tx) => {
+  const s3KeysToDelete = await this.prisma.$transaction(async (tx) => {
     const locked = await tx.operator.updateMany({
       where: { id, deletedAt: null },
       data: { updatedAt: new Date() },
@@ -367,6 +392,27 @@ async deleteOperator(id: string, actorId: string): Promise<void> {
       data: { operatorDisputeStatement: null, customerDisputeStatement: null },
     });
 
+    // This operator's own uploaded evidence (completion photos, dispute
+    // evidence) — not the customer's. Same outbox pattern as deleteUser:
+    // written in the same transaction as the RequestMedia delete, cleared
+    // only once S3 confirms.
+    const media = await tx.requestMedia.findMany({
+      where: {
+        rescueRequest: { assignedOperatorId: id },
+        uploadedByRole: UserRole.OPERATOR,
+      },
+      select: { id: true, s3Key: true },
+    });
+    if (media.length > 0) {
+      await tx.pendingMediaDeletion.createMany({
+        data: media.map((m) => ({ s3Key: m.s3Key })),
+        skipDuplicates: true,
+      });
+    }
+    await tx.requestMedia.deleteMany({
+      where: { id: { in: media.map((m) => m.id) } },
+    });
+
     await tx.auditLog.create({
       data: {
         category: 'account_deleted',
@@ -375,7 +421,22 @@ async deleteOperator(id: string, actorId: string): Promise<void> {
         details: { targetType: 'Operator', targetId: id },
       },
     });
+
+    return media.map((m) => m.s3Key);
   });
+
+  // Outside the transaction — S3 isn't transactional with Postgres. Same
+  // best-effort-then-retry shape as deleteUser above.
+  for (const key of s3KeysToDelete) {
+    try {
+      await this.s3Service.deleteObject(key);
+      await this.prisma.pendingMediaDeletion.delete({ where: { s3Key: key } });
+    } catch (err) {
+      console.error(`Failed to delete media object ${key} after deleting operator ${id}:`, err);
+      Sentry.captureException(err, { extra: { s3Key: key, operatorId: id } });
+      // Deliberately not removed — stays for RetryMediaDeletionCheck (Section 4).
+    }
+  }
 }
 ```
 
@@ -1002,8 +1063,9 @@ export class PurgeExpiredFinancialDataCheck {
 ```
 
 **`RetryMediaDeletionCheck`** — clears whatever the best-effort loop in
-`deleteUser` (Section 2a) couldn't delete immediately. Idempotent because
-S3's `DeleteObject` succeeds even on an already-gone key:
+`deleteUser` or `deleteOperator` (both write to the same
+`PendingMediaDeletion` outbox) couldn't delete immediately. Idempotent
+because S3's `DeleteObject` succeeds even on an already-gone key:
 
 ```ts
 @Injectable()
@@ -1125,6 +1187,27 @@ actual serialization behavior. No relational condition belongs in a locking
 - **`deleteUser` deletes the customer's `RequestMedia` rows and their S3
   objects** — captured `s3Key`s match what `S3Service.deleteObject` is
   called with, once per row, after the transaction commits.
+- **`deleteUser` only deletes `uploadedByRole: CUSTOMER` media, never the
+  operator's** — a request with one `CUSTOMER`-uploaded (`INITIAL`) row
+  and one `OPERATOR`-uploaded (`COMPLETION`) row on the same
+  `rescueRequestId` → only the `CUSTOMER` row is found, queued for S3
+  deletion, and removed; the `OPERATOR` row and its S3 object are
+  untouched. **This is the regression that matters most for this
+  query** — before `uploadedByRole` existed, this filter was implicit
+  (all media was customer-uploaded); adding it back after the schema
+  changed is what this fix is for.
+- **`deleteOperator` deletes the operator's own `RequestMedia` rows and
+  their S3 objects** — same shape as `deleteUser`'s equivalent test,
+  scoped to `rescueRequest.assignedOperatorId` + `uploadedByRole:
+  OPERATOR`.
+- **`deleteOperator` only deletes `uploadedByRole: OPERATOR` media,
+  never the customer's** — mirrors the `deleteUser` regression test
+  above: a `CUSTOMER`-uploaded row on the same request survives.
+- **`deleteOperator` still commits when an S3 delete fails**, same
+  shape as `deleteUser`'s equivalent test.
+- **`deleteOperator` writes a `PendingMediaDeletion` row for every media
+  item in the same transaction as the `RequestMedia` delete**, same
+  shape as `deleteUser`'s equivalent test.
 - **`deleteUser` still commits when an S3 delete fails** — `s3Service
   .deleteObject` rejects for one key → the deletion itself is unaffected
   (already committed), a Sentry exception is captured, no exception
@@ -1156,9 +1239,11 @@ actual serialization behavior. No relational condition belongs in a locking
   `customerDisputeStatement` nulled (**this is the regression that matters
   most for this test** — an earlier draft only cleared the operator's own
   statement, missing that the customer's words can identify the operator
-  too). Location/media on the same request are untouched — that's the
-  customer's identifying data, addressed only when the customer is
-  separately deleted.
+  too). Location on the same request is untouched — that's the customer's
+  identifying data, addressed only when the customer is separately
+  deleted. (Media is *not* uniformly untouched here any more — see the
+  `uploadedByRole`-scoped media tests above: the customer's `INITIAL`
+  media survives, the operator's `COMPLETION`/`DISPUTE` media does not.)
 - **Post-delete login lookup fails** — a `User` with `email: null` cannot be
   found by `AuthService.login`'s `findUnique({ where: { email } })`.
 - **Purge check is a no-op when nothing qualifies** — `run()` returns `0`, no
