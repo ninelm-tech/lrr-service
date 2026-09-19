@@ -477,18 +477,34 @@ export class WhatsAppCustomerFlowService {
         );
       }
 
-      const customer =
-        await this.sharedService.findOrCreateCustomer(phoneNumber);
-      const rescueRequest = await this.prisma.rescueRequest.create({
-        data: {
-          customerId: customer.id,
-          status: RescueRequestStatus.WAITING_FOR_MEDIA,
-          latitude: session.latitude,
-          longitude: session.longitude,
-          vehicleType: session.vehicleType as VehicleType,
-          destination: session.destination,
-          issueType,
-        },
+      const rescueRequest = await this.prisma.$transaction(async (tx) => {
+        const customer = await this.sharedService.findOrCreateCustomer(
+          phoneNumber,
+          tx,
+        );
+
+        // Lock-as-mutex against a concurrent account deletion: contends for
+        // the same User row deleteUser's own updateMany writes to, so
+        // whichever transaction commits first wins.
+        const stillActive = await tx.user.updateMany({
+          where: { id: customer.id, deletedAt: null },
+          data: { updatedAt: new Date() },
+        });
+        if (stillActive.count === 0) {
+          throw new BadRequestException('This account is no longer active.');
+        }
+
+        return tx.rescueRequest.create({
+          data: {
+            customerId: customer.id,
+            status: RescueRequestStatus.WAITING_FOR_MEDIA,
+            latitude: session.latitude,
+            longitude: session.longitude,
+            vehicleType: session.vehicleType as VehicleType,
+            destination: session.destination,
+            issueType,
+          },
+        });
       });
 
       await this.sessionStore.update(userId, {

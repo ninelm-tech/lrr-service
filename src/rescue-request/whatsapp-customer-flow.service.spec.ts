@@ -428,6 +428,8 @@ describe('WhatsAppCustomerFlowService', () => {
     let issueService: WhatsAppCustomerFlowService;
     let prisma: {
       rescueRequest: { create: jest.Mock };
+      user: { updateMany: jest.Mock };
+      $transaction: jest.Mock;
     };
     let sessionStore: { update: jest.Mock };
     let sharedService: { findOrCreateCustomer: jest.Mock };
@@ -446,6 +448,8 @@ describe('WhatsAppCustomerFlowService', () => {
     beforeEach(async () => {
       prisma = {
         rescueRequest: { create: jest.fn().mockResolvedValue({ id: 'req-1' }) },
+        user: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        $transaction: jest.fn((cb: (tx: unknown) => unknown) => cb(prisma)),
       };
       sessionStore = { update: jest.fn() };
       sharedService = {
@@ -553,6 +557,26 @@ describe('WhatsAppCustomerFlowService', () => {
           data: expect.objectContaining({ issueType: 'ACCIDENT' }),
         }),
       );
+    });
+
+    it('aborts request creation when the customer was deleted before the transaction commits', async () => {
+      prisma.user.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        issueService.handleCustomerMessage(
+          phoneNumber,
+          userId,
+          '3',
+          '3',
+          undefined,
+          undefined,
+          undefined,
+          baseSession,
+          {},
+        ),
+      ).rejects.toThrow('This account is no longer active.');
+
+      expect(prisma.rescueRequest.create).not.toHaveBeenCalled();
     });
   });
 

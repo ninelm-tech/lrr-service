@@ -3,7 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { GeocodingService } from '../integrations/geocoding/geocoding.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
-import { UserRole } from '@prisma/client';
+import { Prisma, UserRole } from '@prisma/client';
 
 /**
  * Small shared helpers with no WhatsApp-flow state of their own, used by
@@ -25,8 +25,11 @@ export class RescueRequestSharedService {
     private readonly sessionStore: WhatsAppSessionStore,
   ) {}
 
-  async findOrCreateCustomer(phoneNumber: string) {
-    return this.prisma.user.upsert({
+  async findOrCreateCustomer(
+    phoneNumber: string,
+    client: Prisma.TransactionClient | PrismaService = this.prisma,
+  ) {
+    return client.user.upsert({
       where: { phoneNumber },
       update: {},
       create: { phoneNumber, role: UserRole.CUSTOMER },

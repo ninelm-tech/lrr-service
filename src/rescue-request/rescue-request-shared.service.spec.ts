@@ -44,6 +44,21 @@ describe('RescueRequestSharedService', () => {
         create: { phoneNumber: '+2348012345678', role: 'CUSTOMER' },
       });
     });
+
+    it('runs against the given transaction client when one is provided', async () => {
+      const txUser = { upsert: jest.fn().mockResolvedValue({ id: 'cust-1' }) };
+      const tx = { user: txUser } as never;
+
+      const result = await service.findOrCreateCustomer('+2348012345678', tx);
+
+      expect(txUser.upsert).toHaveBeenCalledWith({
+        where: { phoneNumber: '+2348012345678' },
+        update: {},
+        create: { phoneNumber: '+2348012345678', role: 'CUSTOMER' },
+      });
+      expect(prisma.user.upsert).not.toHaveBeenCalled();
+      expect(result).toEqual({ id: 'cust-1' });
+    });
   });
 
   describe('formatLocationSection', () => {
