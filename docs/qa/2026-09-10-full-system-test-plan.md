@@ -1,6 +1,6 @@
 # LRR Full System Test Plan
 
-**Date:** 2026-09-10 · **Last updated:** 2026-09-18 (added §17 — operator email-optional signup, phone+OTP login, and password reset, all now Termii-SMS-backed)
+**Date:** 2026-09-10 · **Last updated:** 2026-09-19 (added §18 — SUPER_ADMIN account deletion for customers and operators)
 **Scope:** Every customer/operator/staff-facing flow currently implemented, on staging. Manual, WhatsApp + admin dashboard driven — the automated Jest suite (356 unit + 152 integration tests, `lrr-service`) already covers unit-level logic and real-database behaviour; this plan verifies the real, end-to-end experience a real user would have, including the one thing the automated suite cannot: that money actually moves at Paystack, not just in our own database.
 
 **How to use this:** Work top to bottom. Each numbered case has Setup → Steps → Expected Result. Check the box when the actual result matches. If it doesn't, stop, note what actually happened, and file it rather than continuing past a failure in that flow — later cases often assume the earlier ones worked.
@@ -16,6 +16,7 @@
 - Access to the Paystack dashboard for the same mode (test/live) the environment under test actually uses — several steps below only pass if the money movement shows up there, not just in our own UI
 - A SUPER_ADMIN bearer token for one direct API call in §14 (there's no dashboard button for it yet, and this endpoint moves platform money out so it's SUPER_ADMIN-only, same as payouts) — grab it from your browser's dev tools (Storage) while logged in as a SUPER_ADMIN, or however your team normally makes authenticated calls against the API
 - For §17: 2-3 fresh phone numbers not already in the database (as any role), able to receive **real SMS** (not WhatsApp) — codes now go out via Termii, so a Nigerian number is required for delivery to actually work in staging/production
+- For §18: a SUPER_ADMIN login specifically (ADMIN is not enough — the delete action doesn't appear for that role), and several **disposable** test customer/operator accounts you're OK permanently anonymizing — deletion cannot be undone, so don't run §18 against real accounts or the same fixtures other sections still need
 
 ---
 
@@ -492,6 +493,108 @@ covered here.
   again using the *same* code that just succeeded.
   **Expected:** Rejected — `"Code expired — request a new one."` A code
   cannot be replayed after it's already been consumed once.
+
+---
+
+## 18. Account Deletion — SUPER_ADMIN Only — new this pass
+
+Deletion **anonymizes**, it never hard-deletes: name/email/phone/bank
+details are cleared or replaced, but the row itself stays (with
+`deletedAt` set) so payment history survives for financial recordkeeping.
+There is no undo — once confirmed, it's done. Both actions live on the
+admin dashboard: **Manage Users** for customers, **Operators** for
+operator businesses. Only a `SUPER_ADMIN` sees the Delete button at all —
+`ADMIN` and `PRODUCT` logins don't get an inline rejection, the button
+simply isn't there.
+
+### Customer deletion (Manage Users)
+
+- [ ] **18.1 — Golden path**
+  Log in as SUPER_ADMIN, go to **Manage Users**, find a disposable test
+  customer with no active job and no unresolved dispute. Click **Delete**,
+  confirm the browser dialog (*"Delete this account? This anonymizes
+  their personal details and cannot be undone."*).
+  **Expected:** The list refreshes; that row now shows name "Deleted
+  User", blank email/phone, and a **Deleted** badge replaces the Delete
+  button.
+
+- [ ] **18.2 — Blocked: active request**
+  Attempt 18.1's steps on a customer who currently has a rescue request
+  that isn't `COMPLETED`/`CANCELLED` yet.
+  **Expected:** Rejected inline — *"Cannot delete: 1 request(s) still
+  active, with an unresolved dispute, or with a payment still
+  processing"*. Nothing changes; the customer's data is untouched.
+
+- [ ] **18.3 — Blocked: unresolved dispute**
+  Same as 18.2, but on a customer whose request is `COMPLETED` yet still
+  has an open (unresolved) dispute.
+  **Expected:** Same rejection message as 18.2 — a completed status alone
+  isn't enough; the dispute must be resolved first.
+
+- [ ] **18.4 — Blocked: payment still processing**
+  Same as 18.2, but on a customer whose request is already `CANCELLED`
+  with a refund still `PENDING`/`SUBMITTED`/`BLOCKED` (not yet settled).
+  **Expected:** Same rejection message again — a cancelled request with
+  money still in flight is not yet safe to anonymize.
+
+- [ ] **18.5 — Already deleted**
+  Click Delete again on the row from 18.1.
+  **Expected:** There shouldn't be a button left to click — the Deleted
+  badge replaced it. If you hit the endpoint directly instead: *"This
+  account has already been deleted"*.
+
+- [ ] **18.6 — Non-SUPER_ADMIN can't see the action**
+  Log in as an ADMIN (not SUPER_ADMIN) and view the same Manage Users
+  table.
+  **Expected:** The Actions column has no Delete button for any row
+  (Deleted badges still show where applicable) — deletion isn't offered
+  as an option at all for this role.
+
+- [ ] **18.7 — Deleted customer is unfindable afterward**
+  After 18.1, try to log that customer in (if they had password/email
+  credentials), and separately send a WhatsApp SOS from their same phone
+  number.
+  **Expected:** Login fails (the email is gone). The WhatsApp message
+  starts a **brand-new** customer signup flow, as if that number had
+  never messaged before — this is correct, not a bug; from the
+  platform's side that old identity no longer exists.
+
+### Operator deletion (Operators tab)
+
+- [ ] **18.8 — Golden path**
+  Go to **Operators**, find a disposable test operator with no active
+  job, no unresolved dispute, and no completed job with an unpaid payout.
+  Click **Delete**, confirm (*"Delete this operator's account? This
+  anonymizes their business details and cannot be undone."*).
+  **Expected:** List refreshes; the row shows business name "Deleted
+  Operator", blank phone, status **Suspended**, and a **Deleted** badge
+  next to it. It also drops out of "Available Now" on the Operators
+  overview.
+
+- [ ] **18.9 — Blocked: active or disputed request**
+  Attempt 18.8 on an operator with a currently-assigned, non-terminal
+  request, or a completed one with an open dispute.
+  **Expected:** Rejected inline — *"Cannot delete: 1 request(s) still
+  active or disputed"*.
+
+- [ ] **18.10 — Blocked: unsettled payout**
+  Attempt 18.8 on an operator with a `COMPLETED` job whose payout hasn't
+  actually succeeded yet (no payout attempted, or the only attempt(s) so
+  far are `FAILED`/`REVERSED`).
+  **Expected:** Rejected inline — *"Cannot delete: 1 completed request(s)
+  still have an unsettled payout"*. Pay the operator out first (§10), then
+  retry — it should succeed once a `SUCCEEDED` payout exists for that job.
+
+- [ ] **18.11 — Already deleted**
+  Same idea as 18.5, on the Operators tab.
+  **Expected:** *"This operator has already been deleted"* if attempted
+  directly. **Known, non-blocking quirk:** the row's Reinstate button
+  still shows after deletion — don't file that as new, it's a known,
+  disclosed rough edge, not a regression.
+
+- [ ] **18.12 — Non-SUPER_ADMIN can't see the action**
+  Same as 18.6, but on the Operators tab as ADMIN or PRODUCT.
+  **Expected:** No Delete button on any row for either role.
 
 ---
 
