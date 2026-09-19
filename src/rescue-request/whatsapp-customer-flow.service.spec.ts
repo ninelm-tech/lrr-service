@@ -1216,4 +1216,150 @@ describe('WhatsAppCustomerFlowService', () => {
       });
     });
   });
+
+  describe('handleCustomerMessage — dispute evidence', () => {
+    let service: WhatsAppCustomerFlowService;
+    let prisma: {
+      rescueRequest: { update: jest.Mock; findUnique: jest.Mock };
+      requestMedia: { count: jest.Mock; create: jest.Mock };
+    };
+    let sessionStore: { update: jest.Mock };
+    let twilioService: { downloadMedia: jest.Mock };
+    let s3Service: { uploadMedia: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: {
+          update: jest.fn().mockResolvedValue({}),
+          findUnique: jest.fn(),
+        },
+        requestMedia: {
+          count: jest.fn().mockResolvedValue(0),
+          create: jest.fn().mockResolvedValue({}),
+        },
+      };
+      sessionStore = { update: jest.fn().mockResolvedValue(undefined) };
+      twilioService = {
+        downloadMedia: jest.fn().mockResolvedValue(Buffer.from('fake')),
+      };
+      s3Service = { uploadMedia: jest.fn().mockResolvedValue(undefined) };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppCustomerFlowService,
+          { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: S3Service, useValue: s3Service },
+          { provide: GeocodingService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PaystackService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppCustomerFlowService>(
+        WhatsAppCustomerFlowService,
+      );
+    });
+
+    it('text-only statement ends the state exactly as before', async () => {
+      const session = {
+        state: WhatsAppFlowState.AWAITING_DISPUTE_REASON,
+        rescueRequestId: 'req-1',
+      } as unknown as WhatsAppSession;
+
+      await service.handleCustomerMessage(
+        '+2348010000000',
+        'cust-1',
+        'the operator never showed up',
+        'the operator never showed up',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {},
+      );
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { customerDisputeStatement: 'the operator never showed up' },
+      });
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
+        state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
+      });
+    });
+
+    it('media with no text saves the attachment and stays in the same state', async () => {
+      const session = {
+        state: WhatsAppFlowState.AWAITING_DISPUTE_REASON,
+        rescueRequestId: 'req-1',
+      } as unknown as WhatsAppSession;
+
+      const result = await service.handleCustomerMessage(
+        '+2348010000000',
+        'cust-1',
+        '',
+        '',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {
+          NumMedia: '1',
+          MediaUrl0: 'https://twilio.example/media/7',
+          MediaContentType0: 'image/jpeg',
+        },
+      );
+
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+      expect(sessionStore.update).not.toHaveBeenCalled();
+      expect(result).toContain('Got it');
+    });
+
+    it('media plus text saves the attachment and ends the state', async () => {
+      const session = {
+        state: WhatsAppFlowState.AWAITING_DISPUTE_REASON,
+        rescueRequestId: 'req-1',
+      } as unknown as WhatsAppSession;
+
+      await service.handleCustomerMessage(
+        '+2348010000000',
+        'cust-1',
+        'see attached',
+        'see attached',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {
+          NumMedia: '1',
+          MediaUrl0: 'https://twilio.example/media/8',
+          MediaContentType0: 'image/jpeg',
+        },
+      );
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { customerDisputeStatement: 'see attached' },
+      });
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
+        state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
+      });
+      expect(s3Service.uploadMedia).toHaveBeenCalled();
+    });
+  });
 });

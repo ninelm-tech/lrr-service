@@ -157,9 +157,44 @@ export class WhatsAppCustomerFlowService {
     // operator-side equivalent: whatever the customer sends next while in
     // this state is their statement, not a command.
     if (session.state === WhatsAppFlowState.AWAITING_DISPUTE_REASON) {
-      if (session.rescueRequestId) {
+      const rescueRequestId = session.rescueRequestId;
+      const numMedia = Number(body.NumMedia ?? 0);
+
+      if (rescueRequestId && numMedia > 0) {
+        let existingCount = await this.prisma.requestMedia.count({
+          where: {
+            rescueRequestId,
+            context: MediaContext.DISPUTE,
+            uploadedByRole: UserRole.CUSTOMER,
+          },
+        });
+        for (let i = 0; i < numMedia; i++) {
+          if (existingCount >= MAX_MEDIA_ITEMS) break;
+          const mediaUrl = body[`MediaUrl${i}`] as string | undefined;
+          const contentType = body[`MediaContentType${i}`] as
+            | string
+            | undefined;
+          if (!mediaUrl || !contentType) continue;
+          const saved = await this.captureMediaAttachment(
+            rescueRequestId,
+            mediaUrl,
+            contentType,
+            MediaContext.DISPUTE,
+            UserRole.CUSTOMER,
+          );
+          if (saved) existingCount++;
+        }
+      }
+
+      if (!rawMessage) {
+        return this.reply(
+          `📸 Got it — send more evidence, or reply with your explanation to finish.`,
+        );
+      }
+
+      if (rescueRequestId) {
         await this.prisma.rescueRequest.update({
-          where: { id: session.rescueRequestId },
+          where: { id: rescueRequestId },
           data: { customerDisputeStatement: rawMessage },
         });
       }
