@@ -15,6 +15,7 @@ import {
   MediaContext,
   Prisma,
   RescueRequestStatus,
+  UserRole,
   VehicleType,
 } from '@prisma/client';
 import {
@@ -190,9 +191,35 @@ export class DispatchService {
       rescueRequestId: string;
       expiresAt: Date;
       batchId: string;
+      operatorId: string;
     },
     quotedPriceKobo: number | undefined,
   ): Promise<{ quoted: boolean; message: string }> {
+    const claimResult = await this.prisma.$transaction(async (tx) => {
+      const operatorStillActive = await tx.operator.updateMany({
+        where: { id: offer.operatorId, deletedAt: null },
+        data: { updatedAt: new Date() },
+      });
+      if (operatorStillActive.count === 0) {
+        throw new BadRequestException('This operator is no longer available.');
+      }
+      return this.claimOfferInTx(tx, offer, quotedPriceKobo);
+    });
+
+    await this.afterOfferClaim(offer, quotedPriceKobo, claimResult.claimed);
+    return { quoted: claimResult.quoted, message: claimResult.message };
+  }
+
+  private async claimOfferInTx(
+    tx: Prisma.TransactionClient,
+    offer: {
+      id: string;
+      rescueRequestId: string;
+      expiresAt: Date;
+      batchId: string;
+    },
+    quotedPriceKobo: number | undefined,
+  ): Promise<{ claimed: boolean; quoted: boolean; message: string }> {
     const isDecline = quotedPriceKobo === undefined;
 
     // Bidding already closed: the shortlist is with the motorist, so this
@@ -203,7 +230,7 @@ export class DispatchService {
     // the offer's expiresAt has also passed and the claim would otherwise
     // return the generic "expired" message.
     if (!isDecline && (await this.isBiddingClosed(offer.rescueRequestId))) {
-      await this.prisma.dispatchOffer.updateMany({
+      await tx.dispatchOffer.updateMany({
         where: { id: offer.id, status: 'PENDING' },
         data: {
           status: 'NOT_SELECTED',
@@ -217,6 +244,7 @@ export class DispatchService {
         quotedPriceKobo,
       });
       return {
+        claimed: false,
         quoted: false,
         message: `⌛ Bidding has already closed for ${formatJobRef(offer.rescueRequestId)} — the customer is choosing from the quotes received. Thanks for responding; watch for new offers!`,
       };
@@ -228,7 +256,7 @@ export class DispatchService {
     // gap is exactly what starts phase 2 or reorders a shortlist. The
     // conditional write is where the guarantee has to live, because both the
     // WhatsApp and dashboard channels funnel through here.
-    const claimed = await this.prisma.dispatchOffer.updateMany({
+    const claimed = await tx.dispatchOffer.updateMany({
       where: { id: offer.id, status: 'PENDING', expiresAt: { gt: new Date() } },
       data: {
         status: isDecline ? 'DECLINED' : 'QUOTED',
@@ -237,7 +265,11 @@ export class DispatchService {
       },
     });
     if (claimed.count === 0) {
-      return { quoted: false, message: `Sorry, that offer has expired.` };
+      return {
+        claimed: false,
+        quoted: false,
+        message: `Sorry, that offer has expired.`,
+      };
     }
 
     if (isDecline) {
@@ -245,8 +277,8 @@ export class DispatchService {
         rescueRequestId: offer.rescueRequestId,
         offerId: offer.id,
       });
-      await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.batchId);
       return {
+        claimed: true,
         quoted: false,
         message: `Understood — ${formatJobRef(offer.rescueRequestId)} declined. We'll offer this job to another operator.`,
       };
@@ -257,16 +289,23 @@ export class DispatchService {
       offerId: offer.id,
       quotedPriceKobo,
     });
-    // Order matters: phase 2 must have started (deadline persisted) before
-    // maybeResolveBatchEarly runs, or the early check would still be
-    // batch-scoped and could resolve one batch while others are pending.
-    await this.beginQuoteCollectionIfFirst(offer.rescueRequestId);
-    await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.batchId);
-
     return {
+      claimed: true,
       quoted: true,
       message: `✅ Quote of ₦${(quotedPriceKobo / 100).toLocaleString()} submitted for ${formatJobRef(offer.rescueRequestId)}! We'll notify you if you're selected.`,
     };
+  }
+
+  private async afterOfferClaim(
+    offer: { rescueRequestId: string; batchId: string },
+    quotedPriceKobo: number | undefined,
+    claimed: boolean,
+  ): Promise<void> {
+    if (!claimed) return;
+    if (quotedPriceKobo !== undefined) {
+      await this.beginQuoteCollectionIfFirst(offer.rescueRequestId);
+    }
+    await this.maybeResolveBatchEarly(offer.rescueRequestId, offer.batchId);
   }
 
   /**
@@ -1309,8 +1348,18 @@ export class DispatchService {
       throw new BadRequestException('This offer is no longer available.');
     }
 
-    const result = await this.processQuoteOrDecline(offer, priceKobo);
-    return { data: result };
+    const claimResult = await this.prisma.$transaction(async (tx) => {
+      await this.operatorMembershipService.lockActiveMembership(
+        tx,
+        { userId, role: UserRole.OPERATOR },
+        offer.operatorId,
+      );
+      return this.claimOfferInTx(tx, offer, priceKobo);
+    });
+    await this.afterOfferClaim(offer, priceKobo, claimResult.claimed);
+    return {
+      data: { quoted: claimResult.quoted, message: claimResult.message },
+    };
   }
 
   // ══════════════════════════════════════════════════════

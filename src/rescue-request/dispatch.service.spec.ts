@@ -250,6 +250,7 @@ describe('DispatchService', () => {
     const offer = {
       id: 'offer-1',
       rescueRequestId: 'req-1',
+      operatorId: 'op-1',
       expiresAt: new Date(Date.now() + 600000),
       batchId: 'batch-1',
     };
@@ -273,6 +274,10 @@ describe('DispatchService', () => {
       };
 
       prisma = {
+        $transaction: jest.fn((callback) => callback(prisma)),
+        operator: {
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        },
         rescueRequest: {
           findUnique: jest.fn(async () => ({ ...row })),
           // Models the atomic once-only set: the `quoteCollectionDeadline: null`
@@ -536,6 +541,72 @@ describe('DispatchService', () => {
       } finally {
         jest.useRealTimers();
       }
+    });
+
+    it('does not claim through the public WhatsApp path when the operator was deleted', async () => {
+      prisma.operator.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        service.processQuoteOrDecline(offer, 2_500_000),
+      ).rejects.toThrow('This operator is no longer available.');
+
+      expect(prisma.dispatchOffer.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('respondToOffer deletion lock', () => {
+    it('locks active membership before claiming a dashboard offer', async () => {
+      const prisma: any = {
+        operatorMember: {
+          findMany: jest.fn().mockResolvedValue([{ operatorId: 'op-1' }]),
+        },
+        dispatchOffer: {
+          findUnique: jest.fn().mockResolvedValue({
+            id: 'offer-1',
+            operatorId: 'op-1',
+            rescueRequestId: 'req-1',
+            batchId: 'batch-1',
+            status: 'PENDING',
+            expiresAt: new Date(Date.now() + 60_000),
+          }),
+          updateMany: jest.fn(),
+        },
+      };
+      prisma.$transaction = jest.fn((callback) => callback(prisma));
+      const operatorMembershipService = {
+        lockActiveMembership: jest
+          .fn()
+          .mockRejectedValue(new Error('This operator has been deleted.')),
+      };
+      const module = await Test.createTestingModule({
+        providers: [
+          DispatchService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+          {
+            provide: OperatorMembershipService,
+            useValue: operatorMembershipService,
+          },
+        ],
+      }).compile();
+      const service = module.get(DispatchService);
+
+      await expect(
+        service.respondToOffer('user-1', 'offer-1', 2_500_000),
+      ).rejects.toThrow('This operator has been deleted.');
+
+      expect(
+        operatorMembershipService.lockActiveMembership,
+      ).toHaveBeenCalledWith(
+        prisma,
+        { userId: 'user-1', role: 'OPERATOR' },
+        'op-1',
+      );
+      expect(prisma.dispatchOffer.updateMany).not.toHaveBeenCalled();
     });
   });
 
