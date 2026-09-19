@@ -533,6 +533,43 @@ describe('RescueRequestAdminService', () => {
         }),
       );
     });
+
+    it('searches by the short WhatsApp Job ID', async () => {
+      prisma.rescueRequest.findMany.mockResolvedValue([]);
+      prisma.rescueRequest.count.mockResolvedValue(0);
+
+      await service.adminList({ search: 'Job #GHI789' });
+
+      expect(prisma.rescueRequest.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            OR: expect.arrayContaining([
+              { id: { endsWith: 'GHI789', mode: 'insensitive' } },
+            ]),
+          }),
+        }),
+      );
+    });
+
+    it('supports Job ID search through the role-scoped list endpoint', async () => {
+      prisma.rescueRequest.findMany.mockResolvedValue([]);
+      prisma.rescueRequest.count.mockResolvedValue(0);
+
+      await service.listForUser(
+        { role: 'ADMIN', userId: 'admin-1' },
+        { search: '#ghi789' },
+      );
+
+      expect(prisma.rescueRequest.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            OR: expect.arrayContaining([
+              { id: { endsWith: 'ghi789', mode: 'insensitive' } },
+            ]),
+          }),
+        }),
+      );
+    });
   });
 
   describe('assignOperator', () => {

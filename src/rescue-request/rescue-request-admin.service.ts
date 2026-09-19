@@ -92,8 +92,10 @@ export class RescueRequestAdminService {
 
     if (from && to)
       where.createdAt = { gte: new Date(from), lte: new Date(to) };
-    if (search) {
+    if (typeof search === 'string' && search.trim()) {
+      const requestIdFilter = this.requestIdSearchFilter(search);
       where.OR = [
+        ...(requestIdFilter ? [requestIdFilter] : []),
         {
           customer: { phoneNumber: { contains: search, mode: 'insensitive' } },
         },
@@ -616,8 +618,10 @@ export class RescueRequestAdminService {
       whereClause.createdAt = { gte: new Date(from), lte: new Date(to) };
     else if (from) whereClause.createdAt = { gte: new Date(from) };
     else if (to) whereClause.createdAt = { lte: new Date(to) };
-    if (search) {
+    if (typeof search === 'string' && search.trim()) {
+      const requestIdFilter = this.requestIdSearchFilter(search);
       whereClause.OR = [
+        ...(requestIdFilter ? [requestIdFilter] : []),
         {
           customer: { phoneNumber: { contains: search, mode: 'insensitive' } },
         },
@@ -938,6 +942,18 @@ export class RescueRequestAdminService {
           ? raw.depositAmount! + acceptedQuoteBalance - raw.serviceFeeAmount
           : undefined,
     };
+  }
+
+  private requestIdSearchFilter(
+    search: string,
+  ): Prisma.RescueRequestWhereInput | undefined {
+    const reference = search
+      .trim()
+      .replace(/^job(?:\s*#\s*|\s+)/i, '')
+      .replace(/^#\s*/, '');
+    return reference
+      ? { id: { endsWith: reference, mode: 'insensitive' } }
+      : undefined;
   }
 
   /**
