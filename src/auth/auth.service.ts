@@ -614,6 +614,7 @@ export class AuthService {
           role: true,
           createdAt: true,
           updatedAt: true,
+          deletedAt: true,
         },
       }),
       this.prisma.user.count({ where }),
