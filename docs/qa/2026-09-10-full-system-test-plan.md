@@ -1,6 +1,6 @@
 # LRR Full System Test Plan
 
-**Date:** 2026-09-10 · **Last updated:** 2026-09-13 (added §10.5 — retry refused once a sibling attempt already succeeded — and §16, the new Audit Log)
+**Date:** 2026-09-10 · **Last updated:** 2026-09-18 (added §17 — operator email-optional signup, phone+OTP login, and password reset, all now Termii-SMS-backed)
 **Scope:** Every customer/operator/staff-facing flow currently implemented, on staging. Manual, WhatsApp + admin dashboard driven — the automated Jest suite (356 unit + 152 integration tests, `lrr-service`) already covers unit-level logic and real-database behaviour; this plan verifies the real, end-to-end experience a real user would have, including the one thing the automated suite cannot: that money actually moves at Paystack, not just in our own database.
 
 **How to use this:** Work top to bottom. Each numbered case has Setup → Steps → Expected Result. Check the box when the actual result matches. If it doesn't, stop, note what actually happened, and file it rather than continuing past a failure in that flow — later cases often assume the earlier ones worked.
@@ -15,6 +15,7 @@
 - A real (or test-mode) Paystack card for payment steps
 - Access to the Paystack dashboard for the same mode (test/live) the environment under test actually uses — several steps below only pass if the money movement shows up there, not just in our own UI
 - A SUPER_ADMIN bearer token for one direct API call in §14 (there's no dashboard button for it yet, and this endpoint moves platform money out so it's SUPER_ADMIN-only, same as payouts) — grab it from your browser's dev tools (Storage) while logged in as a SUPER_ADMIN, or however your team normally makes authenticated calls against the API
+- For §17: 2-3 fresh phone numbers not already in the database (as any role), able to receive **real SMS** (not WhatsApp) — codes now go out via Termii, so a Nigerian number is required for delivery to actually work in staging/production
 
 ---
 
@@ -359,6 +360,138 @@ A durable, SUPER_ADMIN-only record of security-sensitive and financial admin act
 - [ ] **16.8 — ADMIN cannot reach the audit log**
   Log in as an `ADMIN` (not `SUPER_ADMIN`) and try to open `/audit-log` directly by URL.
   **Expected:** Redirected away — the link isn't even in their nav menu, and the page itself refuses them.
+
+---
+
+## 17. Operator Portal Authentication — Email-Optional Signup, Phone+OTP Login, Password Reset — new this pass
+
+Unlike the sections above, this one is driven from the **web dashboard**
+(`lrr-web` — the registration page at `/register` and the login modal), not
+WhatsApp. Codes are delivered by **real SMS via Termii**, not WhatsApp — the
+phone used must be able to receive SMS. A fresh operator signup lands in
+`Pending` status in the admin Operators tab; that's expected, not a bug —
+approving them to `ACTIVE` is a separate, pre-existing admin action not
+covered here.
+
+### Registration
+
+- [ ] **17.1 — Fresh signup, email provided**
+  On `/register`, fill the operator form with a brand-new phone number and a
+  real email. Blur out of the phone field.
+  **Expected:** An SMS with a 6-digit code arrives within a few seconds. The
+  form shows a code-input box and a **Verify** button immediately — no
+  separate "Send code" click is needed.
+
+- [ ] **17.2 — Fresh signup, email omitted**
+  Same as 17.1, but leave the Email field blank entirely.
+  **Expected:** No validation error on the empty email field. Enter the SMS
+  code, click Verify, then submit the rest of the form.
+  **Then:** `POST /operators` returns `"Operator registered successfully.
+  Pending approval."` and the new operator appears in the admin Operators
+  tab with a blank/absent email and status `Pending`.
+
+- [ ] **17.3 — Cannot submit without verifying**
+  Fill the form with a fresh phone number but do not enter/verify the SMS
+  code (or skip the phone field's blur entirely).
+  **Expected:** Submission is rejected — `"Verify your phone number
+  first."` — no operator/user record is created.
+
+- [ ] **17.4 — Resend code**
+  After the code UI appears (17.1), click **Resend code** without waiting.
+  **Expected:** Rejected with `"Please wait before requesting another
+  code."` (60s cooldown). Wait 60 real seconds and retry — a new SMS
+  arrives and the old code stops working (see 17.15-style replay check,
+  same underlying mechanism).
+
+- [ ] **17.5 — Duplicate email rejected**
+  Sign up with a fresh phone number but an email already used by another
+  operator/user.
+  **Expected:** `"Email or phone number already registered"` — no new
+  record created.
+
+- [ ] **17.6 — Existing customer phone "upgrades" to operator**
+  Use a phone number that already exists as a `CUSTOMER` (e.g. one that's
+  SOS'd via WhatsApp before). Verify it via SMS code as in 17.1, then
+  submit the operator form.
+  **Expected:** Succeeds — the existing `User` row's role moves from
+  `CUSTOMER` to `OPERATOR` rather than creating a second account. Confirm
+  via the admin Users list that only one user exists for that phone number,
+  now with role `OPERATOR`.
+
+- [ ] **17.7 — Per-phone-number send cap**
+  Trigger `POST /otp/send-code` for the same phone number 5 times within an
+  hour (blur/resend repeatedly, respecting the 60s cooldown between each).
+  **Expected:** The 6th attempt within that rolling hour is rejected —
+  `"Too many code requests — please try again later."`
+
+- [ ] **17.8 — Per-IP rate limit**
+  From the same machine/IP, trigger `POST /otp/send-code` for **6 different**
+  fresh phone numbers within 10 minutes (the per-phone cap in 17.7 doesn't
+  apply here since each number is used once).
+  **Expected:** The 6th request is rejected with **HTTP 429** — this is the
+  new IP-based guard, independent of the per-phone-number cap. `POST
+  /otp/verify-code` is unaffected — verifying a code already sent still
+  works during this window.
+
+### Login
+
+- [ ] **17.9 — Login with email + password**
+  On the login modal, leave the mode toggle on **Password**, enter an
+  operator's email + password.
+  **Expected:** Signs in successfully.
+
+- [ ] **17.10 — Login with phone + password**
+  Same modal, same mode, but enter the operator's phone number (local or
+  E.164 format) instead of email, same password.
+  **Expected:** Signs in successfully — same account as 17.9.
+
+- [ ] **17.11 — Login via phone code (OTP)**
+  Switch the mode toggle to **Phone code**. Enter an operator's phone
+  number, click **Send code**.
+  **Expected:** An SMS arrives. Enter it and submit.
+  **Then:** Signs in successfully, same account as 17.9/17.10.
+
+- [ ] **17.12 — OTP login doesn't reveal non-operator/unknown numbers**
+  Repeat 17.11's "Send code" step with (a) a phone number that doesn't
+  exist in the system at all, and (b) an existing `CUSTOMER`'s phone
+  number.
+  **Expected:** Both cases return the same generic success response as
+  17.11 (no error, no indication the number is invalid/ineligible) — but no
+  SMS actually arrives for either, and attempting to verify with any code
+  afterward fails. This is deliberate (enumeration-safe) — don't file the
+  lack of an SMS as a bug here.
+
+### Password reset
+
+- [ ] **17.13 — Request a reset code**
+  From the login modal, click **Forgot password?**. Enter an operator's
+  email (try this once with email, once more with their phone number
+  instead — both should work) and a new password (8+ chars), submit.
+  **Expected:** Generic message — `"If an account exists, we've sent a
+  reset code to its registered phone number."` — and the modal advances to
+  the code-entry step. An SMS with a 6-digit code arrives at the account's
+  phone number regardless of whether you typed email or phone as the
+  identifier.
+
+- [ ] **17.14 — Complete the reset**
+  On the code-entry step, enter the account's phone number and the code
+  just received, submit.
+  **Expected:** `"Password updated. You can now log in."` Log out (if
+  applicable) and log in with the new password to confirm it actually took.
+
+- [ ] **17.15 — Wrong code rejected**
+  Repeat 17.13 to get a fresh code, but enter a deliberately wrong 6-digit
+  code on the reset step.
+  **Expected:** Rejected (`"Code expired or not found"` or similar) — the
+  password is **not** changed; the real code sent in this same request is
+  still usable afterward (confirm by immediately retrying with the correct
+  code).
+
+- [ ] **17.16 — Code is single-use**
+  Successfully complete a reset (17.14), then immediately try to reset
+  again using the *same* code that just succeeded.
+  **Expected:** Rejected — `"Code expired — request a new one."` A code
+  cannot be replayed after it's already been consumed once.
 
 ---
 
