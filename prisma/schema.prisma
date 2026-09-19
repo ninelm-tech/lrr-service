@@ -278,8 +278,18 @@ model PlatformConfig {
   updatedAt               DateTime @updatedAt
 }
 
-// Photos/video/audio submitted by the motorist for a request, forwarded
-// to operators as signed redirect links in the dispatch offer.
+enum MediaContext {
+  INITIAL
+  COMPLETION
+  DISPUTE
+}
+
+// Photos/video/audio evidence attached to a request — the motorist's
+// initial breakdown media (forwarded to operators as signed redirect links
+// in the dispatch offer), the operator's completion evidence, or either
+// party's dispute evidence. `context` distinguishes which; `uploadedByRole`
+// who sent it (only meaningful to disambiguate for DISPUTE, since INITIAL
+// is always CUSTOMER and COMPLETION is always OPERATOR).
 model RequestMedia {
   id String @id @default(cuid())
 
@@ -290,9 +300,13 @@ model RequestMedia {
   s3Key       String
   contentType String
 
+  context        MediaContext @default(INITIAL)
+  uploadedByRole UserRole     @default(CUSTOMER)
+
   createdAt DateTime @default(now())
 
   @@index([rescueRequestId])
+  @@index([rescueRequestId, context, uploadedByRole])
 }
 
 // Tracks each operator offer during dispatch (accept/decline/timeout)
