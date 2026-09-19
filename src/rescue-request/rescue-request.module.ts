@@ -1,16 +1,28 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
 import { DisputeService } from './dispute.service';
 import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestAdminService } from './rescue-request-admin.service';
 import { DispatchService } from './dispatch.service';
-import { DispatchOfferSweeperService } from './dispatch-offer-sweeper.service';
+import { ReconcilerService } from './reconciler/reconciler.service';
+import { RECONCILER_CHECKS } from './reconciler/reconciler-check.interface';
+import { OfferSweepCheck } from './reconciler/checks/offer-sweep.check';
+import { DepositExpiryCheck } from './reconciler/checks/deposit-expiry.check';
+import { DepositReminderCheck } from './reconciler/checks/deposit-reminder.check';
+import { BiddingCloseCheck } from './reconciler/checks/bidding-close.check';
+import { BatchResolveCheck } from './reconciler/checks/batch-resolve.check';
+import { QuoteSelectionTimeoutCheck } from './reconciler/checks/quote-selection-timeout.check';
+import { StalledConfirmationCheck } from './reconciler/checks/stalled-confirmation.check';
+import { PaymentVerifyCheck } from './reconciler/checks/payment-verify.check';
 import { WhatsAppOperatorFlowService } from './whatsapp-operator-flow.service';
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 import { WhatsAppInboundService } from './whatsapp-inbound.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { PrismaModule } from '../prisma/prisma.module';
+// forwardRef both ways: PaymentModule already depends on this module for
+// the webhook side effects, and this module now needs PaymentLedgerService.
+import { PaymentModule } from '../payment/payment.module';
 import { RescueRequestController } from './rescue-request.controller';
 import { PaystackModule } from '../integrations/paystack/paystack.module';
 import { TwilioModule } from '../integrations/twilio/twilio.module';
@@ -21,9 +33,11 @@ import { PlatformConfigModule } from '../platform-config/platform-config.module'
 import { RatingModule } from '../rating/rating.module';
 import { PayoutModule } from '../payout/payout.module';
 import { AuthGuard } from '../auth/auth.guard';
+import { AuditLogModule } from '../audit-log/audit-log.module';
 
 @Module({
   imports: [
+    forwardRef(() => PaymentModule),
     PrismaModule,
     PaystackModule,
     TwilioModule,
@@ -32,7 +46,11 @@ import { AuthGuard } from '../auth/auth.guard';
     OperatorModule,
     PlatformConfigModule,
     RatingModule,
-    PayoutModule,
+    AuditLogModule,
+    // Also forwardRef'd: PayoutModule -> PaymentModule -> this module ->
+    // PayoutModule is a cycle, so entering the graph from PayoutModule
+    // evaluates this decorator while PayoutModule is still undefined.
+    forwardRef(() => PayoutModule),
     JwtModule.register({
       secret: process.env.JWT_SECRET || 'your-secret-key',
       signOptions: { expiresIn: '24h' },
@@ -40,10 +58,66 @@ import { AuthGuard } from '../auth/auth.guard';
   ],
   controllers: [RescueRequestController],
   providers: [
-    RescueRequestSharedService, DisputeService, PaymentEventsService, RescueRequestAdminService,
-    DispatchService, DispatchOfferSweeperService, WhatsAppOperatorFlowService, WhatsAppCustomerFlowService, WhatsAppInboundService,
-    WhatsAppSessionStore, AuthGuard,
+    RescueRequestSharedService,
+    DisputeService,
+    PaymentEventsService,
+    RescueRequestAdminService,
+    DispatchService,
+    OfferSweepCheck,
+    DepositExpiryCheck,
+    DepositReminderCheck,
+    BiddingCloseCheck,
+    BatchResolveCheck,
+    QuoteSelectionTimeoutCheck,
+    StalledConfirmationCheck,
+    PaymentVerifyCheck,
+    ReconcilerService,
+    {
+      // The checks the 15-second loop runs, in order. A check is registered
+      // here and nowhere else, so this list is the whole inventory of
+      // scheduled work in the service.
+      provide: RECONCILER_CHECKS,
+      useFactory: (
+        offerSweep: OfferSweepCheck,
+        depositExpiry: DepositExpiryCheck,
+        depositReminder: DepositReminderCheck,
+        biddingClose: BiddingCloseCheck,
+        batchResolve: BatchResolveCheck,
+        quoteSelectionTimeout: QuoteSelectionTimeoutCheck,
+        stalledConfirmation: StalledConfirmationCheck,
+        paymentVerify: PaymentVerifyCheck,
+      ) => [
+        offerSweep,
+        depositExpiry,
+        depositReminder,
+        biddingClose,
+        batchResolve,
+        quoteSelectionTimeout,
+        stalledConfirmation,
+        paymentVerify,
+      ],
+      inject: [
+        OfferSweepCheck,
+        DepositExpiryCheck,
+        DepositReminderCheck,
+        BiddingCloseCheck,
+        BatchResolveCheck,
+        QuoteSelectionTimeoutCheck,
+        StalledConfirmationCheck,
+        PaymentVerifyCheck,
+      ],
+    },
+    WhatsAppOperatorFlowService,
+    WhatsAppCustomerFlowService,
+    WhatsAppInboundService,
+    WhatsAppSessionStore,
+    AuthGuard,
   ],
-  exports: [PaymentEventsService, RescueRequestAdminService, DispatchService, WhatsAppInboundService],
+  exports: [
+    PaymentEventsService,
+    RescueRequestAdminService,
+    DispatchService,
+    WhatsAppInboundService,
+  ],
 })
 export class RescueRequestModule {}

@@ -36,8 +36,6 @@ describe('WhatsAppSessionStore', () => {
       destination: '123 Workshop Road',
       rescueRequestId: null,
       depositReference: null,
-      dispatchRound: 0,
-      offeredOperatorIds: '[]',
       updatedAt: new Date(),
     });
 
@@ -65,8 +63,6 @@ describe('WhatsAppSessionStore', () => {
       destination: null,
       rescueRequestId: 'req-1',
       depositReference: null,
-      dispatchRound: 0,
-      offeredOperatorIds: '[]',
       relayTarget: 'OPERATOR',
       updatedAt: new Date(),
     });
@@ -78,5 +74,49 @@ describe('WhatsAppSessionStore', () => {
       data: { relayTarget: 'OPERATOR' },
     });
     expect(result.relayTarget).toBe('OPERATOR');
+  });
+
+  it('treats a rating prompt older than ten minutes as IDLE, without writing anything', async () => {
+    prisma.whatsAppSession.upsert.mockResolvedValue({
+      userId: 'u1',
+      state: 'WAITING_FOR_RATING',
+      rescueRequestId: 'req-1',
+      updatedAt: new Date(Date.now() - 11 * 60 * 1000),
+    });
+
+    const session = await store.getOrCreate('u1');
+
+    expect(session.state).toBe('IDLE');
+    // The timer this replaces cleared the request id too. Reporting IDLE
+    // while still carrying the finished job would let later code act on it.
+    expect(session.rescueRequestId).toBeUndefined();
+    expect(prisma.whatsAppSession.update).not.toHaveBeenCalled();
+  });
+
+  it('keeps a recent rating prompt active', async () => {
+    prisma.whatsAppSession.upsert.mockResolvedValue({
+      userId: 'u1',
+      state: 'WAITING_FOR_RATING',
+      rescueRequestId: 'req-1',
+      updatedAt: new Date(Date.now() - 60 * 1000),
+    });
+
+    const session = await store.getOrCreate('u1');
+
+    expect(session.state).toBe('WAITING_FOR_RATING');
+    expect(session.rescueRequestId).toBe('req-1');
+  });
+
+  it('does not stale-out a state that is not a rating prompt', async () => {
+    prisma.whatsAppSession.upsert.mockResolvedValue({
+      userId: 'u1',
+      state: 'AWAITING_COMPLETION_CONFIRM',
+      rescueRequestId: 'req-1',
+      updatedAt: new Date(Date.now() - 11 * 60 * 1000),
+    });
+
+    const session = await store.getOrCreate('u1');
+
+    expect(session.state).toBe('AWAITING_COMPLETION_CONFIRM');
   });
 });

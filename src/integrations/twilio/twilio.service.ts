@@ -11,9 +11,11 @@ export class TwilioService {
   private readonly authToken: string;
 
   constructor(private readonly configService: ConfigService) {
-    this.accountSid = this.configService.get<string>('TWILIO_ACCOUNT_SID') || '';
+    this.accountSid =
+      this.configService.get<string>('TWILIO_ACCOUNT_SID') || '';
     this.authToken = this.configService.get<string>('TWILIO_AUTH_TOKEN') || '';
-    this.whatsappFrom = this.configService.get<string>('TWILIO_WHATSAPP_FROM') || '';
+    this.whatsappFrom =
+      this.configService.get<string>('TWILIO_WHATSAPP_FROM') || '';
 
     this.client = new Twilio(this.accountSid, this.authToken);
   }
@@ -27,7 +29,7 @@ export class TwilioService {
       const formattedTo = to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
       const result = await this.client.messages.create({
         from: `whatsapp:${this.whatsappFrom}`,
-        to:   formattedTo,
+        to: formattedTo,
         body: message,
       });
       console.log('WhatsApp message sent:', result.sid);
@@ -45,12 +47,16 @@ export class TwilioService {
    * template placeholder numbers to values, e.g. { "1": "A1B2C3", "2": "https://..." }
    * for a template body using {{1}} and {{2}}.
    */
-  async sendWhatsAppTemplateMessage(to: string, contentSid: string, variables: Record<string, string>): Promise<void> {
+  async sendWhatsAppTemplateMessage(
+    to: string,
+    contentSid: string,
+    variables: Record<string, string>,
+  ): Promise<void> {
     try {
       const formattedTo = to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
       const result = await this.client.messages.create({
         from: `whatsapp:${this.whatsappFrom}`,
-        to:   formattedTo,
+        to: formattedTo,
         contentSid,
         contentVariables: JSON.stringify(variables),
       });
@@ -62,7 +68,12 @@ export class TwilioService {
       // "The Content Variables parameter is invalid", which is not enough
       // to tell a variable-shape bug from a bad ContentSid — attach the
       // structured fields, plus which SID and variable keys we sent.
-      const twilioError = error as { code?: number; status?: number; moreInfo?: string; details?: unknown };
+      const twilioError = error as {
+        code?: number;
+        status?: number;
+        moreInfo?: string;
+        details?: unknown;
+      };
       console.error('Failed to send WhatsApp template message:', {
         code: twilioError.code,
         status: twilioError.status,
@@ -91,7 +102,9 @@ export class TwilioService {
    * Twilio media URLs require HTTP Basic Auth with the account SID/auth token.
    */
   async downloadMedia(url: string): Promise<Buffer> {
-    const credentials = Buffer.from(`${this.accountSid}:${this.authToken}`).toString('base64');
+    const credentials = Buffer.from(
+      `${this.accountSid}:${this.authToken}`,
+    ).toString('base64');
     const response = await fetch(url, {
       headers: { Authorization: `Basic ${credentials}` },
     });

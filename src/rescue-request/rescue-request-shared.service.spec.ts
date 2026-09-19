@@ -11,7 +11,9 @@ describe('RescueRequestSharedService', () => {
   let geocodingService: { reverseGeocode: jest.Mock };
 
   beforeEach(async () => {
-    prisma = { user: { upsert: jest.fn().mockResolvedValue({ id: 'user-1' }) } };
+    prisma = {
+      user: { upsert: jest.fn().mockResolvedValue({ id: 'user-1' }) },
+    };
     geocodingService = { reverseGeocode: jest.fn().mockResolvedValue(null) };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -19,12 +21,17 @@ describe('RescueRequestSharedService', () => {
         RescueRequestSharedService,
         { provide: PrismaService, useValue: prisma },
         { provide: GeocodingService, useValue: geocodingService },
-        { provide: TwilioService, useValue: { sendWhatsAppMessage: jest.fn() } },
+        {
+          provide: TwilioService,
+          useValue: { sendWhatsAppMessage: jest.fn() },
+        },
         { provide: WhatsAppSessionStore, useValue: { update: jest.fn() } },
       ],
     }).compile();
 
-    service = module.get<RescueRequestSharedService>(RescueRequestSharedService);
+    service = module.get<RescueRequestSharedService>(
+      RescueRequestSharedService,
+    );
   });
 
   describe('findOrCreateCustomer', () => {
@@ -32,20 +39,39 @@ describe('RescueRequestSharedService', () => {
       await service.findOrCreateCustomer('+2348012345678');
 
       expect(prisma.user.upsert).toHaveBeenCalledWith({
-        where:  { phoneNumber: '+2348012345678' },
+        where: { phoneNumber: '+2348012345678' },
         update: {},
         create: { phoneNumber: '+2348012345678', role: 'CUSTOMER' },
       });
+    });
+
+    it('runs against the given transaction client when one is provided', async () => {
+      const txUser = { upsert: jest.fn().mockResolvedValue({ id: 'cust-1' }) };
+      const tx = { user: txUser } as never;
+
+      const result = await service.findOrCreateCustomer('+2348012345678', tx);
+
+      expect(txUser.upsert).toHaveBeenCalledWith({
+        where: { phoneNumber: '+2348012345678' },
+        update: {},
+        create: { phoneNumber: '+2348012345678', role: 'CUSTOMER' },
+      });
+      expect(prisma.user.upsert).not.toHaveBeenCalled();
+      expect(result).toEqual({ id: 'cust-1' });
     });
   });
 
   describe('formatLocationSection', () => {
     it('returns the address plus a map link when reverse geocoding succeeds', async () => {
-      geocodingService.reverseGeocode.mockResolvedValue('12 Adeniyi Jones Ave, Ikeja, Lagos');
+      geocodingService.reverseGeocode.mockResolvedValue(
+        '12 Adeniyi Jones Ave, Ikeja, Lagos',
+      );
 
       const result = await service.formatLocationSection(6.5, 3.4);
 
-      expect(result).toBe('12 Adeniyi Jones Ave, Ikeja, Lagos\n📍 https://maps.google.com/?q=6.5,3.4');
+      expect(result).toBe(
+        '12 Adeniyi Jones Ave, Ikeja, Lagos\n📍 https://maps.google.com/?q=6.5,3.4',
+      );
     });
 
     it('falls back to the map link alone when reverse geocoding returns nothing', async () => {
@@ -54,124 +80,6 @@ describe('RescueRequestSharedService', () => {
       const result = await service.formatLocationSection(6.5, 3.4);
 
       expect(result).toBe('https://maps.google.com/?q=6.5,3.4');
-    });
-  });
-
-  describe('scheduleDepositWindow', () => {
-    let fullPrisma: {
-      rescueRequest: { findUnique: jest.Mock; updateMany: jest.Mock };
-      dispatchOffer: { updateMany: jest.Mock };
-      user: { upsert: jest.Mock };
-    };
-    let twilioService: { sendWhatsAppMessage: jest.Mock };
-    let sessionStore: { update: jest.Mock; clearRelayTargets: jest.Mock };
-
-    beforeEach(async () => {
-      fullPrisma = {
-        rescueRequest: { findUnique: jest.fn(), updateMany: jest.fn() },
-        dispatchOffer: { updateMany: jest.fn() },
-        user: { upsert: jest.fn() },
-      };
-      twilioService = { sendWhatsAppMessage: jest.fn() };
-      sessionStore = { update: jest.fn(), clearRelayTargets: jest.fn().mockResolvedValue(0) };
-
-      const module: TestingModule = await Test.createTestingModule({
-        providers: [
-          RescueRequestSharedService,
-          { provide: PrismaService, useValue: fullPrisma },
-          { provide: GeocodingService, useValue: {} },
-          { provide: TwilioService, useValue: twilioService },
-          { provide: WhatsAppSessionStore, useValue: sessionStore },
-        ],
-      }).compile();
-
-      service = module.get(RescueRequestSharedService);
-    });
-
-    afterEach(() => jest.useRealTimers());
-
-    it('cancels the request at 30 minutes when the claim succeeds — no startDispatch call, no DISPATCHING reset', async () => {
-      jest.useFakeTimers();
-      // The reminder pre-checks (t=5, t=15, t=25) run first; keep them harmless.
-      fullPrisma.rescueRequest.findUnique.mockResolvedValue({ status: 'WAITING_FOR_DEPOSIT' });
-      fullPrisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
-      fullPrisma.dispatchOffer.updateMany.mockResolvedValue({ count: 1 });
-
-      service.scheduleDepositWindow({
-        rescueRequestId: 'req-1', customerId: 'user-1', customerPhone: '+2341', operatorPhone: '+2342',
-        paymentUrl: 'https://paystack.com/pay/abc',
-      });
-
-      // Async variant drains the callback's microtasks for us — a fixed
-      // chain of `await Promise.resolve()` silently under-flushes as soon as
-      // the timer body gains another await.
-      await jest.advanceTimersByTimeAsync(30 * 60 * 1000);
-
-      expect(fullPrisma.rescueRequest.updateMany).toHaveBeenCalledWith({
-        where: { id: 'req-1', status: 'WAITING_FOR_DEPOSIT' },
-        data: { status: 'CANCELLED' },
-      });
-      expect(fullPrisma.dispatchOffer.updateMany).toHaveBeenCalledWith(
-        expect.objectContaining({ where: expect.objectContaining({ rescueRequestId: 'req-1' }) }),
-      );
-      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
-        '+2341',
-        expect.stringContaining("didn't receive payment confirmation"),
-      );
-      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
-        '+2342',
-        expect.stringContaining('no longer available'),
-      );
-      expect(sessionStore.update).toHaveBeenCalledWith('user-1', {
-        state: 'IDLE',
-        rescueRequestId: undefined,
-      });
-    });
-
-    it('does nothing if the payment webhook already claimed the row (race at t=30)', async () => {
-      jest.useFakeTimers();
-      fullPrisma.rescueRequest.findUnique.mockResolvedValue({ status: 'WAITING_FOR_DEPOSIT' });
-      fullPrisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 }); // payment webhook won
-
-      service.scheduleDepositWindow({
-        rescueRequestId: 'req-1', customerId: 'user-1', customerPhone: '+2341', operatorPhone: '+2342',
-        paymentUrl: 'https://paystack.com/pay/abc',
-      });
-
-      jest.advanceTimersByTime(30 * 60 * 1000);
-      await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
-
-      // Reminders at t=5/15/25 legitimately fire (status is still WAITING_FOR_DEPOSIT
-      // at each pre-check) — this test is only about the t=30 claim losing the race,
-      // so it must not have sent either of the cancellation-specific messages.
-      expect(fullPrisma.dispatchOffer.updateMany).not.toHaveBeenCalled();
-      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
-        '+2341',
-        expect.stringContaining("didn't receive payment confirmation"),
-      );
-      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
-        '+2342',
-        expect.stringContaining('no longer available'),
-      );
-      // The payment webhook won the race — its own flow is about to set the
-      // session for a different state; the timeout must not stomp on it.
-      expect(sessionStore.update).not.toHaveBeenCalled();
-    });
-
-    it('skips a reminder if the request is no longer WAITING_FOR_DEPOSIT by the time it fires', async () => {
-      jest.useFakeTimers();
-      fullPrisma.rescueRequest.findUnique.mockResolvedValue({ status: 'OPERATOR_ASSIGNED' }); // paid already
-      fullPrisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 });
-
-      service.scheduleDepositWindow({
-        rescueRequestId: 'req-1', customerId: 'user-1', customerPhone: '+2341', operatorPhone: '+2342',
-        paymentUrl: 'https://paystack.com/pay/abc',
-      });
-
-      jest.advanceTimersByTime(5 * 60 * 1000);
-      await Promise.resolve(); await Promise.resolve();
-
-      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
     });
   });
 
@@ -193,7 +101,9 @@ describe('RescueRequestSharedService', () => {
 
     beforeEach(async () => {
       prisma = {
-        rescueRequest: { findUnique: jest.fn().mockResolvedValue(requestWithOperator) },
+        rescueRequest: {
+          findUnique: jest.fn().mockResolvedValue(requestWithOperator),
+        },
         user: { upsert: jest.fn().mockResolvedValue({ id: 'op-user-1' }) },
       };
       twilioService = { sendWhatsAppMessage: jest.fn() };
@@ -215,14 +125,23 @@ describe('RescueRequestSharedService', () => {
     it('clears the relay for BOTH participants — the operator sits on a separate session row', async () => {
       await service.endRelayForEndedRequest('req-1');
 
-      expect(sessionStore.clearRelayTargets).toHaveBeenCalledWith(['cust-user-1', 'op-user-1']);
+      expect(sessionStore.clearRelayTargets).toHaveBeenCalledWith([
+        'cust-user-1',
+        'op-user-1',
+      ]);
     });
 
     it('tells both parties the chat is over', async () => {
       await service.endRelayForEndedRequest('req-1');
 
-      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith('+2341', expect.stringContaining('Chat ended'));
-      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith('+2342', expect.stringContaining('Chat ended'));
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        '+2341',
+        expect.stringContaining('Chat ended'),
+      );
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        '+2342',
+        expect.stringContaining('Chat ended'),
+      );
     });
 
     it('stays silent when no relay was open — the common case, and must not spam every completed job', async () => {
@@ -236,7 +155,9 @@ describe('RescueRequestSharedService', () => {
     it('never throws — it runs inside payment and cancellation flows that must not fail on it', async () => {
       prisma.rescueRequest.findUnique.mockRejectedValue(new Error('db down'));
 
-      await expect(service.endRelayForEndedRequest('req-1')).resolves.toBeUndefined();
+      await expect(
+        service.endRelayForEndedRequest('req-1'),
+      ).resolves.toBeUndefined();
     });
   });
 });

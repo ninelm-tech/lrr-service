@@ -16,10 +16,14 @@ import { OperatorService } from './operator.service';
 import { CreateOperatorDto } from './dto/create-operator.dto';
 import { UpdateOperatorProfileDto } from './dto/update-operator-profile.dto';
 import { SaveBankDetailsDto } from './dto/save-bank-details.dto';
-import { OperatorMemberRole, OperatorStatus, OperatorType, UserRole } from '@prisma/client';
+import { OperatorMemberRole, OperatorStatus, UserRole } from '@prisma/client';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
+
+interface AuthenticatedOperatorRequest {
+  user: { userId: string; role: string };
+}
 
 @Controller('operators')
 export class OperatorController {
@@ -58,7 +62,9 @@ export class OperatorController {
   @UseGuards(AuthGuard)
   @Get('all-stats')
   async getAllStats(@Query('days') days?: string) {
-    const stats = await this.operatorService.getAllOperatorStats(days ? parseInt(days, 10) : 30);
+    const stats = await this.operatorService.getAllOperatorStats(
+      days ? parseInt(days, 10) : 30,
+    );
     return { data: stats };
   }
 
@@ -68,9 +74,10 @@ export class OperatorController {
    */
   @UseGuards(AuthGuard)
   @Get('me')
-  async getMyOperator(@Req() req: any) {
+  async getMyOperator(@Req() req: AuthenticatedOperatorRequest) {
     const operator = await this.operatorService.findByUserId(req.user.userId);
-    if (!operator) throw new NotFoundException('No operator account found for this user');
+    if (!operator)
+      throw new NotFoundException('No operator account found for this user');
     return { data: operator };
   }
 
@@ -90,7 +97,10 @@ export class OperatorController {
   @UseGuards(AuthGuard)
   @Get(':id/stats')
   async getStats(@Param('id') id: string, @Query('days') days?: string) {
-    const stats = await this.operatorService.getOperatorStats(id, days ? parseInt(days, 10) : 30);
+    const stats = await this.operatorService.getOperatorStats(
+      id,
+      days ? parseInt(days, 10) : 30,
+    );
     return { data: stats };
   }
 
@@ -101,12 +111,16 @@ export class OperatorController {
   @UseGuards(AuthGuard)
   @Patch(':id')
   async updateProfile(
-    @Req() req: any,
+    @Req() req: AuthenticatedOperatorRequest,
     @Param('id') id: string,
     @Body() dto: UpdateOperatorProfileDto,
   ) {
     await this.operatorService.assertCanManageOperator(req.user, id);
-    const operator = await this.operatorService.updateProfile(id, dto);
+    const operator = await this.operatorService.updateProfile(
+      id,
+      dto,
+      req.user,
+    );
     return { message: 'Operator profile updated', data: operator };
   }
 
@@ -117,15 +131,25 @@ export class OperatorController {
   @UseGuards(AuthGuard)
   @Patch(':id/bank-details')
   async saveBankDetails(
-    @Req() req: any,
+    @Req() req: AuthenticatedOperatorRequest,
     @Param('id') id: string,
     @Body() dto: SaveBankDetailsDto,
   ) {
     await this.operatorService.assertCanManageOperator(req.user, id);
-    if (!dto.bankCode?.trim() || !dto.bankName?.trim() || !dto.accountNumber?.trim()) {
-      throw new BadRequestException('bankCode, bankName, and accountNumber are required');
+    if (
+      !dto.bankCode?.trim() ||
+      !dto.bankName?.trim() ||
+      !dto.accountNumber?.trim()
+    ) {
+      throw new BadRequestException(
+        'bankCode, bankName, and accountNumber are required',
+      );
     }
-    const operator = await this.operatorService.saveBankDetails(id, dto);
+    const operator = await this.operatorService.saveBankDetails(
+      id,
+      dto,
+      req.user,
+    );
     return { message: 'Payout bank details saved', data: operator };
   }
 
@@ -136,9 +160,12 @@ export class OperatorController {
    */
   @UseGuards(AuthGuard)
   @Delete(':id/bank-details')
-  async clearBankDetails(@Req() req: any, @Param('id') id: string) {
+  async clearBankDetails(
+    @Req() req: AuthenticatedOperatorRequest,
+    @Param('id') id: string,
+  ) {
     await this.operatorService.assertCanManageOperator(req.user, id);
-    const operator = await this.operatorService.clearBankDetails(id);
+    const operator = await this.operatorService.clearBankDetails(id, req.user);
     return { message: 'Payout bank details removed', data: operator };
   }
 
@@ -165,12 +192,16 @@ export class OperatorController {
   @UseGuards(AuthGuard)
   @Patch(':id/availability')
   async setAvailability(
-    @Req() req: any,
+    @Req() req: AuthenticatedOperatorRequest,
     @Param('id') id: string,
     @Body('isAvailable') isAvailable: boolean,
   ) {
     await this.operatorService.assertIsMemberOrAdmin(req.user, id);
-    const operator = await this.operatorService.setAvailability(id, Boolean(isAvailable));
+    const operator = await this.operatorService.setAvailability(
+      id,
+      Boolean(isAvailable),
+      req.user,
+    );
     return {
       message: `Operator availability set to ${isAvailable}`,
       data: operator,
@@ -183,7 +214,10 @@ export class OperatorController {
 
   @UseGuards(AuthGuard)
   @Get(':id/members')
-  async listMembers(@Req() req: any, @Param('id') id: string) {
+  async listMembers(
+    @Req() req: AuthenticatedOperatorRequest,
+    @Param('id') id: string,
+  ) {
     await this.operatorService.assertIsMemberOrAdmin(req.user, id);
     const members = await this.operatorService.listMembers(id);
     return { data: members };
@@ -192,27 +226,31 @@ export class OperatorController {
   @UseGuards(AuthGuard)
   @Post(':id/members')
   async addMember(
-    @Req() req: any,
+    @Req() req: AuthenticatedOperatorRequest,
     @Param('id') id: string,
     @Body() body: { userId: string; role?: OperatorMemberRole },
   ) {
     await this.operatorService.assertCanManageOperator(req.user, id);
-    const member = await this.operatorService.addMember(id, {
-      userId: body.userId,
-      role:   body.role ?? OperatorMemberRole.STAFF,
-    });
+    const member = await this.operatorService.addMember(
+      id,
+      {
+        userId: body.userId,
+        role: body.role ?? OperatorMemberRole.STAFF,
+      },
+      req.user,
+    );
     return { message: 'Member added', data: member };
   }
 
   @UseGuards(AuthGuard)
   @Delete(':id/members/:memberId')
   async removeMember(
-    @Req() req: any,
+    @Req() req: AuthenticatedOperatorRequest,
     @Param('id') id: string,
     @Param('memberId') memberId: string,
   ) {
     await this.operatorService.assertCanManageOperator(req.user, id);
-    await this.operatorService.removeMember(id, memberId);
+    await this.operatorService.removeMember(id, memberId, req.user);
     return { message: 'Member removed' };
   }
 }

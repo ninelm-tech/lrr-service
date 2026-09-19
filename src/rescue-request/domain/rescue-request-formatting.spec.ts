@@ -1,4 +1,9 @@
-import { formatIssueType, formatStatus, formatJobRef, buildMediaLinksSection } from './rescue-request-formatting';
+import {
+  formatIssueType,
+  formatStatus,
+  formatJobRef,
+  buildMediaLinksSection,
+} from './rescue-request-formatting';
 
 describe('rescue-request-formatting', () => {
   describe('formatIssueType', () => {
@@ -10,7 +15,9 @@ describe('rescue-request-formatting', () => {
 
   describe('formatStatus', () => {
     it('title-cases and replaces all underscores', () => {
-      expect(formatStatus('WAITING_FOR_DEPOSIT' as any)).toBe('Waiting For Deposit');
+      expect(formatStatus('WAITING_FOR_DEPOSIT' as any)).toBe(
+        'Waiting For Deposit',
+      );
       expect(formatStatus('COMPLETED' as any)).toBe('Completed');
     });
   });
@@ -40,7 +47,10 @@ describe('rescue-request-formatting', () => {
 
     it('builds one /media/:id link per item under API_BASE_URL/api/v1', () => {
       process.env.API_BASE_URL = 'https://api.lrr.ninelm.com';
-      const result = buildMediaLinksSection([{ id: 'media-1' }, { id: 'media-2' }]);
+      const result = buildMediaLinksSection([
+        { id: 'media-1' },
+        { id: 'media-2' },
+      ]);
       expect(result).toBe(
         '\n\n📎 Photos/Video/Audio:\nhttps://api.lrr.ninelm.com/api/v1/media/media-1\nhttps://api.lrr.ninelm.com/api/v1/media/media-2',
       );

@@ -1,4 +1,9 @@
-import { BadRequestException, Injectable, forwardRef, Inject } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  forwardRef,
+  Inject,
+} from '@nestjs/common';
 import * as Sentry from '@sentry/node';
 import { logger } from '@sentry/node';
 import * as crypto from 'crypto';
@@ -6,11 +11,29 @@ import { toWhatsAppAddress } from '../common/phone.util';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { IssueType, WhatsAppFlowState } from './state/whatsapp-session.types';
 import { PrismaService } from '../prisma/prisma.service';
-import { RescueRequestStatus, UserRole, VehicleType, MediaType, RatingDirection } from '@prisma/client';
-import { mapVehicleTypeReply, formatVehicleType } from './domain/vehicle-truck-mapping';
+import { DEPOSIT_WINDOW_MS } from './deposit.constants';
+import {
+  RescueRequestStatus,
+  VehicleType,
+  MediaType,
+  MediaContext,
+  UserRole,
+  RatingDirection,
+} from '@prisma/client';
+import {
+  mapVehicleTypeReply,
+  formatVehicleType,
+} from './domain/vehicle-truck-mapping';
 import { estimateEtaMinutes, rankQuotes } from './domain/quote-ranking';
-import { formatIssueType, formatStatus, formatJobRef } from './domain/rescue-request-formatting';
-import { classifyMediaType, getExtensionFromContentType } from './domain/media-classification';
+import {
+  formatIssueType,
+  formatStatus,
+  formatJobRef,
+} from './domain/rescue-request-formatting';
+import {
+  classifyMediaType,
+  getExtensionFromContentType,
+} from './domain/media-classification';
 import { S3Service } from '../integrations/s3/s3.service';
 import { GeocodingService } from '../integrations/geocoding/geocoding.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
@@ -21,17 +44,17 @@ import { RatingService } from '../rating/rating.service';
 import { DispatchService } from './dispatch.service';
 import { DisputeService } from './dispute.service';
 // markJobCompleted (CONFIRM path) closes a real two-way dependency with this
-// service — PaymentEventsService needs scheduleRatingTimeout in return.
+// service.
 import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
+import { PaymentLedgerService } from '../payment/payment-ledger.service';
+import { PaystackCustomerService } from '../payment/paystack-customer.service';
 
-const DEPOSIT_AMOUNT_KOBO = 500000;   // ₦5,000
+const DEPOSIT_AMOUNT_KOBO = 500000; // ₦5,000
 const MAX_MEDIA_ITEMS = 5;
 
 @Injectable()
 export class WhatsAppCustomerFlowService {
-  private readonly RATING_TIMEOUT_MS = 10 * 60 * 1000;
-
   constructor(
     private readonly prisma: PrismaService,
     private readonly twilioService: TwilioService,
@@ -51,24 +74,9 @@ export class WhatsAppCustomerFlowService {
     private readonly paymentEventsService: PaymentEventsService,
     private readonly sessionStore: WhatsAppSessionStore,
     private readonly sharedService: RescueRequestSharedService,
+    private readonly paymentLedger: PaymentLedgerService,
+    private readonly paystackCustomerService: PaystackCustomerService,
   ) {}
-
-  /**
-   * If a rating prompt goes unanswered, silently clear that party's session
-   * back to IDLE after RATING_TIMEOUT_MS — ratings don't block anything, so
-   * this is quiet cleanup, not a hard deadline. Checks the session is still
-   * WAITING_FOR_RATING for the SAME rescueRequestId before clearing, so it
-   * can't clobber a state the party has since moved past (already rated, or
-   * started a fresh SOS).
-   */
-  scheduleRatingTimeout(userId: string, rescueRequestId: string) {
-    setTimeout(async () => {
-      const fresh = await this.sessionStore.getOrCreate(userId);
-      if (fresh.state === WhatsAppFlowState.WAITING_FOR_RATING && fresh.rescueRequestId === rescueRequestId) {
-        await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
-      }
-    }, this.RATING_TIMEOUT_MS);
-  }
 
   /**
    * Customer-side WhatsApp state machine. Called by WhatsAppInboundService
@@ -127,14 +135,21 @@ export class WhatsAppCustomerFlowService {
       if (!rescueRequest?.assignedOperator) {
         return this.reply(`No operator is assigned to your request yet.`);
       }
-      const opUser = await this.sharedService.findOrCreateCustomer(rescueRequest.assignedOperator.phoneNumber);
+      const opUser = await this.sharedService.findOrCreateCustomer(
+        rescueRequest.assignedOperator.phoneNumber,
+      );
       await this.sessionStore.update(userId, { relayTarget: 'OPERATOR' });
-      await this.sessionStore.update(opUser.id, { relayTarget: 'CUSTOMER', rescueRequestId: session.rescueRequestId });
+      await this.sessionStore.update(opUser.id, {
+        relayTarget: 'CUSTOMER',
+        rescueRequestId: session.rescueRequestId,
+      });
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
         `You're now connected with your customer. Messages will be relayed. Reply END CHAT anytime to stop.`,
       );
-      return this.reply(`You're now connected with your driver. Messages will be relayed. Reply END CHAT anytime to stop.`);
+      return this.reply(
+        `You're now connected with your driver. Messages will be relayed. Reply END CHAT anytime to stop.`,
+      );
     }
 
     // ── Waiting for dispute statement (customer's side of the story) ──────
@@ -142,36 +157,73 @@ export class WhatsAppCustomerFlowService {
     // operator-side equivalent: whatever the customer sends next while in
     // this state is their statement, not a command.
     if (session.state === WhatsAppFlowState.AWAITING_DISPUTE_REASON) {
-      if (session.rescueRequestId) {
+      const rescueRequestId = session.rescueRequestId;
+      const numMedia = Number(body.NumMedia ?? 0);
+
+      if (rescueRequestId && numMedia > 0) {
+        let existingCount = await this.prisma.requestMedia.count({
+          where: {
+            rescueRequestId,
+            context: MediaContext.DISPUTE,
+            uploadedByRole: UserRole.CUSTOMER,
+          },
+        });
+        for (let i = 0; i < numMedia; i++) {
+          if (existingCount >= MAX_MEDIA_ITEMS) break;
+          const mediaUrl = body[`MediaUrl${i}`] as string | undefined;
+          const contentType = body[`MediaContentType${i}`] as
+            | string
+            | undefined;
+          if (!mediaUrl || !contentType) continue;
+          const saved = await this.captureMediaAttachment(
+            rescueRequestId,
+            mediaUrl,
+            contentType,
+            MediaContext.DISPUTE,
+            UserRole.CUSTOMER,
+          );
+          if (saved) existingCount++;
+        }
+      }
+
+      if (!rawMessage) {
+        return this.reply(
+          `📸 Got it — send more evidence, or reply with your explanation to finish.`,
+        );
+      }
+
+      if (rescueRequestId) {
         await this.prisma.rescueRequest.update({
-          where: { id: session.rescueRequestId },
+          where: { id: rescueRequestId },
           data: { customerDisputeStatement: rawMessage },
         });
       }
-      await this.sessionStore.update(userId, { state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM });
-      return this.reply(`Thanks — we've recorded that. Our team will be in touch.`);
+      await this.sessionStore.update(userId, {
+        state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
+      });
+      return this.reply(
+        `Thanks — we've recorded that. Our team will be in touch.`,
+      );
     }
 
     // ── CONFIRM / DISPUTE job completion (customer side) ──────────────────
     if (session.state === WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM) {
       if (message === 'confirm') {
         if (session.rescueRequestId) {
-          // Defense in depth: a session can end up stale (pointed at a
-          // request that's already CANCELLED/COMPLETED) for reasons other
-          // than the specific admin-cancel bug this used to hit — self-heal
-          // here rather than assuming every failure means "still disputed."
-          const current = await this.prisma.rescueRequest.findUnique({
-            where: { id: session.rescueRequestId },
-            select: { status: true, disputeResolvedAt: true },
-          });
-          if (current?.status === RescueRequestStatus.CANCELLED || current?.status === RescueRequestStatus.COMPLETED) {
-            await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
-            return this.reply(`This request has already ended. Send SOS if you need assistance again.`);
-          }
+          const check = await this.checkRequestStillOpen(
+            userId,
+            session.rescueRequestId,
+          );
+          if (check.ended) return check.twiml;
 
           try {
-            await this.paymentEventsService.markJobCompleted(session.rescueRequestId);
-            await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
+            await this.paymentEventsService.markJobCompleted(
+              session.rescueRequestId,
+            );
+            await this.sessionStore.update(userId, {
+              state: WhatsAppFlowState.IDLE,
+              rescueRequestId: undefined,
+            });
           } catch (err) {
             // Typically: this request was disputed. "still under review" if
             // unresolved, or "check the payment link we already sent" if
@@ -179,7 +231,7 @@ export class WhatsAppCustomerFlowService {
             // settlement link; this CONFIRM must not send a second one).
             if (err instanceof BadRequestException) {
               return this.reply(
-                current?.disputeResolvedAt
+                check.disputeResolvedAt
                   ? `Your dispute has been resolved — please use the payment link we already sent to complete payment.`
                   : `This request is still under dispute review — our team will follow up before you can confirm completion.`,
               );
@@ -191,7 +243,24 @@ export class WhatsAppCustomerFlowService {
       }
       if (message === 'dispute') {
         if (session.rescueRequestId) {
-          await this.disputeService.raiseDispute(session.rescueRequestId, phoneNumber, userId);
+          // Same self-heal as CONFIRM, above: without it, a delayed or
+          // duplicated WhatsApp delivery of DISPUTE can land after the
+          // request already ended (paid in full, cancelled) and reopen it —
+          // raiseDispute() has no status check of its own, and a staff
+          // member resolving that reopened dispute would send a brand-new
+          // balance payment link for a request that was already settled,
+          // charging the customer a second time.
+          const check = await this.checkRequestStillOpen(
+            userId,
+            session.rescueRequestId,
+          );
+          if (check.ended) return check.twiml;
+
+          await this.disputeService.raiseDispute(
+            session.rescueRequestId,
+            phoneNumber,
+            userId,
+          );
         }
         return this.xmlOk();
       }
@@ -216,7 +285,10 @@ export class WhatsAppCustomerFlowService {
             },
           },
         });
-        if (openRequest && openRequest.status === RescueRequestStatus.WAITING_FOR_MEDIA) {
+        if (
+          openRequest &&
+          openRequest.status === RescueRequestStatus.WAITING_FOR_MEDIA
+        ) {
           // Stale request abandoned before any media was sent — nothing else expires it,
           // so auto-cancel it and let the new SOS proceed normally.
           await this.prisma.rescueRequest.update({
@@ -237,8 +309,6 @@ export class WhatsAppCustomerFlowService {
         issueType: undefined,
         rescueRequestId: undefined,
         depositReference: undefined,
-        dispatchRound: 0,
-        offeredOperatorIds: [],
       });
 
       return this.reply(
@@ -258,7 +328,10 @@ export class WhatsAppCustomerFlowService {
           where: {
             customerId: userId,
             status: {
-              notIn: [RescueRequestStatus.COMPLETED, RescueRequestStatus.CANCELLED] as RescueRequestStatus[],
+              notIn: [
+                RescueRequestStatus.COMPLETED,
+                RescueRequestStatus.CANCELLED,
+              ] as RescueRequestStatus[],
             },
           },
           orderBy: { createdAt: 'desc' },
@@ -284,6 +357,14 @@ export class WhatsAppCustomerFlowService {
           where: { rescueRequestId: requestIdToCancel, status: 'PENDING' },
           data: { status: 'TIMED_OUT', respondedAt: new Date() },
         });
+        // Also close out any already-QUOTED offer — left as QUOTED, it
+        // outlives this cancellation and deliverQuoteShortlist would
+        // otherwise still find it on a later reconciler tick and send the
+        // customer a "pick a quote" message for a request they just cancelled.
+        await this.prisma.dispatchOffer.updateMany({
+          where: { rescueRequestId: requestIdToCancel, status: 'QUOTED' },
+          data: { status: 'NOT_SELECTED', respondedAt: new Date() },
+        });
         // Clearing this customer's session below drops their own relay, but
         // the operator's sits on a separate row and would survive.
         await this.sharedService.endRelayForEndedRequest(requestIdToCancel);
@@ -301,11 +382,15 @@ export class WhatsAppCustomerFlowService {
           );
         }
 
-        return this.reply(`❌ Your rescue request has been cancelled. You were not charged.\n\nSend SOS or HELP if you need assistance again.`);
+        return this.reply(
+          `❌ Your rescue request has been cancelled. You were not charged.\n\nSend SOS or HELP if you need assistance again.`,
+        );
       }
 
       // Nothing to cancel
-      return this.reply(`You don't have an active rescue request to cancel.\n\nSend SOS or HELP if you need assistance.`);
+      return this.reply(
+        `You don't have an active rescue request to cancel.\n\nSend SOS or HELP if you need assistance.`,
+      );
     }
 
     // ── Step 1: Waiting for location ───────────────────────────────────────
@@ -329,7 +414,9 @@ export class WhatsAppCustomerFlowService {
     if (session.state === WhatsAppFlowState.WAITING_FOR_VEHICLE_TYPE) {
       const vehicleType = mapVehicleTypeReply(message);
       if (!vehicleType) {
-        return this.reply(`Please reply with a number 1-4 to select the vehicle type.`);
+        return this.reply(
+          `Please reply with a number 1-4 to select the vehicle type.`,
+        );
       }
       await this.sessionStore.update(userId, {
         vehicleType,
@@ -352,7 +439,10 @@ export class WhatsAppCustomerFlowService {
         if (sharedAddress) {
           destination = sharedAddress;
         } else {
-          const geocoded = await this.geocodingService.reverseGeocode(latitude, longitude);
+          const geocoded = await this.geocodingService.reverseGeocode(
+            latitude,
+            longitude,
+          );
           destination = geocoded ?? `${latitude}, ${longitude}`;
         }
       } else if (rawMessage) {
@@ -360,23 +450,64 @@ export class WhatsAppCustomerFlowService {
       }
 
       if (!destination) {
-        return this.reply(`Please type where you'd like the car towed to, or share a location pin.`);
+        return this.reply(
+          `Please type where you'd like the car towed to, or share a location pin.`,
+        );
       }
 
-      const customer = await this.sharedService.findOrCreateCustomer(phoneNumber);
-      const rescueRequest = await this.prisma.rescueRequest.create({
-        data: {
-          customerId:  customer.id,
-          status:      RescueRequestStatus.WAITING_FOR_MEDIA,
-          latitude:    session.latitude,
-          longitude:   session.longitude,
-          vehicleType: session.vehicleType as VehicleType,
-          destination,
-        },
+      // The RescueRequest isn't created yet — issue type (asked next) is
+      // informational-only and never gates dispatch, but it must reach the
+      // operator's job offer, so it has to be on the row before dispatch
+      // ever starts. destination is carried in session until then.
+      await this.sessionStore.update(userId, {
+        destination,
+        state: WhatsAppFlowState.WAITING_FOR_ISSUE_TYPE,
+      });
+      return this.reply(
+        `📍 Got it!\n\nWhat's wrong with the vehicle?\n\n1️⃣ Breakdown\n2️⃣ Accident\n3️⃣ Flat tyre\n4️⃣ Fuel`,
+      );
+    }
+
+    // ── Step 3a: Waiting for issue type ────────────────────────────────────
+    if (session.state === WhatsAppFlowState.WAITING_FOR_ISSUE_TYPE) {
+      const issueType = this.mapIssueType(message);
+      if (!issueType) {
+        return this.reply(
+          `Please reply with a number 1-4 to select what's wrong:\n\n1️⃣ Breakdown\n2️⃣ Accident\n3️⃣ Flat tyre\n4️⃣ Fuel`,
+        );
+      }
+
+      const rescueRequest = await this.prisma.$transaction(async (tx) => {
+        const customer = await this.sharedService.findOrCreateCustomer(
+          phoneNumber,
+          tx,
+        );
+
+        // Lock-as-mutex against a concurrent account deletion: contends for
+        // the same User row deleteUser's own updateMany writes to, so
+        // whichever transaction commits first wins.
+        const stillActive = await tx.user.updateMany({
+          where: { id: customer.id, deletedAt: null },
+          data: { updatedAt: new Date() },
+        });
+        if (stillActive.count === 0) {
+          throw new BadRequestException('This account is no longer active.');
+        }
+
+        return tx.rescueRequest.create({
+          data: {
+            customerId: customer.id,
+            status: RescueRequestStatus.WAITING_FOR_MEDIA,
+            latitude: session.latitude,
+            longitude: session.longitude,
+            vehicleType: session.vehicleType as VehicleType,
+            destination: session.destination,
+            issueType,
+          },
+        });
       });
 
       await this.sessionStore.update(userId, {
-        destination,
         rescueRequestId: rescueRequest.id,
         state: WhatsAppFlowState.WAITING_FOR_MEDIA,
       });
@@ -389,24 +520,38 @@ export class WhatsAppCustomerFlowService {
     if (session.state === WhatsAppFlowState.WAITING_FOR_MEDIA) {
       const rescueRequestId = session.rescueRequestId;
       if (!rescueRequestId) {
-        await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE });
-        return this.reply(`Sorry, we lost track of your request. Please send SOS to start again.`);
+        await this.sessionStore.update(userId, {
+          state: WhatsAppFlowState.IDLE,
+        });
+        return this.reply(
+          `Sorry, we lost track of your request. Please send SOS to start again.`,
+        );
       }
 
       if (message === '2') {
         const visualCount = await this.prisma.requestMedia.count({
-          where: { rescueRequestId, mediaType: { in: [MediaType.IMAGE, MediaType.VIDEO] } },
+          where: {
+            rescueRequestId,
+            mediaType: { in: [MediaType.IMAGE, MediaType.VIDEO] },
+          },
         });
         if (visualCount === 0) {
           return this.reply(
             `Please send at least one photo or video before continuing — a voice note alone isn't enough for the operator to assess the vehicle.`,
           );
         }
-        return this.handleMediaFinished(phoneNumber, userId, session, rescueRequestId);
+        return this.handleMediaFinished(
+          phoneNumber,
+          userId,
+          session,
+          rescueRequestId,
+        );
       }
 
       if (message === '1') {
-        return this.reply(`Go ahead — send your photo(s), video(s), or voice note(s).`);
+        return this.reply(
+          `Go ahead — send your photo(s), video(s), or voice note(s).`,
+        );
       }
 
       const numMedia = Number(body.NumMedia ?? 0);
@@ -416,7 +561,9 @@ export class WhatsAppCustomerFlowService {
         );
       }
 
-      const existingCount = await this.prisma.requestMedia.count({ where: { rescueRequestId } });
+      const existingCount = await this.prisma.requestMedia.count({
+        where: { rescueRequestId },
+      });
       let savedCount = existingCount;
       let failedCount = 0;
       let capReached = false;
@@ -431,7 +578,13 @@ export class WhatsAppCustomerFlowService {
         const contentType: string | undefined = body[`MediaContentType${i}`];
         if (!mediaUrl || !contentType) continue;
 
-        const saved = await this.captureMediaAttachment(rescueRequestId, mediaUrl, contentType);
+        const saved = await this.captureMediaAttachment(
+          rescueRequestId,
+          mediaUrl,
+          contentType,
+          MediaContext.INITIAL,
+          UserRole.CUSTOMER,
+        );
         if (saved) {
           savedCount++;
         } else {
@@ -442,9 +595,10 @@ export class WhatsAppCustomerFlowService {
       const capNote = capReached
         ? `\n\n⚠️ You've reached the ${MAX_MEDIA_ITEMS}-item limit — further attachments won't be saved.`
         : '';
-      const failNote = failedCount > 0
-        ? `\n\n⚠️ ${failedCount} item(s) failed to upload — please resend if important.`
-        : '';
+      const failNote =
+        failedCount > 0
+          ? `\n\n⚠️ ${failedCount} item(s) failed to upload — please resend if important.`
+          : '';
 
       return this.reply(
         `📸 Received (${savedCount}/${MAX_MEDIA_ITEMS} items saved).${capNote}${failNote}\n\n1️⃣ Add more\n2️⃣ Continue to dispatch`,
@@ -455,7 +609,9 @@ export class WhatsAppCustomerFlowService {
     if (session.state === WhatsAppFlowState.WAITING_FOR_QUOTE_SELECTION) {
       const choice = Number(message);
       if (!Number.isInteger(choice) || choice < 1) {
-        return this.reply(`Please reply with the number of the quote you'd like to choose.`);
+        return this.reply(
+          `Please reply with the number of the quote you'd like to choose.`,
+        );
       }
       return this.handleQuoteSelected(phoneNumber, userId, choice);
     }
@@ -477,7 +633,10 @@ export class WhatsAppCustomerFlowService {
     // ── Step 5: Waiting for post-job rating (motorist rates operator) ─────
     if (session.state === WhatsAppFlowState.WAITING_FOR_RATING) {
       return this.handleRatingReply(
-        userId, rawMessage, session.rescueRequestId, RatingDirection.MOTORIST_TO_OPERATOR,
+        userId,
+        rawMessage,
+        session.rescueRequestId,
+        RatingDirection.MOTORIST_TO_OPERATOR,
       );
     }
 
@@ -490,11 +649,18 @@ export class WhatsAppCustomerFlowService {
    * Downloads one Twilio media attachment, uploads it to S3, and creates the
    * RequestMedia row. Returns false (rather than throwing) on any failure —
    * a single bad attachment must not break the rest of the batch or the flow.
+   * Shared across the customer and operator flows (see
+   * WhatsAppOperatorFlowService, which calls this via its injected
+   * customerFlowService) — context/uploadedByRole let every caller tag
+   * which of INITIAL/COMPLETION/DISPUTE this attachment belongs to and who
+   * sent it.
    */
-  private async captureMediaAttachment(
+  async captureMediaAttachment(
     rescueRequestId: string,
     mediaUrl: string,
     contentType: string,
+    context: MediaContext,
+    uploadedByRole: UserRole,
   ): Promise<boolean> {
     const mediaType = classifyMediaType(contentType);
     if (!mediaType) return false;
@@ -507,10 +673,23 @@ export class WhatsAppCustomerFlowService {
       await this.s3Service.uploadMedia(buffer, contentType, s3Key);
 
       await this.prisma.requestMedia.create({
-        data: { rescueRequestId, mediaType, s3Key, contentType },
+        data: {
+          rescueRequestId,
+          mediaType,
+          s3Key,
+          contentType,
+          context,
+          uploadedByRole,
+        },
       });
 
-      logger.info('media: attachment saved', { rescueRequestId, mediaType, contentType });
+      logger.info('media: attachment saved', {
+        rescueRequestId,
+        mediaType,
+        context,
+        uploadedByRole,
+        contentType,
+      });
       return true;
     } catch (error) {
       console.error('Failed to capture media attachment:', error);
@@ -524,9 +703,16 @@ export class WhatsAppCustomerFlowService {
    * END CHAT closes it for both, since there's no reason for one side to
    * keep relaying to someone who's already left.
    */
-  private async endChatRelay(customerUserId: string, customerPhone: string, rescueRequestId: string | undefined): Promise<void> {
+  private async endChatRelay(
+    customerUserId: string,
+    customerPhone: string,
+    rescueRequestId: string | undefined,
+  ): Promise<void> {
     await this.sessionStore.update(customerUserId, { relayTarget: null });
-    await this.twilioService.sendWhatsAppMessage(toWhatsAppAddress(customerPhone), `Chat ended.`);
+    await this.twilioService.sendWhatsAppMessage(
+      toWhatsAppAddress(customerPhone),
+      `Chat ended.`,
+    );
 
     if (!rescueRequestId) return;
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
@@ -535,7 +721,9 @@ export class WhatsAppCustomerFlowService {
     });
     if (!rescueRequest?.assignedOperator?.phoneNumber) return;
 
-    const opUser = await this.sharedService.findOrCreateCustomer(rescueRequest.assignedOperator.phoneNumber);
+    const opUser = await this.sharedService.findOrCreateCustomer(
+      rescueRequest.assignedOperator.phoneNumber,
+    );
     await this.sessionStore.update(opUser.id, { relayTarget: null });
     await this.twilioService.sendWhatsAppMessage(
       toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
@@ -558,7 +746,9 @@ export class WhatsAppCustomerFlowService {
     ]);
     if (!customer || !rescueRequestRow) {
       await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE });
-      return this.reply(`Sorry, we lost track of your request. Please send SOS to start again.`);
+      return this.reply(
+        `Sorry, we lost track of your request. Please send SOS to start again.`,
+      );
     }
     const vehicleType = rescueRequestRow.vehicleType as VehicleType;
     const destination = rescueRequestRow.destination as string;
@@ -568,10 +758,12 @@ export class WhatsAppCustomerFlowService {
       data: { status: RescueRequestStatus.DISPATCHING },
     });
 
+    // No dispatch state to reset here any more. It lives on the RescueRequest,
+    // which starts at round 0 with an empty exclusion list — so a customer's
+    // second request can no longer inherit the first's, which is precisely
+    // why these resets existed on the per-person session.
     await this.sessionStore.update(userId, {
-      state:              WhatsAppFlowState.REQUEST_CONFIRMED,
-      dispatchRound:      0,
-      offeredOperatorIds: [],
+      state: WhatsAppFlowState.REQUEST_CONFIRMED,
     });
 
     const greet = customer.name ? `Hi ${customer.name.split(' ')[0]}! ` : '';
@@ -597,45 +789,96 @@ export class WhatsAppCustomerFlowService {
   ) {
     const rescueRequest = await this.prisma.rescueRequest.create({
       data: {
-        customerId:    customer.id,
-        status:        RescueRequestStatus.WAITING_FOR_DEPOSIT,
-        latitude:      session.latitude,
-        longitude:     session.longitude,
+        customerId: customer.id,
+        status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
+        latitude: session.latitude,
+        longitude: session.longitude,
         issueType,
         depositAmount: amountKobo,
+        // Same statement as the status, as at every other entry into
+        // WAITING_FOR_DEPOSIT. Until now this path set no deadline at all, so
+        // nothing ever cancelled these requests despite the message below
+        // promising exactly that.
+        depositWindowExpiresAt: new Date(Date.now() + DEPOSIT_WINDOW_MS),
       },
     });
 
-    const reference = this.paystackService.generateReference('DEP');
-    const email = customer.email || `${phoneNumber.replace(/\D/g, '')}@lrr.ng`;
+    // 1. The row is committed before anything leaves, so a crash here cannot
+    //    produce a payment nothing knows about.
+    const payment = await this.paymentLedger.create({
+      rescueRequestId: rescueRequest.id,
+      type: 'DEPOSIT',
+      amount: amountKobo,
+    });
 
+    // 2. Claim BEFORE the call, which also pushes verifyAfter out so nothing
+    //    verifies a request still in flight. Only the winner calls Paystack.
+    if (
+      !(await this.paymentLedger.claimForSubmission(payment.id, new Date()))
+    ) {
+      return this.reply(
+        `We're setting up your payment — you'll get a link shortly.`,
+      );
+    }
+    const reference = this.paymentLedger.referenceFor(payment);
+    // Never customer.email directly — the frozen identity Paystack already
+    // knows this user by, so a real email set later doesn't split them into
+    // a second Paystack customer. See PaystackCustomerService.
+    const { email } = await this.paystackCustomerService.customerFor(
+      customer.id,
+    );
+
+    // 3. Call Paystack.
     const paymentResponse = await this.paystackService.initializePayment({
       email,
       amount: amountKobo,
       reference,
       metadata: {
         rescueRequestId: rescueRequest.id,
-        customerId:      customer.id,
+        customerId: customer.id,
         phoneNumber,
         type: 'deposit',
       },
     });
 
-    if (!paymentResponse.status) {
-      console.error('Failed to initialize Paystack payment:', paymentResponse);
-      return this.reply(`Sorry, we couldn't create a payment link. Please try again.`);
+    // 4. An ambiguous failure may have created a transaction we never saw, so
+    //    it stays SUBMITTED with checkoutUrl null — the pair that tells
+    //    recovery no link ever reached the customer. Only a definitive
+    //    rejection fails the row.
+    if (paymentResponse.outcome === 'ambiguous') {
+      console.error('Paystack initialize was inconclusive:', paymentResponse);
+      return this.reply(
+        `We're still setting up your payment — hold on a moment.`,
+      );
     }
+    if (paymentResponse.outcome === 'rejected') {
+      await this.paymentLedger.recordRejection(
+        payment.id,
+        paymentResponse.message ?? 'initialize rejected',
+      );
+      return this.reply(
+        `Sorry, we couldn't create a payment link. Please try again.`,
+      );
+    }
+
+    // 5. Persist the URL BEFORE sending it. Once this commits, recovery must
+    //    never fail this attempt — the customer may act on the link.
+    const checkoutUrl = paymentResponse.data.authorization_url;
+    await this.prisma.payment.update({
+      where: { id: payment.id },
+      data: { checkoutUrl },
+    });
 
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequest.id },
-      data:  { depositReference: reference },
+      data: { depositPaymentUrl: checkoutUrl },
     });
 
     await this.sessionStore.update(customer.id, {
       issueType,
-      rescueRequestId:  rescueRequest.id,
+      rescueRequestId: rescueRequest.id,
       depositReference: reference,
-      state:            WhatsAppFlowState.WAITING_FOR_DEPOSIT,
+      state: WhatsAppFlowState.WAITING_FOR_DEPOSIT,
     });
 
     const isStandardDeposit = amountKobo === DEPOSIT_AMOUNT_KOBO;
@@ -646,7 +889,7 @@ export class WhatsAppCustomerFlowService {
       : `💰 *One-time fee: ₦50,000* (paid in full now)\n`;
 
     return this.reply(
-      `Issue: ${formatIssueType(issueType)}${note}\n\n${costBreakdown}\n⚠️ *ACTION NEEDED* — tap the link below to pay ${isStandardDeposit ? '₦5,000 deposit' : '₦50,000'} and confirm your rescue:\n\n👉 ${paymentResponse.data.authorization_url}\n\n⏱ Pay within 30 minutes or the request is cancelled.`,
+      `Issue: ${formatIssueType(issueType)}${note}\n\n${costBreakdown}\n⚠️ *ACTION NEEDED* — tap the link below to pay ${isStandardDeposit ? '₦5,000 deposit' : '₦50,000'} and confirm your rescue:\n\n👉 ${checkoutUrl}\n\n⏱ Pay within 30 minutes or the request is cancelled.`,
     );
   }
 
@@ -662,7 +905,9 @@ export class WhatsAppCustomerFlowService {
     }
 
     if (!rescueRequestId) {
-      await this.sessionStore.update(reviewerUserId, { state: WhatsAppFlowState.IDLE });
+      await this.sessionStore.update(reviewerUserId, {
+        state: WhatsAppFlowState.IDLE,
+      });
       return this.reply(`Thanks for your feedback!`);
     }
 
@@ -704,9 +949,10 @@ export class WhatsAppCustomerFlowService {
       try {
         const config = await this.platformConfigService.getConfig();
         if (config.disputeAlertPhoneNumber) {
-          const who = direction === RatingDirection.MOTORIST_TO_OPERATOR
-            ? 'Customer rated the operator'
-            : 'Operator rated the customer';
+          const who =
+            direction === RatingDirection.MOTORIST_TO_OPERATOR
+              ? 'Customer rated the operator'
+              : 'Operator rated the customer';
           await this.twilioService.sendWhatsAppMessage(
             toWhatsAppAddress(config.disputeAlertPhoneNumber),
             `⚠️ Low rating (${score}/5) on ${formatJobRef(rescueRequestId)} — ${who} low. Please review.`,
@@ -723,12 +969,18 @@ export class WhatsAppCustomerFlowService {
     );
   }
 
-  private async handleQuoteSelected(phoneNumber: string, userId: string, choice: number) {
+  private async handleQuoteSelected(
+    phoneNumber: string,
+    userId: string,
+    choice: number,
+  ) {
     const session = await this.sessionStore.getOrCreate(userId);
     const rescueRequestId = session.rescueRequestId;
     if (!rescueRequestId) {
       await this.sessionStore.update(userId, { state: WhatsAppFlowState.IDLE });
-      return this.reply(`Sorry, we lost track of your request. Please send SOS to start again.`);
+      return this.reply(
+        `Sorry, we lost track of your request. Please send SOS to start again.`,
+      );
     }
 
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
@@ -736,7 +988,9 @@ export class WhatsAppCustomerFlowService {
       include: { customer: true },
     });
     if (!rescueRequest) {
-      return this.reply(`Sorry, we lost track of your request. Please send SOS to start again.`);
+      return this.reply(
+        `Sorry, we lost track of your request. Please send SOS to start again.`,
+      );
     }
 
     const quotedOffers = await this.prisma.dispatchOffer.findMany({
@@ -755,54 +1009,116 @@ export class WhatsAppCustomerFlowService {
       businessName: offer.operator.businessName,
       quotedPrice: offer.quotedPrice!,
       etaMinutes: estimateEtaMinutes(
-        this.operatorService['calculateDistance'](lat, lon, Number(offer.operator.latitude), Number(offer.operator.longitude)),
+        this.operatorService['calculateDistance'](
+          lat,
+          lon,
+          Number(offer.operator.latitude),
+          Number(offer.operator.longitude),
+        ),
       ),
     }));
     const ranked = rankQuotes(forRanking);
 
     const selected = ranked[choice - 1];
     if (!selected) {
-      return this.reply(`That's not one of the options. Please reply with a valid number from the list.`);
-    }
-
-    // Atomic claim — only proceeds if the request is still DISPATCHING.
-    const claimed = await this.prisma.rescueRequest.updateMany({
-      where: { id: rescueRequestId, status: RescueRequestStatus.DISPATCHING },
-      data: { status: RescueRequestStatus.WAITING_FOR_DEPOSIT },
-    });
-    if (claimed.count === 0) {
-      return this.reply(`Sorry, this request has already moved on.`);
+      return this.reply(
+        `That's not one of the options. Please reply with a valid number from the list.`,
+      );
     }
 
     const config = await this.platformConfigService.getConfig();
-    const serviceFeeAmount = Math.round((selected.quotedPrice * config.serviceFeePercent) / 100);
+    const serviceFeeAmount = Math.round(
+      (selected.quotedPrice * config.serviceFeePercent) / 100,
+    );
     const total = selected.quotedPrice + serviceFeeAmount;
     const depositAmount = Math.round((total * config.depositPercent) / 100);
     const balanceAmount = total - depositAmount;
 
-    await this.prisma.rescueRequest.update({
-      where: { id: rescueRequestId },
-      data: { serviceFeeAmount, depositAmount, balanceAmount, assignedOperatorId: selected.operatorId },
-    });
-
     const selectedOffer = quotedOffers.find((o) => o.id === selected.offerId)!;
-    await this.prisma.dispatchOffer.update({
-      where: { id: selectedOffer.id },
-      data: { status: 'SELECTED_PENDING_PAYMENT', respondedAt: new Date() },
-    });
-    await this.prisma.dispatchOffer.updateMany({
-      where: { rescueRequestId, status: 'QUOTED', id: { not: selectedOffer.id } },
-      data: { status: 'NOT_SELECTED', respondedAt: new Date() },
-    });
-    // Operators who hadn't responded at all yet (never quoted, never
-    // declined) are NOT covered by the update above — it only matches
-    // QUOTED. Left PENDING, this job keeps counting as "open" for them
-    // (findOpenOffers) until their own offer's expiresAt eventually
-    // passes, well after the job has actually moved on and completed.
-    await this.prisma.dispatchOffer.updateMany({
-      where: { rescueRequestId, status: 'PENDING' },
-      data: { status: 'TIMED_OUT', respondedAt: new Date() },
-    });
+    let payment;
+    try {
+      payment = await this.prisma.$transaction(async (tx) => {
+        const customerStillActive = await tx.user.updateMany({
+          where: { id: rescueRequest.customerId, deletedAt: null },
+          data: { updatedAt: new Date() },
+        });
+        if (customerStillActive.count === 0) {
+          throw new BadRequestException('This customer has been deleted.');
+        }
+
+        const operatorStillActive = await tx.operator.updateMany({
+          where: { id: selected.operatorId, deletedAt: null },
+          data: { updatedAt: new Date() },
+        });
+        if (operatorStillActive.count === 0) {
+          throw new BadRequestException(
+            'The selected operator is no longer available.',
+          );
+        }
+
+        const claimed = await tx.rescueRequest.updateMany({
+          where: {
+            id: rescueRequestId,
+            status: RescueRequestStatus.DISPATCHING,
+          },
+          data: {
+            status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
+            serviceFeeAmount,
+            depositAmount,
+            balanceAmount,
+            assignedOperatorId: selected.operatorId,
+            depositWindowExpiresAt: new Date(Date.now() + DEPOSIT_WINDOW_MS),
+            depositRemindersSent: 0,
+          },
+        });
+        if (claimed.count === 0) {
+          throw new BadRequestException('This request has already moved on.');
+        }
+
+        await tx.dispatchOffer.update({
+          where: { id: selectedOffer.id },
+          data: {
+            status: 'SELECTED_PENDING_PAYMENT',
+            respondedAt: new Date(),
+          },
+        });
+        await tx.dispatchOffer.updateMany({
+          where: {
+            rescueRequestId,
+            status: 'QUOTED',
+            id: { not: selectedOffer.id },
+          },
+          data: { status: 'NOT_SELECTED', respondedAt: new Date() },
+        });
+        await tx.dispatchOffer.updateMany({
+          where: { rescueRequestId, status: 'PENDING' },
+          data: { status: 'TIMED_OUT', respondedAt: new Date() },
+        });
+
+        return this.paymentLedger.create({
+          rescueRequestId,
+          type: 'DEPOSIT',
+          amount: depositAmount,
+          tx,
+        });
+      });
+    } catch (error) {
+      if (
+        error instanceof BadRequestException &&
+        error.message.includes('operator')
+      ) {
+        Sentry.captureException(error, {
+          extra: { rescueRequestId, operatorId: selected.operatorId },
+        });
+        return this.reply(
+          `Sorry, that operator is no longer available. Please choose another quote.`,
+        );
+      }
+      if (error instanceof BadRequestException) {
+        return this.reply(`Sorry, this request has already moved on.`);
+      }
+      throw error;
+    }
 
     // Notify the operators who weren't picked.
     await Promise.all(
@@ -816,11 +1132,24 @@ export class WhatsAppCustomerFlowService {
         ),
     );
 
-    await this.sessionStore.update(userId, { state: WhatsAppFlowState.OPERATOR_FOUND_WAITING_PAYMENT });
+    await this.sessionStore.update(userId, {
+      state: WhatsAppFlowState.OPERATOR_FOUND_WAITING_PAYMENT,
+    });
 
     const operator = selectedOffer.operator;
-    const reference = this.paystackService.generateReference('DEP');
-    const email = rescueRequest.customer.email ?? `${phoneNumber.replace(/\D/g, '')}@lrr.ng`;
+    // The protocol, as in initiateDeposit: commit, claim, call, classify.
+    if (
+      !(await this.paymentLedger.claimForSubmission(payment.id, new Date()))
+    ) {
+      return this.reply(
+        `We're setting up your payment — you'll get a link shortly.`,
+      );
+    }
+    const reference = this.paymentLedger.referenceFor(payment);
+    // Never rescueRequest.customer.email directly — see initiateDeposit.
+    const { email } = await this.paystackCustomerService.customerFor(
+      rescueRequest.customerId,
+    );
 
     const paymentResponse = await this.paystackService.initializePayment({
       email,
@@ -834,14 +1163,30 @@ export class WhatsAppCustomerFlowService {
       },
     });
 
-    if (!paymentResponse.status) {
-      console.error('Failed to create deposit payment link:', paymentResponse);
-      return this.reply(`⚠️ We couldn't generate a payment link. Our team has been alerted. Reply CANCEL to cancel.`);
+    if (paymentResponse.outcome === 'ambiguous') {
+      console.error('Paystack initialize was inconclusive:', paymentResponse);
+      return this.reply(
+        `We're still setting up your payment — hold on a moment.`,
+      );
+    }
+    if (paymentResponse.outcome === 'rejected') {
+      await this.paymentLedger.recordRejection(
+        payment.id,
+        paymentResponse.message ?? 'initialize rejected',
+      );
+      return this.reply(
+        `⚠️ We couldn't generate a payment link. Our team has been alerted. Reply CANCEL to cancel.`,
+      );
     }
 
+    const checkoutUrl = paymentResponse.data.authorization_url;
+    await this.prisma.payment.update({
+      where: { id: payment.id },
+      data: { checkoutUrl },
+    });
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequestId },
-      data: { depositReference: reference },
+      data: { depositPaymentUrl: checkoutUrl },
     });
 
     const depositNaira = (depositAmount / 100).toLocaleString();
@@ -849,31 +1194,71 @@ export class WhatsAppCustomerFlowService {
 
     void this.twilioService.sendWhatsAppMessage(
       phoneNumber,
-      `🚗 *Operator selected!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *5 minutes*:\n\n👉 ${paymentResponse.data.authorization_url}\n\nYour operator is confirmed once you pay. Reply CANCEL to cancel (no charge).`,
+      `🚗 *Operator selected!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *5 minutes*:\n\n👉 ${checkoutUrl}\n\nYour operator is confirmed once you pay. Reply CANCEL to cancel (no charge).`,
     );
-
-    this.sharedService.scheduleDepositWindow({
-      rescueRequestId,
-      customerId: userId,
-      customerPhone: phoneNumber,
-      operatorPhone: toWhatsAppAddress(operator.phoneNumber),
-      paymentUrl: paymentResponse.data.authorization_url,
-    });
 
     return this.xmlOk();
   }
 
   private isSosMessage(message: string): boolean {
-    return ['help', 'sos', 'stuck', 'rescue', 'emergency'].some((w) => message.includes(w));
+    return ['help', 'sos', 'stuck', 'rescue', 'emergency'].some((w) =>
+      message.includes(w),
+    );
   }
 
   private mapIssueType(message: string): IssueType | undefined {
     const map: Record<string, IssueType> = {
-      '1': 'BREAKDOWN', '2': 'ACCIDENT', '3': 'FLAT_TYRE', '4': 'FUEL',
-      'breakdown': 'BREAKDOWN', 'accident': 'ACCIDENT',
-      'flat': 'FLAT_TYRE', 'tyre': 'FLAT_TYRE', 'fuel': 'FUEL',
+      '1': 'BREAKDOWN',
+      '2': 'ACCIDENT',
+      '3': 'FLAT_TYRE',
+      '4': 'FUEL',
+      breakdown: 'BREAKDOWN',
+      accident: 'ACCIDENT',
+      flat: 'FLAT_TYRE',
+      tyre: 'FLAT_TYRE',
+      fuel: 'FUEL',
     };
     return map[message];
+  }
+
+  /**
+   * Guards the CONFIRM/DISPUTE branch against a stale AWAITING_COMPLETION_CONFIRM
+   * session pointed at a request that already ended (paid in full,
+   * cancelled) — self-heals the session and returns the TwiML to reply
+   * with immediately. `disputeResolvedAt` is returned alongside for
+   * CONFIRM's own unrelated use (phrasing its "still disputed" message);
+   * it plays no part in the ended check itself.
+   */
+  private async checkRequestStillOpen(
+    userId: string,
+    rescueRequestId: string,
+  ): Promise<
+    | { ended: true; twiml: string }
+    | { ended: false; disputeResolvedAt: Date | null }
+  > {
+    const current = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      select: { status: true, disputeResolvedAt: true },
+    });
+    if (
+      current?.status === RescueRequestStatus.CANCELLED ||
+      current?.status === RescueRequestStatus.COMPLETED
+    ) {
+      await this.sessionStore.update(userId, {
+        state: WhatsAppFlowState.IDLE,
+        rescueRequestId: undefined,
+      });
+      return {
+        ended: true,
+        twiml: this.reply(
+          `This request has already ended. Send SOS if you need assistance again.`,
+        ),
+      };
+    }
+    return {
+      ended: false,
+      disputeResolvedAt: current?.disputeResolvedAt ?? null,
+    };
   }
 
   private reply(message: string): string {

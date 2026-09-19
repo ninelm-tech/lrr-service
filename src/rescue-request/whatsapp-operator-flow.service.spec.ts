@@ -6,8 +6,12 @@ import { DispatchService } from './dispatch.service';
 import { PaymentEventsService } from './payment-events.service';
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
-import { WhatsAppFlowState } from './state/whatsapp-session.types';
+import {
+  WhatsAppFlowState,
+  WhatsAppSession,
+} from './state/whatsapp-session.types';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
+import { MediaContext, UserRole } from '@prisma/client';
 
 describe('WhatsAppOperatorFlowService', () => {
   describe('handleOperatorMessage — rating branch ordering', () => {
@@ -25,7 +29,9 @@ describe('WhatsAppOperatorFlowService', () => {
         rescueRequest: { findUnique: jest.fn() },
         dispatchOffer: { findMany: jest.fn().mockResolvedValue([]) },
       };
-      customerFlowService = { handleRatingReply: jest.fn().mockResolvedValue('rated') };
+      customerFlowService = {
+        handleRatingReply: jest.fn().mockResolvedValue('rated'),
+      };
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
@@ -34,23 +40,47 @@ describe('WhatsAppOperatorFlowService', () => {
           { provide: TwilioService, useValue: {} },
           {
             provide: DispatchService,
-            useValue: { processQuoteOrDecline: jest.fn().mockResolvedValue({ message: 'declined' }) },
+            useValue: {
+              processQuoteOrDecline: jest
+                .fn()
+                .mockResolvedValue({ message: 'declined' }),
+            },
           },
           { provide: PaymentEventsService, useValue: {} },
-          { provide: WhatsAppCustomerFlowService, useValue: customerFlowService },
+          {
+            provide: WhatsAppCustomerFlowService,
+            useValue: customerFlowService,
+          },
           { provide: WhatsAppSessionStore, useValue: {} },
           { provide: PlatformConfigService, useValue: {} },
         ],
       }).compile();
 
-      orderingService = module.get<WhatsAppOperatorFlowService>(WhatsAppOperatorFlowService);
+      orderingService = module.get<WhatsAppOperatorFlowService>(
+        WhatsAppOperatorFlowService,
+      );
     });
 
     it('routes a WAITING_FOR_RATING operator reply to the rating handler, not the quote parser', async () => {
-      const session = { state: WhatsAppFlowState.WAITING_FOR_RATING, rescueRequestId: 'req-1' } as any;
-      const operator = { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341111111111' };
+      const session = {
+        state: WhatsAppFlowState.WAITING_FOR_RATING,
+        rescueRequestId: 'req-1',
+      } as any;
+      const operator = {
+        id: 'op-1',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2341111111111',
+      };
 
-      const result = await orderingService.handleOperatorMessage('+2341111111111', 'op-user-1', '4', '4', session, operator);
+      const result = await orderingService.handleOperatorMessage(
+        '+2341111111111',
+        'op-user-1',
+        '4',
+        '4',
+        session,
+        operator,
+        {},
+      );
 
       // handleOperatorQuoteOrDecline's quote path always starts with an
       // operator.findUnique lookup — asserting it was never called proves
@@ -58,20 +88,41 @@ describe('WhatsAppOperatorFlowService', () => {
       // treated as a bogus price quote.
       expect(prisma.operator.findUnique).not.toHaveBeenCalled();
       expect(customerFlowService.handleRatingReply).toHaveBeenCalledWith(
-        'op-user-1', '4', 'req-1', 'OPERATOR_TO_MOTORIST',
+        'op-user-1',
+        '4',
+        'req-1',
+        'OPERATOR_TO_MOTORIST',
       );
       expect(result).toBe('rated');
     });
 
     it('routes a WAITING_FOR_RATING operator reply to the new-offer decline instead, when an offer is open', async () => {
-      const session = { state: WhatsAppFlowState.WAITING_FOR_RATING, rescueRequestId: 'req-1' } as any;
-      const operator = { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341111111111' };
+      const session = {
+        state: WhatsAppFlowState.WAITING_FOR_RATING,
+        rescueRequestId: 'req-1',
+      } as any;
+      const operator = {
+        id: 'op-1',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2341111111111',
+      };
       prisma.dispatchOffer.findMany.mockResolvedValue([
-        { rescueRequestId: 'req-2', rescueRequest: { vehicleType: 'SEDAN', destination: 'Ikeja' } },
+        {
+          rescueRequestId: 'req-2',
+          rescueRequest: { vehicleType: 'SEDAN', destination: 'Ikeja' },
+        },
       ]);
       prisma.operator.findUnique.mockResolvedValue(operator);
 
-      await orderingService.handleOperatorMessage('+2341111111111', 'op-user-1', 'no', 'no', session, operator);
+      await orderingService.handleOperatorMessage(
+        '+2341111111111',
+        'op-user-1',
+        'no',
+        'no',
+        session,
+        operator,
+        {},
+      );
 
       // A stale rating prompt must not swallow a decline for a genuinely
       // open dispatch offer — the rating handler must not fire at all.
@@ -89,11 +140,18 @@ describe('WhatsAppOperatorFlowService', () => {
     let dispatchService: { processQuoteOrDecline: jest.Mock };
 
     const offerA = {
-      id: 'offer-a', rescueRequestId: 'req-aaaaaaAAAAAA', expiresAt: new Date(),
-      rescueRequest: { vehicleType: 'SEDAN', destination: 'Ikeja under bridge' },
+      id: 'offer-a',
+      rescueRequestId: 'req-aaaaaaAAAAAA',
+      expiresAt: new Date(),
+      rescueRequest: {
+        vehicleType: 'SEDAN',
+        destination: 'Ikeja under bridge',
+      },
     };
     const offerB = {
-      id: 'offer-b', rescueRequestId: 'req-bbbbbbBBBBBB', expiresAt: new Date(),
+      id: 'offer-b',
+      rescueRequestId: 'req-bbbbbbBBBBBB',
+      expiresAt: new Date(),
       rescueRequest: { vehicleType: 'SUV', destination: 'Lekki Phase 1' },
     };
 
@@ -103,7 +161,9 @@ describe('WhatsAppOperatorFlowService', () => {
         dispatchOffer: { findMany: jest.fn() },
       };
       dispatchService = {
-        processQuoteOrDecline: jest.fn().mockResolvedValue({ quoted: true, message: 'ok' }),
+        processQuoteOrDecline: jest
+          .fn()
+          .mockResolvedValue({ quoted: true, message: 'ok' }),
       };
 
       const module: TestingModule = await Test.createTestingModule({
@@ -119,21 +179,34 @@ describe('WhatsAppOperatorFlowService', () => {
         ],
       }).compile();
 
-      quoteService = module.get<WhatsAppOperatorFlowService>(WhatsAppOperatorFlowService);
+      quoteService = module.get<WhatsAppOperatorFlowService>(
+        WhatsAppOperatorFlowService,
+      );
     });
 
     it('uses the single pending offer when a bare price is given (unchanged, common case)', async () => {
       prisma.dispatchOffer.findMany.mockResolvedValue([offerA]);
 
-      await (quoteService as any).handleOperatorQuoteOrDecline('+2341', 'user-1', 2500000);
+      await (quoteService as any).handleOperatorQuoteOrDecline(
+        '+2341',
+        'user-1',
+        2500000,
+      );
 
-      expect(dispatchService.processQuoteOrDecline).toHaveBeenCalledWith(offerA, 2500000);
+      expect(dispatchService.processQuoteOrDecline).toHaveBeenCalledWith(
+        offerA,
+        2500000,
+      );
     });
 
     it('asks the operator to disambiguate instead of guessing when multiple offers are pending and no ref is given', async () => {
       prisma.dispatchOffer.findMany.mockResolvedValue([offerB, offerA]);
 
-      const result = await (quoteService as any).handleOperatorQuoteOrDecline('+2341', 'user-1', 2500000);
+      const result = await (quoteService as any).handleOperatorQuoteOrDecline(
+        '+2341',
+        'user-1',
+        2500000,
+      );
 
       expect(dispatchService.processQuoteOrDecline).not.toHaveBeenCalled();
       expect(result).toContain('AAAAAA');
@@ -143,7 +216,11 @@ describe('WhatsAppOperatorFlowService', () => {
     it('describes each open job by vehicle and destination — a bare ref means nothing to an operator', async () => {
       prisma.dispatchOffer.findMany.mockResolvedValue([offerB, offerA]);
 
-      const result = await (quoteService as any).handleOperatorQuoteOrDecline('+2341', 'user-1', 2500000);
+      const result = await (quoteService as any).handleOperatorQuoteOrDecline(
+        '+2341',
+        'user-1',
+        2500000,
+      );
 
       expect(result).toContain('Ikeja under bridge');
       expect(result).toContain('Lekki Phase 1');
@@ -156,20 +233,28 @@ describe('WhatsAppOperatorFlowService', () => {
     it('only filters to offers that have not already expired', async () => {
       prisma.dispatchOffer.findMany.mockResolvedValue([offerA]);
 
-      await (quoteService as any).handleOperatorQuoteOrDecline('+2341', 'user-1', 2500000);
+      await (quoteService as any).handleOperatorQuoteOrDecline(
+        '+2341',
+        'user-1',
+        2500000,
+      );
 
       const where = prisma.dispatchOffer.findMany.mock.calls[0][0].where;
       expect(where.status).toBe('PENDING');
       expect(where.expiresAt.gt).toBeInstanceOf(Date);
     });
 
-    it('answers a bare job ref with that job\'s details and asks for the price, rather than staying silent', async () => {
+    it("answers a bare job ref with that job's details and asks for the price, rather than staying silent", async () => {
       prisma.dispatchOffer.findMany.mockResolvedValue([offerB, offerA]);
 
       const result = await quoteService.handleOperatorMessage(
-        '+2341', 'user-1', '#AAAAAA', '#AAAAAA',
+        '+2341',
+        'user-1',
+        '#AAAAAA',
+        '#AAAAAA',
         { state: WhatsAppFlowState.IDLE } as any,
         { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341' },
+        {},
       );
 
       expect(result).toContain('Ikeja under bridge');
@@ -181,21 +266,32 @@ describe('WhatsAppOperatorFlowService', () => {
       prisma.dispatchOffer.findMany.mockResolvedValue([offerB, offerA]);
 
       await quoteService.handleOperatorMessage(
-        '+2341', 'user-1', '#AAAAAA 25000', '#AAAAAA 25000',
+        '+2341',
+        'user-1',
+        '#AAAAAA 25000',
+        '#AAAAAA 25000',
         { state: WhatsAppFlowState.IDLE } as any,
         { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341' },
+        {},
       );
 
-      expect(dispatchService.processQuoteOrDecline).toHaveBeenCalledWith(offerA, 2500000);
+      expect(dispatchService.processQuoteOrDecline).toHaveBeenCalledWith(
+        offerA,
+        2500000,
+      );
     });
 
     it('does not mistake a six-letter command for a job reference', async () => {
       prisma.dispatchOffer.findMany.mockResolvedValue([offerB, offerA]);
 
       const result = await quoteService.handleOperatorMessage(
-        '+2341', 'user-1', 'onsite', 'onsite',
+        '+2341',
+        'user-1',
+        'onsite',
+        'onsite',
         { state: WhatsAppFlowState.IDLE } as any,
         { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341' },
+        {},
       );
 
       // No open offer ends in "ONSITE", so it falls through to the ARRIVED
@@ -206,15 +302,28 @@ describe('WhatsAppOperatorFlowService', () => {
     it('matches the correct offer when a job ref is given', async () => {
       prisma.dispatchOffer.findMany.mockResolvedValue([offerB, offerA]);
 
-      await (quoteService as any).handleOperatorQuoteOrDecline('+2341', 'user-1', 2500000, 'AAAAAA');
+      await (quoteService as any).handleOperatorQuoteOrDecline(
+        '+2341',
+        'user-1',
+        2500000,
+        'AAAAAA',
+      );
 
-      expect(dispatchService.processQuoteOrDecline).toHaveBeenCalledWith(offerA, 2500000);
+      expect(dispatchService.processQuoteOrDecline).toHaveBeenCalledWith(
+        offerA,
+        2500000,
+      );
     });
 
     it('rejects a job ref that matches none of the pending offers', async () => {
       prisma.dispatchOffer.findMany.mockResolvedValue([offerA]);
 
-      const result = await (quoteService as any).handleOperatorQuoteOrDecline('+2341', 'user-1', 2500000, 'ZZZZZZ');
+      const result = await (quoteService as any).handleOperatorQuoteOrDecline(
+        '+2341',
+        'user-1',
+        2500000,
+        'ZZZZZZ',
+      );
 
       expect(dispatchService.processQuoteOrDecline).not.toHaveBeenCalled();
       expect(result).toContain("doesn't match");
@@ -243,23 +352,40 @@ describe('WhatsAppOperatorFlowService', () => {
         ],
       }).compile();
 
-      service = module.get<WhatsAppOperatorFlowService>(WhatsAppOperatorFlowService);
+      service = module.get<WhatsAppOperatorFlowService>(
+        WhatsAppOperatorFlowService,
+      );
     });
 
-    it('captures the operator\'s raw statement, reverts session state, and acknowledges', async () => {
-      const session = { state: WhatsAppFlowState.AWAITING_DISPUTE_RESPONSE, rescueRequestId: 'req-1' } as any;
+    it("captures the operator's raw statement, reverts session state, and acknowledges", async () => {
+      const session = {
+        state: WhatsAppFlowState.AWAITING_DISPUTE_RESPONSE,
+        rescueRequestId: 'req-1',
+      } as any;
 
       await service.handleOperatorMessage(
-        '+2348011112222', 'op-user-1', 'the customer wasnt there when i arrived',
-        'The customer wasn\'t there when I arrived.', session,
-        { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2348011112222' },
+        '+2348011112222',
+        'op-user-1',
+        'the customer wasnt there when i arrived',
+        "The customer wasn't there when I arrived.",
+        session,
+        {
+          id: 'op-1',
+          businessName: 'Swift Towing',
+          phoneNumber: '+2348011112222',
+        },
+        {},
       );
 
       expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
         where: { id: 'req-1' },
-        data: { operatorDisputeStatement: 'The customer wasn\'t there when I arrived.' },
+        data: {
+          operatorDisputeStatement: "The customer wasn't there when I arrived.",
+        },
       });
-      expect(sessionStore.update).toHaveBeenCalledWith('op-user-1', { state: WhatsAppFlowState.OPERATOR_AT_LOCATION });
+      expect(sessionStore.update).toHaveBeenCalledWith('op-user-1', {
+        state: WhatsAppFlowState.OPERATOR_AT_LOCATION,
+      });
     });
   });
 
@@ -290,18 +416,35 @@ describe('WhatsAppOperatorFlowService', () => {
         ],
       }).compile();
 
-      service = module.get<WhatsAppOperatorFlowService>(WhatsAppOperatorFlowService);
+      service = module.get<WhatsAppOperatorFlowService>(
+        WhatsAppOperatorFlowService,
+      );
     });
 
     it('relays a plain message to the customer while relayTarget is set', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', customerId: 'cust-1', customer: { phoneNumber: customerPhone },
+        id: 'req-1',
+        customerId: 'cust-1',
+        customer: { phoneNumber: customerPhone },
       });
-      const session = { state: WhatsAppFlowState.OPERATOR_AT_LOCATION, rescueRequestId: 'req-1', relayTarget: 'CUSTOMER' } as any;
+      const session = {
+        state: WhatsAppFlowState.OPERATOR_AT_LOCATION,
+        rescueRequestId: 'req-1',
+        relayTarget: 'CUSTOMER',
+      } as any;
 
       await service.handleOperatorMessage(
-        operatorPhone, 'op-user-1', 'on my way', 'On my way, 5 minutes.', session,
-        { id: 'op-1', businessName: 'Swift Towing', phoneNumber: operatorPhone },
+        operatorPhone,
+        'op-user-1',
+        'on my way',
+        'On my way, 5 minutes.',
+        session,
+        {
+          id: 'op-1',
+          businessName: 'Swift Towing',
+          phoneNumber: operatorPhone,
+        },
+        {},
       );
 
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
@@ -312,36 +455,448 @@ describe('WhatsAppOperatorFlowService', () => {
 
     it('END CHAT clears relayTarget on both sides and notifies both', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', customerId: 'cust-1', customer: { phoneNumber: customerPhone },
+        id: 'req-1',
+        customerId: 'cust-1',
+        customer: { phoneNumber: customerPhone },
       });
-      const session = { state: WhatsAppFlowState.OPERATOR_AT_LOCATION, rescueRequestId: 'req-1', relayTarget: 'CUSTOMER' } as any;
+      const session = {
+        state: WhatsAppFlowState.OPERATOR_AT_LOCATION,
+        rescueRequestId: 'req-1',
+        relayTarget: 'CUSTOMER',
+      } as any;
 
       await service.handleOperatorMessage(
-        operatorPhone, 'op-user-1', 'end chat', 'end chat', session,
-        { id: 'op-1', businessName: 'Swift Towing', phoneNumber: operatorPhone },
+        operatorPhone,
+        'op-user-1',
+        'end chat',
+        'end chat',
+        session,
+        {
+          id: 'op-1',
+          businessName: 'Swift Towing',
+          phoneNumber: operatorPhone,
+        },
+        {},
       );
 
-      expect(sessionStore.update).toHaveBeenCalledWith('op-user-1', { relayTarget: null });
-      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', { relayTarget: null });
-      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(expect.stringContaining(operatorPhone), 'Chat ended.');
-      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(expect.stringContaining(customerPhone), 'Chat ended.');
+      expect(sessionStore.update).toHaveBeenCalledWith('op-user-1', {
+        relayTarget: null,
+      });
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
+        relayTarget: null,
+      });
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining(operatorPhone),
+        'Chat ended.',
+      );
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining(customerPhone),
+        'Chat ended.',
+      );
     });
 
     it('does not treat a numeric quote-shaped reply as a command while relaying', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', customerId: 'cust-1', customer: { phoneNumber: customerPhone },
+        id: 'req-1',
+        customerId: 'cust-1',
+        customer: { phoneNumber: customerPhone },
       });
-      const session = { state: WhatsAppFlowState.OPERATOR_AT_LOCATION, rescueRequestId: 'req-1', relayTarget: 'CUSTOMER' } as any;
+      const session = {
+        state: WhatsAppFlowState.OPERATOR_AT_LOCATION,
+        rescueRequestId: 'req-1',
+        relayTarget: 'CUSTOMER',
+      } as any;
 
       await service.handleOperatorMessage(
-        operatorPhone, 'op-user-1', '50000', '50000', session,
-        { id: 'op-1', businessName: 'Swift Towing', phoneNumber: operatorPhone },
+        operatorPhone,
+        'op-user-1',
+        '50000',
+        '50000',
+        session,
+        {
+          id: 'op-1',
+          businessName: 'Swift Towing',
+          phoneNumber: operatorPhone,
+        },
+        {},
       );
 
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
         expect.stringContaining(customerPhone),
         'Driver: 50000',
       );
+    });
+  });
+
+  describe('handleOperatorMessage — completion evidence', () => {
+    let service: WhatsAppOperatorFlowService;
+    let prisma: {
+      operator: { findUnique: jest.Mock };
+      rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
+      requestMedia: { count: jest.Mock };
+      whatsAppSession: { updateMany: jest.Mock };
+      $transaction: jest.Mock;
+    };
+    let sessionStore: { update: jest.Mock; clear: jest.Mock };
+    let customerFlowService: { captureMediaAttachment: jest.Mock };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = {
+        operator: { findUnique: jest.fn() },
+        rescueRequest: {
+          findUnique: jest.fn().mockResolvedValue({
+            id: 'req-1',
+            status: 'OPERATOR_ASSIGNED',
+            customer: { phoneNumber: '+2348010000000' },
+          }),
+          update: jest.fn().mockResolvedValue({}),
+        },
+        requestMedia: { count: jest.fn() },
+        whatsAppSession: { updateMany: jest.fn().mockResolvedValue({}) },
+        // handleOperatorJobDone runs its writes in a transaction — the tx
+        // client here is just this same mock object, so tx.rescueRequest
+        // .update resolves to the already-mocked prisma.rescueRequest.update.
+        $transaction: jest.fn((cb: (tx: unknown) => unknown) => cb(prisma)),
+      };
+      sessionStore = {
+        update: jest.fn().mockResolvedValue(undefined),
+        clear: jest.fn().mockResolvedValue(undefined),
+      };
+      customerFlowService = {
+        captureMediaAttachment: jest.fn().mockResolvedValue(true),
+      };
+      twilioService = {
+        sendWhatsAppMessage: jest.fn().mockResolvedValue(undefined),
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppOperatorFlowService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: DispatchService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          {
+            provide: WhatsAppCustomerFlowService,
+            useValue: customerFlowService,
+          },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: PlatformConfigService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppOperatorFlowService>(
+        WhatsAppOperatorFlowService,
+      );
+    });
+
+    it('DONE transitions to awaiting-media instead of completing the job', async () => {
+      const session = {
+        state: WhatsAppFlowState.OPERATOR_AT_LOCATION,
+        rescueRequestId: 'req-1',
+      } as unknown as WhatsAppSession;
+      const operator = {
+        id: 'op-1',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2341111111111',
+      };
+
+      await service.handleOperatorMessage(
+        '+2341111111111',
+        'op-user-1',
+        'done',
+        'done',
+        session,
+        operator,
+        {},
+      );
+
+      expect(sessionStore.update).toHaveBeenCalledWith('op-user-1', {
+        state: WhatsAppFlowState.OPERATOR_AWAITING_COMPLETION_MEDIA,
+      });
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects "2" (continue) with zero visual evidence saved', async () => {
+      prisma.requestMedia.count.mockResolvedValue(0);
+      const session = {
+        state: WhatsAppFlowState.OPERATOR_AWAITING_COMPLETION_MEDIA,
+        rescueRequestId: 'req-1',
+      } as unknown as WhatsAppSession;
+      const operator = {
+        id: 'op-1',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2341111111111',
+      };
+
+      const result = await service.handleOperatorMessage(
+        '+2341111111111',
+        'op-user-1',
+        '2',
+        '2',
+        session,
+        operator,
+        {},
+      );
+
+      expect(result).toContain('at least one');
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+    });
+
+    it('a voice-note-only submission does not satisfy the gate', async () => {
+      prisma.requestMedia.count.mockResolvedValue(0);
+      const session = {
+        state: WhatsAppFlowState.OPERATOR_AWAITING_COMPLETION_MEDIA,
+        rescueRequestId: 'req-1',
+      } as unknown as WhatsAppSession;
+      const operator = {
+        id: 'op-1',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2341111111111',
+      };
+
+      const result = await service.handleOperatorMessage(
+        '+2341111111111',
+        'op-user-1',
+        '2',
+        '2',
+        session,
+        operator,
+        {},
+      );
+
+      expect(result).toContain('at least one');
+    });
+
+    it('saves an attachment and, once visual evidence exists, "2" completes the job', async () => {
+      prisma.requestMedia.count.mockResolvedValue(1);
+      const session = {
+        state: WhatsAppFlowState.OPERATOR_AWAITING_COMPLETION_MEDIA,
+        rescueRequestId: 'req-1',
+      } as unknown as WhatsAppSession;
+      const operator = {
+        id: 'op-1',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2341111111111',
+      };
+
+      await service.handleOperatorMessage(
+        '+2341111111111',
+        'op-user-1',
+        '2',
+        '2',
+        session,
+        operator,
+        {},
+      );
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalled();
+    });
+
+    it('saves media sent while awaiting completion evidence, tagged COMPLETION/OPERATOR', async () => {
+      const session = {
+        state: WhatsAppFlowState.OPERATOR_AWAITING_COMPLETION_MEDIA,
+        rescueRequestId: 'req-1',
+      } as unknown as WhatsAppSession;
+      const operator = {
+        id: 'op-1',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2341111111111',
+      };
+
+      await service.handleOperatorMessage(
+        '+2341111111111',
+        'op-user-1',
+        '',
+        '',
+        session,
+        operator,
+        {
+          NumMedia: '1',
+          MediaUrl0: 'https://twilio.example/media/9',
+          MediaContentType0: 'image/jpeg',
+        },
+      );
+
+      expect(customerFlowService.captureMediaAttachment).toHaveBeenCalledWith(
+        'req-1',
+        'https://twilio.example/media/9',
+        'image/jpeg',
+        MediaContext.COMPLETION,
+        UserRole.OPERATOR,
+      );
+    });
+
+    it('5 voice notes are never saved and never consume the cap — a photo afterward still satisfies the gate', async () => {
+      const session = {
+        state: WhatsAppFlowState.OPERATOR_AWAITING_COMPLETION_MEDIA,
+        rescueRequestId: 'req-1',
+      } as unknown as WhatsAppSession;
+      const operator = {
+        id: 'op-1',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2341111111111',
+      };
+
+      const audioBody: Record<string, string> = { NumMedia: '5' };
+      for (let i = 0; i < 5; i++) {
+        audioBody[`MediaUrl${i}`] = `https://twilio.example/media/audio-${i}`;
+        audioBody[`MediaContentType${i}`] = 'audio/ogg';
+      }
+
+      const audioResult = await service.handleOperatorMessage(
+        '+2341111111111',
+        'op-user-1',
+        '',
+        '',
+        session,
+        operator,
+        audioBody,
+      );
+
+      expect(customerFlowService.captureMediaAttachment).not.toHaveBeenCalled();
+      expect(audioResult).toContain("aren't used as completion evidence");
+
+      await service.handleOperatorMessage(
+        '+2341111111111',
+        'op-user-1',
+        '',
+        '',
+        session,
+        operator,
+        {
+          NumMedia: '1',
+          MediaUrl0: 'https://twilio.example/media/photo',
+          MediaContentType0: 'image/jpeg',
+        },
+      );
+
+      expect(customerFlowService.captureMediaAttachment).toHaveBeenCalledWith(
+        'req-1',
+        'https://twilio.example/media/photo',
+        'image/jpeg',
+        MediaContext.COMPLETION,
+        UserRole.OPERATOR,
+      );
+
+      prisma.requestMedia.count.mockResolvedValue(1);
+      await service.handleOperatorMessage(
+        '+2341111111111',
+        'op-user-1',
+        '2',
+        '2',
+        session,
+        operator,
+        {},
+      );
+      expect(prisma.rescueRequest.update).toHaveBeenCalled();
+    });
+  });
+
+  describe('handleOperatorMessage — dispute evidence', () => {
+    let service: WhatsAppOperatorFlowService;
+    let prisma: {
+      rescueRequest: { update: jest.Mock };
+      requestMedia: { count: jest.Mock };
+    };
+    let sessionStore: { update: jest.Mock };
+    let customerFlowService: { captureMediaAttachment: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: { update: jest.fn().mockResolvedValue({}) },
+        requestMedia: { count: jest.fn().mockResolvedValue(0) },
+      };
+      sessionStore = { update: jest.fn().mockResolvedValue(undefined) };
+      customerFlowService = {
+        captureMediaAttachment: jest.fn().mockResolvedValue(true),
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppOperatorFlowService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          {
+            provide: WhatsAppCustomerFlowService,
+            useValue: customerFlowService,
+          },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: PlatformConfigService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppOperatorFlowService>(
+        WhatsAppOperatorFlowService,
+      );
+    });
+
+    it('text-only statement ends the state exactly as before', async () => {
+      const session = {
+        state: WhatsAppFlowState.AWAITING_DISPUTE_RESPONSE,
+        rescueRequestId: 'req-1',
+      } as unknown as WhatsAppSession;
+      const operator = {
+        id: 'op-1',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2341111111111',
+      };
+
+      await service.handleOperatorMessage(
+        '+2341111111111',
+        'op-user-1',
+        'i arrived on time, customer was not there',
+        'i arrived on time, customer was not there',
+        session,
+        operator,
+        {},
+      );
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: {
+          operatorDisputeStatement: 'i arrived on time, customer was not there',
+        },
+      });
+    });
+
+    it('media with no text saves the attachment and stays in the same state', async () => {
+      const session = {
+        state: WhatsAppFlowState.AWAITING_DISPUTE_RESPONSE,
+        rescueRequestId: 'req-1',
+      } as unknown as WhatsAppSession;
+      const operator = {
+        id: 'op-1',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2341111111111',
+      };
+
+      const result = await service.handleOperatorMessage(
+        '+2341111111111',
+        'op-user-1',
+        '',
+        '',
+        session,
+        operator,
+        {
+          NumMedia: '1',
+          MediaUrl0: 'https://twilio.example/media/9',
+          MediaContentType0: 'image/jpeg',
+        },
+      );
+
+      expect(customerFlowService.captureMediaAttachment).toHaveBeenCalledWith(
+        'req-1',
+        'https://twilio.example/media/9',
+        'image/jpeg',
+        MediaContext.DISPUTE,
+        UserRole.OPERATOR,
+      );
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+      expect(result).toContain('Got it');
     });
   });
 });

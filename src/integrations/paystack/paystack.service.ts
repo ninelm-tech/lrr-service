@@ -1,5 +1,12 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import {
+  PaystackInitializeResult,
+  PaystackListRefundsResult,
+  PaystackRefundResult,
+  PaystackTransferResult,
+  PaystackVerifyTransactionResult,
+} from './dto/paystack-outcome.dto';
 
 interface InitializePaymentParams {
   email: string;
@@ -18,74 +25,175 @@ interface PaystackInitializeResponse {
   };
 }
 
-interface PaystackVerifyResponse {
-  status: boolean;
-  message: string;
-  data: {
-    status: string; // 'success', 'failed', 'abandoned'
-    reference: string;
-    amount: number;
-    paid_at: string;
-    channel: string;
-    customer: {
-      email: string;
-      phone: string;
-    };
-    metadata: Record<string, any>;
-  };
-}
-
 @Injectable()
 export class PaystackService {
   private readonly baseUrl = 'https://api.paystack.co';
   private readonly secretKey: string;
 
   constructor(private readonly configService: ConfigService) {
-    this.secretKey = this.configService.get<string>('PAYSTACK_SECRET_KEY') || '';
+    this.secretKey =
+      this.configService.get<string>('PAYSTACK_SECRET_KEY') || '';
   }
 
   /**
-   * Initialize a payment and get a payment link
+   * Initialize a payment and get a checkout link.
+   *
+   * Classifies its failure rather than returning a bare boolean: a 5xx or a
+   * dropped connection may have created a transaction under this reference
+   * that we never learned about, and treating that as a rejection would let
+   * a retry issue a second one. See PaystackOutcome.
    */
-  async initializePayment(params: InitializePaymentParams): Promise<PaystackInitializeResponse> {
-    const response = await fetch(`${this.baseUrl}/transaction/initialize`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.secretKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        email: params.email,
-        amount: params.amount,
-        reference: params.reference,
-        metadata: params.metadata,
-      }),
-    });
+  async initializePayment(
+    params: InitializePaymentParams,
+  ): Promise<PaystackInitializeResult> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/transaction/initialize`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.secretKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          email: params.email,
+          amount: params.amount,
+          reference: params.reference,
+          metadata: params.metadata,
+        }),
+      });
+    } catch (error) {
+      // Never a rejection: the request may have landed.
+      return { outcome: 'ambiguous', message: (error as Error).message };
+    }
 
-    const data = await response.json();
+    const data = (await response
+      .json()
+      .catch(() => ({}))) as PaystackInitializeResponse & { code?: string };
     console.log('Paystack initialize response:', data);
-    return data as PaystackInitializeResponse;
+
+    if (!data.status || !data.data) {
+      // Only a 4xx with a provider code is definitive. A 5xx tells us nothing
+      // about whether the transaction was created.
+      if (response.status >= 500) {
+        return { outcome: 'ambiguous', message: data.message };
+      }
+      return { outcome: 'rejected', code: data.code, message: data.message };
+    }
+    return { outcome: 'ok', data: data.data };
   }
 
   /**
-   * Verify a payment by reference
+   * Verify a transaction (a deposit or balance collection) by OUR reference.
+   *
+   * `transaction_not_found` is Paystack's answer for a reference it has
+   * never heard of — 400, not the transfer verify endpoint's 404 `not_found`.
+   * Never conflate the two; a caller branching on the wrong code treats a
+   * transaction result as a transfer result and vice versa.
    */
-  async verifyPayment(reference: string): Promise<PaystackVerifyResponse> {
-    const response = await fetch(`${this.baseUrl}/transaction/verify/${reference}`, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${this.secretKey}`,
-        'Content-Type': 'application/json',
-      },
-    });
+  async verifyTransaction(
+    reference: string,
+  ): Promise<PaystackVerifyTransactionResult> {
+    let response: Response;
+    try {
+      response = await fetch(
+        `${this.baseUrl}/transaction/verify/${reference}`,
+        { headers: { Authorization: `Bearer ${this.secretKey}` } },
+      );
+    } catch (error) {
+      return { outcome: 'ambiguous', message: (error as Error).message };
+    }
 
-    const data = await response.json();
-    console.log('Paystack verify response:', data);
-    return data as PaystackVerifyResponse;
+    const data = (await response.json().catch(() => ({}))) as {
+      status?: boolean;
+      message?: string;
+      code?: string;
+      data?: { status: string; id: number; amount: number; fees?: number };
+    };
+    console.log('Paystack verify transaction response:', data);
+
+    if (!data.status || !data.data) {
+      if (response.status >= 500) {
+        return { outcome: 'ambiguous', message: data.message };
+      }
+      return { outcome: 'rejected', code: data.code, message: data.message };
+    }
+    return { outcome: 'ok', data: data.data };
   }
 
   /**
-   * Generate a unique payment reference
+   * Verify a transfer (a payout) by OUR reference — never by
+   * `transfer_code`, which a lost create response leaves us without.
+   *
+   * Returns the same shape as `initiateTransfer`: both eventually feed
+   * PaymentVerifyCheck's shared classification, since a not-found here is
+   * resolved by calling initiateTransfer again with the identical reference.
+   */
+  async verifyTransfer(reference: string): Promise<PaystackTransferResult> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/transfer/verify/${reference}`, {
+        headers: { Authorization: `Bearer ${this.secretKey}` },
+      });
+    } catch (error) {
+      return { outcome: 'ambiguous', message: (error as Error).message };
+    }
+
+    const data = (await response.json().catch(() => ({}))) as {
+      status?: boolean;
+      message?: string;
+      code?: string;
+      data?: { status: string; transfer_code: string };
+    };
+    console.log('Paystack verify transfer response:', data);
+
+    if (!data.status || !data.data) {
+      if (response.status >= 500) {
+        return { outcome: 'ambiguous', message: data.message };
+      }
+      return { outcome: 'rejected', code: data.code, message: data.message };
+    }
+    return { outcome: 'ok', data: data.data };
+  }
+
+  /**
+   * List refunds against Paystack's NUMERIC transaction id — never our
+   * reference, which returns 200 with an empty list and looks exactly like
+   * "no refund exists". See *Refund recovery*.
+   */
+  async listRefunds(transactionId: string): Promise<PaystackListRefundsResult> {
+    let response: Response;
+    try {
+      response = await fetch(
+        `${this.baseUrl}/refund?transaction=${transactionId}`,
+        { headers: { Authorization: `Bearer ${this.secretKey}` } },
+      );
+    } catch (error) {
+      return { outcome: 'ambiguous', message: (error as Error).message };
+    }
+
+    const data = (await response.json().catch(() => ({}))) as {
+      status?: boolean;
+      message?: string;
+      data?: Array<{ id: number; status: string; merchant_note?: string }>;
+    };
+    console.log('Paystack list refunds response:', data);
+
+    // No `rejected` case: the endpoint answers 200 even for a transaction id
+    // with zero refunds. Only a genuine failure to read is ambiguous.
+    if (!data.status) {
+      return { outcome: 'ambiguous', message: data.message };
+    }
+    return { outcome: 'ok', data: data.data ?? [] };
+  }
+
+  /**
+   * Generate a unique payment reference.
+   *
+   * @deprecated Nothing uses this any more, and new money-moving code must
+   * not. A reference generated here is tied to no Payment row, so neither a
+   * webhook nor verification can find what it belongs to — that disconnect
+   * is what the payment model replaced. Use
+   * `PaymentLedgerService.referenceFor(payment)`. Removed in Task 11.
    */
   generateReference(prefix: string = 'LRR'): string {
     return `${prefix}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
@@ -107,10 +215,13 @@ export class PaystackService {
     const fetchRes = await fetch(`${this.baseUrl}/customer/${params.email}`, {
       headers: { Authorization: `Bearer ${this.secretKey}` },
     });
-    const fetchData = await fetchRes.json() as any;
+    const fetchData = await fetchRes.json();
 
     if (fetchData.status && fetchData.data?.customer_code) {
-      return { customer_code: fetchData.data.customer_code, id: fetchData.data.id };
+      return {
+        customer_code: fetchData.data.customer_code,
+        id: fetchData.data.id,
+      };
     }
 
     // Create new customer
@@ -122,9 +233,12 @@ export class PaystackService {
       },
       body: JSON.stringify(params),
     });
-    const createData = await createRes.json() as any;
+    const createData = await createRes.json();
     console.log('Paystack create customer:', createData);
-    return { customer_code: createData.data.customer_code, id: createData.data.id };
+    return {
+      customer_code: createData.data.customer_code,
+      id: createData.data.id,
+    };
   }
 
   // ── Paystack Plans ───────────────────────────────────────────────────────
@@ -135,7 +249,7 @@ export class PaystackService {
    */
   async createPlan(params: {
     name: string;
-    amount: number;       // in kobo
+    amount: number; // in kobo
     interval: 'monthly' | 'annually';
     description?: string;
   }): Promise<{ plan_code: string; id: number }> {
@@ -147,7 +261,7 @@ export class PaystackService {
       },
       body: JSON.stringify(params),
     });
-    const data = await res.json() as any;
+    const data = await res.json();
     console.log('Paystack create plan:', data);
     return { plan_code: data.data.plan_code, id: data.data.id };
   }
@@ -156,12 +270,15 @@ export class PaystackService {
    * Update an existing Paystack plan (e.g. price change).
    * Note: only affects NEW subscriptions — existing subscribers keep their old amount.
    */
-  async updatePlan(planCode: string, params: {
-    name?: string;
-    amount?: number;      // in kobo
-    interval?: 'monthly' | 'annually';
-    description?: string;
-  }): Promise<boolean> {
+  async updatePlan(
+    planCode: string,
+    params: {
+      name?: string;
+      amount?: number; // in kobo
+      interval?: 'monthly' | 'annually';
+      description?: string;
+    },
+  ): Promise<boolean> {
     const res = await fetch(`${this.baseUrl}/plan/${planCode}`, {
       method: 'PUT',
       headers: {
@@ -170,7 +287,7 @@ export class PaystackService {
       },
       body: JSON.stringify(params),
     });
-    const data = await res.json() as any;
+    const data = await res.json();
     console.log('Paystack update plan:', planCode, data?.status, data?.message);
     return Boolean(data?.status);
   }
@@ -178,11 +295,19 @@ export class PaystackService {
   /**
    * List plans — used to find existing plans by name at startup.
    */
-  async listPlans(): Promise<Array<{ id: number; plan_code: string; name: string; amount: number; interval: string }>> {
+  async listPlans(): Promise<
+    Array<{
+      id: number;
+      plan_code: string;
+      name: string;
+      amount: number;
+      interval: string;
+    }>
+  > {
     const res = await fetch(`${this.baseUrl}/plan?perPage=50`, {
       headers: { Authorization: `Bearer ${this.secretKey}` },
     });
-    const data = await res.json() as any;
+    const data = await res.json();
     return data.data ?? [];
   }
 
@@ -195,9 +320,9 @@ export class PaystackService {
   async initializeSubscriptionCheckout(params: {
     email: string;
     amount: number;
-    plan: string;            // plan_code
+    plan: string; // plan_code
     reference: string;
-    callback_url?: string;   // where Paystack redirects after payment
+    callback_url?: string; // where Paystack redirects after payment
     metadata?: Record<string, any>;
   }): Promise<PaystackInitializeResponse> {
     const res = await fetch(`${this.baseUrl}/transaction/initialize`, {
@@ -207,15 +332,15 @@ export class PaystackService {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        email:        params.email,
-        amount:       params.amount,
-        plan:         params.plan,
-        reference:    params.reference,
+        email: params.email,
+        amount: params.amount,
+        plan: params.plan,
+        reference: params.reference,
         callback_url: params.callback_url,
-        metadata:     params.metadata,
+        metadata: params.metadata,
       }),
     });
-    const data = await res.json() as any;
+    const data = await res.json();
     console.log('Paystack subscription checkout init:', data);
     return data as PaystackInitializeResponse;
   }
@@ -224,8 +349,8 @@ export class PaystackService {
    * Cancel a Paystack subscription.
    */
   async cancelSubscription(params: {
-    code: string;            // subscription_code
-    token: string;           // email_token from Paystack subscription object
+    code: string; // subscription_code
+    token: string; // email_token from Paystack subscription object
   }): Promise<{ status: boolean; message: string }> {
     const res = await fetch(`${this.baseUrl}/subscription/disable`, {
       method: 'POST',
@@ -235,7 +360,7 @@ export class PaystackService {
       },
       body: JSON.stringify(params),
     });
-    const data = await res.json() as any;
+    const data = await res.json();
     console.log('Paystack cancel subscription:', data);
     return data;
   }
@@ -244,10 +369,13 @@ export class PaystackService {
    * Fetch a Paystack subscription by code.
    */
   async fetchSubscription(subscriptionCode: string): Promise<any> {
-    const res = await fetch(`${this.baseUrl}/subscription/${subscriptionCode}`, {
-      headers: { Authorization: `Bearer ${this.secretKey}` },
-    });
-    return (await res.json() as any).data;
+    const res = await fetch(
+      `${this.baseUrl}/subscription/${subscriptionCode}`,
+      {
+        headers: { Authorization: `Bearer ${this.secretKey}` },
+      },
+    );
+    return (await res.json()).data;
   }
 
   private banksCache: Array<{ name: string; code: string }> | null = null;
@@ -255,15 +383,20 @@ export class PaystackService {
   // ── Transfers / Payouts ──────────────────────────────────────────────────
 
   /** Verify a bank account belongs to a real, named holder before saving it. */
-  async resolveAccountNumber(accountNumber: string, bankCode: string): Promise<{ accountName: string }> {
+  async resolveAccountNumber(
+    accountNumber: string,
+    bankCode: string,
+  ): Promise<{ accountName: string }> {
     const res = await fetch(
       `${this.baseUrl}/bank/resolve?account_number=${accountNumber}&bank_code=${bankCode}`,
       { headers: { Authorization: `Bearer ${this.secretKey}` } },
     );
-    const data = await res.json() as any;
+    const data = await res.json();
     console.log('Paystack resolve account:', data);
     if (!data.status || !data.data) {
-      throw new BadRequestException(data.message || 'Could not verify that account number');
+      throw new BadRequestException(
+        data.message || 'Could not verify that account number',
+      );
     }
     return { accountName: data.data.account_name };
   }
@@ -274,8 +407,11 @@ export class PaystackService {
     const res = await fetch(`${this.baseUrl}/bank?country=nigeria`, {
       headers: { Authorization: `Bearer ${this.secretKey}` },
     });
-    const data = await res.json() as any;
-    this.banksCache = (data.data ?? []).map((b: any) => ({ name: b.name, code: b.code }));
+    const data = await res.json();
+    this.banksCache = (data.data ?? []).map((b: any) => ({
+      name: b.name,
+      code: b.code,
+    }));
     return this.banksCache!;
   }
 
@@ -300,10 +436,12 @@ export class PaystackService {
         currency: 'NGN',
       }),
     });
-    const data = await res.json() as any;
+    const data = await res.json();
     console.log('Paystack create transfer recipient:', data);
     if (!data.status || !data.data) {
-      throw new Error(data.message || 'Paystack transfer recipient creation failed');
+      throw new Error(
+        data.message || 'Paystack transfer recipient creation failed',
+      );
     }
     return { recipientCode: data.data.recipient_code };
   }
@@ -313,7 +451,7 @@ export class PaystackService {
     const res = await fetch(`${this.baseUrl}/balance`, {
       headers: { Authorization: `Bearer ${this.secretKey}` },
     });
-    const data = await res.json() as any;
+    const data = await res.json();
     const ngn = (data.data ?? []).find((b: any) => b.currency === 'NGN');
     return ngn?.balance ?? 0;
   }
@@ -324,27 +462,50 @@ export class PaystackService {
     amount: number;
     reference: string;
     reason: string;
-  }): Promise<{ transferCode: string; status: string }> {
-    const res = await fetch(`${this.baseUrl}/transfer`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.secretKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        source: 'balance',
-        amount: params.amount,
-        recipient: params.recipientCode,
-        reference: params.reference,
-        reason: params.reason,
-      }),
-    });
-    const data = await res.json() as any;
-    console.log('Paystack initiate transfer:', data);
-    if (!data.status || !data.data) {
-      throw new Error(data.message || 'Paystack transfer initiation failed');
+  }): Promise<PaystackTransferResult> {
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/transfer`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.secretKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          source: 'balance',
+          amount: params.amount,
+          recipient: params.recipientCode,
+          reference: params.reference,
+          reason: params.reason,
+        }),
+      });
+    } catch (error) {
+      // The instruction may have landed. Ambiguous, never a rejection —
+      // throwing here is what the old shape did, and a caught throw that
+      // reads as "failed" is how a transfer gets sent twice.
+      return { outcome: 'ambiguous', message: (error as Error).message };
     }
-    return { transferCode: data.data.transfer_code, status: data.data.status };
+
+    const data = (await res.json().catch(() => ({}))) as {
+      status?: boolean;
+      message?: string;
+      code?: string;
+      data?: { status: string; transfer_code: string };
+    };
+    console.log('Paystack initiate transfer:', data);
+
+    if (!data.status || !data.data) {
+      // A 5xx tells us nothing about whether the transfer landed; only a 4xx
+      // with a provider code is definitive. Getting this wrong is a
+      // double-pay, because FAILED makes a fresh reference legal.
+      if (res.status >= 500) {
+        return { outcome: 'ambiguous', message: data.message };
+      }
+      // Branch on `code` — Paystack's machine-readable identifier. `message`
+      // is prose and not a contract.
+      return { outcome: 'rejected', code: data.code, message: data.message };
+    }
+    return { outcome: 'ok', data: data.data };
   }
 
   // ── Paystack Refunds ─────────────────────────────────────────────────────
@@ -355,19 +516,51 @@ export class PaystackService {
    * reference (our depositReference) — not a generic "reference". This only
    * INITIATES the refund; Paystack settles it asynchronously and confirms via
    * the refund.processed/refund.failed webhook (see PaymentService).
+   *
+   * `merchantNote` carries the bare Payment.id. It is the sole recovery
+   * handle: refunds accept no reference of ours, so if this response is lost
+   * the only way to find what landed is to list refunds for the transaction
+   * and match on this note. See *Refund recovery* in the design doc.
    */
-  async refundTransaction(transaction: string, amount: number): Promise<{ id: number; status: string }> {
-    const response = await fetch(`${this.baseUrl}/refund`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.secretKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ transaction, amount }),
-    });
+  async refundTransaction(params: {
+    transaction: string;
+    amount: number;
+    merchantNote: string;
+  }): Promise<PaystackRefundResult> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/refund`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.secretKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          transaction: params.transaction,
+          amount: params.amount,
+          merchant_note: params.merchantNote,
+        }),
+      });
+    } catch (error) {
+      // The refund may have been created. Never a rejection — a retry here
+      // would refund the customer twice.
+      return { outcome: 'ambiguous', message: (error as Error).message };
+    }
 
-    const data = await response.json();
+    const data = (await response.json().catch(() => ({}))) as {
+      status?: boolean;
+      message?: string;
+      code?: string;
+      data?: { id: number; status: string };
+    };
     console.log('Paystack refund response:', data);
-    return data.data as { id: number; status: string };
+
+    if (!data.status || !data.data) {
+      if (response.status >= 500) {
+        return { outcome: 'ambiguous', message: data.message };
+      }
+      return { outcome: 'rejected', code: data.code, message: data.message };
+    }
+    return { outcome: 'ok', data: data.data };
   }
 }

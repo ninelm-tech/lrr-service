@@ -19,8 +19,20 @@ describe('estimateEtaMinutes', () => {
 describe('rankQuotes', () => {
   it('ranks a cheaper-but-slower quote above a pricier-but-faster one when price dominates the weighting', () => {
     const quotes = [
-      { offerId: 'a', operatorId: 'op-a', businessName: 'Swift Towing', quotedPrice: 30000, etaMinutes: 20 },
-      { offerId: 'b', operatorId: 'op-b', businessName: 'Lagos Rescue Co', quotedPrice: 20000, etaMinutes: 22 },
+      {
+        offerId: 'a',
+        operatorId: 'op-a',
+        businessName: 'Swift Towing',
+        quotedPrice: 30000,
+        etaMinutes: 20,
+      },
+      {
+        offerId: 'b',
+        operatorId: 'op-b',
+        businessName: 'Lagos Rescue Co',
+        quotedPrice: 20000,
+        etaMinutes: 22,
+      },
     ];
 
     const ranked = rankQuotes(quotes);
@@ -33,8 +45,20 @@ describe('rankQuotes', () => {
 
   it('ranks a much-faster quote above a slightly-cheaper one when ETA gap is large', () => {
     const quotes = [
-      { offerId: 'a', operatorId: 'op-a', businessName: 'QuickHaul', quotedPrice: 26000, etaMinutes: 10 },
-      { offerId: 'b', operatorId: 'op-b', businessName: 'Lagos Rescue Co', quotedPrice: 25000, etaMinutes: 30 },
+      {
+        offerId: 'a',
+        operatorId: 'op-a',
+        businessName: 'QuickHaul',
+        quotedPrice: 26000,
+        etaMinutes: 10,
+      },
+      {
+        offerId: 'b',
+        operatorId: 'op-b',
+        businessName: 'Lagos Rescue Co',
+        quotedPrice: 25000,
+        etaMinutes: 30,
+      },
     ];
 
     const ranked = rankQuotes(quotes);
@@ -46,7 +70,13 @@ describe('rankQuotes', () => {
 
   it('handles a single quote without dividing by zero', () => {
     const quotes = [
-      { offerId: 'a', operatorId: 'op-a', businessName: 'Solo Towing', quotedPrice: 20000, etaMinutes: 15 },
+      {
+        offerId: 'a',
+        operatorId: 'op-a',
+        businessName: 'Solo Towing',
+        quotedPrice: 20000,
+        etaMinutes: 15,
+      },
     ];
 
     const ranked = rankQuotes(quotes);

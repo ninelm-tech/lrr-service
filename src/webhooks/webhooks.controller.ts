@@ -1,4 +1,12 @@
-import { Body, Controller, Post, Header, Headers, HttpCode, Req } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Post,
+  Header,
+  Headers,
+  HttpCode,
+  Req,
+} from '@nestjs/common';
 import type { RawBodyRequest } from '@nestjs/common';
 import type { Request } from 'express';
 import * as Sentry from '@sentry/node';
@@ -36,9 +44,15 @@ export class WebhooksController {
     // the parsed body (JSON.stringify(body)) does not reliably reproduce
     // Paystack's original payload, so that comparison fails signatures that
     // are actually valid.
-    if (!req.rawBody || !this.paymentService.verifyWebhookSignature(req.rawBody, signature)) {
+    if (
+      !req.rawBody ||
+      !this.paymentService.verifyWebhookSignature(req.rawBody, signature)
+    ) {
       console.error('❌ Invalid Paystack webhook signature');
-      Sentry.captureMessage('Invalid Paystack webhook signature received', 'error');
+      Sentry.captureMessage(
+        'Invalid Paystack webhook signature received',
+        'error',
+      );
       return { status: 'error', message: 'Invalid signature' };
     }
 

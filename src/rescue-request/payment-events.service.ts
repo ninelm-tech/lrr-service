@@ -1,4 +1,9 @@
-import { BadRequestException, Injectable, forwardRef, Inject } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  forwardRef,
+  Inject,
+} from '@nestjs/common';
 import * as Sentry from '@sentry/node';
 import { logger } from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
@@ -7,14 +12,18 @@ import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PayoutService } from '../payout/payout.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
-import { RescueRequestStatus, VehicleType } from '@prisma/client';
+import { Payment, Prisma, RescueRequestStatus } from '@prisma/client';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { formatVehicleType } from './domain/vehicle-truck-mapping';
 import { formatJobRef } from './domain/rescue-request-formatting';
+import { hasSucceededPayment } from './domain/derive-payment-state';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
+import { PaymentLedgerService } from '../payment/payment-ledger.service';
+import { PaystackCustomerService } from '../payment/paystack-customer.service';
+import { BalancePaymentTarget } from './dto/balance-payment-target.dto';
 import { DispatchService } from './dispatch.service';
-// scheduleRatingTimeout closes a real two-way dependency with this service
-// (this needs scheduleRatingTimeout; WhatsAppCustomerFlowService needs
+// A real two-way dependency with this service
+// (WhatsAppCustomerFlowService needs
 // markJobCompleted for its CONFIRM branch) — forwardRef required on both sides.
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 
@@ -30,36 +39,62 @@ export class PaymentEventsService {
     private readonly dispatchService: DispatchService,
     @Inject(forwardRef(() => WhatsAppCustomerFlowService))
     private readonly customerFlowService: WhatsAppCustomerFlowService,
+    private readonly paymentLedger: PaymentLedgerService,
+    private readonly paystackCustomerService: PaystackCustomerService,
   ) {}
 
-  async handleDepositPaymentConfirmed(reference: string) {
-    console.log('🔍 Deposit confirmed, reference:', reference);
-
-    const rescueRequest = await this.prisma.rescueRequest.findFirst({
-      where:   { depositReference: reference },
+  /**
+   * Runs the business side effects of a settled DEPOSIT payment — assigning
+   * the operator, notifying both parties, starting dispatch if none was
+   * pre-assigned.
+   *
+   * Callable from two places, deliberately: the webhook (the fast path) and
+   * PaymentVerifyCheck's own success claim (the backstop, when a webhook is
+   * lost). Both call this ONLY after THEIR OWN claim on the Payment row's
+   * terminal state actually won — that CAS is what used to be
+   * depositPaid-based idempotency (a webhook redelivery, or a race between
+   * the two callers, now finds nothing left to claim and never reaches
+   * here), so this method itself needs no separate claim of its own.
+   */
+  async confirmDeposit(payment: Payment): Promise<void> {
+    const rescueRequest = await this.prisma.rescueRequest.findUniqueOrThrow({
+      where: { id: payment.rescueRequestId },
       include: { customer: true, assignedOperator: true },
     });
-    if (!rescueRequest) {
-      console.error('❌ No rescue request for deposit reference:', reference);
-      Sentry.captureMessage(`Deposit webhook: no request found for reference ${reference}`, 'error');
+
+    if (rescueRequest.status === RescueRequestStatus.CANCELLED) {
+      // The deposit landed after the request already moved on — see
+      // handleLateDeposit. Refund eligibility is now purely derived (a
+      // succeeded DEPOSIT on a CANCELLED request), so nothing further needs
+      // recording here beyond the notification.
+      await this.handleLateDeposit(rescueRequest);
+      return;
+    }
+    if (rescueRequest.status !== RescueRequestStatus.WAITING_FOR_DEPOSIT) {
+      console.error(
+        `Deposit confirmed for request ${rescueRequest.id} in unexpected status ${rescueRequest.status}`,
+      );
+      Sentry.captureMessage(
+        'Deposit confirmed in unexpected (non-CANCELLED) status',
+        {
+          level: 'error',
+          extra: {
+            rescueRequestId: rescueRequest.id,
+            paymentId: payment.id,
+            status: rescueRequest.status,
+          },
+        },
+      );
       return;
     }
 
-    const customerId    = rescueRequest.customerId;
+    const customerId = rescueRequest.customerId;
     const customerPhone = rescueRequest.customer.phoneNumber;
 
-    // Mark deposit paid and fully confirm the operator assignment — atomic
-    // claim, not an unconditional write. count === 0 means the WHERE didn't
-    // match; see handleUnclaimedDeposit for why that's ambiguous and must
-    // not be treated as "always late payment."
-    const claimed = await this.prisma.rescueRequest.updateMany({
-      where: { id: rescueRequest.id, status: RescueRequestStatus.WAITING_FOR_DEPOSIT },
-      data:  { depositPaid: true, status: RescueRequestStatus.OPERATOR_ASSIGNED },
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequest.id },
+      data: { status: RescueRequestStatus.OPERATOR_ASSIGNED },
     });
-    if (claimed.count === 0) {
-      await this.handleUnclaimedDeposit(rescueRequest.id, reference);
-      return;
-    }
 
     // The offer is only actually awarded now that payment is confirmed —
     // selection alone (Task 8) only reached SELECTED_PENDING_PAYMENT.
@@ -84,24 +119,29 @@ export class PaymentEventsService {
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
         operator
-          ? `✅ *Payment confirmed — operator is on the way!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType as VehicleType) : 'Unknown'}\n\nYou'll be notified when they arrive.`
+          ? `✅ *Payment confirmed — operator is on the way!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType) : 'Unknown'}\n\nYou'll be notified when they arrive.`
           : `✅ Deposit confirmed! Finding the nearest tow operator...`,
       );
     }
 
     if (operator) {
       // Operator: job is now live — send customer location + details
-      const opUser = await this.sharedService.findOrCreateCustomer(operator.phoneNumber);
+      const opUser = await this.sharedService.findOrCreateCustomer(
+        operator.phoneNumber,
+      );
       await this.sessionStore.update(opUser.id, {
-        state:           WhatsAppFlowState.OPERATOR_ON_JOB,
+        state: WhatsAppFlowState.OPERATOR_ON_JOB,
         rescueRequestId: rescueRequest.id,
       });
       const lat = Number(rescueRequest.latitude);
       const lon = Number(rescueRequest.longitude);
-      const locationSection = await this.sharedService.formatLocationSection(lat, lon);
+      const locationSection = await this.sharedService.formatLocationSection(
+        lat,
+        lon,
+      );
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(operator.phoneNumber),
-        `💰 *Payment confirmed — job is live!* — ${formatJobRef(rescueRequest.id)}\n\nCustomer: ${customerPhone}\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType as VehicleType) : 'Unknown'}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
+        `💰 *Payment confirmed — job is live!* — ${formatJobRef(rescueRequest.id)}\n\nCustomer: ${customerPhone}\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType) : 'Unknown'}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
       );
     } else {
       // Edge case: no operator was pre-assigned (e.g. admin manually sent a payment link)
@@ -110,80 +150,46 @@ export class PaymentEventsService {
   }
 
   /**
-   * claimed.count === 0 on the confirmed-payment claim is ambiguous — it means
-   * EITHER a Paystack webhook redelivery of a payment we already successfully
-   * processed, OR a genuinely late payment arriving after the request moved
-   * on. These must not be conflated: see
-   * docs/superpowers/specs/2026-08-25-deposit-window-and-refunds-design.md
-   * Section 2.
+   * The deposit arrived after its request already moved on with nothing
+   * paid — refund eligibility is now purely derived (see
+   * domain/derive-payment-state.ts), so this is only the notification.
    */
-  private async handleUnclaimedDeposit(rescueRequestId: string, reference: string): Promise<void> {
-    const fresh = await this.prisma.rescueRequest.findUniqueOrThrow({
-      where:   { id: rescueRequestId },
-      include: { customer: true },
-    });
-
-    if (fresh.depositPaid) {
-      logger.info('deposit: duplicate confirmation ignored', { rescueRequestId, reference });
-      return;
-    }
-
-    if (fresh.status === RescueRequestStatus.CANCELLED) {
-      await this.handleLateDeposit(fresh, reference);
-      return;
-    }
-
-    console.error(`Deposit confirmed for request ${rescueRequestId} in unexpected status ${fresh.status}`, { reference });
-    Sentry.captureMessage('Deposit confirmed in unexpected (non-CANCELLED) status', {
-      level: 'error',
-      extra: { rescueRequestId, reference, status: fresh.status },
-    });
-  }
-
-  /**
-   * The only place in the codebase that writes RefundStatus.ELIGIBLE — this
-   * is deliberate. It means "a deposit arrived for a request that has already
-   * moved on with nothing paid yet," which is exactly and only what this
-   * feature's refund path is for. Do not write ELIGIBLE anywhere else.
-   */
-  private async handleLateDeposit(rescueRequest: { id: string; customer: { phoneNumber: string | null } }, reference: string): Promise<void> {
-    await this.prisma.rescueRequest.update({
-      where: { id: rescueRequest.id },
-      data:  { depositPaid: true, depositRefundStatus: 'ELIGIBLE' },
-    });
+  private async handleLateDeposit(rescueRequest: {
+    id: string;
+    customer: { phoneNumber: string | null };
+  }): Promise<void> {
     if (rescueRequest.customer.phoneNumber) {
       await this.twilioService.sendWhatsAppMessage(
         rescueRequest.customer.phoneNumber,
         `Your payment for a cancelled request has come through. We're processing a refund — you'll be notified once it's complete.`,
       );
     }
-    logger.info('deposit: late payment on a non-WAITING_FOR_DEPOSIT request', { rescueRequestId: rescueRequest.id, reference });
+    logger.info('deposit: late payment on a non-WAITING_FOR_DEPOSIT request', {
+      rescueRequestId: rescueRequest.id,
+    });
   }
 
-  async handleBalancePaymentConfirmed(reference: string) {
-    console.log('💰 Balance confirmed, reference:', reference);
-
-    const rescueRequest = await this.prisma.rescueRequest.findFirst({
-      where: { balanceReference: reference },
+  /**
+   * Runs the business side effects of a settled BALANCE payment — completing
+   * the job, notifying both parties, prompting ratings, triggering the
+   * payout. Same calling contract as confirmDeposit: only ever called after
+   * the caller's own claim on the Payment row won.
+   */
+  async confirmBalance(payment: Payment): Promise<void> {
+    const rescueRequest = await this.prisma.rescueRequest.findUniqueOrThrow({
+      where: { id: payment.rescueRequestId },
       include: { customer: true, assignedOperator: true },
     });
-    if (!rescueRequest) {
-      console.error('❌ No rescue request for balance reference:', reference);
-      Sentry.captureMessage(`Balance webhook: no request found for reference ${reference}`, 'error');
-      return;
-    }
 
-    // Atomic claim, mirroring handleDepositPaymentConfirmed: Paystack retries
-    // webhooks, and an unconditional update would re-run everything below on
-    // a redelivery — both parties told "payment confirmed" twice, both rating
-    // prompts re-sent, the rating session re-armed under a reply they already
-    // gave, and a duplicate payout insert that only the unique constraint on
-    // Payout.rescueRequestId stops.
-    const claimed = await this.prisma.rescueRequest.updateMany({
-      where: { id: rescueRequest.id, balancePaid: false },
-      data:  { balancePaid: true, status: RescueRequestStatus.COMPLETED },
+    // Unconditional, not a claim: the Payment row's own CAS is what
+    // guarantees exactly one caller reaches here per settlement. Status may
+    // already be COMPLETED (markJobCompleted sets it before payment lands)
+    // or IN_DISPUTE (resolveDispute leaves it there deliberately) — this
+    // write is correct either way.
+    await this.prisma.rescueRequest.update({
+      where: { id: rescueRequest.id },
+      data: { status: RescueRequestStatus.COMPLETED },
     });
-    if (claimed.count === 0) return;
 
     // The job is over — release any chat relay before the rating prompts
     // below land, since an open relay would otherwise swallow the replies
@@ -191,9 +197,11 @@ export class PaymentEventsService {
     await this.sharedService.endRelayForEndedRequest(rescueRequest.id);
 
     // Notify customer — payment confirmed, then prompt to rate the operator
-    const customerId    = rescueRequest.customerId;
+    const customerId = rescueRequest.customerId;
     const customerPhone = rescueRequest.customer.phoneNumber;
-    const balanceNaira  = ((rescueRequest.balanceAmount ?? 0) / 100).toLocaleString();
+    const balanceNaira = (
+      (rescueRequest.balanceAmount ?? 0) / 100
+    ).toLocaleString();
     const operator = rescueRequest.assignedOperator;
     if (customerPhone) {
       await this.twilioService.sendWhatsAppMessage(
@@ -202,7 +210,9 @@ export class PaymentEventsService {
       );
       const operatorName = operator?.businessName ?? 'your operator';
       const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
-      const hasPortalAccount = Boolean(rescueRequest.customer.email && rescueRequest.customer.passwordHash);
+      const hasPortalAccount = Boolean(
+        rescueRequest.customer.email && rescueRequest.customer.passwordHash,
+      );
       const portalLine = hasPortalAccount
         ? `\n\nWant to see your receipt? Log in at ${frontendUrl}/login`
         : `\n\nWant to see your receipt and past requests? Create an account at ${frontendUrl}/register/customer`;
@@ -215,7 +225,6 @@ export class PaymentEventsService {
       state: WhatsAppFlowState.WAITING_FOR_RATING,
       rescueRequestId: rescueRequest.id,
     });
-    this.customerFlowService.scheduleRatingTimeout(customerId, rescueRequest.id);
 
     // Notify operator — release the vehicle, then prompt to rate the motorist
     //
@@ -234,26 +243,39 @@ export class PaymentEventsService {
         toWhatsAppAddress(operator.phoneNumber),
         `How was your experience with this customer? — ${jobRef}\n\nReply with a number from 1 to 5 to rate them.`,
       );
-      const opUser = await this.sharedService.findOrCreateCustomer(operator.phoneNumber);
+      const opUser = await this.sharedService.findOrCreateCustomer(
+        operator.phoneNumber,
+      );
       await this.sessionStore.update(opUser.id, {
         state: WhatsAppFlowState.WAITING_FOR_RATING,
         rescueRequestId: rescueRequest.id,
       });
-      this.customerFlowService.scheduleRatingTimeout(opUser.id, rescueRequest.id);
     }
 
     if (rescueRequest.assignedOperatorId) {
-      const payoutAmount = (rescueRequest.depositAmount ?? 0) + (rescueRequest.balanceAmount ?? 0) - (rescueRequest.serviceFeeAmount ?? 0);
-      await this.payoutService.createAndProcessPayout(rescueRequest.id, rescueRequest.assignedOperatorId, payoutAmount);
+      const payoutAmount =
+        (rescueRequest.depositAmount ?? 0) +
+        (rescueRequest.balanceAmount ?? 0) -
+        (rescueRequest.serviceFeeAmount ?? 0);
+      await this.payoutService.createAndProcessPayout(
+        rescueRequest.id,
+        rescueRequest.assignedOperatorId,
+        payoutAmount,
+      );
     }
 
-    console.log(`✅ Job ${rescueRequest.id} completed — operator and customer notified`);
+    console.log(
+      `✅ Job ${rescueRequest.id} completed — operator and customer notified`,
+    );
   }
 
   async markJobCompleted(rescueRequestId: string) {
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
       where: { id: rescueRequestId },
-      include: { customer: true },
+      include: {
+        customer: true,
+        payments: { select: { type: true, status: true } },
+      },
     });
     if (!rescueRequest) throw new Error('Rescue request not found');
 
@@ -261,39 +283,89 @@ export class PaymentEventsService {
     // permanently the wrong path for it — DisputeService.resolveDispute
     // sends its own (possibly adjusted) settlement payment link directly,
     // and status only becomes COMPLETED once that's actually paid
-    // (handleBalancePaymentConfirmed). Blocking here regardless of
+    // (confirmBalance). Blocking here regardless of
     // disputeResolvedAt stops a customer's CONFIRM (still possible while
     // their session sits in AWAITING_COMPLETION_CONFIRM) from sending a
     // second, wrong-amount payment link or completing the job before
     // payment — both the admin "mark completed" shortcut and a same-message
     // CONFIRM/DISPUTE race were the two ways this used to be bypassed.
     if (rescueRequest.disputed) {
-      throw new BadRequestException('This request has an unresolved dispute — resolve it before marking the job completed.');
+      throw new BadRequestException(
+        'This request has an unresolved dispute — resolve it before marking the job completed.',
+      );
     }
 
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequestId },
-      data:  { status: RescueRequestStatus.COMPLETED },
+      data: { status: RescueRequestStatus.COMPLETED },
     });
 
-    if (!rescueRequest.balancePaid) {
+    if (!hasSucceededPayment(rescueRequest.payments, 'BALANCE')) {
       await this.sendBalancePaymentLink(rescueRequest);
     }
   }
 
-  async sendBalancePaymentLink(rescueRequest: any) {
+  async sendBalancePaymentLink(rescueRequest: BalancePaymentTarget) {
     const customerPhone = rescueRequest.customer.phoneNumber;
     if (!customerPhone) return;
 
     const balanceAmount = rescueRequest.balanceAmount;
     if (!balanceAmount) {
-      console.error('No balanceAmount persisted for rescue request:', rescueRequest.id);
-      Sentry.captureMessage(`sendBalancePaymentLink: missing balanceAmount for ${rescueRequest.id}`, 'error');
+      console.error(
+        'No balanceAmount persisted for rescue request:',
+        rescueRequest.id,
+      );
+      Sentry.captureMessage(
+        `sendBalancePaymentLink: missing balanceAmount for ${rescueRequest.id}`,
+        'error',
+      );
       return;
     }
 
-    const reference = this.paystackService.generateReference('BAL');
-    const email = rescueRequest.customer.email || `${customerPhone.replace(/\D/g, '')}@lrr.ng`;
+    // The same protocol as the deposit paths: commit, claim, call, classify.
+    //
+    // The insert can be refused by the in-flight unique index when a balance
+    // payment already exists for this request — reachable via dispute
+    // resolution, which sends a settlement link for a request that may
+    // already have had one. Resolving that stale attempt is a design question
+    // the payment model does not answer yet (the settled amount differs, so
+    // the old link is wrong, but a SUBMITTED row must never be failed
+    // blindly). Until it does: never throw out of here. Throwing would fail
+    // the caller's dispute resolution AFTER it has already written the
+    // settled amount. Alert instead, so a human issues the link.
+    let payment;
+    try {
+      payment = await this.paymentLedger.create({
+        rescueRequestId: rescueRequest.id,
+        type: 'BALANCE',
+        amount: balanceAmount,
+      });
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        Sentry.captureMessage(
+          'Balance link skipped — a balance payment is already in flight',
+          {
+            level: 'error',
+            extra: { rescueRequestId: rescueRequest.id, balanceAmount },
+          },
+        );
+        return;
+      }
+      throw error;
+    }
+    if (
+      !(await this.paymentLedger.claimForSubmission(payment.id, new Date()))
+    ) {
+      return; // another caller owns this one
+    }
+    const reference = this.paymentLedger.referenceFor(payment);
+    // Never build the identity email inline — see PaystackCustomerService.
+    const { email } = await this.paystackCustomerService.customerFor(
+      rescueRequest.customerId,
+    );
 
     const paymentResponse = await this.paystackService.initializePayment({
       email,
@@ -301,26 +373,39 @@ export class PaymentEventsService {
       reference,
       metadata: {
         rescueRequestId: rescueRequest.id,
-        customerId:      rescueRequest.customerId,
-        phoneNumber:     customerPhone,
+        customerId: rescueRequest.customerId,
+        phoneNumber: customerPhone,
         type: 'balance',
       },
     });
 
-    if (!paymentResponse.status) {
-      console.error('Failed to create balance payment link:', paymentResponse);
+    if (paymentResponse.outcome === 'ambiguous') {
+      // Leaves the row SUBMITTED with checkoutUrl null — recovery's signal
+      // that no link ever reached the customer.
+      console.error('Paystack initialize was inconclusive:', paymentResponse);
+      return;
+    }
+    if (paymentResponse.outcome === 'rejected') {
+      await this.paymentLedger.recordRejection(
+        payment.id,
+        paymentResponse.message ?? 'initialize rejected',
+      );
       return;
     }
 
-    await this.prisma.rescueRequest.update({
-      where: { id: rescueRequest.id },
-      data:  { balanceReference: reference },
+    const checkoutUrl = paymentResponse.data.authorization_url;
+    await this.prisma.payment.update({
+      where: { id: payment.id },
+      data: { checkoutUrl },
     });
+    // No RescueRequest field to persist this reference into — unlike a
+    // deposit, a balance payment has no reminder path that would need to
+    // find the request from it later. The Payment row is the only record.
 
     const balanceNaira = (balanceAmount / 100).toLocaleString();
     await this.twilioService.sendWhatsAppMessage(
       customerPhone,
-      `✅ Your tow is complete!\n\n⚠️ *ACTION NEEDED* — tap the link below to pay the ₦${balanceNaira} balance:\n\n👉 ${paymentResponse.data.authorization_url}\n\nThank you for using Local Roadside Rescue 🚗`,
+      `✅ Your tow is complete!\n\n⚠️ *ACTION NEEDED* — tap the link below to pay the ₦${balanceNaira} balance:\n\n👉 ${checkoutUrl}\n\nThank you for using Local Roadside Rescue 🚗`,
     );
   }
 }

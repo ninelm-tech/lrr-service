@@ -1,9 +1,18 @@
-import { IsArray, IsEmail, IsEnum, IsNotEmpty, IsNumber, IsOptional, IsString } from 'class-validator';
+import {
+  IsArray,
+  IsEmail,
+  IsEnum,
+  IsNotEmpty,
+  IsNumber,
+  IsOptional,
+  IsString,
+} from 'class-validator';
 import { OperatorType, TruckClass } from '@prisma/client';
 
 export class CreateOperatorDto {
   @IsEmail()
-  email: string;
+  @IsOptional()
+  email?: string;
 
   @IsString()
   @IsNotEmpty()
@@ -57,9 +66,9 @@ export class CreateOperatorDto {
   @IsEnum(TruckClass, { each: true })
   truckClasses: TruckClass[];
 
-  // Only required when phoneNumber already belongs to an existing CUSTOMER
-  // account — proves ownership before that account is upgraded to OPERATOR.
+  // Was optional, only meaningful for the upgrade path. Now required for
+  // every signup — see operator.service.ts create().
   @IsString()
-  @IsOptional()
-  phoneVerificationToken?: string;
+  @IsNotEmpty()
+  phoneVerificationToken: string;
 }

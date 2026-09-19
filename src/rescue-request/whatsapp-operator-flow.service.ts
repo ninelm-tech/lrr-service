@@ -1,10 +1,19 @@
 import { Injectable } from '@nestjs/common';
 import { logger } from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
+import { STALLED_CONFIRMATION_MS } from './confirmation.constants';
 import { TwilioService } from '../integrations/twilio/twilio.service';
-import { RescueRequestStatus, RatingDirection, VehicleType } from '@prisma/client';
+import {
+  RescueRequestStatus,
+  RatingDirection,
+  VehicleType,
+  MediaContext,
+  MediaType,
+  UserRole,
+} from '@prisma/client';
 import { formatJobRef } from './domain/rescue-request-formatting';
 import { formatVehicleType } from './domain/vehicle-truck-mapping';
+import { classifyMediaType } from './domain/media-classification';
 import { DispatchService } from './dispatch.service';
 import { PaymentEventsService } from './payment-events.service';
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
@@ -12,6 +21,8 @@ import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
+
+const MAX_MEDIA_ITEMS = 5;
 
 @Injectable()
 export class WhatsAppOperatorFlowService {
@@ -35,6 +46,7 @@ export class WhatsAppOperatorFlowService {
     rawMessage: string,
     session: Awaited<ReturnType<WhatsAppSessionStore['getOrCreate']>>,
     operator: { id: string; businessName: string; phoneNumber: string },
+    body: Record<string, any>,
   ) {
     // Strip thousands separators so "100,000" parses the same as "100000" —
     // no valid operator command otherwise contains a comma.
@@ -69,14 +81,166 @@ export class WhatsAppOperatorFlowService {
     // keyword-shaped reply here must not be mistaken for a price quote or
     // command.
     if (session.state === WhatsAppFlowState.AWAITING_DISPUTE_RESPONSE) {
-      if (session.rescueRequestId) {
+      const rescueRequestId = session.rescueRequestId;
+      const numMedia = Number(body.NumMedia ?? 0);
+
+      if (rescueRequestId && numMedia > 0) {
+        let existingCount = await this.prisma.requestMedia.count({
+          where: {
+            rescueRequestId,
+            context: MediaContext.DISPUTE,
+            uploadedByRole: UserRole.OPERATOR,
+          },
+        });
+        for (let i = 0; i < numMedia; i++) {
+          if (existingCount >= MAX_MEDIA_ITEMS) break;
+          const mediaUrl = body[`MediaUrl${i}`] as string | undefined;
+          const contentType = body[`MediaContentType${i}`] as
+            | string
+            | undefined;
+          if (!mediaUrl || !contentType) continue;
+          const saved = await this.customerFlowService.captureMediaAttachment(
+            rescueRequestId,
+            mediaUrl,
+            contentType,
+            MediaContext.DISPUTE,
+            UserRole.OPERATOR,
+          );
+          if (saved) existingCount++;
+        }
+      }
+
+      if (!rawMessage) {
+        return this.reply(
+          `📸 Got it — send more evidence, or reply with your explanation to finish.`,
+        );
+      }
+
+      if (rescueRequestId) {
         await this.prisma.rescueRequest.update({
-          where: { id: session.rescueRequestId },
+          where: { id: rescueRequestId },
           data: { operatorDisputeStatement: rawMessage },
         });
       }
-      await this.sessionStore.update(userId, { state: WhatsAppFlowState.OPERATOR_AT_LOCATION });
-      return this.reply(`Thanks — we've recorded that. Our team will be in touch.`);
+      await this.sessionStore.update(userId, {
+        state: WhatsAppFlowState.OPERATOR_AT_LOCATION,
+      });
+      return this.reply(
+        `Thanks — we've recorded that. Our team will be in touch.`,
+      );
+    }
+
+    // ── Awaiting completion evidence ────────────────────────────────────
+    // MUST come before the quote-parsing check below — "1"/"2" here are
+    // the add-more/continue menu, not a price quote, and would otherwise
+    // be silently swallowed as a bogus bare-digit quote attempt.
+    if (
+      session.state === WhatsAppFlowState.OPERATOR_AWAITING_COMPLETION_MEDIA
+    ) {
+      const rescueRequestId = session.rescueRequestId;
+      if (!rescueRequestId) {
+        await this.sessionStore.update(userId, {
+          state: WhatsAppFlowState.OPERATOR_ON_JOB,
+        });
+        return this.reply(
+          `Sorry, we lost track of this job. Please send ARRIVED/DONE again.`,
+        );
+      }
+
+      if (message === '1') {
+        return this.reply(`Go ahead — send your photo(s) or video(s).`);
+      }
+
+      if (message === '2') {
+        const visualCount = await this.prisma.requestMedia.count({
+          where: {
+            rescueRequestId,
+            context: MediaContext.COMPLETION,
+            uploadedByRole: UserRole.OPERATOR,
+            mediaType: { in: [MediaType.IMAGE, MediaType.VIDEO] },
+          },
+        });
+        if (visualCount === 0) {
+          return this.reply(
+            `Please send at least one photo or video before continuing.`,
+          );
+        }
+        return this.handleOperatorJobDone(
+          phoneNumber,
+          userId,
+          rescueRequestId,
+          operator,
+        );
+      }
+
+      const numMedia = Number(body.NumMedia ?? 0);
+      if (numMedia === 0) {
+        return this.reply(
+          `Please send at least one photo or video.\n\n1️⃣ Add more\n2️⃣ Continue`,
+        );
+      }
+
+      const existingCount = await this.prisma.requestMedia.count({
+        where: {
+          rescueRequestId,
+          context: MediaContext.COMPLETION,
+          uploadedByRole: UserRole.OPERATOR,
+        },
+      });
+      let savedCount = existingCount;
+      let failedCount = 0;
+      let audioSkipped = 0;
+      let capReached = false;
+
+      for (let i = 0; i < numMedia; i++) {
+        const mediaUrl = body[`MediaUrl${i}`] as string | undefined;
+        const contentType = body[`MediaContentType${i}`] as string | undefined;
+        if (!mediaUrl || !contentType) continue;
+
+        // Audio is never saved for completion evidence — a voice note
+        // would otherwise consume a cap slot without ever satisfying the
+        // visual-evidence gate above, permanently blocking DONE. Checked
+        // before the cap, not after, so it can never take a slot a
+        // genuine photo/video needs.
+        if (classifyMediaType(contentType) === MediaType.AUDIO) {
+          audioSkipped++;
+          continue;
+        }
+
+        if (savedCount >= MAX_MEDIA_ITEMS) {
+          capReached = true;
+          break;
+        }
+
+        const saved = await this.customerFlowService.captureMediaAttachment(
+          rescueRequestId,
+          mediaUrl,
+          contentType,
+          MediaContext.COMPLETION,
+          UserRole.OPERATOR,
+        );
+        if (saved) {
+          savedCount++;
+        } else {
+          failedCount++;
+        }
+      }
+
+      const capNote = capReached
+        ? `\n\n⚠️ You've reached the ${MAX_MEDIA_ITEMS}-item limit — further attachments won't be saved.`
+        : '';
+      const failNote =
+        failedCount > 0
+          ? `\n\n⚠️ ${failedCount} item(s) failed to upload — please resend if important.`
+          : '';
+      const audioNote =
+        audioSkipped > 0
+          ? `\n\n🎤 Voice notes aren't used as completion evidence — please send a photo or video instead.`
+          : '';
+
+      return this.reply(
+        `📸 Received (${savedCount}/${MAX_MEDIA_ITEMS} items saved).${capNote}${failNote}${audioNote}\n\n1️⃣ Add more\n2️⃣ Continue`,
+      );
     }
 
     // ── Waiting for post-job rating (operator rates motorist) ─────────────
@@ -95,7 +259,10 @@ export class WhatsAppOperatorFlowService {
       const openOffers = await this.findOpenOffers(operator.id);
       if (openOffers.length === 0) {
         return this.customerFlowService.handleRatingReply(
-          userId, message, session.rescueRequestId, RatingDirection.OPERATOR_TO_MOTORIST,
+          userId,
+          message,
+          session.rescueRequestId,
+          RatingDirection.OPERATOR_TO_MOTORIST,
         );
       }
     }
@@ -110,11 +277,21 @@ export class WhatsAppOperatorFlowService {
     // reading the screen.
     const refAndDecline = message.match(/^#?([a-z0-9]{6})\s+(no|decline)$/i);
     if (refAndDecline) {
-      return this.handleOperatorQuoteOrDecline(phoneNumber, userId, undefined, refAndDecline[1].toUpperCase());
+      return this.handleOperatorQuoteOrDecline(
+        phoneNumber,
+        userId,
+        undefined,
+        refAndDecline[1].toUpperCase(),
+      );
     }
     const refAndPrice = message.match(/^#?([a-z0-9]{6})\s+(\d+)$/i);
     if (refAndPrice) {
-      return this.handleOperatorQuoteOrDecline(phoneNumber, userId, Number(refAndPrice[2]) * 100, refAndPrice[1].toUpperCase());
+      return this.handleOperatorQuoteOrDecline(
+        phoneNumber,
+        userId,
+        Number(refAndPrice[2]) * 100,
+        refAndPrice[1].toUpperCase(),
+      );
     }
     // A ref on its own — the operator answered "which job?" but left out the
     // price. Handled explicitly because silence is the worst possible reply:
@@ -126,45 +303,95 @@ export class WhatsAppOperatorFlowService {
     // mistaken for job references.
     const bareRef = message.match(/^#?([a-z0-9]{6})$/i);
     if (bareRef) {
-      const handled = await this.handleBareJobRef(phoneNumber, bareRef[1].toUpperCase());
+      const handled = await this.handleBareJobRef(
+        phoneNumber,
+        bareRef[1].toUpperCase(),
+      );
       if (handled) return handled;
     }
     if (message === 'no' || message === 'decline') {
       return this.handleOperatorQuoteOrDecline(phoneNumber, userId, undefined);
     }
     if (/^\d+$/.test(message)) {
-      return this.handleOperatorQuoteOrDecline(phoneNumber, userId, Number(message) * 100);
+      return this.handleOperatorQuoteOrDecline(
+        phoneNumber,
+        userId,
+        Number(message) * 100,
+      );
     }
 
     // ── ARRIVED at customer location ───────────────────────────────────────
-    if (message === 'arrived' || message === 'on site' || message === 'onsite') {
-      if (session.state !== WhatsAppFlowState.OPERATOR_ON_JOB || !session.rescueRequestId) {
+    if (
+      message === 'arrived' ||
+      message === 'on site' ||
+      message === 'onsite'
+    ) {
+      if (
+        session.state !== WhatsAppFlowState.OPERATOR_ON_JOB ||
+        !session.rescueRequestId
+      ) {
         logger.info('whatsapp: ARRIVED rejected — wrong session state', {
-          operatorId: operator.id, sessionState: session.state, rescueRequestId: session.rescueRequestId,
+          operatorId: operator.id,
+          sessionState: session.state,
+          rescueRequestId: session.rescueRequestId,
         });
-        return this.reply(`You don't have an active job. Wait for a dispatch offer.`);
+        return this.reply(
+          `You don't have an active job. Wait for a dispatch offer.`,
+        );
       }
-      logger.info('whatsapp: ARRIVED accepted', { operatorId: operator.id, rescueRequestId: session.rescueRequestId });
-      return this.handleOperatorArrived(phoneNumber, userId, session.rescueRequestId, operator);
+      logger.info('whatsapp: ARRIVED accepted', {
+        operatorId: operator.id,
+        rescueRequestId: session.rescueRequestId,
+      });
+      return this.handleOperatorArrived(
+        phoneNumber,
+        userId,
+        session.rescueRequestId,
+        operator,
+      );
     }
 
     // ── Job DONE — prompt customer to confirm ──────────────────────────────
-    if (message === 'done' || message === 'complete' || message === 'finished') {
-      if (session.state !== WhatsAppFlowState.OPERATOR_AT_LOCATION || !session.rescueRequestId) {
+    if (
+      message === 'done' ||
+      message === 'complete' ||
+      message === 'finished'
+    ) {
+      if (
+        session.state !== WhatsAppFlowState.OPERATOR_AT_LOCATION ||
+        !session.rescueRequestId
+      ) {
         logger.info('whatsapp: DONE rejected — wrong session state', {
-          operatorId: operator.id, sessionState: session.state, rescueRequestId: session.rescueRequestId,
+          operatorId: operator.id,
+          sessionState: session.state,
+          rescueRequestId: session.rescueRequestId,
         });
-        return this.reply(`Please send ARRIVED first when you reach the customer location.`);
+        return this.reply(
+          `Please send ARRIVED first when you reach the customer location.`,
+        );
       }
-      logger.info('whatsapp: DONE accepted', { operatorId: operator.id, rescueRequestId: session.rescueRequestId });
-      return this.handleOperatorJobDone(phoneNumber, userId, session.rescueRequestId, operator);
+      logger.info('whatsapp: DONE accepted — awaiting completion evidence', {
+        operatorId: operator.id,
+        rescueRequestId: session.rescueRequestId,
+      });
+      await this.sessionStore.update(userId, {
+        state: WhatsAppFlowState.OPERATOR_AWAITING_COMPLETION_MEDIA,
+      });
+      return this.reply(
+        `📸 Please send at least one photo or video showing the completed job.`,
+      );
     }
 
     // ── Contextual help ───────────────────────────────────────────────────
     if (session.state === WhatsAppFlowState.OPERATOR_ON_JOB) {
-      logger.info('whatsapp: unrecognized message while ON_JOB — sent ARRIVED reminder', {
-        operatorId: operator.id, message, rescueRequestId: session.rescueRequestId,
-      });
+      logger.info(
+        'whatsapp: unrecognized message while ON_JOB — sent ARRIVED reminder',
+        {
+          operatorId: operator.id,
+          message,
+          rescueRequestId: session.rescueRequestId,
+        },
+      );
       return this.reply(
         `📍 ${formatJobRef(session.rescueRequestId!)} — Send *ARRIVED* when you reach the customer location so we can notify them.`,
       );
@@ -179,7 +406,10 @@ export class WhatsAppOperatorFlowService {
     // got silent empty TwiML back. This used to be invisible; log it so an
     // operator saying "nothing happened" is traceable to what they actually sent.
     logger.info('whatsapp: operator message unhandled — no branch matched', {
-      operatorId: operator.id, message, sessionState: session.state, rescueRequestId: session.rescueRequestId,
+      operatorId: operator.id,
+      message,
+      sessionState: session.state,
+      rescueRequestId: session.rescueRequestId,
     });
     return this.xmlOk();
   }
@@ -211,9 +441,13 @@ export class WhatsAppOperatorFlowService {
 
     let offer = pendingOffers[0];
     if (jobRef) {
-      const matched = pendingOffers.find((o) => formatJobRef(o.rescueRequestId).endsWith(jobRef));
+      const matched = pendingOffers.find((o) =>
+        formatJobRef(o.rescueRequestId).endsWith(jobRef),
+      );
       if (!matched) {
-        return this.reply(`That job reference doesn't match any of your open offers. Reply "NO" or just your price if you only have one job open.`);
+        return this.reply(
+          `That job reference doesn't match any of your open offers. Reply "NO" or just your price if you only have one job open.`,
+        );
       }
       offer = matched;
     } else if (pendingOffers.length > 1) {
@@ -222,7 +456,10 @@ export class WhatsAppOperatorFlowService {
       );
     }
 
-    const result = await this.dispatchService.processQuoteOrDecline(offer, quotedPriceKobo);
+    const result = await this.dispatchService.processQuoteOrDecline(
+      offer,
+      quotedPriceKobo,
+    );
     return this.reply(result.message);
   }
 
@@ -262,7 +499,10 @@ export class WhatsAppOperatorFlowService {
    * so printing it would add a column that never varies.
    */
   private describeOffers(
-    offers: { rescueRequestId: string; rescueRequest: { vehicleType: string | null; destination: string | null } }[],
+    offers: {
+      rescueRequestId: string;
+      rescueRequest: { vehicleType: string | null; destination: string | null };
+    }[],
   ): string {
     return offers.map((o) => `• ${this.describeOffer(o)}`).join('\n');
   }
@@ -291,12 +531,19 @@ export class WhatsAppOperatorFlowService {
    * because real commands are six characters too ("onsite", "cancel") and
    * must not be swallowed as job references.
    */
-  private async handleBareJobRef(operatorPhone: string, jobRef: string): Promise<string | null> {
-    const operator = await this.prisma.operator.findUnique({ where: { phoneNumber: operatorPhone } });
+  private async handleBareJobRef(
+    operatorPhone: string,
+    jobRef: string,
+  ): Promise<string | null> {
+    const operator = await this.prisma.operator.findUnique({
+      where: { phoneNumber: operatorPhone },
+    });
     if (!operator) return null;
 
     const openOffers = await this.findOpenOffers(operator.id);
-    const matched = openOffers.find((o) => formatJobRef(o.rescueRequestId).endsWith(jobRef));
+    const matched = openOffers.find((o) =>
+      formatJobRef(o.rescueRequestId).endsWith(jobRef),
+    );
     if (!matched) return null;
 
     return this.reply(
@@ -314,12 +561,20 @@ export class WhatsAppOperatorFlowService {
       where: { id: rescueRequestId },
       include: { customer: true },
     });
-    if (!rescueRequest || rescueRequest.status === RescueRequestStatus.CANCELLED || rescueRequest.status === RescueRequestStatus.COMPLETED) {
+    if (
+      !rescueRequest ||
+      rescueRequest.status === RescueRequestStatus.CANCELLED ||
+      rescueRequest.status === RescueRequestStatus.COMPLETED
+    ) {
       logger.info('whatsapp: ARRIVED rejected — request already ended', {
-        operatorId: operator.id, rescueRequestId, status: rescueRequest?.status ?? 'NOT_FOUND',
+        operatorId: operator.id,
+        rescueRequestId,
+        status: rescueRequest?.status ?? 'NOT_FOUND',
       });
       await this.sessionStore.clear(operatorUserId);
-      return this.reply(`${formatJobRef(rescueRequestId)} has already ended. Watch out for new dispatch offers.`);
+      return this.reply(
+        `${formatJobRef(rescueRequestId)} has already ended. Watch out for new dispatch offers.`,
+      );
     }
 
     // Update request status to ARRIVED
@@ -342,7 +597,9 @@ export class WhatsAppOperatorFlowService {
       );
     }
 
-    return this.reply(`✅ ${formatJobRef(rescueRequestId)} — Arrival confirmed! The customer has been notified.\n\nSend *DONE* when the job is complete.`);
+    return this.reply(
+      `✅ ${formatJobRef(rescueRequestId)} — Arrival confirmed! The customer has been notified.\n\nSend *DONE* when the job is complete.`,
+    );
   }
 
   private async handleOperatorJobDone(
@@ -355,60 +612,66 @@ export class WhatsAppOperatorFlowService {
       where: { id: rescueRequestId },
       include: { customer: true },
     });
-    if (!rescueRequest || rescueRequest.status === RescueRequestStatus.CANCELLED || rescueRequest.status === RescueRequestStatus.COMPLETED) {
+    if (
+      !rescueRequest ||
+      rescueRequest.status === RescueRequestStatus.CANCELLED ||
+      rescueRequest.status === RescueRequestStatus.COMPLETED
+    ) {
       await this.sessionStore.clear(operatorUserId);
       return this.reply(`${formatJobRef(rescueRequestId)} has already ended.`);
     }
 
     const customerPhone = rescueRequest.customer.phoneNumber;
-    const customerId    = rescueRequest.customerId;
+    const customerId = rescueRequest.customerId;
 
-    // Put customer session in AWAITING_COMPLETION_CONFIRM
-    if (customerId) {
-      await this.sessionStore.update(customerId, {
-        state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
-        rescueRequestId,
+    // The DONE transition is three writes, and all three must land together.
+    //
+    // confirmationDueAt is the only thing that will ever bring staff back to
+    // this job: nothing else sets that column, so a write that fails — or a
+    // process that dies between the writes — loses the alert permanently and
+    // the customer's silence goes unnoticed. The two session moves are in
+    // here for the same reason: an operator freed while the customer was
+    // never asked to confirm, or the reverse, is a state no check repairs.
+    //
+    // Staff are alerted after 30 minutes; the job is never auto-completed.
+    // By this point the vehicle has moved and the operator is waiting to be
+    // paid, so forcing COMPLETED on nothing but silence would move money and
+    // custody without confirmation. A quiet customer (dead phone, long tow,
+    // simply busy) looks identical to one avoiding payment — only a human
+    // can tell those apart. The job stays in AWAITING_COMPLETION_CONFIRM
+    // until the customer responds or staff resolve it.
+    await this.prisma.$transaction(async (tx) => {
+      await tx.rescueRequest.update({
+        where: { id: rescueRequestId },
+        data: {
+          confirmationDueAt: new Date(Date.now() + STALLED_CONFIRMATION_MS),
+        },
       });
-    }
+      if (customerId) {
+        await tx.whatsAppSession.updateMany({
+          where: { userId: customerId },
+          data: {
+            state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
+            rescueRequestId,
+          },
+        });
+      }
+      // On the transaction client, not sessionStore — a clear on the default
+      // client would commit independently and could survive a rollback of
+      // the other two.
+      await tx.whatsAppSession.updateMany({
+        where: { userId: operatorUserId },
+        data: { state: WhatsAppFlowState.IDLE, rescueRequestId: null },
+      });
+    });
+
+    // Notification only after the commit, like every other in this design.
     if (customerPhone) {
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
         `🔧 ${operator.businessName} says the job is done!\n\nReply *CONFIRM* to release your vehicle and receive the balance payment link.\n\nIf there's a problem, reply *DISPUTE* and our team will investigate.`,
       );
     }
-
-    // Alert staff after 30 minutes if the customer hasn't confirmed — never
-    // auto-complete on their behalf. By this point the vehicle has already
-    // moved and the operator is waiting to be paid, so forcing the job to
-    // COMPLETED and telling the operator to release the vehicle based on
-    // nothing but silence would move money and vehicle custody without any
-    // genuine confirmation the job actually went as reported. A quiet
-    // customer (dead phone, multi-hour tow, generally busy) looks
-    // identical to one deliberately avoiding payment — only a human
-    // following up can tell those apart. The job stays in
-    // AWAITING_COMPLETION_CONFIRM indefinitely until the customer responds
-    // or staff resolve it.
-    setTimeout(async () => {
-      const fresh = await this.prisma.rescueRequest.findUnique({
-        where: { id: rescueRequestId },
-        select: { status: true, disputed: true },
-      });
-      if (!fresh || fresh.disputed || fresh.status === RescueRequestStatus.COMPLETED || fresh.status === RescueRequestStatus.CANCELLED) {
-        return;
-      }
-      try {
-        const config = await this.platformConfigService.getConfig();
-        if (!config.disputeAlertPhoneNumber) return;
-        await this.twilioService.sendWhatsAppMessage(
-          toWhatsAppAddress(config.disputeAlertPhoneNumber),
-          `⏱ ${formatJobRef(rescueRequestId)}: customer hasn't confirmed completion 30 minutes after the operator marked it DONE. Please check on them.`,
-        );
-      } catch (error) {
-        console.error('Failed to send stalled-confirmation staff alert:', error);
-      }
-    }, 30 * 60 * 1000);
-
-    await this.sessionStore.update(operatorUserId, { state: WhatsAppFlowState.IDLE, rescueRequestId: undefined });
 
     return this.reply(
       `✅ Job marked as done! Waiting for customer confirmation.\n\nIf they confirm, you'll receive a notification. Thank you 🙏`,
@@ -420,9 +683,16 @@ export class WhatsAppOperatorFlowService {
    * END CHAT closes it for both, since there's no reason for one side to
    * keep relaying to someone who's already left.
    */
-  private async endChatRelay(operatorUserId: string, operatorPhone: string, rescueRequestId: string | undefined): Promise<void> {
+  private async endChatRelay(
+    operatorUserId: string,
+    operatorPhone: string,
+    rescueRequestId: string | undefined,
+  ): Promise<void> {
     await this.sessionStore.update(operatorUserId, { relayTarget: null });
-    await this.twilioService.sendWhatsAppMessage(toWhatsAppAddress(operatorPhone), `Chat ended.`);
+    await this.twilioService.sendWhatsAppMessage(
+      toWhatsAppAddress(operatorPhone),
+      `Chat ended.`,
+    );
 
     if (!rescueRequestId) return;
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
@@ -431,8 +701,13 @@ export class WhatsAppOperatorFlowService {
     });
     if (!rescueRequest?.customer?.phoneNumber) return;
 
-    await this.sessionStore.update(rescueRequest.customerId, { relayTarget: null });
-    await this.twilioService.sendWhatsAppMessage(toWhatsAppAddress(rescueRequest.customer.phoneNumber), `Chat ended.`);
+    await this.sessionStore.update(rescueRequest.customerId, {
+      relayTarget: null,
+    });
+    await this.twilioService.sendWhatsAppMessage(
+      toWhatsAppAddress(rescueRequest.customer.phoneNumber),
+      `Chat ended.`,
+    );
   }
 
   private reply(message: string): string {

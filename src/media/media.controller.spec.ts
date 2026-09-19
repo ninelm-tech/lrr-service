@@ -33,14 +33,24 @@ describe('MediaController', () => {
 
     const result = await controller.redirectToMedia('media-1');
 
-    expect(prisma.requestMedia.findUnique).toHaveBeenCalledWith({ where: { id: 'media-1' } });
-    expect(s3.getSignedUrl).toHaveBeenCalledWith('rescue-requests/req-1/abc.jpg', expect.any(Number));
-    expect(result).toEqual({ url: 'https://signed.example.com/abc.jpg', statusCode: 302 });
+    expect(prisma.requestMedia.findUnique).toHaveBeenCalledWith({
+      where: { id: 'media-1' },
+    });
+    expect(s3.getSignedUrl).toHaveBeenCalledWith(
+      'rescue-requests/req-1/abc.jpg',
+      expect.any(Number),
+    );
+    expect(result).toEqual({
+      url: 'https://signed.example.com/abc.jpg',
+      statusCode: 302,
+    });
   });
 
   it('throws NotFoundException for a nonexistent media ID', async () => {
     prisma.requestMedia.findUnique.mockResolvedValue(null);
 
-    await expect(controller.redirectToMedia('missing-id')).rejects.toThrow(NotFoundException);
+    await expect(controller.redirectToMedia('missing-id')).rejects.toThrow(
+      NotFoundException,
+    );
   });
 });

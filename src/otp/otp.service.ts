@@ -1,8 +1,7 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
-import { TwilioService } from '../integrations/twilio/twilio.service';
-import { toWhatsAppAddress } from '../common/phone.util';
+import { TermiiService } from '../integrations/termii/termii.service';
 import { UserRole } from '@prisma/client';
 
 const CODE_TTL_MS = 10 * 60 * 1000;
@@ -28,7 +27,7 @@ function generateToken(): string {
 export class OtpService {
   constructor(
     private readonly prisma: PrismaService,
-    private readonly twilioService: TwilioService,
+    private readonly termiiService: TermiiService,
   ) {}
 
   /** Exposed only so tests can compute a matching codeHash without duplicating the hash fn. */
@@ -36,16 +35,19 @@ export class OtpService {
     return hash(code);
   }
 
-  async sendCode(phoneNumber: string): Promise<{ required: boolean; available?: boolean }> {
-    const existingUser = await this.prisma.user.findUnique({ where: { phoneNumber } });
+  async sendCode(
+    phoneNumber: string,
+  ): Promise<{ required: boolean; available?: boolean }> {
+    const existingUser = await this.prisma.user.findUnique({
+      where: { phoneNumber },
+    });
 
-    if (!existingUser) {
-      return { required: false, available: true };
-    }
-    if (existingUser.role !== UserRole.CUSTOMER) {
+    if (existingUser && existingUser.role !== UserRole.CUSTOMER) {
       return { required: false, available: false };
     }
 
+    // Brand-new phone (fresh operator signup) or an existing CUSTOMER
+    // (upgrade path) — both now verify ownership before proceeding.
     await this.sendCodeToPhone(phoneNumber, 'verification code');
     return { required: true };
   }
@@ -57,8 +59,12 @@ export class OtpService {
    * loosening sendCode's role check, since the two callers have genuinely
    * different eligibility rules.
    */
-  async sendPasswordResetCode(phoneNumber: string): Promise<{ required: boolean }> {
-    const existingUser = await this.prisma.user.findUnique({ where: { phoneNumber } });
+  async sendPasswordResetCode(
+    phoneNumber: string,
+  ): Promise<{ required: boolean }> {
+    const existingUser = await this.prisma.user.findUnique({
+      where: { phoneNumber },
+    });
     if (!existingUser || !existingUser.passwordHash) {
       return { required: false };
     }
@@ -67,16 +73,58 @@ export class OtpService {
     return { required: true };
   }
 
-  private async sendCodeToPhone(phoneNumber: string, label: string): Promise<void> {
+  /**
+   * OTP-based login — unlike sendCode (upgrade/signup verification) and
+   * sendPasswordResetCode (any role with a portal password), eligibility here
+   * is role === OPERATOR only: this route trades a password for a single SMS
+   * code, a strictly weaker factor than what CUSTOMER/ADMIN/SUPER_ADMIN
+   * accounts assume. The response never reveals whether the number is
+   * unknown, ineligible, or genuinely sent — same account-enumeration
+   * defense as sendPasswordResetCode's generic messaging, applied to the
+   * return value itself since this endpoint has no separate message field.
+   */
+  async sendLoginCode(phoneNumber: string): Promise<{ required: boolean }> {
+    const existingUser = await this.prisma.user.findUnique({
+      where: { phoneNumber },
+    });
+    if (existingUser?.role === UserRole.OPERATOR) {
+      try {
+        await this.sendCodeToPhone(phoneNumber, 'login code');
+      } catch (error) {
+        if (!(error instanceof BadRequestException)) throw error;
+        // Swallow the rate-limit error too — letting it escape would leak
+        // "this phone is a real, eligible OPERATOR account" via a side
+        // channel (error vs. no error) even though the response body is
+        // already uniform. The caller sees the same generic outcome either
+        // way: sent, rate-limited, or ineligible are indistinguishable.
+      }
+    }
+    return { required: true };
+  }
+
+  private async sendCodeToPhone(
+    phoneNumber: string,
+    label: string,
+  ): Promise<void> {
     const recent = await this.prisma.phoneVerification.findMany({
-      where: { phoneNumber, createdAt: { gte: new Date(Date.now() - SEND_WINDOW_MS) } },
+      where: {
+        phoneNumber,
+        createdAt: { gte: new Date(Date.now() - SEND_WINDOW_MS) },
+      },
       orderBy: { createdAt: 'desc' },
     });
-    if (recent.length > 0 && Date.now() - recent[0].createdAt.getTime() < RESEND_COOLDOWN_MS) {
-      throw new BadRequestException('Please wait before requesting another code.');
+    if (
+      recent.length > 0 &&
+      Date.now() - recent[0].createdAt.getTime() < RESEND_COOLDOWN_MS
+    ) {
+      throw new BadRequestException(
+        'Please wait before requesting another code.',
+      );
     }
     if (recent.length >= MAX_SENDS_PER_WINDOW) {
-      throw new BadRequestException('Too many code requests — please try again later.');
+      throw new BadRequestException(
+        'Too many code requests — please try again later.',
+      );
     }
 
     const code = generateCode();
@@ -88,19 +136,24 @@ export class OtpService {
       },
     });
 
-    await this.twilioService.sendWhatsAppMessage(
-      toWhatsAppAddress(phoneNumber),
+    await this.termiiService.sendSms(
+      phoneNumber,
       `Your LRR ${label} is ${code}. It expires in 10 minutes.`,
     );
   }
 
-  async verifyCode(phoneNumber: string, code: string): Promise<{ token: string }> {
+  async verifyCode(
+    phoneNumber: string,
+    code: string,
+  ): Promise<{ token: string }> {
     const row = await this.prisma.phoneVerification.findFirst({
       where: { phoneNumber, expiresAt: { gt: new Date() } },
       orderBy: { createdAt: 'desc' },
     });
     if (!row) {
-      throw new BadRequestException('Code expired or not found — request a new one.');
+      throw new BadRequestException(
+        'Code expired or not found — request a new one.',
+      );
     }
     if (row.attempts >= MAX_ATTEMPTS) {
       throw new BadRequestException('Too many attempts — request a new code.');

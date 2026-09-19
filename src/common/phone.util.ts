@@ -21,11 +21,11 @@ export function normalizePhone(raw: string): string {
   phone = phone.replace(/\D/g, ''); // keep digits only
 
   if (phone.startsWith('234')) {
-    phone = '+' + phone;             // 2348012345678 → +2348012345678
+    phone = '+' + phone; // 2348012345678 → +2348012345678
   } else if (phone.startsWith('0')) {
     phone = '+234' + phone.slice(1); // 08012345678 → +2348012345678
   } else if (phone.length === 10) {
-    phone = '+234' + phone;          // 8012345678 → +2348012345678
+    phone = '+234' + phone; // 8012345678 → +2348012345678
   } else if (hasPlus) {
     phone = '+' + phone;
   } else {

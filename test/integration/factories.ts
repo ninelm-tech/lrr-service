@@ -14,20 +14,29 @@ export async function truncateAll(prisma: PrismaService): Promise<void> {
   // serial columns predictable between tests.
   await prisma.$executeRawUnsafe(`
     TRUNCATE TABLE
-      "Rating", "Payout", "RequestMedia", "DispatchOffer",
+      "Rating", "RequestMedia", "DispatchOffer",
       "RescueRequest", "WhatsAppSession", "OperatorMember",
-      "Operator", "User"
+      "Operator", "User", "AuditLog", "PendingMediaDeletion"
     RESTART IDENTITY CASCADE
   `);
 }
 
-export async function createCustomer(prisma: PrismaService, phoneNumber?: string) {
+export async function createCustomer(
+  prisma: PrismaService,
+  phoneNumber?: string,
+) {
   return prisma.user.create({
-    data: { phoneNumber: phoneNumber ?? `+234800${unique().slice(-7)}`, role: 'CUSTOMER' },
+    data: {
+      phoneNumber: phoneNumber ?? `+234800${unique().slice(-7)}`,
+      role: 'CUSTOMER',
+    },
   });
 }
 
-export async function createOperator(prisma: PrismaService, phoneNumber?: string) {
+export async function createOperator(
+  prisma: PrismaService,
+  phoneNumber?: string,
+) {
   return prisma.operator.create({
     data: {
       businessName: 'Swift Towing',
@@ -72,6 +81,7 @@ export async function createOffer(
       rescueRequestId,
       operatorId,
       status: 'PENDING',
+      dispatchRound: 0,
       expiresAt: new Date(Date.now() + 10 * 60 * 1000),
       batchId: `batch-${unique()}`,
       ...overrides,
@@ -85,6 +95,6 @@ export async function createSession(
   overrides: Record<string, unknown> = {},
 ) {
   return prisma.whatsAppSession.create({
-    data: { userId, state: 'IDLE', offeredOperatorIds: '[]', ...overrides },
+    data: { userId, state: 'IDLE', ...overrides },
   });
 }
