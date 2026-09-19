@@ -1167,8 +1167,14 @@ describe('WhatsAppCustomerFlowService', () => {
         providers: [
           WhatsAppCustomerFlowService,
           { provide: PrismaService, useValue: prisma },
-          { provide: PaymentLedgerService, useValue: createPaymentLedgerMock() },
-          { provide: PaystackCustomerService, useValue: createPaystackCustomerServiceMock() },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
           { provide: TwilioService, useValue: twilioService },
           { provide: S3Service, useValue: s3Service },
           { provide: GeocodingService, useValue: {} },
@@ -1199,13 +1205,14 @@ describe('WhatsAppCustomerFlowService', () => {
       );
 
       expect(saved).toBe(true);
-      expect(prisma.requestMedia.create).toHaveBeenCalledWith({
-        data: expect.objectContaining({
-          rescueRequestId: 'req-1',
-          mediaType: MediaType.IMAGE,
-          context: MediaContext.COMPLETION,
-          uploadedByRole: UserRole.OPERATOR,
-        }),
+      const [[{ data }]] = prisma.requestMedia.create.mock.calls as [
+        [Record<string, unknown>],
+      ];
+      expect(data).toMatchObject({
+        rescueRequestId: 'req-1',
+        mediaType: MediaType.IMAGE,
+        context: MediaContext.COMPLETION,
+        uploadedByRole: UserRole.OPERATOR,
       });
     });
   });

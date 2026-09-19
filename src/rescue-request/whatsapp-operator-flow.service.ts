@@ -7,9 +7,13 @@ import {
   RescueRequestStatus,
   RatingDirection,
   VehicleType,
+  MediaContext,
+  MediaType,
+  UserRole,
 } from '@prisma/client';
 import { formatJobRef } from './domain/rescue-request-formatting';
 import { formatVehicleType } from './domain/vehicle-truck-mapping';
+import { classifyMediaType } from './domain/media-classification';
 import { DispatchService } from './dispatch.service';
 import { PaymentEventsService } from './payment-events.service';
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
@@ -17,6 +21,8 @@ import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
+
+const MAX_MEDIA_ITEMS = 5;
 
 @Injectable()
 export class WhatsAppOperatorFlowService {
@@ -86,6 +92,119 @@ export class WhatsAppOperatorFlowService {
       });
       return this.reply(
         `Thanks — we've recorded that. Our team will be in touch.`,
+      );
+    }
+
+    // ── Awaiting completion evidence ────────────────────────────────────
+    // MUST come before the quote-parsing check below — "1"/"2" here are
+    // the add-more/continue menu, not a price quote, and would otherwise
+    // be silently swallowed as a bogus bare-digit quote attempt.
+    if (
+      session.state === WhatsAppFlowState.OPERATOR_AWAITING_COMPLETION_MEDIA
+    ) {
+      const rescueRequestId = session.rescueRequestId;
+      if (!rescueRequestId) {
+        await this.sessionStore.update(userId, {
+          state: WhatsAppFlowState.OPERATOR_ON_JOB,
+        });
+        return this.reply(
+          `Sorry, we lost track of this job. Please send ARRIVED/DONE again.`,
+        );
+      }
+
+      if (message === '1') {
+        return this.reply(`Go ahead — send your photo(s) or video(s).`);
+      }
+
+      if (message === '2') {
+        const visualCount = await this.prisma.requestMedia.count({
+          where: {
+            rescueRequestId,
+            context: MediaContext.COMPLETION,
+            uploadedByRole: UserRole.OPERATOR,
+            mediaType: { in: [MediaType.IMAGE, MediaType.VIDEO] },
+          },
+        });
+        if (visualCount === 0) {
+          return this.reply(
+            `Please send at least one photo or video before continuing.`,
+          );
+        }
+        return this.handleOperatorJobDone(
+          phoneNumber,
+          userId,
+          rescueRequestId,
+          operator,
+        );
+      }
+
+      const numMedia = Number(body.NumMedia ?? 0);
+      if (numMedia === 0) {
+        return this.reply(
+          `Please send at least one photo or video.\n\n1️⃣ Add more\n2️⃣ Continue`,
+        );
+      }
+
+      const existingCount = await this.prisma.requestMedia.count({
+        where: {
+          rescueRequestId,
+          context: MediaContext.COMPLETION,
+          uploadedByRole: UserRole.OPERATOR,
+        },
+      });
+      let savedCount = existingCount;
+      let failedCount = 0;
+      let audioSkipped = 0;
+      let capReached = false;
+
+      for (let i = 0; i < numMedia; i++) {
+        const mediaUrl = body[`MediaUrl${i}`] as string | undefined;
+        const contentType = body[`MediaContentType${i}`] as string | undefined;
+        if (!mediaUrl || !contentType) continue;
+
+        // Audio is never saved for completion evidence — a voice note
+        // would otherwise consume a cap slot without ever satisfying the
+        // visual-evidence gate above, permanently blocking DONE. Checked
+        // before the cap, not after, so it can never take a slot a
+        // genuine photo/video needs.
+        if (classifyMediaType(contentType) === MediaType.AUDIO) {
+          audioSkipped++;
+          continue;
+        }
+
+        if (savedCount >= MAX_MEDIA_ITEMS) {
+          capReached = true;
+          break;
+        }
+
+        const saved = await this.customerFlowService.captureMediaAttachment(
+          rescueRequestId,
+          mediaUrl,
+          contentType,
+          MediaContext.COMPLETION,
+          UserRole.OPERATOR,
+        );
+        if (saved) {
+          savedCount++;
+        } else {
+          failedCount++;
+        }
+      }
+
+      const capNote = capReached
+        ? `\n\n⚠️ You've reached the ${MAX_MEDIA_ITEMS}-item limit — further attachments won't be saved.`
+        : '';
+      const failNote =
+        failedCount > 0
+          ? `\n\n⚠️ ${failedCount} item(s) failed to upload — please resend if important.`
+          : '';
+      const audioNote =
+        audioSkipped > 0
+          ? `\n\n🎤 Voice notes aren't used as completion evidence — please send a photo or video instead.`
+          : '';
+
+      return this.reply(
+        `📸 Received (${savedCount}/${MAX_MEDIA_ITEMS} items saved).${capNote}${failNote}${audioNote}\n\n1️⃣ Add more\n2️⃣ Continue`,
       );
     }
 
@@ -216,15 +335,15 @@ export class WhatsAppOperatorFlowService {
           `Please send ARRIVED first when you reach the customer location.`,
         );
       }
-      logger.info('whatsapp: DONE accepted', {
+      logger.info('whatsapp: DONE accepted — awaiting completion evidence', {
         operatorId: operator.id,
         rescueRequestId: session.rescueRequestId,
       });
-      return this.handleOperatorJobDone(
-        phoneNumber,
-        userId,
-        session.rescueRequestId,
-        operator,
+      await this.sessionStore.update(userId, {
+        state: WhatsAppFlowState.OPERATOR_AWAITING_COMPLETION_MEDIA,
+      });
+      return this.reply(
+        `📸 Please send at least one photo or video showing the completed job.`,
       );
     }
 

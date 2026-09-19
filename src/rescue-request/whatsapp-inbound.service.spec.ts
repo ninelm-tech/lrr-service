@@ -51,10 +51,11 @@ describe('WhatsAppInboundService', () => {
       phoneNumber,
     });
 
-    const result = await service.handleIncomingWhatsAppMessage({
+    const inboundBody = {
       From: `whatsapp:${phoneNumber}`,
       Body: 'hi',
-    });
+    };
+    const result = await service.handleIncomingWhatsAppMessage(inboundBody);
 
     expect(sharedService.findOrCreateCustomer).toHaveBeenCalledWith(
       phoneNumber,
@@ -66,6 +67,7 @@ describe('WhatsAppInboundService', () => {
       'hi',
       { state: 'IDLE' },
       { id: 'op-1', businessName: 'Swift Towing', phoneNumber },
+      inboundBody,
     );
     expect(customerFlowService.handleCustomerMessage).not.toHaveBeenCalled();
     expect(result).toBe('operator-reply');
