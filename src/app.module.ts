@@ -14,6 +14,7 @@ import { MediaModule } from './media/media.module';
 import { PlatformConfigModule } from './platform-config/platform-config.module';
 import { RatingModule } from './rating/rating.module';
 import { OtpModule } from './otp/otp.module';
+import { AccountDeletionModule } from './account-deletion/account-deletion.module';
 import { SentryInterceptor } from './common/sentry.interceptor';
 
 @Module({
@@ -37,6 +38,7 @@ import { SentryInterceptor } from './common/sentry.interceptor';
     PlatformConfigModule,
     RatingModule,
     OtpModule,
+    AccountDeletionModule,
   ],
   controllers: [AppController],
   providers: [
