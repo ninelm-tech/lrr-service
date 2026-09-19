@@ -1,5 +1,14 @@
-
-import { Body, Controller, Get, Param, Patch, Post, Query, Req, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  Patch,
+  Post,
+  Query,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import { UserRole } from '@prisma/client';
 import { DisputeService } from './dispute.service';
 import { RescueRequestAdminService } from './rescue-request-admin.service';
@@ -11,6 +20,8 @@ import { ResolveDisputeDto } from './dto/resolve-dispute.dto';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { AuditLogService } from '../audit-log/audit-log.service';
+import type { AuthenticatedRequest } from '../auth/authenticated-request.interface';
 
 @UseGuards(AuthGuard)
 @Controller('rescue-requests')
@@ -19,6 +30,7 @@ export class RescueRequestController {
     private readonly disputeService: DisputeService,
     private readonly rescueRequestAdminService: RescueRequestAdminService,
     private readonly dispatchService: DispatchService,
+    private readonly auditLogService: AuditLogService,
   ) {}
 
   @Get()
@@ -47,7 +59,10 @@ export class RescueRequestController {
     @Param('offerId') offerId: string,
     @Body() body: { priceNaira?: number },
   ) {
-    const priceKobo = body.priceNaira !== undefined ? Math.round(body.priceNaira * 100) : undefined;
+    const priceKobo =
+      body.priceNaira !== undefined
+        ? Math.round(body.priceNaira * 100)
+        : undefined;
     return this.dispatchService.respondToOffer(
       (req.user as any).userId,
       offerId,
@@ -75,7 +90,10 @@ export class RescueRequestController {
   @Post(':id/offer-to/:operatorId')
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
-  async offerToOperator(@Param('id') id: string, @Param('operatorId') operatorId: string) {
+  async offerToOperator(
+    @Param('id') id: string,
+    @Param('operatorId') operatorId: string,
+  ) {
     await this.dispatchService.manualOfferToOperator(id, operatorId);
     return { message: 'Offer sent' };
   }
@@ -105,12 +123,30 @@ export class RescueRequestController {
   /**
    * Admin-triggered refund for a deposit that arrived after its request was
    * already cancelled. Always refunds the full deposit amount.
+   *
+   * SUPER_ADMIN only — like payouts, this moves platform money out to a
+   * customer, not just a payment link the customer acts on.
    */
   @Post(':id/refund-deposit')
   @UseGuards(RolesGuard)
-  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
-  async refundDeposit(@Param('id') id: string) {
+  @Roles(UserRole.SUPER_ADMIN)
+  async refundDeposit(
+    @Req() req: AuthenticatedRequest,
+    @Param('id') id: string,
+  ) {
+    const depositAmount =
+      await this.rescueRequestAdminService.getDepositAmount(id);
     await this.rescueRequestAdminService.refundDeposit(id);
+    await this.auditLogService.record({
+      category: 'deposit_refunded',
+      message: `Refunded deposit for rescue request ${id}`,
+      details: {
+        rescueRequestId: id,
+        before: { refunded: false },
+        after: { refunded: true, amount: depositAmount },
+      },
+      actorId: req.user.userId,
+    });
     return { message: 'Refund initiated' };
   }
 
@@ -122,17 +158,16 @@ export class RescueRequestController {
     @Param('id') id: string,
     @Body() body: { status: string },
   ) {
-    return this.rescueRequestAdminService.updateStatus(id, { status: body.status });
+    return this.rescueRequestAdminService.updateStatus(id, {
+      status: body.status,
+    });
   }
 
   /** Cancel a request, optionally with a reason sent to the customer. */
   @Patch(':id/cancel')
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
-  async cancel(
-    @Param('id') id: string,
-    @Body() body: { reason?: string },
-  ) {
+  async cancel(@Param('id') id: string, @Body() body: { reason?: string }) {
     return this.rescueRequestAdminService.cancel(id, { reason: body.reason });
   }
 
@@ -140,7 +175,28 @@ export class RescueRequestController {
   @Patch(':id/resolve-dispute')
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
-  async resolveDispute(@Param('id') id: string, @Body() dto: ResolveDisputeDto) {
-    return this.disputeService.resolveDispute(id, dto.resolutionNote, dto.balanceAdjustmentPercent);
+  async resolveDispute(
+    @Req() req: AuthenticatedRequest,
+    @Param('id') id: string,
+    @Body() dto: ResolveDisputeDto,
+  ) {
+    const result = await this.disputeService.resolveDispute(
+      id,
+      dto.resolutionNote,
+      dto.balanceAdjustmentPercent,
+    );
+    await this.auditLogService.record({
+      category: 'dispute_resolved',
+      message: `Resolved dispute for rescue request ${id}`,
+      details: {
+        rescueRequestId: id,
+        resolutionNote: dto.resolutionNote,
+        balanceAdjustmentPercent: dto.balanceAdjustmentPercent,
+        before: { balanceAmount: result.originalBalance },
+        after: { balanceAmount: result.settledBalance },
+      },
+      actorId: req.user.userId,
+    });
+    return result;
   }
 }

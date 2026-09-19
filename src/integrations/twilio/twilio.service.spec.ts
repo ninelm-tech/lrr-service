@@ -41,7 +41,9 @@ describe('TwilioService', () => {
       });
       global.fetch = fetchMock as any;
 
-      const result = await service.downloadMedia('https://api.twilio.com/media/ME123');
+      const result = await service.downloadMedia(
+        'https://api.twilio.com/media/ME123',
+      );
 
       expect(fetchMock).toHaveBeenCalledWith(
         'https://api.twilio.com/media/ME123',
@@ -56,9 +58,13 @@ describe('TwilioService', () => {
     });
 
     it('throws if the fetch response is not ok', async () => {
-      global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 404 }) as any;
+      global.fetch = jest
+        .fn()
+        .mockResolvedValue({ ok: false, status: 404 }) as any;
 
-      await expect(service.downloadMedia('https://api.twilio.com/media/missing')).rejects.toThrow();
+      await expect(
+        service.downloadMedia('https://api.twilio.com/media/missing'),
+      ).rejects.toThrow();
     });
   });
 });

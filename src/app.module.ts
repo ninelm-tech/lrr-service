@@ -14,6 +14,7 @@ import { MediaModule } from './media/media.module';
 import { PlatformConfigModule } from './platform-config/platform-config.module';
 import { RatingModule } from './rating/rating.module';
 import { OtpModule } from './otp/otp.module';
+import { AccountDeletionModule } from './account-deletion/account-deletion.module';
 import { SentryInterceptor } from './common/sentry.interceptor';
 
 @Module({
@@ -21,6 +22,11 @@ import { SentryInterceptor } from './common/sentry.interceptor';
     ConfigModule.forRoot({
       isGlobal: true,
     }),
+    // ThrottlerModule's storage/tracker infrastructure (a @Global()
+    // registration, per @nestjs/throttler) is registered in OtpModule, not
+    // here — see the comment there for why. Nothing is throttled by default;
+    // OtpModule and AuthModule apply ThrottlerGuard locally to their two
+    // SMS-triggering routes only.
     IntegrationsModule,
     PrismaModule,
     AuthModule,
@@ -32,6 +38,7 @@ import { SentryInterceptor } from './common/sentry.interceptor';
     PlatformConfigModule,
     RatingModule,
     OtpModule,
+    AccountDeletionModule,
   ],
   controllers: [AppController],
   providers: [

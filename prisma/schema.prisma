@@ -64,14 +64,6 @@ enum RescueRequestStatus {
   STALLED
 }
 
-enum RefundStatus {
-  NONE      // not a late-payment case
-  ELIGIBLE  // handleLateDeposit fired — admin can refund
-  PENDING   // refund initiated at Paystack, awaiting webhook confirmation
-  COMPLETED
-  FAILED
-}
-
 enum IssueType {
   BREAKDOWN
   ACCIDENT
@@ -102,12 +94,23 @@ enum MediaType {
 // ============== MODELS ==============
 
 model User {
-  id           String    @id @default(cuid())
-  email        String?   @unique
-  phoneNumber  String?   @unique
+  id           String   @id @default(cuid())
+  email        String?  @unique
+  phoneNumber  String?  @unique
   passwordHash String?
   name         String?
   role         UserRole
+
+  // A Paystack customer, resolved once on first payment and never replaced —
+  // see PaystackCustomerService. Paystack attaches saved cards and
+  // authorizations to the customer, so a second code for the same person
+  // would split their payment instruments.
+  paystackCustomerCode String? @unique
+  // The email that customer was created under. NOT the same thing as
+  // `email` above: Paystack cannot change a customer's email after
+  // creation, so this is frozen and sent on every later transaction, while
+  // `email` stays free to change for our own comms/login purposes.
+  paystackCustomerEmail String?
 
   operatorMemberships OperatorMember[]
   rescueRequests      RescueRequest[]
@@ -116,32 +119,33 @@ model User {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+  deletedAt DateTime?
 
   @@index([role])
   @@index([phoneNumber])
 }
 
 model Operator {
-  id            String         @id @default(cuid())
+  id String @id @default(cuid())
 
-  type          OperatorType   @default(TOW_TRUCK)
-  truckClasses  TruckClass[]   @default([])
+  type         OperatorType @default(TOW_TRUCK)
+  truckClasses TruckClass[] @default([])
 
-  businessName  String
-  contactName   String
-  phoneNumber   String         @unique
-  email         String?
+  businessName String
+  contactName  String
+  phoneNumber  String? @unique
+  email        String?
 
-  address       String
-  latitude      Decimal
-  longitude     Decimal
+  address   String
+  latitude  Decimal
+  longitude Decimal
 
   serviceRadius Int            @default(10)
   status        OperatorStatus @default(PENDING)
   isAvailable   Boolean        @default(true)
 
-  verifiedAt    DateTime?
-  notes         String?
+  verifiedAt DateTime?
+  notes      String?
 
   // Payout bank details, minimized: the full account number is sent to
   // Paystack to create a transfer recipient and then discarded — only
@@ -155,10 +159,11 @@ model Operator {
   rescueRequests RescueRequest[]
   dispatchOffers DispatchOffer[]
   ratings        Rating[]
-  payouts        Payout[]
+  payments       Payment[]
 
-  createdAt     DateTime       @default(now())
-  updatedAt     DateTime       @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
 
   @@index([status])
   @@index([type])
@@ -166,18 +171,18 @@ model Operator {
 }
 
 model OperatorMember {
-  id         String              @id @default(cuid())
+  id String @id @default(cuid())
 
-  userId     String
-  user       User                @relation(fields: [userId], references: [id])
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
 
   operatorId String
-  operator   Operator            @relation(fields: [operatorId], references: [id])
+  operator   Operator @relation(fields: [operatorId], references: [id])
 
-  role       OperatorMemberRole  @default(STAFF)
+  role OperatorMemberRole @default(STAFF)
 
-  createdAt  DateTime            @default(now())
-  updatedAt  DateTime            @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@unique([userId, operatorId])
   @@index([operatorId])
@@ -186,116 +191,158 @@ model OperatorMember {
 }
 
 model RescueRequest {
-  id                 String              @id @default(cuid())
-  
-  customerId         String
-  customer           User                @relation(fields: [customerId], references: [id])
+  id String @id @default(cuid())
 
-  status             RescueRequestStatus @default(WAITING_FOR_LOCATION)
+  customerId String
+  customer   User   @relation(fields: [customerId], references: [id])
 
-  latitude           Decimal?
-  longitude          Decimal?
+  status RescueRequestStatus @default(WAITING_FOR_LOCATION)
 
-  issueType          IssueType?
-  vehicleType        VehicleType?
-  destination        String?
+  latitude  Decimal?
+  longitude Decimal?
 
-  depositPaid        Boolean             @default(false)
-  depositAmount      Int?
-  serviceFeeAmount    Int?
-  depositReference   String?
-  depositRefundStatus RefundStatus       @default(NONE)
-  depositRefundId    Int?
-  balancePaid        Boolean             @default(false)
-  balanceAmount      Int?
-  balanceReference   String?
+  issueType   IssueType?
+  vehicleType VehicleType?
+  destination String?
 
-  disputed           Boolean             @default(false)
-  disputeRaisedAt    DateTime?
-  disputeResolvedAt  DateTime?
+  depositAmount    Int?
+  serviceFeeAmount Int?
+  // The Paystack checkout link for the deposit's reference (Payment.id via
+  // referenceFor). Persisted so a deposit reminder sent minutes later can
+  // still be a one-tap action — the reminder is generated by the
+  // reconciler, long after the link left scope. There is no equivalent
+  // column for the balance leg; its link is only ever sent, never resent.
+  depositPaymentUrl String?
+  balanceAmount     Int?
+
+  disputed                     Boolean   @default(false)
+  disputeRaisedAt              DateTime?
+  disputeResolvedAt            DateTime?
   // Free-text statement each side sends when asked "what happened?" after a
   // dispute is raised. Each is captured once — not an open-ended thread.
-  customerDisputeStatement String?
-  operatorDisputeStatement String?
+  customerDisputeStatement     String?
+  operatorDisputeStatement     String?
   // Staff's note on what was found/decided, entered alongside the settlement.
-  disputeResolutionNote    String?
+  disputeResolutionNote        String?
   // Snapshot of balanceAmount taken at resolution time, before any
   // adjustment — balanceAmount itself becomes the settled figure, so this
   // is the only place "what was originally owed" survives.
   disputeOriginalBalanceAmount Int?
 
   assignedOperatorId String?
-  assignedOperator   Operator?           @relation(fields: [assignedOperatorId], references: [id])
+  assignedOperator   Operator? @relation(fields: [assignedOperatorId], references: [id])
 
-  createdAt          DateTime            @default(now())
-  updatedAt          DateTime            @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   quoteCollectionDeadline DateTime?
 
-  dispatchOffers     DispatchOffer[]
-  media              RequestMedia[]
-  ratings            Rating[]
-  payout             Payout?
+  // Durable scheduling — every deadline that used to live in a setTimeout is
+  // a column here, so the reconciler can find outstanding work after a
+  // restart. See docs/superpowers/specs/2026-09-12-durable-scheduling-design.md.
+  depositWindowExpiresAt  DateTime?
+  depositRemindersSent    Int       @default(0)
+  biddingClosedAt         DateTime?
+  quoteSelectionExpiresAt DateTime?
+  confirmationDueAt       DateTime?
+  dispatchRound           Int       @default(0)
+  offeredOperatorIds      String[]  @default([])
+
+  dispatchOffers DispatchOffer[]
+  media          RequestMedia[]
+  ratings        Rating[]
+  payments       Payment[]
 
   @@index([customerId])
   @@index([status])
   @@index([createdAt])
-  @@index([depositReference])
-  @@index([balanceReference])
+  @@index([depositWindowExpiresAt])
+  @@index([quoteCollectionDeadline])
+  @@index([quoteSelectionExpiresAt])
+  @@index([confirmationDueAt])
 }
 
 // Singleton row — platform-wide pricing configuration, admin-editable.
 // Read fresh at quote-selection time; never cached, never re-read after a
 // job's amounts are persisted onto its RescueRequest.
 model PlatformConfig {
-  id                    String   @id @default(cuid())
-  serviceFeePercent     Decimal  @default(10.0)
-  depositPercent        Decimal  @default(10.0)
+  id                      String   @id @default(cuid())
+  serviceFeePercent       Decimal  @default(10.0)
+  depositPercent          Decimal  @default(10.0)
   // How long (minutes) each batch of offered operators has to respond
   // (quote or decline) before the round expires and dispatch retries.
-  dispatchWindowMinutes Int      @default(10)
+  dispatchWindowMinutes   Int      @default(10)
   // WhatsApp number staff disputes are alerted to. Optional — unset means
   // the staff alert step is skipped, not an error.
   disputeAlertPhoneNumber String?
-  quoteCollectionMinutes Int      @default(5)
-  dispatchBatchSize      Int      @default(3)
-  updatedAt             DateTime @updatedAt
+  quoteCollectionMinutes  Int      @default(5)
+  dispatchBatchSize       Int      @default(3)
+  updatedAt               DateTime @updatedAt
 }
 
-// Photos/video/audio submitted by the motorist for a request, forwarded
-// to operators as signed redirect links in the dispatch offer.
+enum MediaContext {
+  INITIAL
+  COMPLETION
+  DISPUTE
+}
+
+// Photos/video/audio evidence attached to a request — the motorist's
+// initial breakdown media (forwarded to operators as signed redirect links
+// in the dispatch offer), the operator's completion evidence, or either
+// party's dispute evidence. `context` distinguishes which; `uploadedByRole`
+// who sent it (only meaningful to disambiguate for DISPUTE, since INITIAL
+// is always CUSTOMER and COMPLETION is always OPERATOR).
 model RequestMedia {
-  id               String        @id @default(cuid())
+  id String @id @default(cuid())
 
-  rescueRequestId  String
-  rescueRequest    RescueRequest @relation(fields: [rescueRequestId], references: [id])
+  rescueRequestId String
+  rescueRequest   RescueRequest @relation(fields: [rescueRequestId], references: [id])
 
-  mediaType        MediaType
-  s3Key            String
-  contentType      String
+  mediaType   MediaType
+  s3Key       String
+  contentType String
 
-  createdAt        DateTime      @default(now())
+  context        MediaContext @default(INITIAL)
+  uploadedByRole UserRole     @default(CUSTOMER)
+
+  createdAt DateTime @default(now())
 
   @@index([rescueRequestId])
+  @@index([rescueRequestId, context, uploadedByRole])
+}
+
+// Durable outbox for S3 objects deleted from RequestMedia's DB rows —
+// account deletion (deleteUser/deleteOperator) writes here in the same
+// transaction as the RequestMedia delete; cleared only once a confirmed
+// S3 delete removes the row. See docs/superpowers/specs/2026-09-15-account-deletion-design.md.
+model PendingMediaDeletion {
+  id        String   @id @default(cuid())
+  s3Key     String   @unique
+  createdAt DateTime @default(now())
 }
 
 // Tracks each operator offer during dispatch (accept/decline/timeout)
 model DispatchOffer {
-  id               String              @id @default(cuid())
+  id String @id @default(cuid())
 
-  rescueRequestId  String
-  rescueRequest    RescueRequest       @relation(fields: [rescueRequestId], references: [id])
+  rescueRequestId String
+  rescueRequest   RescueRequest @relation(fields: [rescueRequestId], references: [id])
 
-  operatorId       String
-  operator         Operator            @relation(fields: [operatorId], references: [id])
+  operatorId String
+  operator   Operator @relation(fields: [operatorId], references: [id])
 
-  status           DispatchOfferStatus @default(PENDING)
-  quotedPrice      Int?
-  offeredAt        DateTime            @default(now())
-  respondedAt      DateTime?
-  expiresAt        DateTime
+  status      DispatchOfferStatus @default(PENDING)
+  quotedPrice Int?
+  offeredAt   DateTime            @default(now())
+  respondedAt DateTime?
+  expiresAt   DateTime
 
-  batchId          String
+  batchId String
+
+  // Which dispatch round this offer belongs to. Deliberately has no default:
+  // an offer created without a round could never be matched to the request's
+  // own round, and batch resolve would silently skip it.
+  dispatchRound Int
 
   @@index([rescueRequestId])
   @@index([operatorId])
@@ -312,29 +359,29 @@ enum RatingDirection {
 // collected via WhatsApp (score) and an optional unauthenticated web link
 // (comment), sent right after balance payment confirms.
 model Rating {
-  id               String          @id @default(cuid())
+  id String @id @default(cuid())
 
-  rescueRequestId  String
-  rescueRequest    RescueRequest   @relation(fields: [rescueRequestId], references: [id])
+  rescueRequestId String
+  rescueRequest   RescueRequest @relation(fields: [rescueRequestId], references: [id])
 
-  direction        RatingDirection
+  direction RatingDirection
 
-  operatorId       String
-  operator         Operator        @relation(fields: [operatorId], references: [id])
+  operatorId String
+  operator   Operator @relation(fields: [operatorId], references: [id])
 
-  customerId       String
-  customer         User            @relation(fields: [customerId], references: [id])
+  customerId String
+  customer   User   @relation(fields: [customerId], references: [id])
 
-  score            Int
-  comment          String?
+  score   Int
+  comment String?
 
   // Set when score is 1-2 — durable record so a low rating survives past
   // the one-time staff WhatsApp alert, and is visible/filterable later.
-  flagged          Boolean         @default(false)
-  flaggedAt        DateTime?
+  flagged           Boolean   @default(false)
+  flaggedAt         DateTime?
   flaggedResolvedAt DateTime?
 
-  createdAt        DateTime        @default(now())
+  createdAt DateTime @default(now())
 
   @@unique([rescueRequestId, direction])
   @@index([operatorId])
@@ -346,18 +393,18 @@ model Rating {
 // Twilio gives us a phone number on every inbound message; we always
 // resolve it to a User (creating one if needed) before touching this table.
 model WhatsAppSession {
-  id      String @id @default(cuid())
+  id String @id @default(cuid())
 
   // Every session belongs to exactly one User (created on first SOS if unregistered).
-  userId  String @unique
-  user    User   @relation(fields: [userId], references: [id])
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id])
 
   // Flow state (matches WhatsAppFlowState enum)
-  state   String @default("IDLE")
+  state String @default("IDLE")
 
   // Location captured during flow
-  latitude    Decimal?
-  longitude   Decimal?
+  latitude  Decimal?
+  longitude Decimal?
 
   // Issue selected
   issueType   String?
@@ -369,10 +416,6 @@ model WhatsAppSession {
 
   // Payment reference (deposit)
   depositReference String?
-
-  // Dispatch tracking
-  dispatchRound      Int    @default(0)
-  offeredOperatorIds String @default("[]") // JSON array of operator IDs already tried
 
   // Masked chat relay — 'OPERATOR' on the customer's own session means "I'm
   // relaying to my operator"; 'CUSTOMER' on the operator's own session means
@@ -388,60 +431,136 @@ model WhatsAppSession {
 // register as an operator on the same number. Rows are cheap to accumulate;
 // no cleanup job in this pass, expiry is enforced at query time only.
 model PhoneVerification {
-  id                      String    @id @default(cuid())
+  id String @id @default(cuid())
 
-  phoneNumber             String
-  createdAt               DateTime  @default(now())
+  phoneNumber String
+  createdAt   DateTime @default(now())
 
-  codeHash                String
-  expiresAt               DateTime
-  verifiedAt              DateTime?
-  attempts                Int       @default(0)
+  codeHash   String
+  expiresAt  DateTime
+  verifiedAt DateTime?
+  attempts   Int       @default(0)
 
   // Issued on successful verify — proves this row was already validated
   // once, without re-exposing the original code.
-  verificationTokenHash   String?
-  tokenExpiresAt          DateTime?
-  consumedAt              DateTime?
+  verificationTokenHash String?
+  tokenExpiresAt        DateTime?
+  consumedAt            DateTime?
 
   @@index([phoneNumber])
 }
 
-enum PayoutStatus {
-  PENDING     // created; either not yet attempted, or blocked from attempting (see blockReason)
-  PROCESSING  // transfer initiated, awaiting webhook confirmation
-  SUCCESS
-  FAILED      // an actual transfer attempt was made and did not succeed
+
+enum PaymentType {
+  DEPOSIT
+  BALANCE
+  REFUND
+  PAYOUT
 }
 
-enum PayoutBlockReason {
+enum PaymentStatus {
+  PENDING // committed; no call attempted
+  SUBMITTED // a call was attempted; outcome unknown
+  BLOCKED // reached Paystack, which is waiting on a human
+  SUCCEEDED
+  FAILED // Paystack definitively rejected it
+  REVERSED
+}
+
+enum PaymentBlockReason {
+  // Never reached Paystack — we are the blocker. Safe to retry fresh.
   NO_BANK_DETAILS
   INSUFFICIENT_BALANCE
+  // Reached Paystack, which is now waiting on a human. Never retry these:
+  // the money movement already exists provider-side.
+  AWAITING_OTP
+  NEEDS_CUSTOMER_DETAILS
 }
 
-// One payout per completed job — created and processed synchronously
-// inside handleBalancePaymentConfirmed. PENDING with a non-null blockReason
-// means the payout was never attempted (no bank details / insufficient
-// platform balance); FAILED means an attempt was made and did not succeed.
-// Both cases require an admin-triggered retry — never auto-retried.
-model Payout {
-  id                   String             @id @default(cuid())
+/// One row is one ATTEMPT, never reused. A retry inserts a sibling and the
+/// failed row keeps its status and reason forever — the table is the audit
+/// trail, which is why no separate failure log is needed.
+///
+/// See docs/superpowers/specs/2026-09-12-payment-model-design.md. Two partial
+/// unique indexes that Prisma cannot express live in the migration:
+/// at most one attempt in flight (PENDING/SUBMITTED/BLOCKED) and at most one
+/// SUCCEEDED, per request and type.
+model Payment {
+  id String @id @default(cuid())
 
-  rescueRequestId      String             @unique
-  rescueRequest        RescueRequest      @relation(fields: [rescueRequestId], references: [id])
+  rescueRequestId String
+  rescueRequest   RescueRequest @relation(fields: [rescueRequestId], references: [id])
 
-  operatorId           String
-  operator             Operator           @relation(fields: [operatorId], references: [id])
+  type   PaymentType
+  status PaymentStatus @default(PENDING)
 
-  amount               Int
-  status               PayoutStatus       @default(PENDING)
-  blockReason          PayoutBlockReason?
-  paystackTransferCode String?            @unique
-  failureReason        String?
+  amount      Int // kobo, always positive; `type` says which way it flows
+  currency    String @default("NGN")
+  providerFee Int? // collections: charge.success `fees`; payouts: transfer `fee_charged`
+  netAmount   Int? // what actually landed
 
-  createdAt            DateTime           @default(now())
-  completedAt          DateTime?
+  // Namespaced: `txn:123`, `refund:456`, `trf:TRF_ab12`. Paystack's
+  // transaction ids and refund ids are independent numeric sequences, so a
+  // bare id would let transaction 123 and refund 123 collide on this unique
+  // index for no real reason.
+  providerRef String? @unique
 
+  operatorId String? // payouts only
+  operator   Operator? @relation(fields: [operatorId], references: [id])
+
+  failureReason String?
+  blockReason   PaymentBlockReason?
+
+  // NOT nullable, and defaulted, so a row is chaseable the instant it is
+  // committed. If this could be null, the crash window between INSERT and
+  // the CAS would produce a payment PaymentVerifyCheck's PENDING branch can
+  // never match — and that branch exists precisely for that window.
+  verifyAfter    DateTime @default(now())
+  // Bounded escalation: after MAX_VERIFY_ATTEMPTS the check stops guessing
+  // and tells a human.
+  verifyAttempts Int      @default(0)
+
+  // Collections only. The checkout URL exists ONLY in the initialize
+  // response, and Paystack will not re-issue one for an existing reference,
+  // so a lost response leaves an attempt nobody can pay. Persisting it is
+  // what lets recovery tell "no link was ever sent" (safe to fail) from
+  // "the customer may hold a link" (never fail).
+  checkoutUrl String?
+
+  createdAt DateTime  @default(now())
+  settledAt DateTime?
+
+  @@index([rescueRequestId])
+  @@index([status, verifyAfter])
   @@index([operatorId])
-  @@index([status])
+}
+
+/// A durable record of security-sensitive, financial, or otherwise
+/// consequential actions — the kind Sentry alerts on but that shouldn't
+/// only live there, since Sentry isn't something everyone checks and it
+/// ages out. `category` is a plain string rather than an enum on purpose:
+/// new categories are just a new string at the call site, not a migration.
+model AuditLog {
+  id String @id @default(cuid())
+
+  category String
+  message  String
+  /// Structured context specific to the category (ids, amounts, the
+  /// changed fields) — never secrets or full payment card/bank details.
+  details  Json?
+
+  /// Who did it, when there's a human actor. Null for system-detected
+  /// anomalies (e.g. an unrecognized webhook) — nobody "did" those.
+  actorId String?
+
+  createdAt DateTime @default(now())
+
+  /// Set once a human has looked at this entry and judged it handled.
+  /// Bookkeeping only — reviewing an entry never changes anything else in
+  /// the system (contrast with the reconciliation feature this replaced,
+  /// which asserted money had moved; this only asserts someone looked).
+  reviewedAt DateTime?
+  reviewedBy String?
+
+  @@index([category, createdAt])
 }

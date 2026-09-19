@@ -80,26 +80,42 @@ describe('PlatformConfigService', () => {
 
   describe('updateConfig', () => {
     it('rejects a serviceFeePercent below 0', async () => {
-      await expect(service.updateConfig({ serviceFeePercent: -1 })).rejects.toThrow(BadRequestException);
+      await expect(
+        service.updateConfig({ serviceFeePercent: -1 }),
+      ).rejects.toThrow(BadRequestException);
     });
 
     it('rejects a depositPercent above 100', async () => {
-      await expect(service.updateConfig({ depositPercent: 101 })).rejects.toThrow(BadRequestException);
+      await expect(
+        service.updateConfig({ depositPercent: 101 }),
+      ).rejects.toThrow(BadRequestException);
     });
 
     it('rejects a dispatchWindowMinutes outside 1-60', async () => {
-      await expect(service.updateConfig({ dispatchWindowMinutes: 0 })).rejects.toThrow(BadRequestException);
-      await expect(service.updateConfig({ dispatchWindowMinutes: 61 })).rejects.toThrow(BadRequestException);
+      await expect(
+        service.updateConfig({ dispatchWindowMinutes: 0 }),
+      ).rejects.toThrow(BadRequestException);
+      await expect(
+        service.updateConfig({ dispatchWindowMinutes: 61 }),
+      ).rejects.toThrow(BadRequestException);
     });
 
     it('rejects a dispatchBatchSize outside 1-20', async () => {
-      await expect(service.updateConfig({ dispatchBatchSize: 0 })).rejects.toThrow(BadRequestException);
-      await expect(service.updateConfig({ dispatchBatchSize: 21 })).rejects.toThrow(BadRequestException);
+      await expect(
+        service.updateConfig({ dispatchBatchSize: 0 }),
+      ).rejects.toThrow(BadRequestException);
+      await expect(
+        service.updateConfig({ dispatchBatchSize: 21 }),
+      ).rejects.toThrow(BadRequestException);
     });
 
     it('rejects a quoteCollectionMinutes outside 1-60', async () => {
-      await expect(service.updateConfig({ quoteCollectionMinutes: 0 })).rejects.toThrow(BadRequestException);
-      await expect(service.updateConfig({ quoteCollectionMinutes: 61 })).rejects.toThrow(BadRequestException);
+      await expect(
+        service.updateConfig({ quoteCollectionMinutes: 0 }),
+      ).rejects.toThrow(BadRequestException);
+      await expect(
+        service.updateConfig({ quoteCollectionMinutes: 61 }),
+      ).rejects.toThrow(BadRequestException);
     });
 
     it('persists a new quoteCollectionMinutes', async () => {
@@ -134,7 +150,10 @@ describe('PlatformConfigService', () => {
         disputeAlertPhoneNumber: null,
       });
 
-      const result = await service.updateConfig({ serviceFeePercent: 15, dispatchWindowMinutes: 15 });
+      const result = await service.updateConfig({
+        serviceFeePercent: 15,
+        dispatchWindowMinutes: 15,
+      });
 
       expect(prisma.platformConfig.update).toHaveBeenCalledWith({
         where: { id: 'default' },
@@ -180,7 +199,9 @@ describe('PlatformConfigService', () => {
         disputeAlertPhoneNumber: '+2348012345678',
       });
 
-      const result = await service.updateConfig({ disputeAlertPhoneNumber: '+2348012345678' });
+      const result = await service.updateConfig({
+        disputeAlertPhoneNumber: '+2348012345678',
+      });
 
       expect(prisma.platformConfig.update).toHaveBeenCalledWith({
         where: { id: 'cfg-1' },

@@ -1,5 +1,15 @@
-import { BadRequestException, forwardRef, Inject, Injectable, NotFoundException } from '@nestjs/common';
-import { RescueRequestStatus } from '@prisma/client';
+import {
+  BadRequestException,
+  forwardRef,
+  Inject,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import {
+  PaymentStatus,
+  PaymentType,
+  RescueRequestStatus,
+} from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
@@ -37,14 +47,77 @@ export class DisputeService {
    * session into AWAITING_DISPUTE_REASON — without it we can still raise
    * the dispute, we just can't prompt that customer for their statement.
    */
-  async raiseDispute(rescueRequestId: string, customerPhoneNumber: string, customerUserId?: string) {
-    const rescueRequest = await this.prisma.rescueRequest.findUnique({
-      where: { id: rescueRequestId },
-      include: { customer: true, assignedOperator: true },
-    });
-    if (!rescueRequest) return;
+  async raiseDispute(
+    rescueRequestId: string,
+    customerPhoneNumber: string,
+    customerUserId?: string,
+  ) {
+    const decision = await this.prisma.$transaction(async (tx) => {
+      const initial = await tx.rescueRequest.findUnique({
+        where: { id: rescueRequestId },
+        select: { customerId: true },
+      });
+      if (!initial) return null;
 
-    if (rescueRequest.disputed && !rescueRequest.disputeResolvedAt) {
+      const customerStillActive = await tx.user.updateMany({
+        where: { id: initial.customerId, deletedAt: null },
+        data: { updatedAt: new Date() },
+      });
+      if (customerStillActive.count === 0) {
+        throw new BadRequestException(
+          'Cannot raise a dispute: this customer has been deleted.',
+        );
+      }
+
+      // Assignment writers lock the customer first, so this read is stable
+      // once the User lock above is held and identifies the current operator.
+      const assignment = await tx.rescueRequest.findUnique({
+        where: { id: rescueRequestId },
+        select: { assignedOperatorId: true },
+      });
+      if (!assignment) return null;
+
+      if (assignment.assignedOperatorId) {
+        const operatorStillActive = await tx.operator.updateMany({
+          where: { id: assignment.assignedOperatorId, deletedAt: null },
+          data: { updatedAt: new Date() },
+        });
+        if (operatorStillActive.count === 0) {
+          throw new BadRequestException(
+            'Cannot raise a dispute: the assigned operator has been deleted.',
+          );
+        }
+      }
+
+      const rescueRequest = await tx.rescueRequest.findUnique({
+        where: { id: rescueRequestId },
+        include: { customer: true, assignedOperator: true },
+      });
+      if (!rescueRequest) return null;
+
+      if (rescueRequest.disputed && !rescueRequest.disputeResolvedAt) {
+        return { rescueRequest, alreadyOpen: true, isReopen: false };
+      }
+
+      const isReopen =
+        rescueRequest.disputed && !!rescueRequest.disputeResolvedAt;
+
+      await tx.rescueRequest.update({
+        where: { id: rescueRequestId },
+        data: {
+          disputed: true,
+          disputeRaisedAt: new Date(),
+          disputeResolvedAt: null,
+          status: RescueRequestStatus.IN_DISPUTE,
+        },
+      });
+
+      return { rescueRequest, alreadyOpen: false, isReopen };
+    });
+    if (!decision) return;
+
+    const { rescueRequest, alreadyOpen, isReopen } = decision;
+    if (alreadyOpen) {
       // Already open — no DB write, no re-alert.
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(customerPhoneNumber),
@@ -52,15 +125,6 @@ export class DisputeService {
       );
       return;
     }
-
-    const isReopen = rescueRequest.disputed && !!rescueRequest.disputeResolvedAt;
-
-    await this.prisma.rescueRequest.update({
-      where: { id: rescueRequestId },
-      data: isReopen
-        ? { disputed: true, disputeRaisedAt: new Date(), disputeResolvedAt: null, status: RescueRequestStatus.IN_DISPUTE }
-        : { disputed: true, disputeRaisedAt: new Date(), status: RescueRequestStatus.IN_DISPUTE },
-    });
 
     const config = await this.platformConfigService.getConfig();
     const callLine = config.disputeAlertPhoneNumber
@@ -71,8 +135,8 @@ export class DisputeService {
       toWhatsAppAddress(customerPhoneNumber),
       (isReopen
         ? `⚠️ Your dispute has been reopened. Our team is on it and will contact you shortly.`
-        : `⚠️ Your dispute has been logged. Our team will contact you within 30 minutes.`)
-        + `\n\nPlease reply with what happened, so we have your side of the story.${callLine}`,
+        : `⚠️ Your dispute has been logged. Our team will contact you within 30 minutes.`) +
+        `\n\nPlease reply with what happened, so we have your side of the story.${callLine}`,
     );
 
     if (customerUserId) {
@@ -87,7 +151,9 @@ export class DisputeService {
     // a failed operator notification shouldn't block the dispute itself.
     if (rescueRequest.assignedOperator?.phoneNumber) {
       try {
-        const opUser = await this.sharedService.findOrCreateCustomer(rescueRequest.assignedOperator.phoneNumber);
+        const opUser = await this.sharedService.findOrCreateCustomer(
+          rescueRequest.assignedOperator.phoneNumber,
+        );
         await this.sessionStore.update(opUser.id, {
           state: WhatsAppFlowState.AWAITING_DISPUTE_RESPONSE,
           rescueRequestId,
@@ -96,9 +162,9 @@ export class DisputeService {
           toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
           (isReopen
             ? `⚠️ The customer's dispute on ${formatJobRef(rescueRequestId)} has been reopened.`
-            : `⚠️ The customer has disputed ${formatJobRef(rescueRequestId)}. Our team will review shortly.`)
-            + `\n\nDo NOT release the vehicle until you hear from us.`
-            + `\n\nPlease reply with your side of what happened.${callLine}`,
+            : `⚠️ The customer has disputed ${formatJobRef(rescueRequestId)}. Our team will review shortly.`) +
+            `\n\nDo NOT release the vehicle until you hear from us.` +
+            `\n\nPlease reply with your side of what happened.${callLine}`,
         );
       } catch (error) {
         console.error('Failed to notify operator of raised dispute:', error);
@@ -156,7 +222,7 @@ export class DisputeService {
    * balanceAdjustmentPercent (1-100, default 100 = no change) settles what
    * the customer actually owes. Status is deliberately left at IN_DISPUTE —
    * it only becomes COMPLETED once the settled amount is actually paid
-   * (handleBalancePaymentConfirmed), same trigger every job already uses.
+   * (confirmBalance), same trigger every job already uses.
    * This snapshots the pre-adjustment balance onto
    * disputeOriginalBalanceAmount before overwriting balanceAmount with the
    * settled figure, so "quoted vs. actually charged" is never lost.
@@ -165,9 +231,19 @@ export class DisputeService {
     rescueRequestId: string,
     resolutionNote: string,
     balanceAdjustmentPercent = 100,
-  ): Promise<{ resolved: boolean }> {
-    if (!Number.isInteger(balanceAdjustmentPercent) || balanceAdjustmentPercent < 1 || balanceAdjustmentPercent > 100) {
-      throw new BadRequestException('balanceAdjustmentPercent must be an integer between 1 and 100.');
+  ): Promise<{
+    resolved: boolean;
+    originalBalance?: number;
+    settledBalance?: number;
+  }> {
+    if (
+      !Number.isInteger(balanceAdjustmentPercent) ||
+      balanceAdjustmentPercent < 1 ||
+      balanceAdjustmentPercent > 100
+    ) {
+      throw new BadRequestException(
+        'balanceAdjustmentPercent must be an integer between 1 and 100.',
+      );
     }
 
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
@@ -185,8 +261,31 @@ export class DisputeService {
       return { resolved: true };
     }
 
+    // A dispute can be reopened (see raiseDispute's isReopen branch) after
+    // its balance was already collected in full — this endpoint is only
+    // meant to adjust an UNPAID balance before it's charged. Sending a new
+    // settlement link on top of one already paid would charge the customer
+    // a second time, which is exactly what happened before this check
+    // existed. If a refund is owed here, issue it directly rather than
+    // through dispute resolution.
+    const alreadyPaid = await this.prisma.payment.findFirst({
+      where: {
+        rescueRequestId,
+        type: PaymentType.BALANCE,
+        status: PaymentStatus.SUCCEEDED,
+      },
+      select: { id: true },
+    });
+    if (alreadyPaid) {
+      throw new BadRequestException(
+        "This request's balance has already been paid in full — resolving the dispute again would collect a second payment. Issue a refund directly instead.",
+      );
+    }
+
     const originalBalance = rescueRequest.balanceAmount ?? 0;
-    const settledBalance = Math.round(originalBalance * balanceAdjustmentPercent / 100);
+    const settledBalance = Math.round(
+      (originalBalance * balanceAdjustmentPercent) / 100,
+    );
 
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequestId },
@@ -200,19 +299,25 @@ export class DisputeService {
 
     // Send the settlement payment link directly — resolving a dispute
     // replaces the customer's CONFIRM, it doesn't ask them to CONFIRM again.
-    await this.paymentEventsService.sendBalancePaymentLink({ ...rescueRequest, balanceAmount: settledBalance });
+    await this.paymentEventsService.sendBalancePaymentLink({
+      ...rescueRequest,
+      balanceAmount: settledBalance,
+    });
 
     const jobRef = formatJobRef(rescueRequestId);
     const operatorMessage = `The dispute on ${jobRef} has been resolved. A payment link for ₦${(settledBalance / 100).toLocaleString()} has been sent to the customer.`;
 
     try {
       if (rescueRequest.assignedOperator?.phoneNumber) {
-        await this.twilioService.sendWhatsAppMessage(toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber), operatorMessage);
+        await this.twilioService.sendWhatsAppMessage(
+          toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
+          operatorMessage,
+        );
       }
     } catch (error) {
       console.error('Failed to notify operator of dispute resolution:', error);
     }
 
-    return { resolved: true };
+    return { resolved: true, originalBalance, settledBalance };
   }
 }

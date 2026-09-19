@@ -11,9 +11,7 @@ describe('PaystackController', () => {
 
     const module: TestingModule = await Test.createTestingModule({
       controllers: [PaystackController],
-      providers: [
-        { provide: PaystackService, useValue: paystackService },
-      ],
+      providers: [{ provide: PaystackService, useValue: paystackService }],
     }).compile();
 
     controller = module.get<PaystackController>(PaystackController);
@@ -25,7 +23,9 @@ describe('PaystackController', () => {
 
   describe('listBanks', () => {
     it('returns the bank list from PaystackService', async () => {
-      paystackService.listBanks.mockResolvedValue([{ name: 'GTBank', code: '058' }]);
+      paystackService.listBanks.mockResolvedValue([
+        { name: 'GTBank', code: '058' },
+      ]);
 
       const result = await controller.listBanks();
 

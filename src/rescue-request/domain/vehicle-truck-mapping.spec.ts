@@ -48,12 +48,18 @@ describe('mapVehicleTypeReply', () => {
     expect(mapVehicleTypeReply('SUV')).toBe(VehicleType.SUV);
     expect(mapVehicleTypeReply('armored')).toBe(VehicleType.ARMORED_LUXURY);
     expect(mapVehicleTypeReply('armoured')).toBe(VehicleType.ARMORED_LUXURY);
-    expect(mapVehicleTypeReply('armored luxury')).toBe(VehicleType.ARMORED_LUXURY);
-    expect(mapVehicleTypeReply('ARMOURED LUXURY')).toBe(VehicleType.ARMORED_LUXURY);
+    expect(mapVehicleTypeReply('armored luxury')).toBe(
+      VehicleType.ARMORED_LUXURY,
+    );
+    expect(mapVehicleTypeReply('ARMOURED LUXURY')).toBe(
+      VehicleType.ARMORED_LUXURY,
+    );
     expect(mapVehicleTypeReply('luxury')).toBe(VehicleType.ARMORED_LUXURY);
     expect(mapVehicleTypeReply('trailer')).toBe(VehicleType.HEAVY_TRAILER);
     expect(mapVehicleTypeReply('heavy')).toBe(VehicleType.HEAVY_TRAILER);
-    expect(mapVehicleTypeReply('HEAVY TRAILER')).toBe(VehicleType.HEAVY_TRAILER);
+    expect(mapVehicleTypeReply('HEAVY TRAILER')).toBe(
+      VehicleType.HEAVY_TRAILER,
+    );
   });
 
   it('returns undefined for unrecognised input', () => {
@@ -65,7 +71,9 @@ describe('mapVehicleTypeReply', () => {
 describe('formatVehicleType', () => {
   it('formats enum values as readable labels', () => {
     expect(formatVehicleType(VehicleType.SEDAN)).toBe('Sedan');
-    expect(formatVehicleType(VehicleType.ARMORED_LUXURY)).toBe('Armored/Luxury');
+    expect(formatVehicleType(VehicleType.ARMORED_LUXURY)).toBe(
+      'Armored/Luxury',
+    );
     expect(formatVehicleType(VehicleType.HEAVY_TRAILER)).toBe('Heavy Trailer');
   });
 });

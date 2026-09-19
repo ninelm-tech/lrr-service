@@ -1,7 +1,12 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import * as Sentry from '@sentry/node';
+import { Payment } from '@prisma/client';
 import { PaymentEventsService } from './payment-events.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { PaymentLedgerService } from '../payment/payment-ledger.service';
+import { createPaymentLedgerMock } from '../payment/testing/payment-ledger.mock';
+import { PaystackCustomerService } from '../payment/paystack-customer.service';
+import { createPaystackCustomerServiceMock } from '../payment/testing/paystack-customer.mock';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PayoutService } from '../payout/payout.service';
@@ -9,6 +14,10 @@ import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { DispatchService } from './dispatch.service';
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
+
+/** The two fields confirmDeposit/confirmBalance actually read off Payment. */
+const paymentFor = (rescueRequestId: string, id = 'pay-1'): Payment =>
+  ({ id, rescueRequestId }) as Payment;
 
 jest.mock('@sentry/node', () => ({
   captureMessage: jest.fn(),
@@ -26,6 +35,7 @@ describe('PaymentEventsService', () => {
       findUniqueOrThrow: jest.Mock;
     };
     dispatchOffer: { updateMany: jest.Mock };
+    payment: { update: jest.Mock };
   };
   let payoutServiceMock: { createAndProcessPayout: jest.Mock };
   let sessionStore: { update: jest.Mock };
@@ -41,29 +51,37 @@ describe('PaymentEventsService', () => {
   beforeEach(async () => {
     prisma = {
       rescueRequest: {
-        findFirst: jest.fn().mockResolvedValue({
+        findFirst: jest.fn(),
+        findUnique: jest.fn(),
+        update: jest.fn().mockResolvedValue({}),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findUniqueOrThrow: jest.fn().mockResolvedValue({
           id: 'req-1',
           customerId: 'cust-1',
+          status: 'WAITING_FOR_DEPOSIT',
           balanceAmount: 200000,
           depositAmount: 50000,
           serviceFeeAmount: 25000,
           assignedOperatorId: 'op-1',
           customer: { phoneNumber: '+2348012345678' },
-          assignedOperator: { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2349012345678' },
+          assignedOperator: {
+            id: 'op-1',
+            businessName: 'Swift Towing',
+            phoneNumber: '+2349012345678',
+          },
         }),
-        findUnique: jest.fn(),
-        update: jest.fn(),
-        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
-        findUniqueOrThrow: jest.fn(),
       },
       dispatchOffer: { updateMany: jest.fn() },
+      payment: { update: jest.fn() },
     };
     payoutServiceMock = { createAndProcessPayout: jest.fn() };
     sessionStore = { update: jest.fn() };
     twilioService = { sendWhatsAppMessage: jest.fn() };
     sharedService = {
       findOrCreateCustomer: jest.fn().mockResolvedValue({ id: 'op-user-1' }),
-      formatLocationSection: jest.fn().mockResolvedValue('https://maps.google.com/?q=6.5,3.4'),
+      formatLocationSection: jest
+        .fn()
+        .mockResolvedValue('https://maps.google.com/?q=6.5,3.4'),
       endRelayForEndedRequest: jest.fn(),
     };
     dispatchService = { startDispatch: jest.fn() };
@@ -73,6 +91,14 @@ describe('PaymentEventsService', () => {
       providers: [
         PaymentEventsService,
         { provide: PrismaService, useValue: prisma },
+        {
+          provide: PaymentLedgerService,
+          useValue: createPaymentLedgerMock(),
+        },
+        {
+          provide: PaystackCustomerService,
+          useValue: createPaystackCustomerServiceMock(),
+        },
         { provide: PaystackService, useValue: {} },
         { provide: TwilioService, useValue: twilioService },
         { provide: PayoutService, useValue: payoutServiceMock },
@@ -86,61 +112,47 @@ describe('PaymentEventsService', () => {
     service = module.get<PaymentEventsService>(PaymentEventsService);
   });
 
-  describe('handleDepositPaymentConfirmed', () => {
-    it('assigns the operator and confirms when the claim succeeds', async () => {
-      prisma.rescueRequest.findFirst.mockResolvedValue({
-        id: 'req-1', customerId: 'cust-1', assignedOperatorId: 'op-1',
-        customer: { phoneNumber: '+2341' }, assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+  describe('confirmDeposit', () => {
+    // Redelivery/race idempotency is no longer this method's job — the
+    // caller's own claim on the Payment row (claimTerminal's CAS) is what
+    // guarantees confirmDeposit is reached at most once per settlement, and
+    // that CAS is already covered in payment-ledger.int-spec.ts. This
+    // method now trusts its caller and always proceeds when called.
+
+    it('assigns the operator and confirms for a WAITING_FOR_DEPOSIT request', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        status: 'WAITING_FOR_DEPOSIT',
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
       });
-      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
 
-      await service.handleDepositPaymentConfirmed('DEP_ref_1');
+      await service.confirmDeposit(paymentFor('req-1'));
 
-      expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith({
-        where: { id: 'req-1', status: 'WAITING_FOR_DEPOSIT' },
-        data: { depositPaid: true, status: 'OPERATOR_ASSIGNED' },
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { status: 'OPERATOR_ASSIGNED' },
       });
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
         '+2341',
         expect.stringContaining('operator is on the way'),
       );
-      expect(prisma.rescueRequest.findUniqueOrThrow).not.toHaveBeenCalled();
     });
 
-    it('is a silent no-op when the claim fails because the deposit was already paid (webhook redelivery)', async () => {
-      prisma.rescueRequest.findFirst.mockResolvedValue({
-        id: 'req-1', customerId: 'cust-1', assignedOperatorId: 'op-1',
-        customer: { phoneNumber: '+2341' }, assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
-      });
-      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 }); // claim failed
+    it('routes to handleLateDeposit for a CANCELLED request, and writes nothing — eligibility is derived', async () => {
       prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
-        id: 'req-1', depositPaid: true, status: 'OPERATOR_ASSIGNED', // already processed
+        id: 'req-1',
+        customerId: 'cust-1',
+        status: 'CANCELLED',
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: null,
       });
 
-      await service.handleDepositPaymentConfirmed('DEP_ref_1');
+      await service.confirmDeposit(paymentFor('req-1'));
 
-      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
-      expect(prisma.rescueRequest.update).not.toHaveBeenCalled(); // handleLateDeposit's write must not fire
-      expect(Sentry.captureMessage).not.toHaveBeenCalled();
-    });
-
-    it('routes to handleLateDeposit when the request is CANCELLED and not yet paid', async () => {
-      prisma.rescueRequest.findFirst.mockResolvedValue({
-        id: 'req-1', customerId: 'cust-1',
-        customer: { phoneNumber: '+2341' }, assignedOperator: null,
-      });
-      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 });
-      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
-        id: 'req-1', customer: { phoneNumber: '+2341' }, depositPaid: false, status: 'CANCELLED',
-      });
-      prisma.rescueRequest.update.mockResolvedValue({});
-
-      await service.handleDepositPaymentConfirmed('DEP_ref_1');
-
-      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
-        where: { id: 'req-1' },
-        data: { depositPaid: true, depositRefundStatus: 'ELIGIBLE' },
-      });
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
         '+2341',
         expect.stringContaining("We're processing a refund"),
@@ -149,16 +161,15 @@ describe('PaymentEventsService', () => {
     });
 
     it('alerts Sentry and does nothing automatic for an unexpected non-CANCELLED status', async () => {
-      prisma.rescueRequest.findFirst.mockResolvedValue({
-        id: 'req-1', customerId: 'cust-1',
-        customer: { phoneNumber: '+2341' }, assignedOperator: null,
-      });
-      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 });
       prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
-        id: 'req-1', depositPaid: false, status: 'ARRIVED', // some other status, neither WAITING_FOR_DEPOSIT nor CANCELLED
+        id: 'req-1',
+        customerId: 'cust-1',
+        status: 'ARRIVED', // some other status, neither WAITING_FOR_DEPOSIT nor CANCELLED
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: null,
       });
 
-      await service.handleDepositPaymentConfirmed('DEP_ref_1');
+      await service.confirmDeposit(paymentFor('req-1'));
 
       expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
       expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
@@ -169,15 +180,51 @@ describe('PaymentEventsService', () => {
     });
   });
 
-  describe('handleBalancePaymentConfirmed — payout trigger', () => {
-    it('triggers a payout for depositAmount + balanceAmount - serviceFeeAmount', async () => {
-      await service.handleBalancePaymentConfirmed('BAL_ref');
+  describe('confirmBalance — payout trigger', () => {
+    // As with confirmDeposit: redelivery/race idempotency is the caller's
+    // claim on the Payment row, not this method's job any more.
+    const BALANCE_REQUEST_FIXTURE = {
+      id: 'req-1',
+      customerId: 'cust-1',
+      balanceAmount: 200000,
+      depositAmount: 50000,
+      serviceFeeAmount: 25000,
+      assignedOperatorId: 'op-1',
+      customer: { phoneNumber: '+2348012345678' },
+      assignedOperator: {
+        id: 'op-1',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2349012345678',
+      },
+    };
 
-      expect(payoutServiceMock.createAndProcessPayout).toHaveBeenCalledWith('req-1', 'op-1', 225000);
+    beforeEach(() => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue(
+        BALANCE_REQUEST_FIXTURE,
+      );
+    });
+
+    it('completes the request unconditionally — the Payment CAS is what guarantees exactly once', async () => {
+      await service.confirmBalance(paymentFor('req-1'));
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { status: 'COMPLETED' },
+      });
+    });
+
+    it('triggers a payout for depositAmount + balanceAmount - serviceFeeAmount', async () => {
+      await service.confirmBalance(paymentFor('req-1'));
+
+      expect(payoutServiceMock.createAndProcessPayout).toHaveBeenCalledWith(
+        'req-1',
+        'op-1',
+        225000,
+      );
     });
 
     it('invites a phone-only customer to create a portal account', async () => {
-      await service.handleBalancePaymentConfirmed('BAL_ref');
+      await service.confirmBalance(paymentFor('req-1'));
 
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
         '+2348012345678',
@@ -186,39 +233,24 @@ describe('PaymentEventsService', () => {
     });
 
     it('releases any open chat relay — otherwise it swallows the rating replies prompted just below', async () => {
-      await service.handleBalancePaymentConfirmed('BAL_ref');
+      await service.confirmBalance(paymentFor('req-1'));
 
-      expect(sharedService.endRelayForEndedRequest).toHaveBeenCalledWith('req-1');
-    });
-
-    it('claims on balancePaid so the completion only ever runs once', async () => {
-      await service.handleBalancePaymentConfirmed('BAL_ref');
-
-      expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith({
-        where: { id: 'req-1', balancePaid: false },
-        data: { balancePaid: true, status: 'COMPLETED' },
-      });
-    });
-
-    it('is a silent no-op on a webhook redelivery — no second payout, no duplicate messages', async () => {
-      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 }); // already claimed
-
-      await service.handleBalancePaymentConfirmed('BAL_ref');
-
-      expect(payoutServiceMock.createAndProcessPayout).not.toHaveBeenCalled();
-      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
-      expect(customerFlowService.scheduleRatingTimeout).not.toHaveBeenCalled();
+      expect(sharedService.endRelayForEndedRequest).toHaveBeenCalledWith(
+        'req-1',
+      );
     });
 
     it('tells a customer who already has portal credentials to log in instead', async () => {
-      prisma.rescueRequest.findFirst.mockResolvedValue({
-        id: 'req-1', customerId: 'cust-1', balanceAmount: 200000, depositAmount: 50000, serviceFeeAmount: 25000,
-        assignedOperatorId: 'op-1',
-        customer: { phoneNumber: '+2348012345678', email: 'ada@example.com', passwordHash: 'hashed' },
-        assignedOperator: { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2349012345678' },
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        ...BALANCE_REQUEST_FIXTURE,
+        customer: {
+          phoneNumber: '+2348012345678',
+          email: 'ada@example.com',
+          passwordHash: 'hashed',
+        },
       });
 
-      await service.handleBalancePaymentConfirmed('BAL_ref');
+      await service.confirmBalance(paymentFor('req-1'));
 
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
         '+2348012345678',
@@ -230,22 +262,42 @@ describe('PaymentEventsService', () => {
   describe('markJobCompleted', () => {
     it('blocks a request that was ever disputed, resolved or not', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', disputed: true, disputeResolvedAt: new Date('2026-01-01'),
-        balancePaid: false, customer: { phoneNumber: '+2348012345678' },
+        id: 'req-1',
+        disputed: true,
+        disputeResolvedAt: new Date('2026-01-01'),
+        payments: [],
+        customer: { phoneNumber: '+2348012345678' },
       });
 
-      await expect(service.markJobCompleted('req-1')).rejects.toThrow('unresolved dispute');
+      await expect(service.markJobCompleted('req-1')).rejects.toThrow(
+        'unresolved dispute',
+      );
       expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
     });
 
     it('proceeds normally for a request that was never disputed', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
-        id: 'req-1', disputed: false, disputeResolvedAt: null,
-        balancePaid: false, balanceAmount: 45000, customerId: 'cust-1',
+        id: 'req-1',
+        disputed: false,
+        disputeResolvedAt: null,
+        // No succeeded BALANCE payment — derived depositPaid/balancePaid
+        // replacement for the old balancePaid: false.
+        payments: [],
+        balanceAmount: 45000,
+        customerId: 'cust-1',
         customer: { phoneNumber: '+2348012345678', email: null },
       });
       prisma.rescueRequest.update.mockResolvedValue({});
-      const paystackService = { generateReference: jest.fn().mockReturnValue('BAL-1'), initializePayment: jest.fn().mockResolvedValue({ status: true, data: { authorization_url: 'https://pay.example/1' } }) };
+      const paystackService = {
+        initializePayment: jest.fn().mockResolvedValue({
+          outcome: 'ok',
+          data: {
+            authorization_url: 'https://pay.example/1',
+            access_code: 'acc_1',
+            reference: 'BAL_pay-1',
+          },
+        }),
+      };
       (service as any).paystackService = paystackService;
 
       await service.markJobCompleted('req-1');
@@ -254,6 +306,24 @@ describe('PaymentEventsService', () => {
         where: { id: 'req-1' },
         data: { status: 'COMPLETED' },
       });
+    });
+
+    it('does not send a balance link when a succeeded BALANCE payment already exists', async () => {
+      const paystackService = { initializePayment: jest.fn() };
+      (service as any).paystackService = paystackService;
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        disputed: false,
+        disputeResolvedAt: null,
+        payments: [{ type: 'BALANCE', status: 'SUCCEEDED' }],
+        balanceAmount: 45000,
+        customerId: 'cust-1',
+        customer: { phoneNumber: '+2348012345678', email: null },
+      });
+
+      await service.markJobCompleted('req-1');
+
+      expect(paystackService.initializePayment).not.toHaveBeenCalled();
     });
   });
 });
