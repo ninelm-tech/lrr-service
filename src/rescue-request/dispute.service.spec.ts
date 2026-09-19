@@ -11,6 +11,9 @@ import { WhatsAppFlowState } from './state/whatsapp-session.types';
 describe('DisputeService', () => {
   let service: DisputeService;
   let prisma: {
+    $transaction: jest.Mock;
+    user: { updateMany: jest.Mock };
+    operator: { updateMany: jest.Mock };
     rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
     payment: { findFirst: jest.Mock };
   };
@@ -31,9 +34,15 @@ describe('DisputeService', () => {
   beforeEach(async () => {
     delete process.env.TWILIO_DISPUTE_TEMPLATE_SID;
     prisma = {
+      $transaction: jest.fn(),
+      user: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+      operator: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
       rescueRequest: { findUnique: jest.fn(), update: jest.fn() },
       payment: { findFirst: jest.fn().mockResolvedValue(null) },
     };
+    prisma.$transaction.mockImplementation(
+      (callback: (tx: typeof prisma) => Promise<unknown>) => callback(prisma),
+    );
     twilioService = {
       sendWhatsAppMessage: jest.fn(),
       sendWhatsAppTemplateMessage: jest.fn(),
@@ -94,6 +103,7 @@ describe('DisputeService', () => {
         data: {
           disputed: true,
           disputeRaisedAt: expect.any(Date),
+          disputeResolvedAt: null,
           status: 'IN_DISPUTE',
         },
       });
@@ -255,6 +265,91 @@ describe('DisputeService', () => {
         expect.stringContaining(customerPhone),
         expect.stringContaining('reopened'),
       );
+    });
+
+    it('locks the customer before the assigned operator and updates inside the transaction', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: rescueRequestId,
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        disputed: false,
+        disputeResolvedAt: null,
+        assignedOperator: null,
+        customer: { id: 'cust-1', phoneNumber: customerPhone },
+      });
+
+      await service.raiseDispute(rescueRequestId, customerPhone, 'cust-1');
+
+      expect(prisma.user.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: 'cust-1', deletedAt: null } }),
+      );
+      expect(prisma.operator.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: 'op-1', deletedAt: null } }),
+      );
+      expect(prisma.user.updateMany.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.operator.updateMany.mock.invocationCallOrder[0],
+      );
+      expect(prisma.rescueRequest.update).toHaveBeenCalled();
+    });
+
+    it('aborts without notifications when the customer has been deleted', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        customerId: 'cust-1',
+      });
+      prisma.user.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        service.raiseDispute(rescueRequestId, customerPhone, 'cust-1'),
+      ).rejects.toThrow('customer has been deleted');
+
+      expect(prisma.operator.updateMany).not.toHaveBeenCalled();
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+      expect(sessionStore.update).not.toHaveBeenCalled();
+    });
+
+    it('aborts without notifications when the assigned operator has been deleted', async () => {
+      prisma.rescueRequest.findUnique
+        .mockResolvedValueOnce({ customerId: 'cust-1' })
+        .mockResolvedValueOnce({ assignedOperatorId: 'op-1' });
+      prisma.operator.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        service.raiseDispute(rescueRequestId, customerPhone, 'cust-1'),
+      ).rejects.toThrow('assigned operator has been deleted');
+
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+      expect(sessionStore.update).not.toHaveBeenCalled();
+    });
+
+    it('does not notify until the dispute transaction has committed', async () => {
+      let transactionFinished = false;
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: rescueRequestId,
+        customerId: 'cust-1',
+        assignedOperatorId: null,
+        disputed: false,
+        disputeResolvedAt: null,
+        assignedOperator: null,
+        customer: { id: 'cust-1', phoneNumber: customerPhone },
+      });
+      prisma.$transaction.mockImplementation(
+        async (callback: (tx: typeof prisma) => Promise<unknown>) => {
+          const result = await callback(prisma);
+          transactionFinished = true;
+          return result;
+        },
+      );
+      twilioService.sendWhatsAppMessage.mockImplementation(() => {
+        expect(transactionFinished).toBe(true);
+        return Promise.resolve();
+      });
+
+      await service.raiseDispute(rescueRequestId, customerPhone, 'cust-1');
+
+      expect(transactionFinished).toBe(true);
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalled();
     });
   });
 

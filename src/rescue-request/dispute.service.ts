@@ -52,13 +52,72 @@ export class DisputeService {
     customerPhoneNumber: string,
     customerUserId?: string,
   ) {
-    const rescueRequest = await this.prisma.rescueRequest.findUnique({
-      where: { id: rescueRequestId },
-      include: { customer: true, assignedOperator: true },
-    });
-    if (!rescueRequest) return;
+    const decision = await this.prisma.$transaction(async (tx) => {
+      const initial = await tx.rescueRequest.findUnique({
+        where: { id: rescueRequestId },
+        select: { customerId: true },
+      });
+      if (!initial) return null;
 
-    if (rescueRequest.disputed && !rescueRequest.disputeResolvedAt) {
+      const customerStillActive = await tx.user.updateMany({
+        where: { id: initial.customerId, deletedAt: null },
+        data: { updatedAt: new Date() },
+      });
+      if (customerStillActive.count === 0) {
+        throw new BadRequestException(
+          'Cannot raise a dispute: this customer has been deleted.',
+        );
+      }
+
+      // Assignment writers lock the customer first, so this read is stable
+      // once the User lock above is held and identifies the current operator.
+      const assignment = await tx.rescueRequest.findUnique({
+        where: { id: rescueRequestId },
+        select: { assignedOperatorId: true },
+      });
+      if (!assignment) return null;
+
+      if (assignment.assignedOperatorId) {
+        const operatorStillActive = await tx.operator.updateMany({
+          where: { id: assignment.assignedOperatorId, deletedAt: null },
+          data: { updatedAt: new Date() },
+        });
+        if (operatorStillActive.count === 0) {
+          throw new BadRequestException(
+            'Cannot raise a dispute: the assigned operator has been deleted.',
+          );
+        }
+      }
+
+      const rescueRequest = await tx.rescueRequest.findUnique({
+        where: { id: rescueRequestId },
+        include: { customer: true, assignedOperator: true },
+      });
+      if (!rescueRequest) return null;
+
+      if (rescueRequest.disputed && !rescueRequest.disputeResolvedAt) {
+        return { rescueRequest, alreadyOpen: true, isReopen: false };
+      }
+
+      const isReopen =
+        rescueRequest.disputed && !!rescueRequest.disputeResolvedAt;
+
+      await tx.rescueRequest.update({
+        where: { id: rescueRequestId },
+        data: {
+          disputed: true,
+          disputeRaisedAt: new Date(),
+          disputeResolvedAt: null,
+          status: RescueRequestStatus.IN_DISPUTE,
+        },
+      });
+
+      return { rescueRequest, alreadyOpen: false, isReopen };
+    });
+    if (!decision) return;
+
+    const { rescueRequest, alreadyOpen, isReopen } = decision;
+    if (alreadyOpen) {
       // Already open — no DB write, no re-alert.
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(customerPhoneNumber),
@@ -66,25 +125,6 @@ export class DisputeService {
       );
       return;
     }
-
-    const isReopen =
-      rescueRequest.disputed && !!rescueRequest.disputeResolvedAt;
-
-    await this.prisma.rescueRequest.update({
-      where: { id: rescueRequestId },
-      data: isReopen
-        ? {
-            disputed: true,
-            disputeRaisedAt: new Date(),
-            disputeResolvedAt: null,
-            status: RescueRequestStatus.IN_DISPUTE,
-          }
-        : {
-            disputed: true,
-            disputeRaisedAt: new Date(),
-            status: RescueRequestStatus.IN_DISPUTE,
-          },
-    });
 
     const config = await this.platformConfigService.getConfig();
     const callLine = config.disputeAlertPhoneNumber
