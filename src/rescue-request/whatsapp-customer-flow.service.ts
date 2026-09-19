@@ -16,6 +16,8 @@ import {
   RescueRequestStatus,
   VehicleType,
   MediaType,
+  MediaContext,
+  UserRole,
   RatingDirection,
 } from '@prisma/client';
 import {
@@ -529,6 +531,8 @@ export class WhatsAppCustomerFlowService {
           rescueRequestId,
           mediaUrl,
           contentType,
+          MediaContext.INITIAL,
+          UserRole.CUSTOMER,
         );
         if (saved) {
           savedCount++;
@@ -594,11 +598,18 @@ export class WhatsAppCustomerFlowService {
    * Downloads one Twilio media attachment, uploads it to S3, and creates the
    * RequestMedia row. Returns false (rather than throwing) on any failure —
    * a single bad attachment must not break the rest of the batch or the flow.
+   * Shared across the customer and operator flows (see
+   * WhatsAppOperatorFlowService, which calls this via its injected
+   * customerFlowService) — context/uploadedByRole let every caller tag
+   * which of INITIAL/COMPLETION/DISPUTE this attachment belongs to and who
+   * sent it.
    */
-  private async captureMediaAttachment(
+  async captureMediaAttachment(
     rescueRequestId: string,
     mediaUrl: string,
     contentType: string,
+    context: MediaContext,
+    uploadedByRole: UserRole,
   ): Promise<boolean> {
     const mediaType = classifyMediaType(contentType);
     if (!mediaType) return false;
@@ -611,12 +622,21 @@ export class WhatsAppCustomerFlowService {
       await this.s3Service.uploadMedia(buffer, contentType, s3Key);
 
       await this.prisma.requestMedia.create({
-        data: { rescueRequestId, mediaType, s3Key, contentType },
+        data: {
+          rescueRequestId,
+          mediaType,
+          s3Key,
+          contentType,
+          context,
+          uploadedByRole,
+        },
       });
 
       logger.info('media: attachment saved', {
         rescueRequestId,
         mediaType,
+        context,
+        uploadedByRole,
         contentType,
       });
       return true;

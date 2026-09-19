@@ -40,6 +40,7 @@ export class WhatsAppOperatorFlowService {
     rawMessage: string,
     session: Awaited<ReturnType<WhatsAppSessionStore['getOrCreate']>>,
     operator: { id: string; businessName: string; phoneNumber: string },
+    body: Record<string, any>,
   ) {
     // Strip thousands separators so "100,000" parses the same as "100000" —
     // no valid operator command otherwise contains a comma.

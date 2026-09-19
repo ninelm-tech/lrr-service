@@ -78,6 +78,7 @@ export class WhatsAppInboundService {
         rawMessage,
         session,
         operatorRecord,
+        body,
       );
     }
 

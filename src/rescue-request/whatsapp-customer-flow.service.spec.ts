@@ -21,6 +21,7 @@ import {
   WhatsAppFlowState,
   WhatsAppSession,
 } from './state/whatsapp-session.types';
+import { MediaContext, MediaType, UserRole } from '@prisma/client';
 
 describe('WhatsAppCustomerFlowService', () => {
   describe('handleRatingReply', () => {
@@ -1146,6 +1147,66 @@ describe('WhatsAppCustomerFlowService', () => {
       });
       expect(quotedCall[0].data.status).toBe('NOT_SELECTED');
       expect(quotedCall[0].data.respondedAt).toBeInstanceOf(Date);
+    });
+  });
+
+  describe('captureMediaAttachment', () => {
+    let service: WhatsAppCustomerFlowService;
+    let prisma: { requestMedia: { create: jest.Mock } };
+    let twilioService: { downloadMedia: jest.Mock };
+    let s3Service: { uploadMedia: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = { requestMedia: { create: jest.fn().mockResolvedValue({}) } };
+      twilioService = {
+        downloadMedia: jest.fn().mockResolvedValue(Buffer.from('fake')),
+      };
+      s3Service = { uploadMedia: jest.fn().mockResolvedValue(undefined) };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppCustomerFlowService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaymentLedgerService, useValue: createPaymentLedgerMock() },
+          { provide: PaystackCustomerService, useValue: createPaystackCustomerServiceMock() },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: S3Service, useValue: s3Service },
+          { provide: GeocodingService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PaystackService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppCustomerFlowService>(
+        WhatsAppCustomerFlowService,
+      );
+    });
+
+    it('saves the row tagged with the context and uploader role it was called with', async () => {
+      const saved = await service.captureMediaAttachment(
+        'req-1',
+        'https://twilio.example/media/1',
+        'image/jpeg',
+        MediaContext.COMPLETION,
+        UserRole.OPERATOR,
+      );
+
+      expect(saved).toBe(true);
+      expect(prisma.requestMedia.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          rescueRequestId: 'req-1',
+          mediaType: MediaType.IMAGE,
+          context: MediaContext.COMPLETION,
+          uploadedByRole: UserRole.OPERATOR,
+        }),
+      });
     });
   });
 });

@@ -75,6 +75,7 @@ describe('WhatsAppOperatorFlowService', () => {
         '4',
         session,
         operator,
+        {},
       );
 
       // handleOperatorQuoteOrDecline's quote path always starts with an
@@ -116,6 +117,7 @@ describe('WhatsAppOperatorFlowService', () => {
         'no',
         session,
         operator,
+        {},
       );
 
       // A stale rating prompt must not swallow a decline for a genuinely
@@ -248,6 +250,7 @@ describe('WhatsAppOperatorFlowService', () => {
         '#AAAAAA',
         { state: WhatsAppFlowState.IDLE } as any,
         { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341' },
+        {},
       );
 
       expect(result).toContain('Ikeja under bridge');
@@ -265,6 +268,7 @@ describe('WhatsAppOperatorFlowService', () => {
         '#AAAAAA 25000',
         { state: WhatsAppFlowState.IDLE } as any,
         { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341' },
+        {},
       );
 
       expect(dispatchService.processQuoteOrDecline).toHaveBeenCalledWith(
@@ -283,6 +287,7 @@ describe('WhatsAppOperatorFlowService', () => {
         'onsite',
         { state: WhatsAppFlowState.IDLE } as any,
         { id: 'op-1', businessName: 'Swift Towing', phoneNumber: '+2341' },
+        {},
       );
 
       // No open offer ends in "ONSITE", so it falls through to the ARRIVED
@@ -365,6 +370,7 @@ describe('WhatsAppOperatorFlowService', () => {
           businessName: 'Swift Towing',
           phoneNumber: '+2348011112222',
         },
+        {},
       );
 
       expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
@@ -434,6 +440,7 @@ describe('WhatsAppOperatorFlowService', () => {
           businessName: 'Swift Towing',
           phoneNumber: operatorPhone,
         },
+        {},
       );
 
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
@@ -465,6 +472,7 @@ describe('WhatsAppOperatorFlowService', () => {
           businessName: 'Swift Towing',
           phoneNumber: operatorPhone,
         },
+        {},
       );
 
       expect(sessionStore.update).toHaveBeenCalledWith('op-user-1', {
@@ -506,6 +514,7 @@ describe('WhatsAppOperatorFlowService', () => {
           businessName: 'Swift Towing',
           phoneNumber: operatorPhone,
         },
+        {},
       );
 
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(

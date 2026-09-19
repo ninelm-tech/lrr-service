@@ -15,6 +15,9 @@ export enum WhatsAppFlowState {
   OPERATOR_ON_JOB = 'OPERATOR_ON_JOB',
   // Set after operator sends ARRIVED and customer is notified
   OPERATOR_AT_LOCATION = 'OPERATOR_AT_LOCATION',
+  // Set after operator sends DONE — operator must submit at least one
+  // photo/video before the job actually completes.
+  OPERATOR_AWAITING_COMPLETION_MEDIA = 'OPERATOR_AWAITING_COMPLETION_MEDIA',
 
   // ── Customer payment state ───────────────────────────────
   // Operator found and tentatively assigned; customer has 5 minutes to pay deposit.
