@@ -56,6 +56,7 @@ describe('Deposit submission protocol (integration)', () => {
           .fn()
           .mockResolvedValue({ code: 'cus_test', email: 'customer@lrr.ng' }),
       } as never,
+      {} as never,
     );
   });
 

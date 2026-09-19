@@ -112,7 +112,11 @@ export class OperatorController {
     @Body() dto: UpdateOperatorProfileDto,
   ) {
     await this.operatorService.assertCanManageOperator(req.user, id);
-    const operator = await this.operatorService.updateProfile(id, dto);
+    const operator = await this.operatorService.updateProfile(
+      id,
+      dto,
+      req.user,
+    );
     return { message: 'Operator profile updated', data: operator };
   }
 
@@ -137,7 +141,11 @@ export class OperatorController {
         'bankCode, bankName, and accountNumber are required',
       );
     }
-    const operator = await this.operatorService.saveBankDetails(id, dto);
+    const operator = await this.operatorService.saveBankDetails(
+      id,
+      dto,
+      req.user,
+    );
     return { message: 'Payout bank details saved', data: operator };
   }
 
@@ -150,7 +158,7 @@ export class OperatorController {
   @Delete(':id/bank-details')
   async clearBankDetails(@Req() req: any, @Param('id') id: string) {
     await this.operatorService.assertCanManageOperator(req.user, id);
-    const operator = await this.operatorService.clearBankDetails(id);
+    const operator = await this.operatorService.clearBankDetails(id, req.user);
     return { message: 'Payout bank details removed', data: operator };
   }
 
@@ -185,6 +193,7 @@ export class OperatorController {
     const operator = await this.operatorService.setAvailability(
       id,
       Boolean(isAvailable),
+      req.user,
     );
     return {
       message: `Operator availability set to ${isAvailable}`,
@@ -212,10 +221,14 @@ export class OperatorController {
     @Body() body: { userId: string; role?: OperatorMemberRole },
   ) {
     await this.operatorService.assertCanManageOperator(req.user, id);
-    const member = await this.operatorService.addMember(id, {
-      userId: body.userId,
-      role: body.role ?? OperatorMemberRole.STAFF,
-    });
+    const member = await this.operatorService.addMember(
+      id,
+      {
+        userId: body.userId,
+        role: body.role ?? OperatorMemberRole.STAFF,
+      },
+      req.user,
+    );
     return { message: 'Member added', data: member };
   }
 
@@ -227,7 +240,7 @@ export class OperatorController {
     @Param('memberId') memberId: string,
   ) {
     await this.operatorService.assertCanManageOperator(req.user, id);
-    await this.operatorService.removeMember(id, memberId);
+    await this.operatorService.removeMember(id, memberId, req.user);
     return { message: 'Member removed' };
   }
 }

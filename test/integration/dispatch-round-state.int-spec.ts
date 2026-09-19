@@ -85,6 +85,7 @@ describe('dispatch round state (integration)', () => {
       platformConfig as never,
       sessionStore as never,
       shared as never,
+      {} as never,
     );
   }
 

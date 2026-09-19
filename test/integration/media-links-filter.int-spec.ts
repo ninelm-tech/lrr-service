@@ -52,6 +52,7 @@ describe('RescueRequestAdminService.detailForUser — mediaLinks filter (integra
       {} as unknown as WhatsAppSessionStore, // unused by detailForUser
       {} as unknown as PaymentLedgerService, // unused by detailForUser
       {} as unknown as PaystackCustomerService, // unused by detailForUser
+      {} as never,
     );
   });
 
@@ -130,6 +131,15 @@ describe('DispatchService.listMyPendingOffers — mediaLinks filter (integration
       {} as unknown as PlatformConfigService, // unused by listMyPendingOffers
       {} as unknown as WhatsAppSessionStore, // unused by listMyPendingOffers
       {} as unknown as RescueRequestSharedService, // unused by listMyPendingOffers
+      {
+        findActiveOperatorIdsForUser: async (userId: string) => {
+          const memberships = await prisma.operatorMember.findMany({
+            where: { userId },
+            select: { operatorId: true },
+          });
+          return memberships.map((membership) => membership.operatorId);
+        },
+      } as never,
     );
   });
 

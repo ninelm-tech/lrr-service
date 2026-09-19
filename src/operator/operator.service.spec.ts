@@ -6,6 +6,7 @@ import { PaystackService } from '../integrations/paystack/paystack.service';
 import { OtpService } from '../otp/otp.service';
 import { TruckClass } from '@prisma/client';
 import { CreateOperatorDto } from './dto/create-operator.dto';
+import { OperatorMembershipService } from './operator-membership.service';
 
 describe('OperatorService', () => {
   let service: OperatorService;
@@ -14,6 +15,7 @@ describe('OperatorService', () => {
       findMany: jest.Mock;
       findUnique: jest.Mock;
       update: jest.Mock;
+      updateMany: jest.Mock;
       create: jest.Mock;
     };
     dispatchOffer: { findMany: jest.Mock };
@@ -23,8 +25,14 @@ describe('OperatorService', () => {
       findUnique: jest.Mock;
       create: jest.Mock;
       update: jest.Mock;
+      updateMany: jest.Mock;
     };
-    operatorMember: { create: jest.Mock; findFirst: jest.Mock };
+    operatorMember: {
+      create: jest.Mock;
+      findFirst: jest.Mock;
+      findUnique: jest.Mock;
+      delete: jest.Mock;
+    };
     phoneVerification: { updateMany: jest.Mock };
     $transaction: jest.Mock;
   };
@@ -33,6 +41,8 @@ describe('OperatorService', () => {
     createTransferRecipient: jest.Mock;
   };
   let otpService: { findValidTokenRow: jest.Mock };
+  let operatorMembershipService: { lockActiveMembership: jest.Mock };
+  const actingUser = { userId: 'user-1', role: 'OPERATOR' };
 
   beforeEach(async () => {
     prisma = {
@@ -40,6 +50,7 @@ describe('OperatorService', () => {
         findMany: jest.fn(),
         findUnique: jest.fn(),
         update: jest.fn(),
+        updateMany: jest.fn(),
         create: jest.fn(),
       },
       dispatchOffer: { findMany: jest.fn().mockResolvedValue([]) },
@@ -54,16 +65,25 @@ describe('OperatorService', () => {
         findUnique: jest.fn(),
         create: jest.fn(),
         update: jest.fn(),
+        updateMany: jest.fn(),
       },
-      operatorMember: { create: jest.fn(), findFirst: jest.fn() },
+      operatorMember: {
+        create: jest.fn(),
+        findFirst: jest.fn(),
+        findUnique: jest.fn(),
+        delete: jest.fn(),
+      },
       phoneVerification: { updateMany: jest.fn() },
-      $transaction: jest.fn(),
+      $transaction: jest.fn((cb: (tx: unknown) => unknown) => cb(prisma)),
     };
     paystackMock = {
       resolveAccountNumber: jest.fn(),
       createTransferRecipient: jest.fn(),
     };
     otpService = { findValidTokenRow: jest.fn() };
+    operatorMembershipService = {
+      lockActiveMembership: jest.fn().mockResolvedValue(undefined),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -71,6 +91,10 @@ describe('OperatorService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: PaystackService, useValue: paystackMock },
         { provide: OtpService, useValue: otpService },
+        {
+          provide: OperatorMembershipService,
+          useValue: operatorMembershipService,
+        },
       ],
     }).compile();
 
@@ -119,11 +143,15 @@ describe('OperatorService', () => {
         paystackRecipientCode: 'RCP_new123',
       });
 
-      const result = await service.saveBankDetails('op-1', {
-        bankCode: '058',
-        bankName: 'GTBank',
-        accountNumber: '0123456789',
-      });
+      const result = await service.saveBankDetails(
+        'op-1',
+        {
+          bankCode: '058',
+          bankName: 'GTBank',
+          accountNumber: '0123456789',
+        },
+        actingUser,
+      );
 
       expect(paystackMock.resolveAccountNumber).toHaveBeenCalledWith(
         '0123456789',
@@ -149,11 +177,15 @@ describe('OperatorService', () => {
 
     it('rejects an account number that is not exactly 10 digits (ValidationPipe is not wired up, so this is enforced manually)', async () => {
       await expect(
-        service.saveBankDetails('op-1', {
-          bankCode: '058',
-          bankName: 'GTBank',
-          accountNumber: '123',
-        }),
+        service.saveBankDetails(
+          'op-1',
+          {
+            bankCode: '058',
+            bankName: 'GTBank',
+            accountNumber: '123',
+          },
+          actingUser,
+        ),
       ).rejects.toThrow('accountNumber must be exactly 10 digits');
       expect(paystackMock.resolveAccountNumber).not.toHaveBeenCalled();
     });
@@ -173,7 +205,7 @@ describe('OperatorService', () => {
         paystackRecipientCode: null,
       });
 
-      await service.clearBankDetails('op-1');
+      await service.clearBankDetails('op-1', actingUser);
 
       expect(prisma.operator.update).toHaveBeenCalledWith({
         where: { id: 'op-1' },
@@ -189,10 +221,79 @@ describe('OperatorService', () => {
     it('throws NotFoundException for a nonexistent operator', async () => {
       prisma.operator.findUnique.mockResolvedValue(null);
 
-      await expect(service.clearBankDetails('missing')).rejects.toThrow(
-        'Operator not found',
-      );
+      await expect(
+        service.clearBankDetails('missing', actingUser),
+      ).rejects.toThrow('Operator not found');
       expect(prisma.operator.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('deletion locks for operator mutations', () => {
+    beforeEach(() => {
+      operatorMembershipService.lockActiveMembership.mockRejectedValue(
+        new Error('This operator has been deleted.'),
+      );
+    });
+
+    it('blocks availability updates before writing', async () => {
+      await expect(
+        service.setAvailability('op-1', true, actingUser),
+      ).rejects.toThrow('This operator has been deleted.');
+
+      expect(prisma.operator.update).not.toHaveBeenCalled();
+    });
+
+    it('blocks profile updates before reading or writing', async () => {
+      await expect(
+        service.updateProfile('op-1', {}, actingUser),
+      ).rejects.toThrow('This operator has been deleted.');
+
+      expect(prisma.operator.findUnique).not.toHaveBeenCalled();
+      expect(prisma.operator.update).not.toHaveBeenCalled();
+    });
+
+    it('blocks member additions before touching the target user', async () => {
+      await expect(
+        service.addMember(
+          'op-1',
+          { userId: 'target-1', role: 'STAFF' },
+          actingUser,
+        ),
+      ).rejects.toThrow('This operator has been deleted.');
+
+      expect(prisma.user.updateMany).not.toHaveBeenCalled();
+      expect(prisma.operatorMember.create).not.toHaveBeenCalled();
+    });
+
+    it('blocks member removals before reading the membership', async () => {
+      await expect(
+        service.removeMember('op-1', 'member-1', actingUser),
+      ).rejects.toThrow('This operator has been deleted.');
+
+      expect(prisma.operatorMember.findUnique).not.toHaveBeenCalled();
+      expect(prisma.operatorMember.delete).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('addMember target-user lock', () => {
+    it('rejects a missing or deleted target user before creating membership', async () => {
+      prisma.user.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        service.addMember(
+          'op-1',
+          { userId: 'target-1', role: 'STAFF' },
+          actingUser,
+        ),
+      ).rejects.toThrow(
+        'Cannot add this member: account not found or has been deleted.',
+      );
+
+      expect(prisma.user.updateMany).toHaveBeenCalledWith({
+        where: { id: 'target-1', deletedAt: null },
+        data: { updatedAt: expect.any(Date) },
+      });
+      expect(prisma.operatorMember.create).not.toHaveBeenCalled();
     });
   });
 

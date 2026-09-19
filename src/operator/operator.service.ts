@@ -21,6 +21,7 @@ import { UpdateOperatorProfileDto } from './dto/update-operator-profile.dto';
 import { SaveBankDetailsDto } from './dto/save-bank-details.dto';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { OtpService } from '../otp/otp.service';
+import { OperatorMembershipService } from './operator-membership.service';
 
 // ── Scoring weights ────────────────────────────────────────────────────────────
 // Distance is the dominant factor but reliability and speed matter.
@@ -70,6 +71,7 @@ export class OperatorService {
     private readonly prisma: PrismaService,
     private readonly paystackService: PaystackService,
     private readonly otpService: OtpService,
+    private readonly operatorMembershipService: OperatorMembershipService,
   ) {}
 
   // ══════════════════════════════════════════════════════
@@ -664,7 +666,11 @@ export class OperatorService {
    * recipientCode are stored. Changing bank details later simply repeats
    * this whole flow, overwriting paystackRecipientCode with a new one.
    */
-  async saveBankDetails(id: string, dto: SaveBankDetailsDto) {
+  async saveBankDetails(
+    id: string,
+    dto: SaveBankDetailsDto,
+    actingUser: { userId: string; role: string },
+  ) {
     // Manual check, not just the DTO's decorators — this app has no global
     // ValidationPipe wired up yet, so class-validator decorators alone
     // don't currently run (see rating.controller.ts for the same gap).
@@ -672,45 +678,62 @@ export class OperatorService {
       throw new BadRequestException('accountNumber must be exactly 10 digits');
     }
 
-    const operator = await this.prisma.operator.findUnique({ where: { id } });
-    if (!operator) throw new NotFoundException('Operator not found');
+    return this.prisma.$transaction(async (tx) => {
+      await this.operatorMembershipService.lockActiveMembership(
+        tx,
+        actingUser,
+        id,
+      );
+      const operator = await tx.operator.findUnique({ where: { id } });
+      if (!operator) throw new NotFoundException('Operator not found');
 
-    const { accountName } = await this.paystackService.resolveAccountNumber(
-      dto.accountNumber,
-      dto.bankCode,
-    );
-    const { recipientCode } =
-      await this.paystackService.createTransferRecipient({
-        accountNumber: dto.accountNumber,
-        bankCode: dto.bankCode,
-        accountName,
-        businessName: operator.businessName,
+      const { accountName } = await this.paystackService.resolveAccountNumber(
+        dto.accountNumber,
+        dto.bankCode,
+      );
+      const { recipientCode } =
+        await this.paystackService.createTransferRecipient({
+          accountNumber: dto.accountNumber,
+          bankCode: dto.bankCode,
+          accountName,
+          businessName: operator.businessName,
+        });
+
+      return tx.operator.update({
+        where: { id },
+        data: {
+          bankName: dto.bankName,
+          accountName,
+          accountNumberLast4: dto.accountNumber.slice(-4),
+          paystackRecipientCode: recipientCode,
+        },
       });
-
-    return this.prisma.operator.update({
-      where: { id },
-      data: {
-        bankName: dto.bankName,
-        accountName,
-        accountNumberLast4: dto.accountNumber.slice(-4),
-        paystackRecipientCode: recipientCode,
-      },
     });
   }
 
   /** Removes the stored payout account. Does not touch the Paystack recipient itself, only our reference to it. */
-  async clearBankDetails(id: string) {
-    const operator = await this.prisma.operator.findUnique({ where: { id } });
-    if (!operator) throw new NotFoundException('Operator not found');
+  async clearBankDetails(
+    id: string,
+    actingUser: { userId: string; role: string },
+  ) {
+    return this.prisma.$transaction(async (tx) => {
+      await this.operatorMembershipService.lockActiveMembership(
+        tx,
+        actingUser,
+        id,
+      );
+      const operator = await tx.operator.findUnique({ where: { id } });
+      if (!operator) throw new NotFoundException('Operator not found');
 
-    return this.prisma.operator.update({
-      where: { id },
-      data: {
-        bankName: null,
-        accountName: null,
-        accountNumberLast4: null,
-        paystackRecipientCode: null,
-      },
+      return tx.operator.update({
+        where: { id },
+        data: {
+          bankName: null,
+          accountName: null,
+          accountNumberLast4: null,
+          paystackRecipientCode: null,
+        },
+      });
     });
   }
 
@@ -719,86 +742,98 @@ export class OperatorService {
    * Status, availability and verification are deliberately NOT updatable here —
    * they have their own (admin-guarded) endpoints.
    */
-  async updateProfile(id: string, dto: UpdateOperatorProfileDto) {
-    const operator = await this.prisma.operator.findUnique({ where: { id } });
-    if (!operator) throw new NotFoundException('Operator not found');
-
-    const data: Record<string, any> = {};
-
-    if (dto.businessName !== undefined) {
-      const name = dto.businessName.trim();
-      if (!name) throw new BadRequestException('Business name cannot be empty');
-      data.businessName = name;
-    }
-    if (dto.contactName !== undefined && dto.contactName.trim())
-      data.contactName = dto.contactName.trim();
-    if (dto.email !== undefined)
-      data.email = dto.email.trim().toLowerCase() || null;
-    if (dto.address !== undefined && dto.address.trim())
-      data.address = dto.address.trim();
-
-    if (dto.phoneNumber !== undefined && dto.phoneNumber.trim()) {
-      const phoneNumber = normalizePhone(dto.phoneNumber);
-      if (phoneNumber !== operator.phoneNumber) {
-        const existing = await this.prisma.operator.findUnique({
-          where: { phoneNumber },
-        });
-        if (existing && existing.id !== id)
-          throw new ConflictException(
-            'Phone number already in use by another operator',
-          );
-        data.phoneNumber = phoneNumber;
-      }
-    }
-
-    if (dto.latitude !== undefined && dto.longitude !== undefined) {
-      const lat = Number(dto.latitude);
-      const lng = Number(dto.longitude);
-      if (
-        Number.isNaN(lat) ||
-        Number.isNaN(lng) ||
-        Math.abs(lat) > 90 ||
-        Math.abs(lng) > 180
-      ) {
-        throw new BadRequestException('Invalid coordinates');
-      }
-      data.latitude = lat;
-      data.longitude = lng;
-    }
-
-    if (dto.type !== undefined) {
-      if (!Object.values(OperatorType).includes(dto.type)) {
-        throw new BadRequestException(`Invalid operator type: ${dto.type}`);
-      }
-      data.type = dto.type;
-    }
-
-    if (dto.truckClasses !== undefined) {
-      const invalid = dto.truckClasses.filter(
-        (tc) => !Object.values(TruckClass).includes(tc),
+  async updateProfile(
+    id: string,
+    dto: UpdateOperatorProfileDto,
+    actingUser: { userId: string; role: string },
+  ) {
+    return this.prisma.$transaction(async (tx) => {
+      await this.operatorMembershipService.lockActiveMembership(
+        tx,
+        actingUser,
+        id,
       );
-      if (invalid.length > 0) {
-        throw new BadRequestException(
-          `Invalid truck class(es): ${invalid.join(', ')}`,
-        );
-      }
-      data.truckClasses = dto.truckClasses;
-    }
+      const operator = await tx.operator.findUnique({ where: { id } });
+      if (!operator) throw new NotFoundException('Operator not found');
 
-    if (dto.serviceRadius !== undefined) {
-      const radius = Number(dto.serviceRadius);
-      if (Number.isNaN(radius) || radius < 1 || radius > 100) {
-        throw new BadRequestException(
-          'Service radius must be between 1 and 100 km',
-        );
-      }
-      data.serviceRadius = radius;
-    }
+      const data: Record<string, any> = {};
 
-    return this.prisma.operator.update({
-      where: { id },
-      data,
-      include: { members: { include: { user: true } } },
+      if (dto.businessName !== undefined) {
+        const name = dto.businessName.trim();
+        if (!name)
+          throw new BadRequestException('Business name cannot be empty');
+        data.businessName = name;
+      }
+      if (dto.contactName !== undefined && dto.contactName.trim())
+        data.contactName = dto.contactName.trim();
+      if (dto.email !== undefined)
+        data.email = dto.email.trim().toLowerCase() || null;
+      if (dto.address !== undefined && dto.address.trim())
+        data.address = dto.address.trim();
+
+      if (dto.phoneNumber !== undefined && dto.phoneNumber.trim()) {
+        const phoneNumber = normalizePhone(dto.phoneNumber);
+        if (phoneNumber !== operator.phoneNumber) {
+          const existing = await tx.operator.findUnique({
+            where: { phoneNumber },
+          });
+          if (existing && existing.id !== id)
+            throw new ConflictException(
+              'Phone number already in use by another operator',
+            );
+          data.phoneNumber = phoneNumber;
+        }
+      }
+
+      if (dto.latitude !== undefined && dto.longitude !== undefined) {
+        const lat = Number(dto.latitude);
+        const lng = Number(dto.longitude);
+        if (
+          Number.isNaN(lat) ||
+          Number.isNaN(lng) ||
+          Math.abs(lat) > 90 ||
+          Math.abs(lng) > 180
+        ) {
+          throw new BadRequestException('Invalid coordinates');
+        }
+        data.latitude = lat;
+        data.longitude = lng;
+      }
+
+      if (dto.type !== undefined) {
+        if (!Object.values(OperatorType).includes(dto.type)) {
+          throw new BadRequestException(`Invalid operator type: ${dto.type}`);
+        }
+        data.type = dto.type;
+      }
+
+      if (dto.truckClasses !== undefined) {
+        const invalid = dto.truckClasses.filter(
+          (tc) => !Object.values(TruckClass).includes(tc),
+        );
+        if (invalid.length > 0) {
+          throw new BadRequestException(
+            `Invalid truck class(es): ${invalid.join(', ')}`,
+          );
+        }
+        data.truckClasses = dto.truckClasses;
+      }
+
+      if (dto.serviceRadius !== undefined) {
+        const radius = Number(dto.serviceRadius);
+        if (Number.isNaN(radius) || radius < 1 || radius > 100) {
+          throw new BadRequestException(
+            'Service radius must be between 1 and 100 km',
+          );
+        }
+        data.serviceRadius = radius;
+      }
+
+      return tx.operator.update({
+        where: { id },
+        data,
+        include: { members: { include: { user: true } } },
+      });
     });
   }
 
@@ -812,10 +847,21 @@ export class OperatorService {
     });
   }
 
-  async setAvailability(id: string, isAvailable: boolean) {
-    return this.prisma.operator.update({
-      where: { id },
-      data: { isAvailable },
+  async setAvailability(
+    id: string,
+    isAvailable: boolean,
+    actingUser: { userId: string; role: string },
+  ) {
+    return this.prisma.$transaction(async (tx) => {
+      await this.operatorMembershipService.lockActiveMembership(
+        tx,
+        actingUser,
+        id,
+      );
+      return tx.operator.update({
+        where: { id },
+        data: { isAvailable },
+      });
     });
   }
 
@@ -845,37 +891,59 @@ export class OperatorService {
   async addMember(
     operatorId: string,
     data: { userId: string; role: OperatorMemberRole },
+    actingUser: { userId: string; role: string },
   ) {
-    // Validate user exists
-    const user = await this.prisma.user.findUnique({
-      where: { id: data.userId },
-    });
-    if (!user) throw new Error('User not found');
-    // Check not already a member
-    const existing = await this.prisma.operatorMember.findUnique({
-      where: { userId_operatorId: { userId: data.userId, operatorId } },
-    });
-    if (existing) throw new Error('User is already a member');
+    return this.prisma.$transaction(async (tx) => {
+      await this.operatorMembershipService.lockActiveMembership(
+        tx,
+        actingUser,
+        operatorId,
+      );
+      const targetStillActive = await tx.user.updateMany({
+        where: { id: data.userId, deletedAt: null },
+        data: { updatedAt: new Date() },
+      });
+      if (targetStillActive.count === 0) {
+        throw new BadRequestException(
+          'Cannot add this member: account not found or has been deleted.',
+        );
+      }
+      const existing = await tx.operatorMember.findUnique({
+        where: { userId_operatorId: { userId: data.userId, operatorId } },
+      });
+      if (existing) throw new Error('User is already a member');
 
-    return this.prisma.operatorMember.create({
-      data: { userId: data.userId, operatorId, role: data.role },
-      include: {
-        user: {
-          select: { id: true, name: true, email: true, phoneNumber: true },
+      return tx.operatorMember.create({
+        data: { userId: data.userId, operatorId, role: data.role },
+        include: {
+          user: {
+            select: { id: true, name: true, email: true, phoneNumber: true },
+          },
         },
-      },
+      });
     });
   }
 
-  async removeMember(operatorId: string, memberId: string) {
-    const member = await this.prisma.operatorMember.findUnique({
-      where: { id: memberId },
+  async removeMember(
+    operatorId: string,
+    memberId: string,
+    actingUser: { userId: string; role: string },
+  ) {
+    return this.prisma.$transaction(async (tx) => {
+      await this.operatorMembershipService.lockActiveMembership(
+        tx,
+        actingUser,
+        operatorId,
+      );
+      const member = await tx.operatorMember.findUnique({
+        where: { id: memberId },
+      });
+      if (!member || member.operatorId !== operatorId)
+        throw new Error('Member not found');
+      if (member.role === OperatorMemberRole.OWNER)
+        throw new Error('Cannot remove the owner');
+      return tx.operatorMember.delete({ where: { id: memberId } });
     });
-    if (!member || member.operatorId !== operatorId)
-      throw new Error('Member not found');
-    if (member.role === OperatorMemberRole.OWNER)
-      throw new Error('Cannot remove the owner');
-    return this.prisma.operatorMember.delete({ where: { id: memberId } });
   }
 
   // ══════════════════════════════════════════════════════
