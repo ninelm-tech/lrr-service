@@ -634,7 +634,7 @@ export class RescueRequestAdminService {
       ];
     }
 
-    if (role === 'SUPER_ADMIN' || role === 'ADMIN') {
+    if (role === 'SUPER_ADMIN' || role === 'ADMIN' || role === 'PRODUCT') {
       if (operatorId) whereClause.assignedOperatorId = operatorId;
       return this.buildListResponse(
         whereClause,

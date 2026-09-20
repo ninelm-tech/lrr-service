@@ -615,6 +615,17 @@ describe('RescueRequestAdminService', () => {
         }),
       );
     });
+
+    it('gives PRODUCT the same full-list access as ADMIN, not the UnauthorizedException fallback', async () => {
+      prisma.rescueRequest.findMany.mockResolvedValue([]);
+      prisma.rescueRequest.count.mockResolvedValue(0);
+
+      await expect(
+        service.listForUser({ role: 'PRODUCT', userId: 'product-1' }, {}),
+      ).resolves.toEqual(
+        expect.objectContaining({ data: [], meta: expect.anything() }),
+      );
+    });
   });
 
   describe('assignOperator', () => {
