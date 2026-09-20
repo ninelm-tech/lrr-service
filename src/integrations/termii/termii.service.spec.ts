@@ -21,56 +21,120 @@ describe('TermiiService', () => {
     await expect(buildService({})).resolves.toBeDefined();
   });
 
-  describe('sendSms', () => {
-    it('posts to /sms/send with the literal message text', async () => {
+  describe('sendOtp', () => {
+    it("posts to /sms/otp/send on Termii's shared OTP sender, and returns the pinId", async () => {
       const service = await buildService({
         TERMII_API_KEY: 'test-key',
-        TERMII_SENDER_ID: 'LRR',
         TERMII_BASE_URL: 'https://v3.api.termii.com/api',
       });
       const fetchMock = jest.fn().mockResolvedValue({
         ok: true,
-        json: () => Promise.resolve({ message_id: 'msg-1' }),
+        text: () => Promise.resolve(JSON.stringify({ pinId: 'pin-abc123' })),
       });
-      global.fetch = fetchMock as any;
+      global.fetch = fetchMock as typeof fetch;
 
-      await service.sendSms(
+      const result = await service.sendOtp(
         '+2348012345678',
-        'Your LRR verification code is 123456.',
+        'Your LRR verification code is < 1234 >. It expires in 10 minutes.',
+        10,
       );
 
+      expect(result).toEqual({ pinId: 'pin-abc123' });
       expect(fetchMock).toHaveBeenCalledWith(
-        'https://v3.api.termii.com/api/sms/send',
-        expect.objectContaining({
-          method: 'POST',
-          body: expect.stringContaining(
-            'Your LRR verification code is 123456.',
-          ),
-        }),
+        'https://v3.api.termii.com/api/sms/otp/send',
+        expect.objectContaining({ method: 'POST' }),
       );
-      const [, options] = fetchMock.mock.calls[0];
-      const body = JSON.parse(options.body);
+      const [, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const body = JSON.parse(options.body as string);
       expect(body).toEqual({
         api_key: 'test-key',
+        message_type: 'NUMERIC',
         to: '+2348012345678',
-        from: 'LRR',
-        sms: 'Your LRR verification code is 123456.',
-        type: 'plain',
-        channel: 'generic',
+        from: 'N-Alert',
+        channel: 'dnd',
+        pin_attempts: 3,
+        pin_time_to_live: 10,
+        pin_length: 6,
+        pin_placeholder: '< 1234 >',
+        message_text:
+          'Your LRR verification code is < 1234 >. It expires in 10 minutes.',
+        pin_type: 'NUMERIC',
       });
     });
 
-    it('throws InternalServerErrorException when the HTTP call fails', async () => {
-      const service = await buildService({
-        TERMII_API_KEY: 'test-key',
-        TERMII_SENDER_ID: 'LRR',
-      });
+    it('throws InternalServerErrorException when the send fails', async () => {
+      const service = await buildService({ TERMII_API_KEY: 'test-key' });
       global.fetch = jest.fn().mockResolvedValue({
         ok: false,
-        json: () => Promise.resolve({ message: 'Insufficient balance' }),
-      }) as any;
+        text: () =>
+          Promise.resolve(JSON.stringify({ message: 'Insufficient balance' })),
+      }) as typeof fetch;
 
-      await expect(service.sendSms('+2348012345678', 'code')).rejects.toThrow(
+      await expect(
+        service.sendOtp('+2348012345678', 'code text', 10),
+      ).rejects.toThrow(InternalServerErrorException);
+    });
+
+    it('throws InternalServerErrorException (not a raw parse crash) when Termii returns a non-JSON error body', async () => {
+      const service = await buildService({ TERMII_API_KEY: 'test-key' });
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: false,
+        text: () => Promise.resolve(''), // e.g. Termii's real empty-body 401
+      }) as typeof fetch;
+
+      await expect(
+        service.sendOtp('+2348012345678', 'code text', 10),
+      ).rejects.toThrow(InternalServerErrorException);
+    });
+  });
+
+  describe('verifyOtp', () => {
+    it("posts to /sms/otp/verify and normalizes Termii's 'True' string to verified: true", async () => {
+      const service = await buildService({
+        TERMII_API_KEY: 'test-key',
+        TERMII_BASE_URL: 'https://v3.api.termii.com/api',
+      });
+      const fetchMock = jest.fn().mockResolvedValue({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify({ verified: 'True' })),
+      });
+      global.fetch = fetchMock as typeof fetch;
+
+      const result = await service.verifyOtp('pin-abc123', '123456');
+
+      expect(result).toEqual({ verified: true });
+      expect(fetchMock).toHaveBeenCalledWith(
+        'https://v3.api.termii.com/api/sms/otp/verify',
+        expect.objectContaining({ method: 'POST' }),
+      );
+      const [, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(JSON.parse(options.body as string)).toEqual({
+        api_key: 'test-key',
+        pin_id: 'pin-abc123',
+        pin: '123456',
+      });
+    });
+
+    it("normalizes an 'Expired' or wrong-code result to verified: false, without throwing", async () => {
+      const service = await buildService({ TERMII_API_KEY: 'test-key' });
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify({ verified: 'Expired' })),
+      }) as typeof fetch;
+
+      const result = await service.verifyOtp('pin-abc123', '000000');
+
+      expect(result).toEqual({ verified: false });
+    });
+
+    it('throws InternalServerErrorException when the HTTP call itself fails', async () => {
+      const service = await buildService({ TERMII_API_KEY: 'test-key' });
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: false,
+        text: () => Promise.resolve(''),
+      }) as typeof fetch;
+
+      await expect(service.verifyOtp('pin-abc123', '123456')).rejects.toThrow(
         InternalServerErrorException,
       );
     });

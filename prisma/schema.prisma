@@ -446,7 +446,10 @@ model PhoneVerification {
   phoneNumber String
   createdAt   DateTime @default(now())
 
-  codeHash   String
+  // Termii's own OTP product (see TermiiService.sendOtp) generates and
+  // holds the actual code server-side — this is the id needed to verify
+  // against it later, not a hash of anything we know ourselves.
+  pinId      String
   expiresAt  DateTime
   verifiedAt DateTime?
   attempts   Int       @default(0)

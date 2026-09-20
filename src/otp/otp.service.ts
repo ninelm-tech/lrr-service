@@ -4,7 +4,8 @@ import { PrismaService } from '../prisma/prisma.service';
 import { TermiiService } from '../integrations/termii/termii.service';
 import { UserRole } from '@prisma/client';
 
-const CODE_TTL_MS = 10 * 60 * 1000;
+const CODE_TTL_MINUTES = 10;
+const CODE_TTL_MS = CODE_TTL_MINUTES * 60 * 1000;
 const TOKEN_TTL_MS = 15 * 60 * 1000;
 const MAX_ATTEMPTS = 5;
 const RESEND_COOLDOWN_MS = 60 * 1000;
@@ -13,10 +14,6 @@ const SEND_WINDOW_MS = 60 * 60 * 1000;
 
 function hash(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex');
-}
-
-function generateCode(): string {
-  return String(crypto.randomInt(100000, 1000000));
 }
 
 function generateToken(): string {
@@ -29,11 +26,6 @@ export class OtpService {
     private readonly prisma: PrismaService,
     private readonly termiiService: TermiiService,
   ) {}
-
-  /** Exposed only so tests can compute a matching codeHash without duplicating the hash fn. */
-  hashForTest(code: string): string {
-    return hash(code);
-  }
 
   async sendCode(
     phoneNumber: string,
@@ -127,19 +119,22 @@ export class OtpService {
       );
     }
 
-    const code = generateCode();
+    // Termii generates and holds the actual code — we only get back the
+    // pinId needed to verify it later, so the send has to happen before
+    // there's a row to create.
+    const { pinId } = await this.termiiService.sendOtp(
+      phoneNumber,
+      `Your LRR ${label} is < 1234 >. It expires in ${CODE_TTL_MINUTES} minutes.`,
+      CODE_TTL_MINUTES,
+    );
+
     await this.prisma.phoneVerification.create({
       data: {
         phoneNumber,
-        codeHash: hash(code),
+        pinId,
         expiresAt: new Date(Date.now() + CODE_TTL_MS),
       },
     });
-
-    await this.termiiService.sendSms(
-      phoneNumber,
-      `Your LRR ${label} is ${code}. It expires in 10 minutes.`,
-    );
   }
 
   async verifyCode(
@@ -158,7 +153,9 @@ export class OtpService {
     if (row.attempts >= MAX_ATTEMPTS) {
       throw new BadRequestException('Too many attempts — request a new code.');
     }
-    if (row.codeHash !== hash(code)) {
+
+    const { verified } = await this.termiiService.verifyOtp(row.pinId, code);
+    if (!verified) {
       await this.prisma.phoneVerification.update({
         where: { id: row.id },
         data: { attempts: row.attempts + 1 },
