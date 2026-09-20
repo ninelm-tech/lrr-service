@@ -125,6 +125,53 @@ describe('PaymentLedgerService (integration)', () => {
     expect(after.providerRef).toBe('txn:987');
   });
 
+  it('quarantines a second provider success for the same request/type', async () => {
+    const { request, payment: first } = await pending();
+    await ledger.claimForSubmission(first.id, new Date());
+    await ledger.claimTerminal(
+      first.id,
+      { status: 'SUCCEEDED' },
+      { providerRef: 'txn:111' },
+    );
+
+    const duplicate = await ledger.create({
+      rescueRequestId: request.id,
+      type: 'DEPOSIT',
+      amount: 500_000,
+    });
+    await ledger.claimForSubmission(duplicate.id, new Date());
+
+    const claimed = await ledger.claimTerminal(
+      duplicate.id,
+      { status: 'SUCCEEDED' },
+      { providerRef: 'txn:222', providerFee: 7_500, netAmount: 492_500 },
+    );
+
+    expect(claimed).toBe(false);
+
+    const after = await reload(duplicate.id);
+    expect(after.status).toBe('DUPLICATE_SUCCEEDED');
+    expect(after.providerRef).toBe('txn:222');
+    expect(after.providerFee).toBe(7_500);
+    expect(after.netAmount).toBe(492_500);
+    expect(after.settledAt).not.toBeNull();
+    expect(after.failureReason).toContain(first.id);
+
+    const audit = await prisma.auditLog.findFirstOrThrow({
+      where: { category: 'duplicate_payment_success' },
+    });
+    expect(audit.details).toEqual(
+      expect.objectContaining({
+        rescueRequestId: request.id,
+        type: 'DEPOSIT',
+        duplicatePaymentId: duplicate.id,
+        existingSucceededPaymentId: first.id,
+        duplicateProviderRef: 'txn:222',
+        existingProviderRef: 'txn:111',
+      }),
+    );
+  });
+
   it('records a rejection as FAILED, so a retry is legal', async () => {
     const { payment } = await pending();
     await ledger.claimForSubmission(payment.id, new Date());

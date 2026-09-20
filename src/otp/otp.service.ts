@@ -40,7 +40,7 @@ export class OtpService {
 
     // Brand-new phone (fresh operator signup) or an existing CUSTOMER
     // (upgrade path) — both now verify ownership before proceeding.
-    await this.sendCodeToPhone(phoneNumber, 'verification code');
+    await this.sendCodeToPhone(phoneNumber);
     return { required: true };
   }
 
@@ -61,7 +61,7 @@ export class OtpService {
       return { required: false };
     }
 
-    await this.sendCodeToPhone(phoneNumber, 'password reset code');
+    await this.sendCodeToPhone(phoneNumber);
     return { required: true };
   }
 
@@ -81,7 +81,7 @@ export class OtpService {
     });
     if (existingUser?.role === UserRole.OPERATOR) {
       try {
-        await this.sendCodeToPhone(phoneNumber, 'login code');
+        await this.sendCodeToPhone(phoneNumber);
       } catch (error) {
         if (!(error instanceof BadRequestException)) throw error;
         // Swallow the rate-limit error too — letting it escape would leak
@@ -94,10 +94,7 @@ export class OtpService {
     return { required: true };
   }
 
-  private async sendCodeToPhone(
-    phoneNumber: string,
-    label: string,
-  ): Promise<void> {
+  private async sendCodeToPhone(phoneNumber: string): Promise<void> {
     const recent = await this.prisma.phoneVerification.findMany({
       where: {
         phoneNumber,
@@ -124,7 +121,9 @@ export class OtpService {
     // there's a row to create.
     const { pinId } = await this.termiiService.sendOtp(
       phoneNumber,
-      `Your LRR ${label} is < 1234 >. It expires in ${CODE_TTL_MINUTES} minutes.`,
+      // Keep this wording aligned with the template approved for this account.
+      // Termii replaces the placeholder with the generated six-digit PIN.
+      `Your LRR verification code is < 1234 >. This code expires in ${CODE_TTL_MINUTES} minutes. Do not share with anyone`,
       CODE_TTL_MINUTES,
     );
 

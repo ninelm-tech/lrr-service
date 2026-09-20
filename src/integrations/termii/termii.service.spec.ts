@@ -35,7 +35,7 @@ describe('TermiiService', () => {
 
       const result = await service.sendOtp(
         '+2348012345678',
-        'Your LRR verification code is < 1234 >. It expires in 10 minutes.',
+        'Your LRR verification code is < 1234 >. This code expires in 10 minutes. Do not share with anyone',
         10,
       );
 
@@ -50,14 +50,14 @@ describe('TermiiService', () => {
         api_key: 'test-key',
         message_type: 'NUMERIC',
         to: '+2348012345678',
-        from: 'N-Alert',
+        from: 'OE Alert',
         channel: 'dnd',
         pin_attempts: 3,
         pin_time_to_live: 10,
         pin_length: 6,
         pin_placeholder: '< 1234 >',
         message_text:
-          'Your LRR verification code is < 1234 >. It expires in 10 minutes.',
+          'Your LRR verification code is < 1234 >. This code expires in 10 minutes. Do not share with anyone',
         pin_type: 'NUMERIC',
       });
     });

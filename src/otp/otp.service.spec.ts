@@ -54,8 +54,8 @@ describe('OtpService', () => {
       expect(result).toEqual({ required: true });
       expect(termiiService.sendOtp).toHaveBeenCalledWith(
         '+2348012345678',
-        expect.stringContaining('verification code'),
-        expect.any(Number),
+        'Your LRR verification code is < 1234 >. This code expires in 10 minutes. Do not share with anyone',
+        10,
       );
       expect(prisma.phoneVerification.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -89,8 +89,8 @@ describe('OtpService', () => {
       expect(result).toEqual({ required: true });
       expect(termiiService.sendOtp).toHaveBeenCalledWith(
         '+2348012345678',
-        expect.stringContaining('verification code'),
-        expect.any(Number),
+        'Your LRR verification code is < 1234 >. This code expires in 10 minutes. Do not share with anyone',
+        10,
       );
     });
 
@@ -163,8 +163,8 @@ describe('OtpService', () => {
       expect(result).toEqual({ required: true });
       expect(termiiService.sendOtp).toHaveBeenCalledWith(
         '+2348012345678',
-        expect.stringContaining('password reset code'),
-        expect.any(Number),
+        'Your LRR verification code is < 1234 >. This code expires in 10 minutes. Do not share with anyone',
+        10,
       );
     });
 
@@ -220,8 +220,8 @@ describe('OtpService', () => {
       expect(result).toEqual({ required: true });
       expect(termiiService.sendOtp).toHaveBeenCalledWith(
         '+2348012345678',
-        expect.stringContaining('login code'),
-        expect.any(Number),
+        'Your LRR verification code is < 1234 >. This code expires in 10 minutes. Do not share with anyone',
+        10,
       );
     });
 

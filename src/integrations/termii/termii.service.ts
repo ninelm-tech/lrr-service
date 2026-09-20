@@ -23,10 +23,11 @@ export class TermiiService {
    * Termii's OTP product (not the generic /sms/send endpoint) — Termii
    * generates, delivers, and holds the actual code server-side; this
    * returns only the pinId needed to verify it later. Delivered over the
-   * 'dnd' channel (bypasses a recipient's Do-Not-Disturb setting), which
-   * requires Termii's own shared 'N-Alert' sender rather than a registered
-   * custom sender id — a fixed requirement of this specific channel, not a
-   * placeholder left in by mistake.
+   * 'dnd' channel (bypasses a recipient's Do-Not-Disturb setting), which on
+   * this account requires the specific shared sender id Termii activated
+   * for it — 'OE Alert', confirmed directly by Termii support (Chinenye
+   * Umeizu, 2026-09-20). NOT the same value another account (zalyx) uses —
+   * this is assigned per-account, not a platform-wide constant.
    */
   async sendOtp(
     phone: string,
@@ -41,7 +42,7 @@ export class TermiiService {
           api_key: this.apiKey,
           message_type: 'NUMERIC',
           to: phone,
-          from: 'N-Alert',
+          from: 'OE Alert',
           channel: 'dnd',
           pin_attempts: DEFAULT_PIN_ATTEMPTS,
           pin_time_to_live: pinTimeToLiveMinutes,

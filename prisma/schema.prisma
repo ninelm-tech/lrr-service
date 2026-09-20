@@ -476,6 +476,7 @@ enum PaymentStatus {
   SUBMITTED // a call was attempted; outcome unknown
   BLOCKED // reached Paystack, which is waiting on a human
   SUCCEEDED
+  DUPLICATE_SUCCEEDED // provider says success, but another row already succeeded for this request/type
   FAILED // Paystack definitively rejected it
   REVERSED
 }
