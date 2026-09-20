@@ -785,6 +785,7 @@ export class RescueRequestAdminService {
       issueType: item.issueType ?? undefined,
       latitude: item.latitude ? Number(item.latitude) : undefined,
       longitude: item.longitude ? Number(item.longitude) : undefined,
+      destination: item.destination ?? undefined,
       depositPaid: hasSucceededPayment(item.payments, PaymentType.DEPOSIT),
       depositReference: this.latestPaymentReference(
         item.payments,

@@ -39,6 +39,7 @@ export class RescueRequestListItemDto {
   issueType?: IssueType;
   latitude?: number;
   longitude?: number;
+  destination?: string;
   depositPaid: boolean;
   depositReference?: string;
   depositAmount?: number;

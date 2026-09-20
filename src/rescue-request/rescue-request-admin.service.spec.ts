@@ -443,7 +443,7 @@ describe('RescueRequestAdminService', () => {
           id: 'req-1',
           status: 'CANCELLED',
           vehicleType: null,
-          destination: null,
+          destination: 'Mainland',
           latitude: null,
           longitude: null,
           depositAmount: 22_000,
@@ -477,6 +477,7 @@ describe('RescueRequestAdminService', () => {
           balanceReference: undefined,
           totalAmount: 110_000,
           acceptedQuoteAmount: 100_000,
+          destination: 'Mainland',
         }),
       );
       // CANCELLED + a succeeded deposit + no refund attempt yet = ELIGIBLE.
@@ -516,6 +517,7 @@ describe('RescueRequestAdminService', () => {
         expect.objectContaining({
           latitude: undefined,
           longitude: undefined,
+          destination: undefined,
           customer: {
             id: 'cust-deleted',
             phoneNumber: null,
