@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { UpdatePlatformConfigDto } from './dto/update-platform-config.dto';
+import { normalizePhone } from '../common/phone.util';
 
 export interface PlatformConfigValues {
   serviceFeePercent: number;
@@ -10,6 +11,8 @@ export interface PlatformConfigValues {
   /** Phase 2: how long quote collection runs from the FIRST quote. */
   quoteCollectionMinutes: number;
   disputeAlertPhoneNumber: string | null;
+  /** Customers routed to isTest operators only — see findAndRankCandidates. */
+  testCustomerPhoneNumbers: string[];
 }
 
 @Injectable()
@@ -25,6 +28,7 @@ export class PlatformConfigService {
       dispatchBatchSize: row!.dispatchBatchSize,
       quoteCollectionMinutes: row!.quoteCollectionMinutes,
       disputeAlertPhoneNumber: row!.disputeAlertPhoneNumber,
+      testCustomerPhoneNumbers: row!.testCustomerPhoneNumbers,
     };
   }
 
@@ -70,9 +74,21 @@ export class PlatformConfigService {
       );
     }
 
+    let normalizedTestNumbers: string[] | undefined;
+    if (dto.testCustomerPhoneNumbers !== undefined) {
+      try {
+        normalizedTestNumbers =
+          dto.testCustomerPhoneNumbers.map(normalizePhone);
+      } catch (error) {
+        throw new BadRequestException(
+          error instanceof Error ? error.message : 'Invalid phone number',
+        );
+      }
+    }
+
     const existing = await this.prisma.platformConfig.findFirst();
 
-    const data: Record<string, number | string> = {};
+    const data: Record<string, number | string | string[]> = {};
     if (dto.serviceFeePercent !== undefined)
       data.serviceFeePercent = dto.serviceFeePercent;
     if (dto.depositPercent !== undefined)
@@ -85,6 +101,8 @@ export class PlatformConfigService {
       data.quoteCollectionMinutes = dto.quoteCollectionMinutes;
     if (dto.disputeAlertPhoneNumber !== undefined)
       data.disputeAlertPhoneNumber = dto.disputeAlertPhoneNumber;
+    if (normalizedTestNumbers !== undefined)
+      data.testCustomerPhoneNumbers = normalizedTestNumbers;
 
     const updated = await this.prisma.platformConfig.update({
       where: { id: existing!.id },
@@ -98,6 +116,7 @@ export class PlatformConfigService {
       dispatchBatchSize: updated.dispatchBatchSize,
       quoteCollectionMinutes: updated.quoteCollectionMinutes,
       disputeAlertPhoneNumber: updated.disputeAlertPhoneNumber,
+      testCustomerPhoneNumbers: updated.testCustomerPhoneNumbers,
     };
   }
 }

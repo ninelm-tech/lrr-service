@@ -68,6 +68,7 @@ describe('dispatch round state (integration)', () => {
         quoteCollectionMinutes: 5,
         serviceFeePercent: 10,
         depositPercent: 10,
+        testCustomerPhoneNumbers: [],
       }),
     };
     const sessionStore = {

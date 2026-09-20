@@ -339,11 +339,13 @@ export class OperatorService {
     extraRadiusKm: number = 0,
     type?: OperatorType,
     truckClasses?: TruckClass[],
+    isTest: boolean = false,
   ): Promise<ScoredOperator[]> {
     const operators = await this.prisma.operator.findMany({
       where: {
         status: OperatorStatus.ACTIVE,
         isAvailable: true,
+        isTest,
         ...(excludeIds.length > 0 && { id: { notIn: excludeIds } }),
         ...(type && { type }),
         ...(truckClasses &&

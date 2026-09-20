@@ -526,6 +526,7 @@ export class DispatchService {
   ): Promise<PrepareNextRoundResult> {
     const rescueRequest = await tx.rescueRequest.findUnique({
       where: { id: rescueRequestId },
+      include: { customer: { select: { phoneNumber: true } } },
     });
     if (!rescueRequest) {
       return { offers: [], exhausted: true, reason: 'no-coverage', round };
@@ -537,6 +538,13 @@ export class DispatchService {
     const eligibleTruckClasses = rescueRequest.vehicleType
       ? getEligibleTruckClasses(rescueRequest.vehicleType)
       : undefined;
+    // Partitions candidate search — see OperatorService.findAndRankCandidates.
+    // Deliberately re-checked on every round from live PlatformConfig, not
+    // snapshotted onto the request: adding/removing a test number should
+    // take effect immediately, same as every other PlatformConfig value.
+    const isTestRequest = config.testCustomerPhoneNumbers.includes(
+      rescueRequest.customer.phoneNumber ?? '',
+    );
 
     let attemptRound = round;
     let extraRadiusKm = Math.max(0, round - 1) * RADIUS_EXPANSION_KM;
@@ -553,6 +561,7 @@ export class DispatchService {
         extraRadiusKm,
         undefined,
         eligibleTruckClasses,
+        isTestRequest,
       );
 
       logger.info('dispatch: candidate search', {
