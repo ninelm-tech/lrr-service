@@ -766,7 +766,9 @@ export class RescueRequestAdminService {
         skip,
         take: limit,
         include: {
-          customer: { select: { id: true, phoneNumber: true } },
+          customer: {
+            select: { id: true, phoneNumber: true, deletedAt: true },
+          },
           assignedOperator: { select: { id: true, businessName: true } },
           payments: {
             select: { id: true, type: true, status: true, createdAt: true },
@@ -799,7 +801,8 @@ export class RescueRequestAdminService {
       depositRefundStatus: deriveRefundStatus(item.status, item.payments),
       customer: {
         id: item.customer.id,
-        phoneNumber: item.customer.phoneNumber!,
+        phoneNumber: item.customer.phoneNumber,
+        deleted: Boolean(item.customer.deletedAt),
       },
       assignedOperator: item.assignedOperator
         ? {
@@ -855,6 +858,17 @@ export class RescueRequestAdminService {
         disputeOriginalBalanceAmount?: number | null;
       },
     );
+    const customer = (
+      raw as {
+        customer: {
+          id: string;
+          phoneNumber: string | null;
+          email: string | null;
+          name: string | null;
+          deletedAt: Date | null;
+        };
+      }
+    ).customer;
 
     return {
       id: raw.id,
@@ -880,10 +894,11 @@ export class RescueRequestAdminService {
       ),
       ...amounts,
       customer: {
-        id: raw.customer.id,
-        phoneNumber: raw.customer.phoneNumber,
-        email: raw.customer.email,
-        name: raw.customer.name,
+        id: customer.id,
+        phoneNumber: customer.phoneNumber,
+        email: customer.email,
+        name: customer.name,
+        deleted: Boolean(customer.deletedAt),
       },
       assignedOperator: raw.assignedOperator
         ? {

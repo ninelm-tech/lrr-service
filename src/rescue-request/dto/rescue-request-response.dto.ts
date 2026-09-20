@@ -9,14 +9,16 @@ import { RequestMediaDto } from '../../media/dto/request-media.dto';
 
 export class CustomerSummaryDto {
   id: string;
-  phoneNumber: string;
+  phoneNumber: string | null;
+  deleted: boolean;
 }
 
 export class CustomerDetailDto {
   id: string;
-  phoneNumber: string;
-  email?: string;
-  name?: string;
+  phoneNumber: string | null;
+  email?: string | null;
+  name?: string | null;
+  deleted: boolean;
 }
 
 export class OperatorSummaryDto {

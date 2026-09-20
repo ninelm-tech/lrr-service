@@ -89,6 +89,7 @@ describe('RescueRequestAdminService', () => {
         phoneNumber: '+2340000000000',
         email: null,
         name: null,
+        deletedAt: null,
       },
       assignedOperatorId: null,
       assignedOperator: null,
@@ -480,6 +481,48 @@ describe('RescueRequestAdminService', () => {
       );
       // CANCELLED + a succeeded deposit + no refund attempt yet = ELIGIBLE.
       expect(result.data[0].depositRefundStatus).toBe('ELIGIBLE');
+    });
+
+    it('marks deleted customers and preserves nullable request fields', async () => {
+      prisma.rescueRequest.findMany.mockResolvedValue([
+        {
+          id: 'req-deleted-customer',
+          status: 'COMPLETED',
+          issueType: 'BREAKDOWN',
+          latitude: null,
+          longitude: null,
+          depositAmount: 10_000,
+          balanceAmount: 90_000,
+          serviceFeeAmount: 0,
+          payments: [],
+          customer: {
+            id: 'cust-deleted',
+            phoneNumber: null,
+            deletedAt: new Date('2026-09-19T17:23:00Z'),
+          },
+          assignedOperator: null,
+          disputed: false,
+          disputeRaisedAt: null,
+          disputeResolvedAt: null,
+          createdAt: new Date('2026-09-19T16:00:00Z'),
+          updatedAt: new Date('2026-09-19T17:23:00Z'),
+        },
+      ]);
+      prisma.rescueRequest.count.mockResolvedValue(1);
+
+      const result = await service.adminList({});
+
+      expect(result.data[0]).toEqual(
+        expect.objectContaining({
+          latitude: undefined,
+          longitude: undefined,
+          customer: {
+            id: 'cust-deleted',
+            phoneNumber: null,
+            deleted: true,
+          },
+        }),
+      );
     });
 
     it('preserves the accepted quote after a dispute reduces the balance', async () => {
