@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
-import { APP_INTERCEPTOR } from '@nestjs/core';
+import { APP_FILTER } from '@nestjs/core';
+import { SentryGlobalFilter, SentryModule } from '@sentry/nestjs/setup';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { IntegrationsModule } from './integrations/integrations.module';
@@ -15,10 +16,12 @@ import { PlatformConfigModule } from './platform-config/platform-config.module';
 import { RatingModule } from './rating/rating.module';
 import { OtpModule } from './otp/otp.module';
 import { AccountDeletionModule } from './account-deletion/account-deletion.module';
-import { SentryInterceptor } from './common/sentry.interceptor';
 
 @Module({
   imports: [
+    // Must be first — Sentry's own recommended module ordering, so it can
+    // wrap everything registered after it.
+    SentryModule.forRoot(),
     ConfigModule.forRoot({
       isGlobal: true,
     }),
@@ -43,8 +46,12 @@ import { SentryInterceptor } from './common/sentry.interceptor';
   controllers: [AppController],
   providers: [
     AppService,
-    // Auto-capture every unhandled 5xx exception into Sentry
-    { provide: APP_INTERCEPTOR, useClass: SentryInterceptor },
+    // Auto-capture every unhandled HTTP exception into Sentry — Sentry's own
+    // maintained mechanism (docs.sentry.io/platforms/node/guides/nestjs),
+    // replacing the old hand-rolled interceptor. Same scope as before (HTTP
+    // routes only — background/reconciler code still needs its own explicit
+    // Sentry.captureException calls, which already exist there).
+    { provide: APP_FILTER, useClass: SentryGlobalFilter },
   ],
 })
 export class AppModule {}
