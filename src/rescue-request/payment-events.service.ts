@@ -203,6 +203,7 @@ export class PaymentEventsService {
       (rescueRequest.balanceAmount ?? 0) / 100
     ).toLocaleString();
     const operator = rescueRequest.assignedOperator;
+    const jobRef = formatJobRef(rescueRequest.id);
     if (customerPhone) {
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
@@ -218,7 +219,9 @@ export class PaymentEventsService {
         : `\n\nWant to see your receipt and past requests? Create an account at ${frontendUrl}/register/customer`;
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
-        `How was your experience with ${operatorName}? Reply with a number from 1 to 5 to rate them.${portalLine}`,
+        `How was your experience with ${operatorName} on ${jobRef}?
+
+Reply with a number from 1 to 5 to rate your experience with the operator.${portalLine}`,
       );
     }
     await this.sessionStore.update(customerId, {
@@ -228,20 +231,17 @@ export class PaymentEventsService {
 
     // Notify operator — release the vehicle, then prompt to rate the motorist
     //
-    // Both messages carry the job ref: an operator can have more than one
-    // job in flight (no busy filter — see operator.service.ts), so a
-    // message that doesn't say which job it's about is ambiguous to them
-    // even though the customer-facing equivalent above never needs it (a
-    // motorist only ever has one active request).
+    // Both rating prompts carry the job ref so the score is clearly tied to
+    // the completed request. This is especially important for operators, who
+    // can have more than one job in flight (there is no busy filter).
     if (operator?.phoneNumber) {
-      const jobRef = formatJobRef(rescueRequest.id);
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(operator.phoneNumber),
         `💵 *Payment received!* — ${jobRef}\n\nThe customer has paid the ₦${balanceNaira} balance in full.\n\n✅ You may now *release the vehicle*. Job complete — well done!\n\nYour payment will be remitted within 24 hours.`,
       );
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(operator.phoneNumber),
-        `How was your experience with this customer? — ${jobRef}\n\nReply with a number from 1 to 5 to rate them.`,
+        `How was your experience with the customer on ${jobRef}?\n\nReply with a number from 1 to 5 to rate your experience with the customer.`,
       );
       const opUser = await this.sharedService.findOrCreateCustomer(
         operator.phoneNumber,

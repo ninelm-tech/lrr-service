@@ -9,14 +9,16 @@ import { RequestMediaDto } from '../../media/dto/request-media.dto';
 
 export class CustomerSummaryDto {
   id: string;
-  phoneNumber: string;
+  phoneNumber: string | null;
+  deleted: boolean;
 }
 
 export class CustomerDetailDto {
   id: string;
-  phoneNumber: string;
-  email?: string;
-  name?: string;
+  phoneNumber: string | null;
+  email?: string | null;
+  name?: string | null;
+  deleted: boolean;
 }
 
 export class OperatorSummaryDto {
@@ -37,8 +39,15 @@ export class RescueRequestListItemDto {
   issueType?: IssueType;
   latitude?: number;
   longitude?: number;
+  destination?: string;
   depositPaid: boolean;
+  depositReference?: string;
+  depositAmount?: number;
   balancePaid: boolean;
+  balanceReference?: string;
+  balanceAmount?: number;
+  totalAmount?: number;
+  acceptedQuoteAmount?: number;
   depositRefundStatus: 'NONE' | 'ELIGIBLE' | 'PENDING' | 'COMPLETED' | 'FAILED';
   customer: CustomerSummaryDto;
   assignedOperator?: OperatorSummaryDto;
@@ -97,6 +106,8 @@ export class RescueRequestDetailDto {
   balancePaid: boolean;
   balanceAmount?: number;
   balanceReference?: string;
+  totalAmount?: number;
+  acceptedQuoteAmount?: number;
   customer: CustomerDetailDto;
   assignedOperator?: OperatorDetailDto;
   disputed: boolean;

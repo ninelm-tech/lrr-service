@@ -901,7 +901,16 @@ export class WhatsAppCustomerFlowService {
   ) {
     const score = Number(rawMessage.trim());
     if (!Number.isInteger(score) || score < 1 || score > 5) {
-      return this.reply(`Please reply with a number from 1 to 5.`);
+      const ratedParty =
+        direction === RatingDirection.MOTORIST_TO_OPERATOR
+          ? 'the operator'
+          : 'the customer';
+      const jobContext = rescueRequestId
+        ? ` for ${formatJobRef(rescueRequestId)}`
+        : '';
+      return this.reply(
+        `Please reply with a number from 1 to 5 to rate your experience with ${ratedParty}${jobContext}.`,
+      );
     }
 
     if (!rescueRequestId) {
@@ -964,8 +973,11 @@ export class WhatsAppCustomerFlowService {
     }
 
     const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
+    const jobContext = rescueRequestId
+      ? ` for ${formatJobRef(rescueRequestId)}`
+      : '';
     return this.reply(
-      `Thanks for rating us ${score}/5! 🙏\n\nWant to add more detail? Tell us more here: ${frontendUrl}/feedback/${rating.id}`,
+      `Thanks for rating your experience${jobContext}: ${score}/5! 🙏\n\nWant to add more detail? Tell us more here: ${frontendUrl}/feedback/${rating.id}`,
     );
   }
 
