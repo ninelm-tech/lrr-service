@@ -2,7 +2,7 @@
  * Sentry instrumentation — MUST be imported before anything else in main.ts.
  * @see https://docs.sentry.io/platforms/node/guides/nestjs/
  */
-import * as Sentry from '@sentry/node';
+import * as Sentry from '@sentry/nestjs';
 
 const isProd = process.env.NODE_ENV === 'production';
 
@@ -41,7 +41,17 @@ Sentry.init({
   profilesSampleRate:
     profilingIntegrations.length > 0 ? (isProd ? 0.5 : 1.0) : 0,
 
-  integrations: profilingIntegrations,
+  // consoleLoggingIntegration forwards plain console.log/warn/error calls
+  // into Sentry's Logs — without it, enableLogs above does nothing for the
+  // console.error calls already sprinkled through the codebase, no matter
+  // how many of them exist. prismaIntegration adds Prisma query spans to
+  // traces. Matches the working setup already in production use elsewhere
+  // (zalyx-ledger-service).
+  integrations: [
+    ...profilingIntegrations,
+    Sentry.prismaIntegration(),
+    Sentry.consoleLoggingIntegration({ levels: ['log', 'warn', 'error'] }),
+  ],
 
   // Tags applied to every event — visible in the Sentry issue list
   initialScope: {

@@ -446,7 +446,10 @@ model PhoneVerification {
   phoneNumber String
   createdAt   DateTime @default(now())
 
-  codeHash   String
+  // Termii's own OTP product (see TermiiService.sendOtp) generates and
+  // holds the actual code server-side — this is the id needed to verify
+  // against it later, not a hash of anything we know ourselves.
+  pinId      String
   expiresAt  DateTime
   verifiedAt DateTime?
   attempts   Int       @default(0)
@@ -473,6 +476,7 @@ enum PaymentStatus {
   SUBMITTED // a call was attempted; outcome unknown
   BLOCKED // reached Paystack, which is waiting on a human
   SUCCEEDED
+  DUPLICATE_SUCCEEDED // provider says success, but another row already succeeded for this request/type
   FAILED // Paystack definitively rejected it
   REVERSED
 }

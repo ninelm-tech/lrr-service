@@ -136,6 +136,8 @@ function describeRetryOutcome(
       return `Transfer failed${payment.failureReason ? `: ${payment.failureReason}` : '.'}`;
     case PaymentStatus.REVERSED:
       return 'Transfer was reversed.';
+    case PaymentStatus.DUPLICATE_SUCCEEDED:
+      return 'Duplicate provider success recorded — manual reconciliation required.';
     default:
       return 'Payout retried.';
   }

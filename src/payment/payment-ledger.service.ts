@@ -206,25 +206,202 @@ export class PaymentLedgerService {
       mapped.status === PaymentStatus.FAILED ||
       mapped.status === PaymentStatus.REVERSED;
 
-    const { count } = await this.prisma.payment.updateMany({
-      where: {
-        id: paymentId,
-        status: { in: [PaymentStatus.SUBMITTED, PaymentStatus.BLOCKED] },
-      },
-      data: {
-        status: mapped.status,
-        blockReason: mapped.blockReason ?? null,
-        settledAt: isTerminal ? new Date() : null,
-        ...(fields.providerRef ? { providerRef: fields.providerRef } : {}),
-        ...(fields.providerFee !== undefined
-          ? { providerFee: fields.providerFee }
-          : {}),
-        ...(fields.netAmount !== undefined
-          ? { netAmount: fields.netAmount }
-          : {}),
+    try {
+      const { count } = await this.prisma.payment.updateMany({
+        where: {
+          id: paymentId,
+          status: { in: [PaymentStatus.SUBMITTED, PaymentStatus.BLOCKED] },
+        },
+        data: {
+          status: mapped.status,
+          blockReason: mapped.blockReason ?? null,
+          settledAt: isTerminal ? new Date() : null,
+          ...(fields.providerRef ? { providerRef: fields.providerRef } : {}),
+          ...(fields.providerFee !== undefined
+            ? { providerFee: fields.providerFee }
+            : {}),
+          ...(fields.netAmount !== undefined
+            ? { netAmount: fields.netAmount }
+            : {}),
+        },
+      });
+      return count === 1;
+    } catch (error) {
+      if (
+        mapped.status === PaymentStatus.SUCCEEDED &&
+        this.isUniqueConstraint(error, ['rescueRequestId', 'type'])
+      ) {
+        await this.recordDuplicateSuccess(paymentId, fields);
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Paystack can report a second real success after another attempt for the
+   * same request/type already won. The unique index is still right: only one
+   * row may be the canonical SUCCEEDED payment that drives business side
+   * effects. This row is quarantined as money that moved but needs a human
+   * reconciliation/refund, and then removed from the verifier's retry set.
+   */
+  private async recordDuplicateSuccess(
+    paymentId: string,
+    fields: {
+      providerRef?: string;
+      providerFee?: number;
+      netAmount?: number;
+    },
+  ): Promise<void> {
+    const payment = await this.prisma.payment.findUnique({
+      where: { id: paymentId },
+      select: {
+        id: true,
+        rescueRequestId: true,
+        type: true,
+        status: true,
+        amount: true,
       },
     });
-    return count === 1;
+    const claimableStatuses: PaymentStatus[] = [
+      PaymentStatus.SUBMITTED,
+      PaymentStatus.BLOCKED,
+    ];
+    if (!payment || !claimableStatuses.includes(payment.status)) {
+      return;
+    }
+
+    const existing = await this.prisma.payment.findFirst({
+      where: {
+        id: { not: payment.id },
+        rescueRequestId: payment.rescueRequestId,
+        type: payment.type,
+        status: PaymentStatus.SUCCEEDED,
+      },
+      select: { id: true, providerRef: true },
+    });
+    if (!existing) {
+      return;
+    }
+
+    const failureReason = `Provider reported success, but payment ${existing.id} already succeeded for this request/type; manual reconciliation required.`;
+    const updated = await this.updateDuplicateSuccessPayment(
+      payment.id,
+      failureReason,
+      fields,
+    );
+    if (!updated) return;
+
+    await this.recordDuplicateSuccessAudit({
+      payment,
+      existing,
+      fields,
+    });
+  }
+
+  private async updateDuplicateSuccessPayment(
+    paymentId: string,
+    failureReason: string,
+    fields: {
+      providerRef?: string;
+      providerFee?: number;
+      netAmount?: number;
+    },
+    includeProviderRef = true,
+  ): Promise<boolean> {
+    try {
+      const { count } = await this.prisma.payment.updateMany({
+        where: {
+          id: paymentId,
+          status: { in: [PaymentStatus.SUBMITTED, PaymentStatus.BLOCKED] },
+        },
+        data: {
+          status: PaymentStatus.DUPLICATE_SUCCEEDED,
+          blockReason: null,
+          settledAt: new Date(),
+          failureReason,
+          ...(includeProviderRef && fields.providerRef
+            ? { providerRef: fields.providerRef }
+            : {}),
+          ...(fields.providerFee !== undefined
+            ? { providerFee: fields.providerFee }
+            : {}),
+          ...(fields.netAmount !== undefined
+            ? { netAmount: fields.netAmount }
+            : {}),
+        },
+      });
+      return count === 1;
+    } catch (error) {
+      if (
+        includeProviderRef &&
+        fields.providerRef &&
+        this.isUniqueConstraint(error, ['providerRef'])
+      ) {
+        return this.updateDuplicateSuccessPayment(
+          paymentId,
+          failureReason,
+          fields,
+          false,
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async recordDuplicateSuccessAudit(input: {
+    payment: {
+      id: string;
+      rescueRequestId: string;
+      type: PaymentType;
+      amount: number;
+    };
+    existing: { id: string; providerRef: string | null };
+    fields: {
+      providerRef?: string;
+      providerFee?: number;
+      netAmount?: number;
+    };
+  }): Promise<void> {
+    try {
+      await this.prisma.auditLog.create({
+        data: {
+          category: 'duplicate_payment_success',
+          message: `Duplicate provider success quarantined for payment ${input.payment.id}`,
+          details: {
+            rescueRequestId: input.payment.rescueRequestId,
+            type: input.payment.type,
+            duplicatePaymentId: input.payment.id,
+            existingSucceededPaymentId: input.existing.id,
+            amount: input.payment.amount,
+            duplicateProviderRef: input.fields.providerRef ?? null,
+            existingProviderRef: input.existing.providerRef,
+            providerFee: input.fields.providerFee ?? null,
+            netAmount: input.fields.netAmount ?? null,
+          },
+        },
+      });
+    } catch (error) {
+      console.error('Failed to write duplicate payment audit log:', error);
+    }
+  }
+
+  private isUniqueConstraint(error: unknown, fields: string[]): boolean {
+    if (
+      !(error instanceof Prisma.PrismaClientKnownRequestError) ||
+      error.code !== 'P2002'
+    ) {
+      return false;
+    }
+
+    const target = error.meta?.target;
+    if (Array.isArray(target)) {
+      return fields.every((field) => target.includes(field));
+    }
+    if (typeof target === 'string') {
+      return fields.every((field) => target.includes(field));
+    }
+    return fields.every((field) => error.message.includes(field));
   }
 
   /** Paystack still says pending — come back later rather than polling hard. */

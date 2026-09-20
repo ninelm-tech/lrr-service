@@ -15,7 +15,7 @@ describe('OtpService', () => {
       update: jest.Mock;
     };
   };
-  let termiiService: { sendSms: jest.Mock };
+  let termiiService: { sendOtp: jest.Mock; verifyOtp: jest.Mock };
 
   beforeEach(async () => {
     prisma = {
@@ -27,7 +27,10 @@ describe('OtpService', () => {
         update: jest.fn(),
       },
     };
-    termiiService = { sendSms: jest.fn() };
+    termiiService = {
+      sendOtp: jest.fn().mockResolvedValue({ pinId: 'pin-1' }),
+      verifyOtp: jest.fn(),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -49,9 +52,15 @@ describe('OtpService', () => {
       const result = await service.sendCode('+2348012345678');
 
       expect(result).toEqual({ required: true });
-      expect(termiiService.sendSms).toHaveBeenCalledWith(
-        expect.stringContaining('+2348012345678'),
-        expect.stringContaining('verification code'),
+      expect(termiiService.sendOtp).toHaveBeenCalledWith(
+        '+2348012345678',
+        'Your LRR verification code is < 1234 >. This code expires in 10 minutes. Do not share with anyone',
+        10,
+      );
+      expect(prisma.phoneVerification.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ pinId: 'pin-1' }),
+        }),
       );
     });
 
@@ -64,7 +73,7 @@ describe('OtpService', () => {
       const result = await service.sendCode('+2348012345678');
 
       expect(result).toEqual({ required: false, available: false });
-      expect(termiiService.sendSms).not.toHaveBeenCalled();
+      expect(termiiService.sendOtp).not.toHaveBeenCalled();
     });
 
     it('sends a code and responds required:true for an existing CUSTOMER number', async () => {
@@ -78,9 +87,10 @@ describe('OtpService', () => {
       const result = await service.sendCode('+2348012345678');
 
       expect(result).toEqual({ required: true });
-      expect(termiiService.sendSms).toHaveBeenCalledWith(
-        expect.stringContaining('+2348012345678'),
-        expect.stringContaining('verification code'),
+      expect(termiiService.sendOtp).toHaveBeenCalledWith(
+        '+2348012345678',
+        'Your LRR verification code is < 1234 >. This code expires in 10 minutes. Do not share with anyone',
+        10,
       );
     });
 
@@ -94,7 +104,7 @@ describe('OtpService', () => {
       ]); // sent seconds ago
 
       await expect(service.sendCode('+2348012345678')).rejects.toThrow('wait');
-      expect(termiiService.sendSms).not.toHaveBeenCalled();
+      expect(termiiService.sendOtp).not.toHaveBeenCalled();
     });
 
     it('rejects when the per-window send cap is hit', async () => {
@@ -112,7 +122,7 @@ describe('OtpService', () => {
       await expect(service.sendCode('+2348012345678')).rejects.toThrow(
         'Too many',
       );
-      expect(termiiService.sendSms).not.toHaveBeenCalled();
+      expect(termiiService.sendOtp).not.toHaveBeenCalled();
     });
   });
 
@@ -123,7 +133,7 @@ describe('OtpService', () => {
       const result = await service.sendPasswordResetCode('+2348012345678');
 
       expect(result).toEqual({ required: false });
-      expect(termiiService.sendSms).not.toHaveBeenCalled();
+      expect(termiiService.sendOtp).not.toHaveBeenCalled();
     });
 
     it('responds required:false and sends nothing when the account has no portal password', async () => {
@@ -136,7 +146,7 @@ describe('OtpService', () => {
       const result = await service.sendPasswordResetCode('+2348012345678');
 
       expect(result).toEqual({ required: false });
-      expect(termiiService.sendSms).not.toHaveBeenCalled();
+      expect(termiiService.sendOtp).not.toHaveBeenCalled();
     });
 
     it('sends a code for any role that has a portal password, not just CUSTOMER', async () => {
@@ -151,9 +161,10 @@ describe('OtpService', () => {
       const result = await service.sendPasswordResetCode('+2348012345678');
 
       expect(result).toEqual({ required: true });
-      expect(termiiService.sendSms).toHaveBeenCalledWith(
-        expect.stringContaining('+2348012345678'),
-        expect.stringContaining('password reset code'),
+      expect(termiiService.sendOtp).toHaveBeenCalledWith(
+        '+2348012345678',
+        'Your LRR verification code is < 1234 >. This code expires in 10 minutes. Do not share with anyone',
+        10,
       );
     });
 
@@ -170,7 +181,7 @@ describe('OtpService', () => {
       await expect(
         service.sendPasswordResetCode('+2348012345678'),
       ).rejects.toThrow('wait');
-      expect(termiiService.sendSms).not.toHaveBeenCalled();
+      expect(termiiService.sendOtp).not.toHaveBeenCalled();
     });
   });
 
@@ -181,7 +192,7 @@ describe('OtpService', () => {
       const result = await service.sendLoginCode('+2348012345678');
 
       expect(result).toEqual({ required: true });
-      expect(termiiService.sendSms).not.toHaveBeenCalled();
+      expect(termiiService.sendOtp).not.toHaveBeenCalled();
     });
 
     it('responds required:true and sends nothing for a non-OPERATOR account — same response either way', async () => {
@@ -193,7 +204,7 @@ describe('OtpService', () => {
       const result = await service.sendLoginCode('+2348012345678');
 
       expect(result).toEqual({ required: true });
-      expect(termiiService.sendSms).not.toHaveBeenCalled();
+      expect(termiiService.sendOtp).not.toHaveBeenCalled();
     });
 
     it('sends a code for an OPERATOR account', async () => {
@@ -207,9 +218,10 @@ describe('OtpService', () => {
       const result = await service.sendLoginCode('+2348012345678');
 
       expect(result).toEqual({ required: true });
-      expect(termiiService.sendSms).toHaveBeenCalledWith(
-        expect.stringContaining('+2348012345678'),
-        expect.stringContaining('login code'),
+      expect(termiiService.sendOtp).toHaveBeenCalledWith(
+        '+2348012345678',
+        'Your LRR verification code is < 1234 >. This code expires in 10 minutes. Do not share with anyone',
+        10,
       );
     });
 
@@ -225,7 +237,7 @@ describe('OtpService', () => {
       const result = await service.sendLoginCode('+2348012345678');
 
       expect(result).toEqual({ required: true });
-      expect(termiiService.sendSms).not.toHaveBeenCalled();
+      expect(termiiService.sendOtp).not.toHaveBeenCalled();
     });
   });
 
@@ -233,15 +245,17 @@ describe('OtpService', () => {
     it('issues a token on a correct, unexpired code', async () => {
       prisma.phoneVerification.findFirst.mockResolvedValue({
         id: 'pv-1',
-        codeHash: service.hashForTest('123456'),
+        pinId: 'pin-1',
         attempts: 0,
         expiresAt: new Date(Date.now() + 60_000),
         verifiedAt: null,
       });
+      termiiService.verifyOtp.mockResolvedValue({ verified: true });
       prisma.phoneVerification.update.mockResolvedValue({});
 
       const result = await service.verifyCode('+2348012345678', '123456');
 
+      expect(termiiService.verifyOtp).toHaveBeenCalledWith('pin-1', '123456');
       expect(result.token).toEqual(expect.any(String));
       expect(prisma.phoneVerification.update).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -257,11 +271,12 @@ describe('OtpService', () => {
     it('rejects a wrong code and increments attempts', async () => {
       prisma.phoneVerification.findFirst.mockResolvedValue({
         id: 'pv-1',
-        codeHash: service.hashForTest('123456'),
+        pinId: 'pin-1',
         attempts: 0,
         expiresAt: new Date(Date.now() + 60_000),
         verifiedAt: null,
       });
+      termiiService.verifyOtp.mockResolvedValue({ verified: false });
 
       await expect(
         service.verifyCode('+2348012345678', '999999'),
@@ -272,10 +287,10 @@ describe('OtpService', () => {
       });
     });
 
-    it('rejects once attempts has reached the max, regardless of expiresAt', async () => {
+    it('rejects once attempts has reached the max, regardless of expiresAt — without calling Termii', async () => {
       prisma.phoneVerification.findFirst.mockResolvedValue({
         id: 'pv-1',
-        codeHash: service.hashForTest('123456'),
+        pinId: 'pin-1',
         attempts: 5,
         expiresAt: new Date(Date.now() + 60_000),
         verifiedAt: null,
@@ -284,6 +299,7 @@ describe('OtpService', () => {
       await expect(
         service.verifyCode('+2348012345678', '123456'),
       ).rejects.toThrow('Too many attempts');
+      expect(termiiService.verifyOtp).not.toHaveBeenCalled();
     });
 
     it('rejects an expired code', async () => {
