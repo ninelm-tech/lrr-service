@@ -143,6 +143,11 @@ model Operator {
   serviceRadius Int            @default(10)
   status        OperatorStatus @default(PENDING)
   isAvailable   Boolean        @default(true)
+  // Set by hand via direct DB write — deliberately no registration/admin
+  // UI for this. Partitions dispatch candidate search
+  // (findAndRankCandidates) so test traffic never reaches real operators
+  // and real customers never reach this one.
+  isTest        Boolean        @default(false)
 
   verifiedAt DateTime?
   notes      String?
@@ -277,6 +282,11 @@ model PlatformConfig {
   disputeAlertPhoneNumber String?
   quoteCollectionMinutes  Int      @default(5)
   dispatchBatchSize       Int      @default(3)
+  // Customers whose requests should be routed to isTest operators only
+  // (and never to real ones), for exercising the full production flow —
+  // real Paystack, real payout — without touching real traffic. Stored as
+  // E.164, same format as User.phoneNumber.
+  testCustomerPhoneNumbers String[] @default([])
   updatedAt               DateTime @updatedAt
 }
 

@@ -1,4 +1,5 @@
 import {
+  IsArray,
   IsInt,
   IsNumber,
   IsOptional,
@@ -41,4 +42,9 @@ export class UpdatePlatformConfigDto {
   @IsString()
   @IsOptional()
   disputeAlertPhoneNumber?: string;
+
+  @IsArray()
+  @IsString({ each: true })
+  @IsOptional()
+  testCustomerPhoneNumbers?: string[];
 }

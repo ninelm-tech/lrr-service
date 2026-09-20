@@ -367,6 +367,40 @@ describe('OperatorService', () => {
     });
   });
 
+  describe('findAndRankCandidates isTest partitioning', () => {
+    it('defaults to non-test operators when isTest is omitted', async () => {
+      prisma.operator.findMany.mockResolvedValue([]);
+
+      await service.findAndRankCandidates(6.5, 3.4, [], 0);
+
+      expect(prisma.operator.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ isTest: false }),
+        }),
+      );
+    });
+
+    it('filters to isTest operators only when isTest is true', async () => {
+      prisma.operator.findMany.mockResolvedValue([]);
+
+      await service.findAndRankCandidates(
+        6.5,
+        3.4,
+        [],
+        0,
+        undefined,
+        undefined,
+        true,
+      );
+
+      expect(prisma.operator.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ isTest: true }),
+        }),
+      );
+    });
+  });
+
   describe('create() truckClasses server-side enforcement', () => {
     const baseDto = (): CreateOperatorDto => ({
       email: 'op@example.com',

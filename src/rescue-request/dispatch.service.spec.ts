@@ -1320,6 +1320,7 @@ describe('DispatchService', () => {
             offeredOperatorIds: [],
             quoteCollectionDeadline: null,
             biddingClosedAt: null,
+            customer: { phoneNumber: '+2348000000000' },
           }),
           findUniqueOrThrow: jest
             .fn()
@@ -1356,6 +1357,7 @@ describe('DispatchService', () => {
         getConfig: jest.fn().mockResolvedValue({
           dispatchWindowMinutes: 10,
           dispatchBatchSize: 3,
+          testCustomerPhoneNumbers: [],
         }),
       };
       twilioService = {
@@ -1384,10 +1386,77 @@ describe('DispatchService', () => {
       batchService = module.get<DispatchService>(DispatchService);
     });
 
+    it("passes isTest: true to findAndRankCandidates when the request's customer is on PlatformConfig.testCustomerPhoneNumbers", async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
+        dispatchRound: 0,
+        offeredOperatorIds: [],
+        quoteCollectionDeadline: null,
+        biddingClosedAt: null,
+        customer: { phoneNumber: '+2348012345678' },
+      });
+      platformConfigService.getConfig.mockResolvedValue({
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        testCustomerPhoneNumbers: ['+2348012345678'],
+      });
+
+      await batchService.startDispatch('req-1', 'cust-1');
+
+      expect(operatorService.findAndRankCandidates).toHaveBeenCalledWith(
+        6.5,
+        3.4,
+        [],
+        0,
+        undefined,
+        ['LIGHT_DUTY', 'TEN_TYRE'],
+        true,
+      );
+    });
+
+    it("passes isTest: false when the request's customer is not on the test list", async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
+        dispatchRound: 0,
+        offeredOperatorIds: [],
+        quoteCollectionDeadline: null,
+        biddingClosedAt: null,
+        customer: { phoneNumber: '+2348099999999' },
+      });
+      platformConfigService.getConfig.mockResolvedValue({
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        testCustomerPhoneNumbers: ['+2348012345678'],
+      });
+
+      await batchService.startDispatch('req-1', 'cust-1');
+
+      expect(operatorService.findAndRankCandidates).toHaveBeenCalledWith(
+        6.5,
+        3.4,
+        [],
+        0,
+        undefined,
+        ['LIGHT_DUTY', 'TEN_TYRE'],
+        false,
+      );
+    });
+
     it('sizes the offered batch from PlatformConfig.dispatchBatchSize, not a hardcoded constant', async () => {
       platformConfigService.getConfig.mockResolvedValue({
         dispatchWindowMinutes: 10,
         dispatchBatchSize: 1,
+        testCustomerPhoneNumbers: [],
       });
 
       await batchService.startDispatch('req-1', 'cust-1');
@@ -1458,6 +1527,7 @@ describe('DispatchService', () => {
         quoteCollectionDeadline: null,
         biddingClosedAt: null,
         issueType: 'FLAT_TYRE',
+        customer: { phoneNumber: '+2348000000000' },
       });
 
       await batchService.startDispatch('req-1', 'cust-1');
@@ -1487,6 +1557,7 @@ describe('DispatchService', () => {
         quoteCollectionDeadline: null,
         biddingClosedAt: null,
         issueType: 'FLAT_TYRE',
+        customer: { phoneNumber: '+2348000000000' },
       });
 
       await batchService.startDispatch('req-1', 'cust-1');
