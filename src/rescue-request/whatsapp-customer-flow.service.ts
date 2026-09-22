@@ -12,6 +12,7 @@ import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { IssueType, WhatsAppFlowState } from './state/whatsapp-session.types';
 import { PrismaService } from '../prisma/prisma.service';
 import { DEPOSIT_WINDOW_MS } from './deposit.constants';
+import { SUPPORT_WHATSAPP_LINK } from './support.constants';
 import {
   RescueRequestStatus,
   VehicleType,
@@ -52,6 +53,20 @@ import { PaystackCustomerService } from '../payment/paystack-customer.service';
 
 const DEPOSIT_AMOUNT_KOBO = 500000; // ₦5,000
 const MAX_MEDIA_ITEMS = 5;
+
+// A request only ever reaches these once the deposit has actually been
+// captured (see PaymentEventsService.handleDepositPaymentConfirmed) and an
+// operator has committed to the job. Self-cancelling past this point over
+// WhatsApp is blocked by policy — the operator may already be en route or
+// on site with nothing to show for it — so it must go through support,
+// which can weigh a fee/refund case by case. Earlier statuses
+// (WAITING_FOR_DEPOSIT, DISPATCHING, ...) are always free to self-cancel.
+const BLOCKED_FROM_SELF_CANCEL: RescueRequestStatus[] = [
+  RescueRequestStatus.OPERATOR_ASSIGNED,
+  RescueRequestStatus.IN_PROGRESS,
+  RescueRequestStatus.ARRIVED,
+  RescueRequestStatus.IN_DISPUTE,
+];
 
 @Injectable()
 export class WhatsAppCustomerFlowService {
@@ -344,6 +359,12 @@ export class WhatsAppCustomerFlowService {
           where: { id: requestIdToCancel },
           include: { assignedOperator: true },
         });
+
+        if (existing && BLOCKED_FROM_SELF_CANCEL.includes(existing.status)) {
+          return this.reply(
+            `Your deposit has been paid and an operator is already on this job, so it can't be cancelled here.\n\nPlease contact support to cancel or discuss a refund: ${SUPPORT_WHATSAPP_LINK}`,
+          );
+        }
 
         await this.prisma.rescueRequest.update({
           where: { id: requestIdToCancel },
