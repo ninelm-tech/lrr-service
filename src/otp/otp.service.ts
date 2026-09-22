@@ -140,6 +140,14 @@ export class OtpService {
     phoneNumber: string,
     code: string,
   ): Promise<{ token: string }> {
+    // No global ValidationPipe, so the DTOs' @IsNotEmpty() never runs — an
+    // empty box used to reach Termii ("Pin is required") and come back as a
+    // generic 500. Also trims: pasted codes often carry stray whitespace.
+    const pin = typeof code === 'string' ? code.trim() : '';
+    if (!pin) {
+      throw new BadRequestException('Enter the code we sent you.');
+    }
+
     const row = await this.prisma.phoneVerification.findFirst({
       where: { phoneNumber, expiresAt: { gt: new Date() } },
       orderBy: { createdAt: 'desc' },
@@ -153,7 +161,17 @@ export class OtpService {
       throw new BadRequestException('Too many attempts — request a new code.');
     }
 
-    const { verified } = await this.termiiService.verifyOtp(row.pinId, code);
+    const { verified, alreadyUsed } = await this.termiiService.verifyOtp(
+      row.pinId,
+      pin,
+    );
+    if (alreadyUsed) {
+      // Termii pins are single-use — not a wrong guess, so no attempt is
+      // burned; the honest answer is "get a new one".
+      throw new BadRequestException(
+        'This code has already been used — request a new one.',
+      );
+    }
     if (!verified) {
       await this.prisma.phoneVerification.update({
         where: { id: row.id },

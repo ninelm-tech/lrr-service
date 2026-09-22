@@ -76,12 +76,19 @@ export class TermiiService {
 
   /**
    * Checks a code against Termii's own record for pinId — LRR never learns
-   * or stores the code itself. `verified` is Termii's own string enum
-   * ('True' | 'Expired' | anything else on a wrong code), normalized to a
-   * real boolean here so callers don't need to know Termii's specific
-   * string shape.
+   * or stores the code itself. `verified` comes back as either the string
+   * 'True' (per Termii's docs) or a real boolean true (observed in
+   * production: valid codes were accepted with HTTP 200 and then rejected
+   * by an exact === 'True' check) — anything else, e.g. 'Expired', is a
+   * failure. Normalized to a boolean here so callers never need to know.
+   *
+   * NOT idempotent: Termii pins are single-use, so a second call for the
+   * same pinId fails with 400 "already been verified".
    */
-  async verifyOtp(pinId: string, pin: string): Promise<{ verified: boolean }> {
+  async verifyOtp(
+    pinId: string,
+    pin: string,
+  ): Promise<{ verified: boolean; alreadyUsed?: boolean }> {
     try {
       const response = await fetch(`${this.baseUrl}/sms/otp/verify`, {
         method: 'POST',
@@ -96,13 +103,35 @@ export class TermiiService {
       const { data, raw } =
         await this.parseBody<TermiiVerifyOtpResponse>(response);
       if (!response.ok) {
+        // Expected, not a fault: the pin was already redeemed (a double
+        // click, a retry after a later step failed). A returned fact rather
+        // than an error so it never pages as a 500 or reads as an outage.
+        if (
+          response.status === 400 &&
+          /already been verified/i.test(data?.message ?? '')
+        ) {
+          console.warn('Termii verifyOtp: pin already used');
+          return { verified: false, alreadyUsed: true };
+        }
         this.reportFailure('verifyOtp', response.status, data?.message, raw);
         throw new InternalServerErrorException(
           'Verification failed. Please try again or request a new OTP.',
         );
       }
 
-      return { verified: data?.verified === 'True' };
+      const verified =
+        data?.verified === true ||
+        (typeof data?.verified === 'string' &&
+          data.verified.toLowerCase() === 'true');
+      if (!verified) {
+        // Shape only — never the pin, pinId or phone number.
+        console.warn('Termii verifyOtp: not verified', {
+          verified: data?.verified,
+          verifiedType: typeof data?.verified,
+          keys: data ? Object.keys(data) : null,
+        });
+      }
+      return { verified };
     } catch (error) {
       if (error instanceof InternalServerErrorException) throw error;
       console.error('Termii verifyOtp error:', error);
