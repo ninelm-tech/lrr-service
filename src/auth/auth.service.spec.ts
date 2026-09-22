@@ -197,6 +197,174 @@ describe('AuthService', () => {
     });
   });
 
+  describe('registerCustomer', () => {
+    it('rejects when no phoneVerificationToken is provided', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.registerCustomer({
+          phoneNumber: '+2348012345678',
+          phoneVerificationToken: '',
+          password: 'password1',
+        }),
+      ).rejects.toThrow('Verify your phone number first.');
+      expect(otpService.findValidTokenRow).not.toHaveBeenCalled();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('rejects when the token does not match a valid verification row', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+      otpService.findValidTokenRow.mockResolvedValue(null);
+
+      await expect(
+        service.registerCustomer({
+          phoneNumber: '+2348012345678',
+          phoneVerificationToken: 'bad-token',
+          password: 'password1',
+        }),
+      ).rejects.toThrow('Verify your phone number first.');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('rejects when the atomic claim matches zero rows — token already consumed since it was looked up', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+      otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-1' });
+      const tx = {
+        phoneVerification: {
+          updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+        },
+        user: { create: jest.fn(), update: jest.fn() },
+      };
+      prisma.$transaction.mockImplementation(
+        (cb: (client: typeof tx) => unknown) => cb(tx),
+      );
+
+      await expect(
+        service.registerCustomer({
+          phoneNumber: '+2348012345678',
+          phoneVerificationToken: 'tok-1',
+          password: 'password1',
+        }),
+      ).rejects.toThrow('Verify your phone number first.');
+      expect(tx.user.create).not.toHaveBeenCalled();
+    });
+
+    it('creates a fresh CUSTOMER account once the token is validated and claimed', async () => {
+      prisma.user.findUnique.mockResolvedValue(null); // no existing phone, no existing email
+      otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-1' });
+      const tx = {
+        phoneVerification: {
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        },
+        user: {
+          create: jest.fn().mockResolvedValue({
+            id: 'user-1',
+            email: 'ada@example.com',
+            name: 'Ada',
+            role: 'CUSTOMER',
+          }),
+          update: jest.fn(),
+        },
+      };
+      prisma.$transaction.mockImplementation(
+        (cb: (client: typeof tx) => unknown) => cb(tx),
+      );
+
+      const result = await service.registerCustomer({
+        phoneNumber: '+2348012345678',
+        phoneVerificationToken: 'tok-1',
+        email: 'ada@example.com',
+        password: 'password1',
+        name: 'Ada',
+      });
+
+      expect(tx.phoneVerification.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'pv-1',
+          consumedAt: null,
+          tokenExpiresAt: { gt: expect.any(Date) },
+        },
+        data: { consumedAt: expect.any(Date) },
+      });
+      expect(tx.user.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          phoneNumber: '+2348012345678',
+          email: 'ada@example.com',
+          name: 'Ada',
+          role: 'CUSTOMER',
+          passwordHash: expect.any(String),
+        }),
+      });
+      expect(result.accessToken).toEqual(expect.any(String));
+      expect(result.user).toEqual({
+        id: 'user-1',
+        email: 'ada@example.com',
+        name: 'Ada',
+        role: 'CUSTOMER',
+      });
+    });
+
+    it('attaches email/password to an existing WhatsApp-created CUSTOMER account once the token is validated — the account-takeover path this closes', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'existing-1',
+        role: 'CUSTOMER',
+      });
+      otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-1' });
+      const tx = {
+        phoneVerification: {
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        },
+        user: {
+          create: jest.fn(),
+          update: jest.fn().mockResolvedValue({
+            id: 'existing-1',
+            email: 'ada@example.com',
+            name: 'Ada',
+            role: 'CUSTOMER',
+          }),
+        },
+      };
+      prisma.$transaction.mockImplementation(
+        (cb: (client: typeof tx) => unknown) => cb(tx),
+      );
+
+      const result = await service.registerCustomer({
+        phoneNumber: '+2348012345678',
+        phoneVerificationToken: 'tok-1',
+        email: 'ada@example.com',
+        password: 'password1',
+        name: 'Ada',
+      });
+
+      expect(tx.user.update).toHaveBeenCalledWith({
+        where: { id: 'existing-1' },
+        data: expect.objectContaining({
+          email: 'ada@example.com',
+          name: 'Ada',
+          passwordHash: expect.any(String),
+        }),
+      });
+      expect(tx.user.create).not.toHaveBeenCalled();
+      expect(result.user.id).toBe('existing-1');
+    });
+
+    it('rejects a phone already registered to a non-customer account without requiring a token', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'existing-1',
+        role: 'OPERATOR',
+      });
+
+      await expect(
+        service.registerCustomer({
+          phoneNumber: '+2348012345678',
+          phoneVerificationToken: '',
+          password: 'password1',
+        }),
+      ).rejects.toThrow('already registered to a different account type');
+      expect(otpService.findValidTokenRow).not.toHaveBeenCalled();
+    });
+  });
+
   describe('requestPasswordReset', () => {
     it('rejects a password shorter than 8 characters', async () => {
       await expect(
