@@ -1375,6 +1375,75 @@ describe('WhatsAppCustomerFlowService', () => {
       expect(quotedCall[0].data.status).toBe('NOT_SELECTED');
       expect(quotedCall[0].data.respondedAt).toBeInstanceOf(Date);
     });
+
+    it.each(['OPERATOR_ASSIGNED', 'IN_PROGRESS', 'ARRIVED', 'IN_DISPUTE'])(
+      'refuses to self-cancel once %s — the deposit is paid and an operator has committed, so this must go through support instead',
+      async (status) => {
+        prisma.rescueRequest.findUnique.mockResolvedValue({
+          id: 'req-1',
+          status,
+          assignedOperator: { phoneNumber: '+2349011111111' },
+        });
+        const session: WhatsAppSession = {
+          userId: 'cust-1',
+          state: WhatsAppFlowState.IDLE,
+          rescueRequestId: 'req-1',
+          updatedAt: new Date(),
+        };
+
+        const result = await service.handleCustomerMessage(
+          '+2348012345678',
+          'cust-1',
+          'cancel',
+          'cancel',
+          undefined,
+          undefined,
+          undefined,
+          session,
+          {},
+        );
+
+        expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+        expect(prisma.dispatchOffer.updateMany).not.toHaveBeenCalled();
+        expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+        expect(result).toContain('contact support');
+      },
+    );
+
+    it.each(['WAITING_FOR_DEPOSIT', 'DISPATCHING'])(
+      'still allows self-cancel while %s — no deposit has been captured yet',
+      async (status) => {
+        prisma.rescueRequest.findUnique.mockResolvedValue({
+          id: 'req-1',
+          status,
+          assignedOperator: null,
+        });
+        const session: WhatsAppSession = {
+          userId: 'cust-1',
+          state: WhatsAppFlowState.IDLE,
+          rescueRequestId: 'req-1',
+          updatedAt: new Date(),
+        };
+
+        const result = await service.handleCustomerMessage(
+          '+2348012345678',
+          'cust-1',
+          'cancel',
+          'cancel',
+          undefined,
+          undefined,
+          undefined,
+          session,
+          {},
+        );
+
+        expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+          where: { id: 'req-1' },
+          data: { status: 'CANCELLED' },
+        });
+        expect(result).toContain('You were not charged');
+      },
+    );
   });
 
   describe('captureMediaAttachment', () => {

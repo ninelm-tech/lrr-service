@@ -19,6 +19,7 @@ import { Roles } from './decorators/roles.decorator';
 import { CreateStaffDto } from './dto/create-staff.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
+import { RegisterCustomerDto } from './dto/register-customer.dto';
 import { SendLoginCodeDto, VerifyLoginCodeDto } from './dto/login-otp.dto';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import type { AuthenticatedRequest } from './authenticated-request.interface';
@@ -42,18 +43,6 @@ export class ChangePasswordDto {
 export class LoginDto {
   identifier: string; // email or phone number
   password: string;
-}
-
-/**
- * Customer self-registration.
- * Phone number is the primary identifier (matches WhatsApp SOS phone).
- * Email + password are optional — used only if they want dashboard login.
- */
-export class RegisterCustomerDto {
-  phoneNumber: string;
-  email?: string;
-  password?: string;
-  name?: string;
 }
 
 @Controller('auth')

@@ -10,6 +10,7 @@ import { logger } from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
 import { UserRole } from '@prisma/client';
 import { normalizePhone } from '../common/phone.util';
+import { claimOnce } from '../common/claim-once.util';
 import { OtpService } from '../otp/otp.service';
 
 export interface JwtPayload {
@@ -178,9 +179,22 @@ export class AuthService {
   /**
    * Register a new customer (self-service via web or WhatsApp subscription flow).
    * Phone number is mandatory — it must match the WhatsApp number they SOS from.
+   *
+   * Ownership of the phone number must be proven with a verified OTP token
+   * (POST /otp/send-code + /otp/verify-code) before we touch the account —
+   * both for a brand-new signup and for attaching a password/email to a
+   * CUSTOMER record the WhatsApp bot already auto-created. Without this,
+   * anyone who knew a customer's phone number could set a new password on
+   * their account here and be handed a valid access token for it — a real
+   * account-takeover path, not just a missing nicety.
+   *
+   * Consumption is the atomic claim itself (see resetPasswordWithCode for
+   * the same pattern), so a token can't be redeemed twice by a concurrent
+   * request.
    */
   async registerCustomer(dto: {
     phoneNumber: string;
+    phoneVerificationToken: string;
     email?: string;
     password?: string;
     name?: string;
@@ -192,38 +206,7 @@ export class AuthService {
     const existingPhone = await this.prisma.user.findUnique({
       where: { phoneNumber },
     });
-    if (existingPhone) {
-      // If already exists as a CUSTOMER (created automatically by WhatsApp bot),
-      // just attach email/password and return a token.
-      if (existingPhone.role === UserRole.CUSTOMER) {
-        const updates: any = {};
-        if (dto.name) updates.name = dto.name;
-        if (dto.email) updates.email = dto.email;
-        if (dto.password)
-          updates.passwordHash = await this.hashPassword(dto.password);
-
-        const updated = await this.prisma.user.update({
-          where: { id: existingPhone.id },
-          data: updates,
-        });
-
-        const accessToken = this.generateToken({
-          id: updated.id,
-          email: updated.email ?? phoneNumber,
-          role: updated.role,
-        });
-
-        return {
-          accessToken,
-          user: {
-            id: updated.id,
-            email: updated.email,
-            name: updated.name,
-            role: updated.role,
-          },
-        };
-      }
-
+    if (existingPhone && existingPhone.role !== UserRole.CUSTOMER) {
       logger.warn(
         'registerCustomer: phone already registered to a non-customer account',
         {
@@ -236,8 +219,9 @@ export class AuthService {
       );
     }
 
-    // Check email uniqueness if provided
-    if (dto.email) {
+    // Check email uniqueness — fresh signups only. The attach path below
+    // only ever touches the CUSTOMER record that already owns this phone.
+    if (!existingPhone && dto.email) {
       const existingEmail = await this.prisma.user.findUnique({
         where: { email: dto.email },
       });
@@ -249,18 +233,62 @@ export class AuthService {
       }
     }
 
+    if (!dto.phoneVerificationToken) {
+      throw new BadRequestException('Verify your phone number first.');
+    }
+    const tokenRow = await this.otpService.findValidTokenRow(
+      phoneNumber,
+      dto.phoneVerificationToken,
+    );
+    if (!tokenRow) {
+      throw new BadRequestException('Verify your phone number first.');
+    }
+
     const passwordHash = dto.password
       ? await this.hashPassword(dto.password)
       : null;
 
-    const user = await this.prisma.user.create({
-      data: {
-        phoneNumber, // normalised +234... form
-        email: dto.email ?? null,
-        passwordHash: passwordHash ?? undefined,
-        name: dto.name ?? null,
-        role: UserRole.CUSTOMER,
-      },
+    const user = await this.prisma.$transaction(async (tx) => {
+      await claimOnce(
+        tx.phoneVerification,
+        {
+          where: {
+            id: tokenRow.id,
+            consumedAt: null,
+            tokenExpiresAt: { gt: new Date() },
+          },
+          data: { consumedAt: new Date() },
+        },
+        new BadRequestException('Verify your phone number first.'),
+      );
+
+      // If already exists as a CUSTOMER (created automatically by WhatsApp
+      // bot), just attach email/password and return a token.
+      if (existingPhone) {
+        const updates: {
+          name?: string;
+          email?: string;
+          passwordHash?: string;
+        } = {};
+        if (dto.name) updates.name = dto.name;
+        if (dto.email) updates.email = dto.email;
+        if (passwordHash) updates.passwordHash = passwordHash;
+
+        return tx.user.update({
+          where: { id: existingPhone.id },
+          data: updates,
+        });
+      }
+
+      return tx.user.create({
+        data: {
+          phoneNumber, // normalised +234... form
+          email: dto.email ?? null,
+          passwordHash: passwordHash ?? undefined,
+          name: dto.name ?? null,
+          role: UserRole.CUSTOMER,
+        },
+      });
     });
     logger.info('registerCustomer: account created', { userId: user.id });
 
@@ -369,17 +397,18 @@ export class AuthService {
     const passwordHash = await this.hashPassword(newPassword);
 
     await this.prisma.$transaction(async (tx) => {
-      const claimed = await tx.phoneVerification.updateMany({
-        where: {
-          id: tokenRow.id,
-          consumedAt: null,
-          tokenExpiresAt: { gt: new Date() },
+      await claimOnce(
+        tx.phoneVerification,
+        {
+          where: {
+            id: tokenRow.id,
+            consumedAt: null,
+            tokenExpiresAt: { gt: new Date() },
+          },
+          data: { consumedAt: new Date() },
         },
-        data: { consumedAt: new Date() },
-      });
-      if (claimed.count !== 1) {
-        throw new BadRequestException('Code expired — request a new one.');
-      }
+        new BadRequestException('Code expired — request a new one.'),
+      );
 
       const user = await tx.user.findUnique({ where: { phoneNumber } });
       if (!user || !user.passwordHash) {
@@ -422,17 +451,18 @@ export class AuthService {
     }
 
     return this.prisma.$transaction(async (tx) => {
-      const claimed = await tx.phoneVerification.updateMany({
-        where: {
-          id: tokenRow.id,
-          consumedAt: null,
-          tokenExpiresAt: { gt: new Date() },
+      await claimOnce(
+        tx.phoneVerification,
+        {
+          where: {
+            id: tokenRow.id,
+            consumedAt: null,
+            tokenExpiresAt: { gt: new Date() },
+          },
+          data: { consumedAt: new Date() },
         },
-        data: { consumedAt: new Date() },
-      });
-      if (claimed.count !== 1) {
-        throw new UnauthorizedException('Code expired — request a new one.');
-      }
+        new UnauthorizedException('Code expired — request a new one.'),
+      );
 
       const user = await tx.user.findUnique({ where: { phoneNumber } });
       if (!user || user.role !== UserRole.OPERATOR) {

@@ -115,6 +115,113 @@ describe('TermiiService', () => {
       });
     });
 
+    it('treats a boolean true as verified — a valid code Termii accepted (HTTP 200) was being rejected because only the string "True" was recognized', async () => {
+      const service = await buildService({ TERMII_API_KEY: 'test-key' });
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify({ verified: true })),
+      }) as typeof fetch;
+
+      const result = await service.verifyOtp('pin-abc123', '123456');
+
+      expect(result).toEqual({ verified: true });
+    });
+
+    it('accepts the string "true" in any casing', async () => {
+      const service = await buildService({ TERMII_API_KEY: 'test-key' });
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify({ verified: 'true' })),
+      }) as typeof fetch;
+
+      const result = await service.verifyOtp('pin-abc123', '123456');
+
+      expect(result).toEqual({ verified: true });
+    });
+
+    it('does not treat a boolean false as verified', async () => {
+      const service = await buildService({ TERMII_API_KEY: 'test-key' });
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify({ verified: false })),
+      }) as typeof fetch;
+
+      const result = await service.verifyOtp('pin-abc123', '000000');
+
+      expect(result).toEqual({ verified: false });
+    });
+
+    it('logs the shape of an unverified 200 response (never the pin, pinId or phone) so an unexpected body is diagnosable', async () => {
+      const service = await buildService({ TERMII_API_KEY: 'test-key' });
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              pinId: 'pin-secret',
+              verified: 'Expired',
+              msisdn: '2348012345678',
+            }),
+          ),
+      }) as typeof fetch;
+
+      await service.verifyOtp('pin-secret', '000000');
+
+      expect(warn).toHaveBeenCalledWith('Termii verifyOtp: not verified', {
+        verified: 'Expired',
+        verifiedType: 'string',
+        keys: ['pinId', 'verified', 'msisdn'],
+      });
+      warn.mockRestore();
+    });
+
+    it('reports an already-consumed pin as alreadyUsed (not an error) — Termii pins are single-use and its real 400 is "Token … has already been verified"', async () => {
+      const service = await buildService({ TERMII_API_KEY: 'test-key' });
+      const consoleError = jest
+        .spyOn(console, 'error')
+        .mockImplementation(() => {});
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: false,
+        status: 400,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              error: true,
+              message: 'Token pin-abc123 has already been verified',
+            }),
+          ),
+      }) as typeof fetch;
+
+      const result = await service.verifyOtp('pin-abc123', '123456');
+
+      expect(result).toEqual({ verified: false, alreadyUsed: true });
+      expect(consoleError).not.toHaveBeenCalled();
+      jest.restoreAllMocks();
+    });
+
+    it('still treats any other non-ok verify response (e.g. "Pin is required") as a server error', async () => {
+      const service = await buildService({ TERMII_API_KEY: 'test-key' });
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: false,
+        status: 400,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              error: true,
+              validationErrors: { pin: 'Pin is required' },
+            }),
+          ),
+      }) as typeof fetch;
+
+      await expect(service.verifyOtp('pin-abc123', '')).rejects.toThrow(
+        InternalServerErrorException,
+      );
+      jest.restoreAllMocks();
+    });
+
     it("normalizes an 'Expired' or wrong-code result to verified: false, without throwing", async () => {
       const service = await buildService({ TERMII_API_KEY: 'test-key' });
       global.fetch = jest.fn().mockResolvedValue({

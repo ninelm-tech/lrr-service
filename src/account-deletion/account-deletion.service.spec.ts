@@ -276,6 +276,34 @@ describe('AccountDeletionService.deleteUser', () => {
       expect(tx.operator.update).not.toHaveBeenCalled();
     });
 
+    // A CANCELLED request with an assigned operator and a paid deposit,
+    // where resolveCancellationSettlement was never called, still owes
+    // this operator their share of the deposit — deleting nulls
+    // paystackRecipientCode, which can never be restored, permanently
+    // stranding that payout. Neither the "active" check above (which
+    // excludes CANCELLED outright) nor the completed-payout check catches
+    // this — it needed its own guard.
+    it('blocks a cancelled request with a paid deposit that still needs a cancellation settlement', async () => {
+      tx.rescueRequest.findMany
+        .mockResolvedValueOnce([]) // blockingRequests
+        .mockResolvedValueOnce([]) // unsettledPayouts (COMPLETED-only)
+        .mockResolvedValueOnce([{ id: 'req-1' }]); // unsettled cancellations
+
+      await expect(service.deleteOperator('op-1', 'admin-1')).rejects.toThrow(
+        '1 cancelled request(s) still have an unsettled cancellation payout',
+      );
+      expect(tx.rescueRequest.findMany).toHaveBeenNthCalledWith(3, {
+        where: {
+          assignedOperatorId: 'op-1',
+          status: 'CANCELLED',
+          cancellationSettledAt: null,
+          payments: { some: { type: 'DEPOSIT', status: 'SUCCEEDED' } },
+        },
+        select: { id: true },
+      });
+      expect(tx.operator.update).not.toHaveBeenCalled();
+    });
+
     it('anonymizes the operator, scrubs statements, and queues only operator media', async () => {
       tx.requestMedia.findMany.mockResolvedValue([
         { id: 'media-1', s3Key: 'operator-key' },

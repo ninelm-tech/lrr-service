@@ -224,6 +224,32 @@ export class AccountDeletionService {
         );
       }
 
+      // A CANCELLED request with a paid deposit and no cancellation
+      // settlement yet still owes this operator their share of that
+      // deposit (see RescueRequestAdminService.resolveCancellationSettlement)
+      // — deleting nulls paystackRecipientCode below, which can never be
+      // restored, permanently stranding that payout. Distinct from the
+      // "active" check above, which deliberately excludes CANCELLED.
+      const unsettledCancellations = await tx.rescueRequest.findMany({
+        where: {
+          assignedOperatorId: id,
+          status: RescueRequestStatus.CANCELLED,
+          cancellationSettledAt: null,
+          payments: {
+            some: {
+              type: PaymentType.DEPOSIT,
+              status: PaymentStatus.SUCCEEDED,
+            },
+          },
+        },
+        select: { id: true },
+      });
+      if (unsettledCancellations.length > 0) {
+        throw new BadRequestException(
+          `Cannot delete: ${unsettledCancellations.length} cancelled request(s) still have an unsettled cancellation payout`,
+        );
+      }
+
       await tx.operator.update({
         where: { id },
         data: {

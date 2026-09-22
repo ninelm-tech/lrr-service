@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { BadRequestException } from '@nestjs/common';
 import { OtpService } from './otp.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { TermiiService } from '../integrations/termii/termii.service';
@@ -308,6 +309,62 @@ describe('OtpService', () => {
       await expect(
         service.verifyCode('+2348012345678', '123456'),
       ).rejects.toThrow('expired');
+    });
+
+    it.each([
+      ['empty', ''],
+      ['whitespace-only', '   '],
+      ['missing', undefined],
+    ])(
+      'rejects an %s code as a clean 400 before touching the database or Termii — there is no global ValidationPipe, so the DTO alone never caught this',
+      async (_label, code) => {
+        await expect(
+          service.verifyCode('+2348012345678', code as string),
+        ).rejects.toThrow(BadRequestException);
+        await expect(
+          service.verifyCode('+2348012345678', code as string),
+        ).rejects.toThrow('Enter the code');
+        expect(prisma.phoneVerification.findFirst).not.toHaveBeenCalled();
+        expect(termiiService.verifyOtp).not.toHaveBeenCalled();
+      },
+    );
+
+    it('trims surrounding whitespace before sending the code to Termii (pasted codes often carry it)', async () => {
+      prisma.phoneVerification.findFirst.mockResolvedValue({
+        id: 'pv-1',
+        pinId: 'pin-1',
+        attempts: 0,
+        expiresAt: new Date(Date.now() + 60_000),
+        verifiedAt: null,
+      });
+      termiiService.verifyOtp.mockResolvedValue({ verified: true });
+      prisma.phoneVerification.update.mockResolvedValue({});
+
+      await service.verifyCode('+2348012345678', ' 123456\n');
+
+      expect(termiiService.verifyOtp).toHaveBeenCalledWith('pin-1', '123456');
+    });
+
+    it('turns a single-use pin that was already consumed into a clean 400 — and does not burn an attempt on it', async () => {
+      prisma.phoneVerification.findFirst.mockResolvedValue({
+        id: 'pv-1',
+        pinId: 'pin-1',
+        attempts: 0,
+        expiresAt: new Date(Date.now() + 60_000),
+        verifiedAt: null,
+      });
+      termiiService.verifyOtp.mockResolvedValue({
+        verified: false,
+        alreadyUsed: true,
+      });
+
+      await expect(
+        service.verifyCode('+2348012345678', '123456'),
+      ).rejects.toThrow(BadRequestException);
+      await expect(
+        service.verifyCode('+2348012345678', '123456'),
+      ).rejects.toThrow('already been used');
+      expect(prisma.phoneVerification.update).not.toHaveBeenCalled();
     });
   });
 });

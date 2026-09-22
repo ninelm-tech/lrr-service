@@ -16,6 +16,7 @@ import {
 } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { normalizePhone } from '../common/phone.util';
+import { claimOnce } from '../common/claim-once.util';
 import { CreateOperatorDto } from './dto/create-operator.dto';
 import { UpdateOperatorProfileDto } from './dto/update-operator-profile.dto';
 import { SaveBankDetailsDto } from './dto/save-bank-details.dto';
@@ -213,19 +214,20 @@ export class OperatorService {
       let user;
 
       if (upgradeUserId) {
-        const claimed = await tx.phoneVerification.updateMany({
-          where: {
-            id: upgradeTokenRowId!,
-            consumedAt: null,
-            tokenExpiresAt: { gt: new Date() },
+        await claimOnce(
+          tx.phoneVerification,
+          {
+            where: {
+              id: upgradeTokenRowId!,
+              consumedAt: null,
+              tokenExpiresAt: { gt: new Date() },
+            },
+            data: { consumedAt: new Date() },
           },
-          data: { consumedAt: new Date() },
-        });
-        if (claimed.count !== 1) {
-          throw new ConflictException(
+          new ConflictException(
             'This number belongs to an existing account — verify your number first.',
-          );
-        }
+          ),
+        );
         const stillFree = data.email
           ? await tx.user.findUnique({ where: { email: data.email } })
           : null;
@@ -246,17 +248,18 @@ export class OperatorService {
         });
       } else {
         // Same atomic-claim pattern as the upgrade branch above.
-        const claimed = await tx.phoneVerification.updateMany({
-          where: {
-            id: freshSignupTokenRowId!,
-            consumedAt: null,
-            tokenExpiresAt: { gt: new Date() },
+        await claimOnce(
+          tx.phoneVerification,
+          {
+            where: {
+              id: freshSignupTokenRowId!,
+              consumedAt: null,
+              tokenExpiresAt: { gt: new Date() },
+            },
+            data: { consumedAt: new Date() },
           },
-          data: { consumedAt: new Date() },
-        });
-        if (claimed.count !== 1) {
-          throw new BadRequestException('Verify your phone number first.');
-        }
+          new BadRequestException('Verify your phone number first.'),
+        );
 
         user = await tx.user.create({
           data: {

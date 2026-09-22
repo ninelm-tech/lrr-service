@@ -16,6 +16,7 @@ import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { OperatorMembershipService } from '../operator/operator-membership.service';
+import { PayoutService } from '../payout/payout.service';
 import { Prisma } from '@prisma/client';
 
 describe('RescueRequestAdminService', () => {
@@ -40,6 +41,10 @@ describe('RescueRequestAdminService', () => {
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
+          {
+            provide: PayoutService,
+            useValue: { createAndProcessPayout: jest.fn() },
+          },
           RescueRequestAdminService,
           { provide: PrismaService, useValue: prisma },
           {
@@ -243,6 +248,10 @@ describe('RescueRequestAdminService', () => {
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
+          {
+            provide: PayoutService,
+            useValue: { createAndProcessPayout: jest.fn() },
+          },
           RescueRequestAdminService,
           { provide: PrismaService, useValue: prisma },
           {
@@ -378,6 +387,10 @@ describe('RescueRequestAdminService', () => {
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
+          {
+            provide: PayoutService,
+            useValue: { createAndProcessPayout: jest.fn() },
+          },
           RescueRequestAdminService,
           { provide: PrismaService, useValue: prisma },
           {
@@ -409,7 +422,7 @@ describe('RescueRequestAdminService', () => {
       );
     });
 
-    it("filters to refund-eligible requests when refundEligible=true is passed, matching refundDeposit's own eligibility condition (status CANCELLED + a succeeded deposit + no active/succeeded refund)", async () => {
+    it("filters to refund-eligible requests when refundEligible=true is passed, matching refundDeposit's own eligibility condition (status CANCELLED + a succeeded deposit + no active/succeeded refund or payout)", async () => {
       prisma.rescueRequest.findMany.mockResolvedValue([]);
       prisma.rescueRequest.count.mockResolvedValue(0);
 
@@ -424,10 +437,24 @@ describe('RescueRequestAdminService', () => {
                 payments: {
                   some: { type: 'DEPOSIT', status: 'SUCCEEDED' },
                   none: {
-                    type: 'REFUND',
-                    status: {
-                      in: ['PENDING', 'SUBMITTED', 'BLOCKED', 'SUCCEEDED'],
-                    },
+                    OR: [
+                      {
+                        type: 'REFUND',
+                        status: {
+                          in: ['PENDING', 'SUBMITTED', 'BLOCKED', 'SUCCEEDED'],
+                        },
+                      },
+                      {
+                        // A cancellation settlement may have paid the
+                        // operator the full deposit with no REFUND row at
+                        // all (customerRefundPercent: 0) — this must also
+                        // count as "not refund-eligible anymore".
+                        type: 'PAYOUT',
+                        status: {
+                          in: ['PENDING', 'SUBMITTED', 'BLOCKED', 'SUCCEEDED'],
+                        },
+                      },
+                    ],
                   },
                 },
               },
@@ -722,6 +749,10 @@ describe('RescueRequestAdminService', () => {
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
+          {
+            provide: PayoutService,
+            useValue: { createAndProcessPayout: jest.fn() },
+          },
           RescueRequestAdminService,
           { provide: PrismaService, useValue: prisma },
           { provide: PaymentLedgerService, useValue: paymentLedger },
@@ -986,6 +1017,10 @@ describe('RescueRequestAdminService', () => {
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
+          {
+            provide: PayoutService,
+            useValue: { createAndProcessPayout: jest.fn() },
+          },
           RescueRequestAdminService,
           { provide: PrismaService, useValue: prisma },
           { provide: PaymentLedgerService, useValue: paymentLedger },
@@ -1198,6 +1233,387 @@ describe('RescueRequestAdminService', () => {
     });
   });
 
+  describe('resolveCancellationSettlement', () => {
+    let service: RescueRequestAdminService;
+    let prisma: {
+      rescueRequest: { findUnique: jest.Mock; updateMany: jest.Mock };
+      payment: { update: jest.Mock };
+    };
+    let paystackService: { refundTransaction: jest.Mock };
+    let paymentLedger: PaymentLedgerMock;
+    let payoutService: { createAndProcessPayout: jest.Mock };
+
+    /**
+     * CANCELLED, paid deposit, an operator was assigned — the eligible
+     * case. serviceFeeAmount/balanceAmount default to 0 so totalAmount
+     * equals depositAmount and feeKeptOut is 0 — most of this block's
+     * tests are about the eligibility/claim/leg-ordering logic, not the
+     * fee math, which has its own dedicated test and full coverage in
+     * compute-cancellation-settlement.spec.ts.
+     */
+    const eligibleRequest = (overrides: Record<string, unknown> = {}) => ({
+      id: 'req-1',
+      status: 'CANCELLED',
+      depositAmount: 500000,
+      serviceFeeAmount: 0,
+      balanceAmount: 0,
+      assignedOperatorId: 'op-1',
+      cancellationSettledAt: null,
+      payments: [{ id: 'dep-1', type: 'DEPOSIT', status: 'SUCCEEDED' }],
+      ...overrides,
+    });
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: {
+          findUnique: jest.fn(),
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        },
+        payment: { update: jest.fn().mockResolvedValue({}) },
+      };
+      paystackService = { refundTransaction: jest.fn() };
+      paymentLedger = createPaymentLedgerMock();
+      payoutService = {
+        createAndProcessPayout: jest.fn().mockResolvedValue(undefined),
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          RescueRequestAdminService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: PaymentLedgerService, useValue: paymentLedger },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          { provide: PaystackService, useValue: paystackService },
+          { provide: TwilioService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
+          { provide: PayoutService, useValue: payoutService },
+          {
+            provide: OperatorMembershipService,
+            useValue: {
+              findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
+            },
+          },
+        ],
+      }).compile();
+
+      service = module.get<RescueRequestAdminService>(
+        RescueRequestAdminService,
+      );
+    });
+
+    it('rejects a percentage outside 0-100', async () => {
+      await expect(
+        service.resolveCancellationSettlement('req-1', 'note', 101),
+      ).rejects.toThrow(
+        'customerRefundPercent must be an integer between 0 and 100',
+      );
+      expect(prisma.rescueRequest.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('rejects when the request was never CANCELLED', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(
+        eligibleRequest({ status: 'IN_PROGRESS' }),
+      );
+
+      await expect(
+        service.resolveCancellationSettlement('req-1', 'note', 50),
+      ).rejects.toThrow('Not eligible');
+      expect(paystackService.refundTransaction).not.toHaveBeenCalled();
+      expect(payoutService.createAndProcessPayout).not.toHaveBeenCalled();
+    });
+
+    it('rejects when no operator was ever assigned — use the plain refund instead', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(
+        eligibleRequest({ assignedOperatorId: null }),
+      );
+
+      await expect(
+        service.resolveCancellationSettlement('req-1', 'note', 50),
+      ).rejects.toThrow('Not eligible');
+    });
+
+    it('rejects when this cancellation was already settled', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(
+        eligibleRequest({
+          cancellationSettledAt: new Date('2026-09-21T00:00:00Z'),
+        }),
+      );
+
+      await expect(
+        service.resolveCancellationSettlement('req-1', 'note', 50),
+      ).rejects.toThrow('already been settled');
+      expect(prisma.rescueRequest.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('rejects when a plain refundDeposit already refunded this request — no double refund through the other endpoint', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(
+        eligibleRequest({
+          payments: [
+            { id: 'dep-1', type: 'DEPOSIT', status: 'SUCCEEDED' },
+            { id: 'ref-1', type: 'REFUND', status: 'SUCCEEDED' },
+          ],
+        }),
+      );
+
+      await expect(
+        service.resolveCancellationSettlement('req-1', 'note', 50),
+      ).rejects.toThrow('already been settled');
+      expect(prisma.rescueRequest.updateMany).not.toHaveBeenCalled();
+      expect(payoutService.createAndProcessPayout).not.toHaveBeenCalled();
+    });
+
+    it('rejects when the atomic claim matches zero rows — settled by a concurrent call between the read and the claim', async () => {
+      // The real guard — see the doc comment on resolveCancellationSettlement.
+      // A REFUND-only (100%) and a PAYOUT-only (0%) submission racing each
+      // other would both pass the Payment-row-free courtesy read above;
+      // this is what actually stops the second one, regardless of which
+      // leg either submission needed.
+      prisma.rescueRequest.findUnique.mockResolvedValue(eligibleRequest());
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        service.resolveCancellationSettlement('req-1', 'note', 70),
+      ).rejects.toThrow('already been settled');
+      expect(paystackService.refundTransaction).not.toHaveBeenCalled();
+      expect(payoutService.createAndProcessPayout).not.toHaveBeenCalled();
+    });
+
+    it('splits the deposit — refunds the customer AND pays the operator — at a partial percentage', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(eligibleRequest());
+      paystackService.refundTransaction.mockResolvedValue({
+        outcome: 'ok',
+        data: { id: 999, status: 'pending' },
+      });
+
+      const result = await service.resolveCancellationSettlement(
+        'req-1',
+        'Operator was already en route — 70/30 split agreed with customer.',
+        70,
+      );
+
+      expect(paymentLedger.create).toHaveBeenCalledWith({
+        rescueRequestId: 'req-1',
+        type: 'REFUND',
+        amount: 350000,
+      });
+      expect(paystackService.refundTransaction).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 350000 }),
+      );
+      expect(payoutService.createAndProcessPayout).toHaveBeenCalledWith(
+        'req-1',
+        'op-1',
+        150000,
+      );
+      // The claim's WHERE re-checks status and assignedOperatorId — same
+      // optimistic-concurrency shape assignOperator's own claim on this
+      // model already uses — and excludes an existing REFUND, so the
+      // real atomic guard (not just the courtesy read above) also closes
+      // the cross-endpoint race with refundDeposit.
+      expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'req-1',
+          cancellationSettledAt: null,
+          status: 'CANCELLED',
+          assignedOperatorId: 'op-1',
+          payments: {
+            none: {
+              type: 'REFUND',
+              status: { in: ['PENDING', 'SUBMITTED', 'BLOCKED', 'SUCCEEDED'] },
+            },
+          },
+        },
+        data: {
+          cancellationSettledAt: expect.any(Date),
+          cancellationSettlementNote:
+            'Operator was already en route — 70/30 split agreed with customer.',
+          cancellationSettlementPercent: 70,
+        },
+      });
+      expect(result).toEqual({
+        feeKeptOut: 0,
+        refundAmount: 350000,
+        payoutAmount: 150000,
+        refundFailed: false,
+      });
+    });
+
+    it("keeps the platform's fee share out before splitting — the worked example: ₦50k quote, 15% fee, 15% deposit", async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(
+        eligibleRequest({
+          depositAmount: 8625,
+          serviceFeeAmount: 7500,
+          balanceAmount: 57500 - 8625, // total (quote+fee) minus the deposit
+        }),
+      );
+      paystackService.refundTransaction.mockResolvedValue({
+        outcome: 'ok',
+        data: { id: 999, status: 'pending' },
+      });
+
+      const result = await service.resolveCancellationSettlement(
+        'req-1',
+        '70/30 split agreed with customer — operator was already en route.',
+        70,
+      );
+
+      expect(paystackService.refundTransaction).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 5250 }),
+      );
+      expect(payoutService.createAndProcessPayout).toHaveBeenCalledWith(
+        'req-1',
+        'op-1',
+        2250,
+      );
+      expect(result).toEqual({
+        feeKeptOut: 1125,
+        refundAmount: 5250,
+        payoutAmount: 2250,
+        refundFailed: false,
+      });
+    });
+
+    it('uses the balance as it stood BEFORE a prior dispute adjustment, not the settled-down figure, so a past dispute cannot inflate the fee kept out', async () => {
+      // Quote ₦100,000, 15% fee (₦15,000) → true total ₦115,000, 15%
+      // deposit → depositAmount=17,250, balanceAmount originally 97,750.
+      // A dispute resolved at 10% overwrote balanceAmount to 9,775 and
+      // snapshotted the original onto disputeOriginalBalanceAmount — that
+      // snapshot, not the settled-down balanceAmount, is the real
+      // "total" the deposit percentage was originally applied to.
+      prisma.rescueRequest.findUnique.mockResolvedValue(
+        eligibleRequest({
+          depositAmount: 17250,
+          serviceFeeAmount: 15000,
+          balanceAmount: 9775,
+          disputeOriginalBalanceAmount: 97750,
+        }),
+      );
+      paystackService.refundTransaction.mockResolvedValue({
+        outcome: 'ok',
+        data: { id: 999, status: 'pending' },
+      });
+
+      const result = await service.resolveCancellationSettlement(
+        'req-1',
+        'note',
+        100,
+      );
+
+      // total = 17250 + 97750 = 115000; feeKeptOut = round(17250*15000/115000) = 2250
+      expect(result).toEqual({
+        feeKeptOut: 2250,
+        refundAmount: 15000,
+        payoutAmount: 0,
+        refundFailed: false,
+      });
+    });
+
+    it('skips the refund call entirely at 0% — the operator gets the whole deposit', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(eligibleRequest());
+
+      const result = await service.resolveCancellationSettlement(
+        'req-1',
+        'Operator had already completed the tow when cancelled.',
+        0,
+      );
+
+      expect(paystackService.refundTransaction).not.toHaveBeenCalled();
+      expect(paymentLedger.create).not.toHaveBeenCalled();
+      expect(payoutService.createAndProcessPayout).toHaveBeenCalledWith(
+        'req-1',
+        'op-1',
+        500000,
+      );
+      expect(prisma.rescueRequest.updateMany).toHaveBeenCalled();
+      expect(result).toEqual({
+        feeKeptOut: 0,
+        refundAmount: 0,
+        payoutAmount: 500000,
+        refundFailed: false,
+      });
+    });
+
+    it('skips the payout call entirely at 100% — same money movement as a plain refund', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(eligibleRequest());
+      paystackService.refundTransaction.mockResolvedValue({
+        outcome: 'ok',
+        data: { id: 999, status: 'pending' },
+      });
+
+      const result = await service.resolveCancellationSettlement(
+        'req-1',
+        'Operator had not left yet — full refund.',
+        100,
+      );
+
+      expect(payoutService.createAndProcessPayout).not.toHaveBeenCalled();
+      expect(paystackService.refundTransaction).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 500000 }),
+      );
+      expect(result).toEqual({
+        feeKeptOut: 0,
+        refundAmount: 500000,
+        payoutAmount: 0,
+        refundFailed: false,
+      });
+    });
+
+    it('still attempts the payout leg when the refund leg is rejected outright — an operator who did the job must not go unpaid because of an unrelated Paystack failure', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(eligibleRequest());
+      paystackService.refundTransaction.mockResolvedValue({
+        outcome: 'rejected',
+        message: 'Transaction not found',
+      });
+
+      const result = await service.resolveCancellationSettlement(
+        'req-1',
+        'note',
+        70,
+      );
+
+      expect(payoutService.createAndProcessPayout).toHaveBeenCalledWith(
+        'req-1',
+        'op-1',
+        150000,
+      );
+      expect(prisma.rescueRequest.updateMany).toHaveBeenCalled();
+      expect(result).toEqual({
+        feeKeptOut: 0,
+        refundAmount: 350000,
+        payoutAmount: 150000,
+        refundFailed: true,
+      });
+    });
+
+    it('does not throw and still claims the settlement when the refund leg is rejected at 100% — nothing left to pay out, but the failure is reported, not thrown', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(eligibleRequest());
+      paystackService.refundTransaction.mockResolvedValue({
+        outcome: 'rejected',
+        message: 'Transaction not found',
+      });
+
+      const result = await service.resolveCancellationSettlement(
+        'req-1',
+        'note',
+        100,
+      );
+
+      expect(payoutService.createAndProcessPayout).not.toHaveBeenCalled();
+      expect(result).toEqual({
+        feeKeptOut: 0,
+        refundAmount: 500000,
+        payoutAmount: 0,
+        refundFailed: true,
+      });
+    });
+  });
+
   describe('adminList — dispute field mapping', () => {
     let service: RescueRequestAdminService;
     let prisma: { rescueRequest: { findMany: jest.Mock; count: jest.Mock } };
@@ -1212,6 +1628,10 @@ describe('RescueRequestAdminService', () => {
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
+          {
+            provide: PayoutService,
+            useValue: { createAndProcessPayout: jest.fn() },
+          },
           RescueRequestAdminService,
           { provide: PrismaService, useValue: prisma },
           {
@@ -1298,6 +1718,10 @@ describe('RescueRequestAdminService', () => {
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
+          {
+            provide: PayoutService,
+            useValue: { createAndProcessPayout: jest.fn() },
+          },
           RescueRequestAdminService,
           { provide: PrismaService, useValue: prisma },
           {
@@ -1418,6 +1842,10 @@ describe('RescueRequestAdminService', () => {
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
+          {
+            provide: PayoutService,
+            useValue: { createAndProcessPayout: jest.fn() },
+          },
           RescueRequestAdminService,
           { provide: PrismaService, useValue: prisma },
           {

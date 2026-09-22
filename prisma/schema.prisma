@@ -234,6 +234,18 @@ model RescueRequest {
   // is the only place "what was originally owed" survives.
   disputeOriginalBalanceAmount Int?
 
+  // Cancellation-after-dispatch settlement — see
+  // RescueRequestAdminService.resolveCancellationSettlement. Distinct from
+  // the dispute fields above: this splits an already-paid DEPOSIT between a
+  // customer refund and an operator payout, rather than adjusting an
+  // unpaid balance.
+  cancellationSettledAt         DateTime?
+  cancellationSettlementNote    String?
+  // 0-100 — what % of the deposit went back to the customer; the operator
+  // received the remainder. Kept for admin display, alongside the actual
+  // REFUND/PAYOUT Payment rows which remain the source of truth for amounts.
+  cancellationSettlementPercent Int?
+
   assignedOperatorId String?
   assignedOperator   Operator? @relation(fields: [assignedOperatorId], references: [id])
 

@@ -53,6 +53,7 @@ describe('RescueRequestAdminService.detailForUser — mediaLinks filter (integra
       {} as unknown as PaymentLedgerService, // unused by detailForUser
       {} as unknown as PaystackCustomerService, // unused by detailForUser
       {} as never,
+      {} as never, // PayoutService — unused by detailForUser
     );
   });
 
