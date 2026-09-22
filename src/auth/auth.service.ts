@@ -10,6 +10,7 @@ import { logger } from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
 import { UserRole } from '@prisma/client';
 import { normalizePhone } from '../common/phone.util';
+import { claimOnce } from '../common/claim-once.util';
 import { OtpService } from '../otp/otp.service';
 
 export interface JwtPayload {
@@ -248,17 +249,18 @@ export class AuthService {
       : null;
 
     const user = await this.prisma.$transaction(async (tx) => {
-      const claimed = await tx.phoneVerification.updateMany({
-        where: {
-          id: tokenRow.id,
-          consumedAt: null,
-          tokenExpiresAt: { gt: new Date() },
+      await claimOnce(
+        tx.phoneVerification,
+        {
+          where: {
+            id: tokenRow.id,
+            consumedAt: null,
+            tokenExpiresAt: { gt: new Date() },
+          },
+          data: { consumedAt: new Date() },
         },
-        data: { consumedAt: new Date() },
-      });
-      if (claimed.count !== 1) {
-        throw new BadRequestException('Verify your phone number first.');
-      }
+        new BadRequestException('Verify your phone number first.'),
+      );
 
       // If already exists as a CUSTOMER (created automatically by WhatsApp
       // bot), just attach email/password and return a token.
@@ -395,17 +397,18 @@ export class AuthService {
     const passwordHash = await this.hashPassword(newPassword);
 
     await this.prisma.$transaction(async (tx) => {
-      const claimed = await tx.phoneVerification.updateMany({
-        where: {
-          id: tokenRow.id,
-          consumedAt: null,
-          tokenExpiresAt: { gt: new Date() },
+      await claimOnce(
+        tx.phoneVerification,
+        {
+          where: {
+            id: tokenRow.id,
+            consumedAt: null,
+            tokenExpiresAt: { gt: new Date() },
+          },
+          data: { consumedAt: new Date() },
         },
-        data: { consumedAt: new Date() },
-      });
-      if (claimed.count !== 1) {
-        throw new BadRequestException('Code expired — request a new one.');
-      }
+        new BadRequestException('Code expired — request a new one.'),
+      );
 
       const user = await tx.user.findUnique({ where: { phoneNumber } });
       if (!user || !user.passwordHash) {
@@ -448,17 +451,18 @@ export class AuthService {
     }
 
     return this.prisma.$transaction(async (tx) => {
-      const claimed = await tx.phoneVerification.updateMany({
-        where: {
-          id: tokenRow.id,
-          consumedAt: null,
-          tokenExpiresAt: { gt: new Date() },
+      await claimOnce(
+        tx.phoneVerification,
+        {
+          where: {
+            id: tokenRow.id,
+            consumedAt: null,
+            tokenExpiresAt: { gt: new Date() },
+          },
+          data: { consumedAt: new Date() },
         },
-        data: { consumedAt: new Date() },
-      });
-      if (claimed.count !== 1) {
-        throw new UnauthorizedException('Code expired — request a new one.');
-      }
+        new UnauthorizedException('Code expired — request a new one.'),
+      );
 
       const user = await tx.user.findUnique({ where: { phoneNumber } });
       if (!user || user.role !== UserRole.OPERATOR) {
