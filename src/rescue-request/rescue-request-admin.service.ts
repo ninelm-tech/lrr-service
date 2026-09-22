@@ -7,6 +7,7 @@ import {
   Inject,
 } from '@nestjs/common';
 import * as crypto from 'crypto';
+import * as Sentry from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
@@ -20,6 +21,7 @@ import {
   RescueRequestStatus,
 } from '@prisma/client';
 import { toWhatsAppAddress } from '../common/phone.util';
+import { claimOnce } from '../common/claim-once.util';
 import { DEPOSIT_WINDOW_MS } from './deposit.constants';
 import {
   RescueRequestListResponseDto,
@@ -38,10 +40,17 @@ import { OperatorMembershipService } from '../operator/operator-membership.servi
 import { mapRefundStatus } from '../payment/domain/paystack-status';
 import {
   deriveRefundStatus,
+  deriveCancellationSettlementEligibility,
   hasSucceededPayment,
   refundEligiblePaymentsFilter,
+  ACTIVE_OR_SUCCEEDED_REFUND_STATUSES,
 } from './domain/derive-payment-state';
+import {
+  computeCancellationSettlement,
+  CancellationSettlement,
+} from './domain/compute-cancellation-settlement';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
+import { PayoutService } from '../payout/payout.service';
 
 @Injectable()
 export class RescueRequestAdminService {
@@ -58,6 +67,7 @@ export class RescueRequestAdminService {
     private readonly paymentLedger: PaymentLedgerService,
     private readonly paystackCustomerService: PaystackCustomerService,
     private readonly operatorMembershipService: OperatorMembershipService,
+    private readonly payoutService: PayoutService,
   ) {}
 
   async adminList(query: any) {
@@ -368,12 +378,27 @@ export class RescueRequestAdminService {
         p.type === PaymentType.DEPOSIT && p.status === PaymentStatus.SUCCEEDED,
     )!;
 
+    await this.submitDepositRefund(id, depositPayment, request.depositAmount);
+  }
+
+  /**
+   * The actual Paystack refund submission, against the deposit's OWN
+   * reference — shared by refundDeposit (always the full deposit) and
+   * resolveCancellationSettlement (a percentage of it). Ledger-guarded via
+   * the same in-flight partial unique index either caller relies on, so a
+   * double-click from either path is a safe no-op, not a double refund.
+   */
+  private async submitDepositRefund(
+    rescueRequestId: string,
+    depositPayment: { id: string; type: PaymentType; status: PaymentStatus },
+    amount: number,
+  ): Promise<void> {
     let payment: Payment;
     try {
       payment = await this.paymentLedger.create({
-        rescueRequestId: id,
+        rescueRequestId,
         type: 'REFUND',
-        amount: request.depositAmount,
+        amount,
       });
     } catch (error) {
       if (
@@ -398,7 +423,7 @@ export class RescueRequestAdminService {
     const result = await this.paystackService.refundTransaction({
       // The deposit's OWN reference — the original transaction to refund.
       transaction: this.paymentLedger.referenceFor(depositPayment),
-      amount: request.depositAmount,
+      amount,
       // The BARE id, not the formatted reference — refunds have no reference,
       // and this note is what recovery matches on.
       merchantNote: payment.id,
@@ -438,6 +463,174 @@ export class RescueRequestAdminService {
       await this.paymentLedger.claimTerminal(payment.id, mapped);
     }
     // Everything else — including `processed` — stays SUBMITTED.
+  }
+
+  /**
+   * Cancellation-after-dispatch settlement: splits an already-paid deposit
+   * between a customer refund and a payout to the operator who was already
+   * assigned, rather than the all-or-nothing refundDeposit. Deliberately
+   * separate from resolveDispute — that adjusts an UNPAID balance before
+   * it's charged; this moves money that was already captured, in two
+   * directions at once.
+   *
+   * customerRefundPercent (0-100): 100 refunds the customer in full and
+   * pays the operator nothing (same money movement as refundDeposit, just
+   * reached via this eligibility instead); 0 does the reverse.
+   *
+   * cancellationSettledAt is claimed atomically — via an updateMany whose
+   * WHERE is the eligibility check, not a separate read-then-write — BEFORE
+   * either leg runs, and is what actually makes two concurrent submissions
+   * safe. A REFUND and a PAYOUT use different Payment `type`s, so they
+   * claim separate in-flight-index slots and would NOT stop each other:
+   * one caller submitting 100% (refund only) and another submitting 0%
+   * (payout only) on the same request at once would otherwise both pass a
+   * Payment-row-based check and both succeed. See
+   * deriveCancellationSettlementEligibility.
+   *
+   * The refund leg runs first and is allowed to throw — a genuine Paystack
+   * rejection should surface cleanly without ever touching the payout.
+   * createAndProcessPayout never throws by its own contract (failures land
+   * on the Payment row instead), so calling it second is safe regardless
+   * of how the refund leg went. The claim is written either way, same as
+   * resolveDispute's disputeResolvedAt — it records that staff made this
+   * decision; the REFUND/PAYOUT Payment rows remain the source of truth
+   * for what actually moved.
+   */
+  async resolveCancellationSettlement(
+    id: string,
+    resolutionNote: string,
+    customerRefundPercent: number,
+  ): Promise<CancellationSettlement & { refundFailed: boolean }> {
+    if (
+      !Number.isInteger(customerRefundPercent) ||
+      customerRefundPercent < 0 ||
+      customerRefundPercent > 100
+    ) {
+      throw new BadRequestException(
+        'customerRefundPercent must be an integer between 0 and 100.',
+      );
+    }
+
+    const request = await this.prisma.rescueRequest.findUnique({
+      where: { id },
+      include: {
+        payments: { select: { id: true, type: true, status: true } },
+      },
+    });
+    if (!request) throw new NotFoundException('Rescue request not found');
+
+    const eligibility = deriveCancellationSettlementEligibility(
+      request.status,
+      request.assignedOperatorId,
+      request.cancellationSettledAt,
+      request.payments,
+    );
+    if (eligibility !== 'ELIGIBLE') {
+      throw new BadRequestException(
+        eligibility === 'SETTLED'
+          ? 'This cancellation has already been settled.'
+          : 'Not eligible — must be a CANCELLED request with a paid deposit and an assigned operator.',
+      );
+    }
+    if (!request.depositAmount) {
+      throw new BadRequestException(
+        `Cannot settle request ${id}: missing depositAmount`,
+      );
+    }
+
+    // Guaranteed non-null: ELIGIBLE requires an assignedOperatorId — see
+    // deriveCancellationSettlementEligibility.
+    const operatorId = request.assignedOperatorId!;
+    // Guaranteed to exist: ELIGIBLE requires a succeeded deposit.
+    const depositPayment = request.payments.find(
+      (p) =>
+        p.type === PaymentType.DEPOSIT && p.status === PaymentStatus.SUCCEEDED,
+    )!;
+
+    // Reconstructed from values frozen on this request at quote-selection
+    // time, not the platform's CURRENT config — depositAmount + balanceAmount
+    // is exactly quote + fee, the "total" the deposit percentage was applied
+    // to, whether or not the balance was ever actually charged. Falls back
+    // through disputeOriginalBalanceAmount first — same as
+    // deriveRequestAmounts below — since a prior dispute resolution
+    // overwrites balanceAmount with the SETTLED figure; using that instead
+    // of the original would understate total and overstate feeKeptOut.
+    const totalAmount =
+      request.depositAmount +
+      (request.disputeOriginalBalanceAmount ?? request.balanceAmount ?? 0);
+    const { feeKeptOut, refundAmount, payoutAmount } =
+      computeCancellationSettlement(
+        request.depositAmount,
+        request.serviceFeeAmount ?? 0,
+        totalAmount,
+        customerRefundPercent,
+      );
+
+    // The real guard — see doc comment above. This read above is only a
+    // courtesy for a clean early error message, same relationship
+    // refundDeposit has with deriveRefundStatus. status and
+    // assignedOperatorId are re-checked here too, same optimistic-
+    // concurrency shape assignOperator's own claim on this model already
+    // uses — and payments.none excludes an existing REFUND, so this claim
+    // itself (not just the courtesy read) closes the cross-endpoint race
+    // with refundDeposit, not only the deterministic sequential case.
+    await claimOnce(
+      this.prisma.rescueRequest,
+      {
+        where: {
+          id,
+          cancellationSettledAt: null,
+          status: RescueRequestStatus.CANCELLED,
+          assignedOperatorId: operatorId,
+          payments: {
+            none: {
+              type: PaymentType.REFUND,
+              status: { in: ACTIVE_OR_SUCCEEDED_REFUND_STATUSES },
+            },
+          },
+        },
+        data: {
+          cancellationSettledAt: new Date(),
+          cancellationSettlementNote: resolutionNote,
+          cancellationSettlementPercent: customerRefundPercent,
+        },
+      },
+      new BadRequestException('This cancellation has already been settled.'),
+    );
+
+    // The refund leg's failure must not strand the operator's payout —
+    // caught and reported, not thrown, so a Paystack-side refund problem
+    // can never leave an operator who did the job unpaid. This matches
+    // createAndProcessPayout's own "never throws" contract for the same
+    // reason; refundDeposit (a single-leg operation with nothing else to
+    // protect) still throws on the same failure.
+    let refundFailed = false;
+    if (refundAmount > 0) {
+      try {
+        await this.submitDepositRefund(id, depositPayment, refundAmount);
+      } catch (error) {
+        refundFailed = true;
+        console.error(
+          `Cancellation settlement ${id}: refund leg failed, still attempting the payout leg:`,
+          error,
+        );
+        Sentry.captureException(error, {
+          extra: {
+            rescueRequestId: id,
+            stage: 'cancellation-settlement-refund',
+          },
+        });
+      }
+    }
+    if (payoutAmount > 0) {
+      await this.payoutService.createAndProcessPayout(
+        id,
+        operatorId,
+        payoutAmount,
+      );
+    }
+
+    return { feeKeptOut, refundAmount, payoutAmount, refundFailed };
   }
 
   /**
@@ -870,6 +1063,12 @@ export class RescueRequestAdminService {
         };
       }
     ).customer;
+    const cancellationSettlement = raw as {
+      serviceFeeAmount: number | null;
+      cancellationSettledAt: Date | null;
+      cancellationSettlementNote: string | null;
+      cancellationSettlementPercent: number | null;
+    };
 
     return {
       id: raw.id,
@@ -894,6 +1093,7 @@ export class RescueRequestAdminService {
         PaymentType.BALANCE,
       ),
       ...amounts,
+      serviceFeeAmount: cancellationSettlement.serviceFeeAmount ?? undefined,
       customer: {
         id: customer.id,
         phoneNumber: customer.phoneNumber,
@@ -917,6 +1117,12 @@ export class RescueRequestAdminService {
       disputeResolutionNote: raw.disputeResolutionNote ?? undefined,
       disputeOriginalBalanceAmount:
         raw.disputeOriginalBalanceAmount ?? undefined,
+      cancellationSettledAt:
+        cancellationSettlement.cancellationSettledAt ?? undefined,
+      cancellationSettlementNote:
+        cancellationSettlement.cancellationSettlementNote ?? undefined,
+      cancellationSettlementPercent:
+        cancellationSettlement.cancellationSettlementPercent ?? undefined,
       createdAt: raw.createdAt,
       updatedAt: raw.updatedAt,
       offers,

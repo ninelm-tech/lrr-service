@@ -108,6 +108,7 @@ export class RescueRequestDetailDto {
   balanceReference?: string;
   totalAmount?: number;
   acceptedQuoteAmount?: number;
+  serviceFeeAmount?: number;
   customer: CustomerDetailDto;
   assignedOperator?: OperatorDetailDto;
   disputed: boolean;
@@ -117,6 +118,9 @@ export class RescueRequestDetailDto {
   operatorDisputeStatement?: string;
   disputeResolutionNote?: string;
   disputeOriginalBalanceAmount?: number;
+  cancellationSettledAt?: Date;
+  cancellationSettlementNote?: string;
+  cancellationSettlementPercent?: number;
   createdAt: Date;
   updatedAt: Date;
   offers?: DispatchOfferAdminDto[];

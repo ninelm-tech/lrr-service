@@ -17,6 +17,7 @@ import type { Request } from 'express';
 import { AdminRescueRequestQueryDto } from './dto/admin-rescue-request.dto';
 import { AssignOperatorDto } from './dto/assign-operator.dto';
 import { ResolveDisputeDto } from './dto/resolve-dispute.dto';
+import { ResolveCancellationSettlementDto } from './dto/resolve-cancellation-settlement.dto';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -194,6 +195,47 @@ export class RescueRequestController {
         balanceAdjustmentPercent: dto.balanceAdjustmentPercent,
         before: { balanceAmount: result.originalBalance },
         after: { balanceAmount: result.settledBalance },
+      },
+      actorId: req.user.userId,
+    });
+    return result;
+  }
+
+  /**
+   * Cancellation-after-dispatch settlement: splits an already-paid deposit
+   * between a customer refund and a payout to the assigned operator, for a
+   * request cancelled once self-cancel is blocked (see
+   * BLOCKED_FROM_SELF_CANCEL in whatsapp-customer-flow.service.ts) and
+   * support has agreed a split with the customer.
+   *
+   * SUPER_ADMIN only — like refund-deposit and payouts, this moves
+   * platform money out on both sides of the split, not just a payment
+   * link the customer acts on themselves.
+   */
+  @Patch(':id/resolve-cancellation-settlement')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.SUPER_ADMIN)
+  async resolveCancellationSettlement(
+    @Req() req: AuthenticatedRequest,
+    @Param('id') id: string,
+    @Body() dto: ResolveCancellationSettlementDto,
+  ) {
+    const result =
+      await this.rescueRequestAdminService.resolveCancellationSettlement(
+        id,
+        dto.resolutionNote,
+        dto.customerRefundPercent,
+      );
+    await this.auditLogService.record({
+      category: 'cancellation_settled',
+      message: `Resolved cancellation settlement for rescue request ${id}`,
+      details: {
+        rescueRequestId: id,
+        resolutionNote: dto.resolutionNote,
+        customerRefundPercent: dto.customerRefundPercent,
+        feeKeptOut: result.feeKeptOut,
+        refundAmount: result.refundAmount,
+        payoutAmount: result.payoutAmount,
       },
       actorId: req.user.userId,
     });
