@@ -852,6 +852,20 @@ export class OperatorService {
     });
   }
 
+  /**
+   * Flags/unflags an operator as a test operator — see
+   * findAndRankCandidates's isTest partitioning. Was previously only
+   * settable via direct DB access; the controller route this backs is
+   * SUPER_ADMIN only, since it changes which customers can reach this
+   * operator at all, not just its own state.
+   */
+  async setIsTest(id: string, isTest: boolean) {
+    return this.prisma.operator.update({
+      where: { id },
+      data: { isTest },
+    });
+  }
+
   async setAvailability(
     id: string,
     isAvailable: boolean,
