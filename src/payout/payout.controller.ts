@@ -15,6 +15,7 @@ import { Roles } from '../auth/decorators/roles.decorator';
 import { UserRole, PaymentStatus, PaymentType } from '@prisma/client';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import type { AuthenticatedRequest } from '../auth/authenticated-request.interface';
+import { isRetryablePayoutState } from './domain/payout-retry';
 
 /**
  * Payouts, read and retried from the Payment ledger directly (Task 11 — the
@@ -48,32 +49,48 @@ export class PayoutController {
       orderBy: { createdAt: 'desc' },
     });
 
-    // A job can have an older FAILED/BLOCKED row sitting right alongside a
-    // newer SUCCEEDED sibling — a normal retry that inserted a fresh
-    // attempt which later succeeded. That older row's own status says
-    // nothing about whether the job is done. Computed separately, unfiltered
-    // by `status`, so this holds even when the admin is viewing a
-    // status-filtered list that wouldn't otherwise include the succeeded
-    // sibling. Scoped to just the jobs on THIS page rather than every
-    // succeeded payout ever, so the query stays bounded as the table grows.
+    // Retry eligibility belongs to the payout as a whole, not an individual
+    // historical attempt. Fetch all siblings for the jobs on this page so a
+    // filtered view still knows which attempt is newest and whether any
+    // attempt already succeeded.
     const requestIds = [...new Set(payments.map((p) => p.rescueRequestId))];
-    const succeeded = requestIds.length
+    const siblings = requestIds.length
       ? await this.prisma.payment.findMany({
           where: {
             type: PaymentType.PAYOUT,
-            status: PaymentStatus.SUCCEEDED,
             rescueRequestId: { in: requestIds },
           },
-          select: { rescueRequestId: true },
+          select: {
+            id: true,
+            rescueRequestId: true,
+            status: true,
+            createdAt: true,
+          },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         })
       : [];
     const succeededRequestIds = new Set(
-      succeeded.map((p) => p.rescueRequestId),
+      siblings
+        .filter((p) => p.status === PaymentStatus.SUCCEEDED)
+        .map((p) => p.rescueRequestId),
     );
+    const latestAttemptIds = new Set<string>();
+    const seenRequestIds = new Set<string>();
+    for (const sibling of siblings) {
+      if (!seenRequestIds.has(sibling.rescueRequestId)) {
+        latestAttemptIds.add(sibling.id);
+        seenRequestIds.add(sibling.rescueRequestId);
+      }
+    }
 
     const data = payments.map((p) => ({
       ...p,
       alreadySucceeded: succeededRequestIds.has(p.rescueRequestId),
+      isLatestAttempt: latestAttemptIds.has(p.id),
+      canRetry:
+        latestAttemptIds.has(p.id) &&
+        !succeededRequestIds.has(p.rescueRequestId) &&
+        isRetryablePayoutState(p),
     }));
     return { data };
   }
@@ -130,6 +147,24 @@ function describeRetryOutcome(
       }
       if (payment.blockReason === 'AWAITING_OTP') {
         return 'Blocked — the transfer is awaiting an OTP at Paystack.';
+      }
+      if (payment.blockReason === 'ACCOUNT_RESTRICTED') {
+        return 'Still blocked — Paystack has not enabled third-party transfers for this business.';
+      }
+      if (payment.blockReason === 'PAYOUT_ON_HOLD') {
+        return 'Still blocked — payouts are on hold at Paystack.';
+      }
+      if (payment.blockReason === 'INVALID_RECIPIENT') {
+        return 'Still blocked — the Paystack transfer recipient must be corrected.';
+      }
+      if (payment.blockReason === 'INVALID_AMOUNT') {
+        return 'Still blocked — Paystack rejected the payout amount.';
+      }
+      if (payment.blockReason === 'INVALID_REFERENCE') {
+        return 'Still blocked — Paystack rejected the payout reference.';
+      }
+      if (payment.blockReason === 'PAYSTACK_VALIDATION') {
+        return 'Still blocked — Paystack rejected the transfer during validation.';
       }
       return 'Still blocked.';
     case PaymentStatus.FAILED:

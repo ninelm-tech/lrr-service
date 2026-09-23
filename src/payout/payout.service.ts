@@ -18,12 +18,8 @@ import { isDuplicateReference } from '../payment/domain/duplicate-reference';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { formatJobRef } from '../rescue-request/domain/rescue-request-formatting';
-
-/** The states retryPayout may act on — the money movement never landed. */
-const RETRYABLE_STATUSES: PaymentStatus[] = [
-  PaymentStatus.FAILED,
-  PaymentStatus.BLOCKED,
-];
+import { classifyTransferValidationRejection } from './domain/paystack-transfer-validation';
+import { isRetryablePayoutState } from './domain/payout-retry';
 
 /**
  * Payouts, on the Payment ledger.
@@ -88,9 +84,31 @@ export class PayoutService {
     if (!payment || payment.type !== PaymentType.PAYOUT) {
       throw new NotFoundException('Payout not found');
     }
-    if (!RETRYABLE_STATUSES.includes(payment.status)) {
+    if (!isRetryablePayoutState(payment)) {
       throw new BadRequestException(
-        `Only blocked or failed payouts can be retried — this one is ${payment.status}.`,
+        payment.status === PaymentStatus.BLOCKED
+          ? `This payout is blocked by ${payment.blockReason ?? 'an unresolved provider action'} and cannot be re-initiated.`
+          : `Only retryable blocked or failed payouts can be retried — this one is ${payment.status}.`,
+      );
+    }
+    const latestAttempt = await this.prisma.payment.findFirst({
+      where: {
+        rescueRequestId: payment.rescueRequestId,
+        type: PaymentType.PAYOUT,
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    });
+    if (
+      latestAttempt?.status === PaymentStatus.SUCCEEDED &&
+      latestAttempt.id !== payment.id
+    ) {
+      throw new BadRequestException(
+        `This payout already succeeded (payment ${latestAttempt.id}) — retrying would risk paying the operator twice.`,
+      );
+    }
+    if (latestAttempt && latestAttempt.id !== payment.id) {
+      throw new BadRequestException(
+        `This payout attempt has been superseded by payment ${latestAttempt.id}. Retry the latest attempt instead.`,
       );
     }
     if (!payment.operatorId) {
@@ -376,9 +394,11 @@ export class PayoutService {
       // Positive evidence the original landed — treat it as in flight, not
       // as a failure. See isDuplicateReference.
       if (isDuplicateReference(result)) return;
-      await this.paymentLedger.recordRejection(
+      // Paystack validates before creating a transfer. Keep our row and
+      // reference retryable when validation rejects the instruction.
+      await this.paymentLedger.recordBlocked(
         paymentId,
-        result.message ?? 'transfer rejected',
+        classifyTransferValidationRejection(result.code, result.message),
       );
       return;
     }
