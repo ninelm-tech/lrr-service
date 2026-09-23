@@ -26,6 +26,7 @@ import { toWhatsAppAddress } from '../../../common/phone.util';
 import { ReconcilerCheck } from '../reconciler-check.interface';
 import { PaymentEventsService } from '../../payment-events.service';
 import { PayoutService } from '../../../payout/payout.service';
+import { classifyTransferValidationRejection } from '../../../payout/domain/paystack-transfer-validation';
 
 /**
  * Chases every `Payment` row whose work is overdue: a `PENDING` row nobody
@@ -494,9 +495,9 @@ export class PaymentVerifyCheck implements ReconcilerCheck {
     if (result.outcome === 'ambiguous') return 'pending';
     if (result.outcome === 'rejected') {
       if (isDuplicateReference(result)) return 'pending';
-      await this.paymentLedger.recordRejection(
+      await this.paymentLedger.recordBlocked(
         paymentId,
-        result.message ?? 'transfer rejected',
+        classifyTransferValidationRejection(result.code, result.message),
       );
       return 'settled';
     }

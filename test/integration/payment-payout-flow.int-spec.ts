@@ -88,30 +88,23 @@ describe('Payout submission protocol (integration)', () => {
     expect(payment.providerRef).toBe('trf:TRF_abc123');
   });
 
-  it('retries an AWAITING_OTP payout by resubmitting the same row and reference', async () => {
-    // Retry must actually reach Paystack whenever the button is shown —
-    // silently refusing to resubmit an otp-blocked row just leaves it
-    // stuck forever, since nothing else ever revisits it. Reusing the same
-    // row/reference is what keeps this safe: the in-flight unique index
-    // still permits only one live PAYOUT row per request, and Paystack
-    // itself rejects a reused reference as a duplicate rather than moving
-    // money twice (see the "never re-sends" and "duplicate reference" cases
-    // below/above).
+  it('does not re-initiate an AWAITING_OTP transfer that already exists at Paystack', async () => {
     const { operator, request } = await payableJob();
     initiateTransfer.mockResolvedValue(transferOk('otp'));
     await run(request.id, operator.id);
     const blocked = await payoutPayment();
     expect(blocked.status).toBe('BLOCKED');
 
-    initiateTransfer.mockResolvedValue(transferOk('pending'));
-    await service.retryPayout(blocked.id);
+    await expect(service.retryPayout(blocked.id)).rejects.toThrow(
+      'blocked by AWAITING_OTP and cannot be re-initiated',
+    );
 
-    expect(initiateTransfer).toHaveBeenCalledTimes(2);
+    expect(initiateTransfer).toHaveBeenCalledTimes(1);
     expect(await prisma.payment.count({ where: { type: 'PAYOUT' } })).toBe(1);
     const after = await payoutPayment();
     expect(after.id).toBe(blocked.id);
-    expect(after.status).toBe('SUBMITTED');
-    expect(after.blockReason).toBeNull();
+    expect(after.status).toBe('BLOCKED');
+    expect(after.blockReason).toBe('AWAITING_OTP');
   });
 
   it('maps abandoned to FAILED — the live bug', async () => {

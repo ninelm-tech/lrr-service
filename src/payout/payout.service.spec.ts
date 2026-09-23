@@ -260,7 +260,7 @@ describe('PayoutService', () => {
       expect(paymentLedger.recordRejection).not.toHaveBeenCalled();
     });
 
-    it('fails the payment on a definitive, non-duplicate rejection', async () => {
+    it('blocks the same payment on a transfer validation rejection', async () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
         paystackRecipientCode: 'RCP_existing',
@@ -275,10 +275,11 @@ describe('PayoutService', () => {
 
       await service.createAndProcessPayout('req-1', 'op-1', 250000);
 
-      expect(paymentLedger.recordRejection).toHaveBeenCalledWith(
+      expect(paymentLedger.recordBlocked).toHaveBeenCalledWith(
         'pay-1',
-        'Recipient is invalid',
+        'INVALID_RECIPIENT',
       );
+      expect(paymentLedger.recordRejection).not.toHaveBeenCalled();
     });
 
     it('blocks on otp rather than leaving the transfer stranded SUBMITTED', async () => {
@@ -385,7 +386,7 @@ describe('PayoutService', () => {
         prisma.payment.findUnique.mockResolvedValue(payoutPayment(status));
 
         await expect(service.retryPayout('pay-1')).rejects.toThrow(
-          `Only blocked or failed payouts can be retried — this one is ${status}.`,
+          `Only retryable blocked or failed payouts can be retried — this one is ${status}.`,
         );
         expect(paystack.initiateTransfer).not.toHaveBeenCalled();
       },
@@ -393,6 +394,8 @@ describe('PayoutService', () => {
 
     it('retries a FAILED payout by inserting a fresh sibling row', async () => {
       prisma.payment.findUnique.mockResolvedValue(payoutPayment('FAILED'));
+      // 1) latest-attempt guard: this is the newest attempt.
+      prisma.payment.findFirst.mockResolvedValueOnce(payoutPayment('FAILED'));
       // 1) findSucceededPayout: no succeeded sibling.
       prisma.payment.findFirst.mockResolvedValueOnce(null);
       // 2) claimPayoutPayment: no existing in-flight row — FAILED isn't
@@ -427,9 +430,13 @@ describe('PayoutService', () => {
       prisma.payment.findUnique.mockResolvedValue(
         payoutPayment('BLOCKED', { blockReason: 'NO_BANK_DETAILS' }),
       );
-      // 1) findSucceededPayout: no succeeded sibling.
+      // 1) latest-attempt guard: this is the newest attempt.
+      prisma.payment.findFirst.mockResolvedValueOnce(
+        payoutPayment('BLOCKED', { blockReason: 'NO_BANK_DETAILS' }),
+      );
+      // 2) findSucceededPayout: no succeeded sibling.
       prisma.payment.findFirst.mockResolvedValueOnce(null);
-      // 2) claimPayoutPayment: the same BLOCKED row, in flight.
+      // 3) claimPayoutPayment: the same BLOCKED row, in flight.
       prisma.payment.findFirst.mockResolvedValueOnce(
         payoutPayment('BLOCKED', { blockReason: 'NO_BANK_DETAILS' }),
       );
@@ -456,43 +463,23 @@ describe('PayoutService', () => {
       expect(paymentLedger.create).not.toHaveBeenCalled();
     });
 
-    it('retries a BLOCKED/AWAITING_OTP payout by resuming the same row — retry must reach Paystack whenever the button is shown', async () => {
+    it('refuses to re-initiate a payout that already exists at Paystack and awaits OTP', async () => {
       prisma.payment.findUnique.mockResolvedValue(
         payoutPayment('BLOCKED', { blockReason: 'AWAITING_OTP' }),
       );
-      // 1) findSucceededPayout: no succeeded sibling.
-      prisma.payment.findFirst.mockResolvedValueOnce(null);
-      // 2) claimPayoutPayment: the same BLOCKED row, in flight.
-      prisma.payment.findFirst.mockResolvedValueOnce(
-        payoutPayment('BLOCKED', { blockReason: 'AWAITING_OTP' }),
-      );
-      // 3) the reload after retrying.
-      prisma.payment.findFirst.mockResolvedValueOnce(
-        payoutPayment('SUBMITTED'),
-      );
-      prisma.operator.findUnique.mockResolvedValue({
-        id: 'op-1',
-        paystackRecipientCode: 'RCP_x',
-      });
-      paystack.checkBalance.mockResolvedValue(1_000_000);
-      paystack.initiateTransfer.mockResolvedValue({
-        outcome: 'ok',
-        data: { transfer_code: 'TRF_retry', status: 'pending' },
-      });
 
-      await service.retryPayout('pay-1');
-
-      expect(paymentLedger.unblock).toHaveBeenCalledWith(
-        'pay-1',
-        expect.any(Date),
+      await expect(service.retryPayout('pay-1')).rejects.toThrow(
+        'blocked by AWAITING_OTP and cannot be re-initiated',
       );
       expect(paymentLedger.create).not.toHaveBeenCalled();
-      expect(paystack.initiateTransfer).toHaveBeenCalledTimes(1);
+      expect(paymentLedger.unblock).not.toHaveBeenCalled();
+      expect(paystack.initiateTransfer).not.toHaveBeenCalled();
     });
 
     it('returns the LATEST attempt for the request, not the stale row passed in', async () => {
       prisma.payment.findUnique.mockResolvedValue(payoutPayment('FAILED'));
       prisma.payment.findFirst
+        .mockResolvedValueOnce(payoutPayment('FAILED')) // latest-attempt guard
         .mockResolvedValueOnce(null) // findSucceededPayout: no succeeded sibling
         .mockResolvedValueOnce(null) // claimPayoutPayment: no existing in-flight row
         .mockResolvedValueOnce(payoutPayment('SUBMITTED', { id: 'pay-2' })); // reload
@@ -533,6 +520,18 @@ describe('PayoutService', () => {
 
       await expect(service.retryPayout('pay-1')).rejects.toThrow(
         'This payout already succeeded (payment pay-2)',
+      );
+      expect(paystack.initiateTransfer).not.toHaveBeenCalled();
+    });
+
+    it('refuses to retry a failed attempt superseded by a newer failed attempt', async () => {
+      prisma.payment.findUnique.mockResolvedValue(payoutPayment('FAILED'));
+      prisma.payment.findFirst.mockResolvedValueOnce(
+        payoutPayment('FAILED', { id: 'pay-2' }),
+      );
+
+      await expect(service.retryPayout('pay-1')).rejects.toThrow(
+        'superseded by payment pay-2',
       );
       expect(paystack.initiateTransfer).not.toHaveBeenCalled();
     });

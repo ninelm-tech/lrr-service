@@ -527,6 +527,28 @@ describe('PaymentVerifyCheck (integration)', () => {
       expect(payment.failureReason).toBeNull();
     });
 
+    it('blocks the same row when Paystack rejects re-submission during account validation', async () => {
+      const { request, operator } = await payoutRequest();
+      const payment = await submittedPayment('PAYOUT', request.id, {
+        operatorId: operator.id,
+      });
+      paystack.verifyTransfer.mockResolvedValue({
+        outcome: 'rejected',
+        code: 'not_found',
+      });
+      paystack.initiateTransfer.mockResolvedValue({
+        outcome: 'rejected',
+        message: 'You cannot initiate third party payouts at this time',
+      });
+
+      await check.run(future());
+
+      const after = await reload(payment.id);
+      expect(after.status).toBe('BLOCKED');
+      expect(after.blockReason).toBe('ACCOUNT_RESTRICTED');
+      expect(after.failureReason).toBeNull();
+    });
+
     it('escalates rather than re-submitting forever, once MAX_VERIFY_ATTEMPTS is reached', async () => {
       const { request, operator } = await payoutRequest();
       const payment = await submittedPayment('PAYOUT', request.id, {

@@ -486,7 +486,7 @@ enum PaymentType {
 enum PaymentStatus {
   PENDING // committed; no call attempted
   SUBMITTED // a call was attempted; outcome unknown
-  BLOCKED // reached Paystack, which is waiting on a human
+  BLOCKED // cannot proceed until an operator, admin, or account setting is fixed
   SUCCEEDED
   DUPLICATE_SUCCEEDED // provider says success, but another row already succeeded for this request/type
   FAILED // Paystack definitively rejected it
@@ -494,18 +494,25 @@ enum PaymentStatus {
 }
 
 enum PaymentBlockReason {
-  // Never reached Paystack — we are the blocker. Safe to retry fresh.
+  // No provider transfer exists yet. Safe to retry the same reference after
+  // the underlying condition is fixed.
   NO_BANK_DETAILS
   INSUFFICIENT_BALANCE
+  ACCOUNT_RESTRICTED
+  PAYOUT_ON_HOLD
+  INVALID_RECIPIENT
+  INVALID_AMOUNT
+  INVALID_REFERENCE
+  PAYSTACK_VALIDATION
   // Reached Paystack, which is now waiting on a human. Never retry these:
   // the money movement already exists provider-side.
   AWAITING_OTP
   NEEDS_CUSTOMER_DETAILS
 }
 
-/// One row is one ATTEMPT, never reused. A retry inserts a sibling and the
-/// failed row keeps its status and reason forever — the table is the audit
-/// trail, which is why no separate failure log is needed.
+/// One row is one provider reference. A blocked instruction that Paystack did
+/// not create can reuse that reference; retrying a terminal provider transfer
+/// inserts a sibling. Terminal rows remain the immutable audit trail.
 ///
 /// See docs/superpowers/specs/2026-09-12-payment-model-design.md. Two partial
 /// unique indexes that Prisma cannot express live in the migration:

@@ -93,7 +93,7 @@ describe('PayoutController', () => {
       expect(result.data).toEqual([]);
     });
 
-    it('scopes the succeeded-lookup to just the jobs on this page, not every succeeded payout ever', async () => {
+    it('scopes the sibling lookup to just the jobs on this page', async () => {
       prisma.payment.findMany
         .mockResolvedValueOnce([
           {
@@ -105,17 +105,22 @@ describe('PayoutController', () => {
             rescueRequest: { id: 'req-1' },
           },
         ])
-        .mockResolvedValueOnce([{ rescueRequestId: 'req-1' }]);
+        .mockResolvedValueOnce([]);
 
       await controller.list('FAILED');
 
       expect(prisma.payment.findMany).toHaveBeenNthCalledWith(2, {
         where: {
           type: 'PAYOUT',
-          status: 'SUCCEEDED',
           rescueRequestId: { in: ['req-1'] },
         },
-        select: { rescueRequestId: true },
+        select: {
+          id: true,
+          rescueRequestId: true,
+          status: true,
+          createdAt: true,
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       });
     });
 
@@ -133,13 +138,28 @@ describe('PayoutController', () => {
             rescueRequest: { id: 'req-1' },
           },
         ])
-        .mockResolvedValueOnce([{ rescueRequestId: 'req-1' }]);
+        .mockResolvedValueOnce([
+          {
+            id: 'pay-2',
+            rescueRequestId: 'req-1',
+            status: 'SUCCEEDED',
+            createdAt: new Date('2026-09-23T16:00:00Z'),
+          },
+          {
+            id: 'pay-1',
+            rescueRequestId: 'req-1',
+            status: 'FAILED',
+            createdAt: new Date('2026-09-23T10:00:00Z'),
+          },
+        ]);
 
       const result = await controller.list('FAILED');
 
       expect(result.data[0]).toMatchObject({
         id: 'pay-1',
         alreadySucceeded: true,
+        isLatestAttempt: false,
+        canRetry: false,
       });
     });
 
@@ -155,13 +175,86 @@ describe('PayoutController', () => {
             rescueRequest: { id: 'req-1' },
           },
         ])
-        .mockResolvedValueOnce([{ rescueRequestId: 'some-other-req' }]);
+        .mockResolvedValueOnce([
+          {
+            id: 'pay-1',
+            rescueRequestId: 'req-1',
+            status: 'FAILED',
+            createdAt: new Date('2026-09-23T10:00:00Z'),
+          },
+        ]);
 
       const result = await controller.list('FAILED');
 
       expect(result.data[0]).toMatchObject({
         id: 'pay-1',
         alreadySucceeded: false,
+        isLatestAttempt: true,
+        canRetry: true,
+      });
+    });
+
+    it('marks only the newest failed attempt as latest and retryable', async () => {
+      prisma.payment.findMany
+        .mockResolvedValueOnce([
+          { id: 'pay-2', status: 'FAILED', rescueRequestId: 'req-1' },
+          { id: 'pay-1', status: 'FAILED', rescueRequestId: 'req-1' },
+        ])
+        .mockResolvedValueOnce([
+          {
+            id: 'pay-2',
+            rescueRequestId: 'req-1',
+            status: 'FAILED',
+            createdAt: new Date('2026-09-23T16:00:00Z'),
+          },
+          {
+            id: 'pay-1',
+            rescueRequestId: 'req-1',
+            status: 'FAILED',
+            createdAt: new Date('2026-09-23T10:00:00Z'),
+          },
+        ]);
+
+      const result = await controller.list();
+
+      expect(result.data).toEqual([
+        expect.objectContaining({
+          id: 'pay-2',
+          isLatestAttempt: true,
+          canRetry: true,
+        }),
+        expect.objectContaining({
+          id: 'pay-1',
+          isLatestAttempt: false,
+          canRetry: false,
+        }),
+      ]);
+    });
+
+    it('does not offer retry for an OTP-blocked transfer that already exists at Paystack', async () => {
+      prisma.payment.findMany
+        .mockResolvedValueOnce([
+          {
+            id: 'pay-1',
+            status: 'BLOCKED',
+            blockReason: 'AWAITING_OTP',
+            rescueRequestId: 'req-1',
+          },
+        ])
+        .mockResolvedValueOnce([
+          {
+            id: 'pay-1',
+            rescueRequestId: 'req-1',
+            status: 'BLOCKED',
+            createdAt: new Date('2026-09-23T10:00:00Z'),
+          },
+        ]);
+
+      const result = await controller.list();
+
+      expect(result.data[0]).toMatchObject({
+        isLatestAttempt: true,
+        canRetry: false,
       });
     });
   });

@@ -7,8 +7,9 @@
  *
  * - **`ok`** — Paystack accepted the request. NOT the same as success; the
  *   body's own status may still be `pending`, `otp` or `queued`.
- * - **`rejected`** — a 4xx with a provider `code`. Definitive: nothing
- *   landed, so failing the row is safe and a fresh attempt is legal.
+ * - **`rejected`** — a 4xx response. Definitive: the requested operation was
+ *   not created. The caller decides whether to block and reuse its reference
+ *   (transfer validation) or terminate the attempt (for example checkout).
  * - **`ambiguous`** — a 5xx, a timeout, or a thrown network error. The
  *   request may have landed. The row must stay SUBMITTED and be verified;
  *   it must NEVER be failed, or a retry becomes legal for a payment that
@@ -45,10 +46,10 @@ export type PaystackInitializeResult =
  * it), even `success`. None of those may be claimed as SUCCEEDED here: that
  * comes only from a webhook or from verification.
  *
- * The outbound direction is where `rejected` needs the most care. A
- * duplicate-reference rejection is POSITIVE EVIDENCE the original transfer
- * landed — the opposite of a failure — so callers must check for it before
- * treating a rejection as one.
+ * The outbound direction is where `rejected` needs the most care. Transfer
+ * validation runs before creation, so a normal rejection blocks and reuses
+ * the same reference after remediation. A duplicate-reference rejection is
+ * POSITIVE EVIDENCE an earlier request landed and must remain in flight.
  */
 export type PaystackTransferResult =
   | { outcome: 'ok'; data: { status: string; transfer_code: string } }

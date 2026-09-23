@@ -163,7 +163,7 @@ export class PaymentLedgerService {
     });
   }
 
-  /** Step 4 — reached Paystack, which is now waiting on a human. */
+  /** Step 4 — cannot proceed until its recorded condition is resolved. */
   async recordBlocked(
     paymentId: string,
     blockReason: PaymentBlockReason,
@@ -177,10 +177,9 @@ export class PaymentLedgerService {
   /**
    * A human resolved what the row was blocked on.
    *
-   * Returns it to SUBMITTED, never to a terminal state: supplying bank
-   * details makes Paystack answer `processing`, not `success`. The webhook or
-   * the verification check finishes it from there, like any other submitted
-   * row.
+   * Returns it to SUBMITTED, never to a terminal state. The caller either
+   * resubmits the same provider reference or continues an existing provider
+   * transfer; webhook or verification owns the final outcome.
    */
   async unblock(paymentId: string, now: Date): Promise<boolean> {
     const { count } = await this.prisma.payment.updateMany({
