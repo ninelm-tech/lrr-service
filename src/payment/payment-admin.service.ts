@@ -56,8 +56,13 @@ export class PaymentAdminService {
     user: { userId: string; role: string },
     query: PaymentListQueryDto,
   ): Promise<PaymentListResponseDto> {
-    const page = query.page ?? 1;
-    const limit = query.limit ?? 20;
+    // parseInt, not the raw query value — this app has no global
+    // ValidationPipe, so an Express query param arrives as a string
+    // ("20", never 20) despite the DTO's own `number` type. Same reason
+    // RescueRequestAdminService.listForUser does this. Prisma's
+    // skip/take reject a string outright.
+    const page = parseInt(String(query.page ?? 1), 10) || 1;
+    const limit = parseInt(String(query.limit ?? 20), 10) || 20;
 
     const where = await this.buildWhere(user, query);
     if (where === null) return { data: [], meta: { page: 1, limit, total: 0 } };

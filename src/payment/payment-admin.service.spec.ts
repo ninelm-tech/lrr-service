@@ -163,6 +163,18 @@ describe('PaymentAdminService', () => {
         }),
       );
     });
+
+    it('coerces page/limit to real numbers — Express query params arrive as strings and there is no global ValidationPipe', async () => {
+      const result = await service.listForUser(
+        { userId: 'admin-1', role: 'SUPER_ADMIN' },
+        { page: '2' as unknown as number, limit: '10' as unknown as number },
+      );
+
+      expect(prisma.payment.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ skip: 10, take: 10 }),
+      );
+      expect(result.meta).toEqual({ page: 2, limit: 10, total: 1 });
+    });
   });
 
   describe('summaryForUser', () => {
