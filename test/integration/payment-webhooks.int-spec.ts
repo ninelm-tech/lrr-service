@@ -57,8 +57,13 @@ describe('Payment webhooks (integration)', () => {
   /** A payment already SUBMITTED, which is the state a webhook arrives into. */
   async function submitted(type: 'DEPOSIT' | 'BALANCE' | 'PAYOUT' | 'REFUND') {
     const customer = await createCustomer(prisma);
-    const operator = type === 'PAYOUT' ? await createOperator(prisma) : null;
-    const request = await createRequest(prisma, customer.id);
+    const operator =
+      type === 'PAYOUT' || type === 'DEPOSIT'
+        ? await createOperator(prisma)
+        : null;
+    const request = await createRequest(prisma, customer.id, {
+      ...(type === 'DEPOSIT' ? { assignedOperatorId: operator!.id } : {}),
+    });
     const payment = await ledger.create({
       rescueRequestId: request.id,
       type,

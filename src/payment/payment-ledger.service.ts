@@ -73,9 +73,18 @@ export class PaymentLedgerService {
       } else {
         const rescueRequest = await client.rescueRequest.findUnique({
           where: { id: input.rescueRequestId },
-          select: { customerId: true },
+          select: { customerId: true, assignedOperatorId: true },
         });
         if (rescueRequest) {
+          if (
+            input.type === PaymentType.DEPOSIT &&
+            !rescueRequest.assignedOperatorId
+          ) {
+            throw new BadRequestException(
+              'Cannot create a deposit payment before an operator is assigned.',
+            );
+          }
+
           const stillActive = await client.user.updateMany({
             where: { id: rescueRequest.customerId, deletedAt: null },
             data: { updatedAt: new Date() },

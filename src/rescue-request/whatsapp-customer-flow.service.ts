@@ -26,11 +26,7 @@ import {
   formatVehicleType,
 } from './domain/vehicle-truck-mapping';
 import { estimateEtaMinutes, rankQuotes } from './domain/quote-ranking';
-import {
-  formatIssueType,
-  formatStatus,
-  formatJobRef,
-} from './domain/rescue-request-formatting';
+import { formatStatus, formatJobRef } from './domain/rescue-request-formatting';
 import {
   classifyMediaType,
   getExtensionFromContentType,
@@ -38,7 +34,10 @@ import {
 import { S3Service } from '../integrations/s3/s3.service';
 import { GeocodingService } from '../integrations/geocoding/geocoding.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
-import { TwilioService } from '../integrations/twilio/twilio.service';
+import {
+  TwilioMediaDownloadError,
+  TwilioService,
+} from '../integrations/twilio/twilio.service';
 import { OperatorService } from '../operator/operator.service';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { RatingService } from '../rating/rating.service';
@@ -51,7 +50,6 @@ import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { PaymentLedgerService } from '../payment/payment-ledger.service';
 import { PaystackCustomerService } from '../payment/paystack-customer.service';
 
-const DEPOSIT_AMOUNT_KOBO = 500000; // ₦5,000
 const MAX_MEDIA_ITEMS = 5;
 
 // A request only ever reaches these once the deposit has actually been
@@ -713,8 +711,22 @@ export class WhatsAppCustomerFlowService {
       });
       return true;
     } catch (error) {
-      console.error('Failed to capture media attachment:', error);
-      Sentry.captureException(error);
+      const twilioStatus =
+        error instanceof TwilioMediaDownloadError ? error.status : undefined;
+      const logContext = {
+        rescueRequestId,
+        context,
+        uploadedByRole,
+        contentType,
+        twilioStatus,
+      };
+
+      if (twilioStatus === 404) {
+        console.warn('Twilio media attachment was unavailable:', logContext);
+      } else {
+        console.error('Failed to capture media attachment:', error);
+        Sentry.captureException(error, { extra: logContext });
+      }
       return false;
     }
   }
@@ -795,123 +807,6 @@ export class WhatsAppCustomerFlowService {
 
     void this.dispatchService.startDispatch(rescueRequestId, customer.id);
     return this.xmlOk();
-  }
-
-  // ──────────────────────────────────────────────────────────────────────────
-  //  Create rescue request + Paystack link
-  // ──────────────────────────────────────────────────────────────────────────
-  private async initiateDeposit(
-    customer: any,
-    session: any,
-    issueType: IssueType,
-    phoneNumber: string,
-    prefixNote: string | null,
-    amountKobo: number,
-  ) {
-    const rescueRequest = await this.prisma.rescueRequest.create({
-      data: {
-        customerId: customer.id,
-        status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
-        latitude: session.latitude,
-        longitude: session.longitude,
-        issueType,
-        depositAmount: amountKobo,
-        // Same statement as the status, as at every other entry into
-        // WAITING_FOR_DEPOSIT. Until now this path set no deadline at all, so
-        // nothing ever cancelled these requests despite the message below
-        // promising exactly that.
-        depositWindowExpiresAt: new Date(Date.now() + DEPOSIT_WINDOW_MS),
-      },
-    });
-
-    // 1. The row is committed before anything leaves, so a crash here cannot
-    //    produce a payment nothing knows about.
-    const payment = await this.paymentLedger.create({
-      rescueRequestId: rescueRequest.id,
-      type: 'DEPOSIT',
-      amount: amountKobo,
-    });
-
-    // 2. Claim BEFORE the call, which also pushes verifyAfter out so nothing
-    //    verifies a request still in flight. Only the winner calls Paystack.
-    if (
-      !(await this.paymentLedger.claimForSubmission(payment.id, new Date()))
-    ) {
-      return this.reply(
-        `We're setting up your payment — you'll get a link shortly.`,
-      );
-    }
-    const reference = this.paymentLedger.referenceFor(payment);
-    // Never customer.email directly — the frozen identity Paystack already
-    // knows this user by, so a real email set later doesn't split them into
-    // a second Paystack customer. See PaystackCustomerService.
-    const { email } = await this.paystackCustomerService.customerFor(
-      customer.id,
-    );
-
-    // 3. Call Paystack.
-    const paymentResponse = await this.paystackService.initializePayment({
-      email,
-      amount: amountKobo,
-      reference,
-      metadata: {
-        rescueRequestId: rescueRequest.id,
-        customerId: customer.id,
-        phoneNumber,
-        type: 'deposit',
-      },
-    });
-
-    // 4. An ambiguous failure may have created a transaction we never saw, so
-    //    it stays SUBMITTED with checkoutUrl null — the pair that tells
-    //    recovery no link ever reached the customer. Only a definitive
-    //    rejection fails the row.
-    if (paymentResponse.outcome === 'ambiguous') {
-      console.error('Paystack initialize was inconclusive:', paymentResponse);
-      return this.reply(
-        `We're still setting up your payment — hold on a moment.`,
-      );
-    }
-    if (paymentResponse.outcome === 'rejected') {
-      await this.paymentLedger.recordRejection(
-        payment.id,
-        paymentResponse.message ?? 'initialize rejected',
-      );
-      return this.reply(
-        `Sorry, we couldn't create a payment link. Please try again.`,
-      );
-    }
-
-    // 5. Persist the URL BEFORE sending it. Once this commits, recovery must
-    //    never fail this attempt — the customer may act on the link.
-    const checkoutUrl = paymentResponse.data.authorization_url;
-    await this.prisma.payment.update({
-      where: { id: payment.id },
-      data: { checkoutUrl },
-    });
-
-    await this.prisma.rescueRequest.update({
-      where: { id: rescueRequest.id },
-      data: { depositPaymentUrl: checkoutUrl },
-    });
-
-    await this.sessionStore.update(customer.id, {
-      issueType,
-      rescueRequestId: rescueRequest.id,
-      depositReference: reference,
-      state: WhatsAppFlowState.WAITING_FOR_DEPOSIT,
-    });
-
-    const isStandardDeposit = amountKobo === DEPOSIT_AMOUNT_KOBO;
-    const note = prefixNote ? `\n\n${prefixNote}` : '';
-
-    const costBreakdown = isStandardDeposit
-      ? `💰 *Total cost: ₦50,000*\n   • ₦5,000 deposit now to confirm\n   • ₦45,000 balance on job completion — car released after payment\n`
-      : `💰 *One-time fee: ₦50,000* (paid in full now)\n`;
-
-    return this.reply(
-      `Issue: ${formatIssueType(issueType)}${note}\n\n${costBreakdown}\n⚠️ *ACTION NEEDED* — tap the link below to pay ${isStandardDeposit ? '₦5,000 deposit' : '₦50,000'} and confirm your rescue:\n\n👉 ${checkoutUrl}\n\n⏱ Pay within 30 minutes or the request is cancelled.`,
-    );
   }
 
   async handleRatingReply(

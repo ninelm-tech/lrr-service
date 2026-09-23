@@ -5,7 +5,10 @@ import { PaymentLedgerService } from '../payment/payment-ledger.service';
 import { createPaymentLedgerMock } from '../payment/testing/payment-ledger.mock';
 import { PaystackCustomerService } from '../payment/paystack-customer.service';
 import { createPaystackCustomerServiceMock } from '../payment/testing/paystack-customer.mock';
-import { TwilioService } from '../integrations/twilio/twilio.service';
+import {
+  TwilioMediaDownloadError,
+  TwilioService,
+} from '../integrations/twilio/twilio.service';
 import { S3Service } from '../integrations/s3/s3.service';
 import { GeocodingService } from '../integrations/geocoding/geocoding.service';
 import { RatingService } from '../rating/rating.service';
@@ -1510,6 +1513,37 @@ describe('WhatsAppCustomerFlowService', () => {
         context: MediaContext.COMPLETION,
         uploadedByRole: UserRole.OPERATOR,
       });
+    });
+
+    it('treats a Twilio media 404 as an unavailable attachment, not a capture exception', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+      twilioService.downloadMedia.mockRejectedValue(
+        new TwilioMediaDownloadError(
+          'https://twilio.example/media/missing',
+          404,
+          'Not Found',
+        ),
+      );
+
+      const saved = await service.captureMediaAttachment(
+        'req-1',
+        'https://twilio.example/media/missing',
+        'image/jpeg',
+        MediaContext.COMPLETION,
+        UserRole.OPERATOR,
+      );
+
+      expect(saved).toBe(false);
+      expect(s3Service.uploadMedia).not.toHaveBeenCalled();
+      expect(prisma.requestMedia.create).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalledWith(
+        'Twilio media attachment was unavailable:',
+        expect.objectContaining({
+          rescueRequestId: 'req-1',
+          twilioStatus: 404,
+        }),
+      );
+      warnSpy.mockRestore();
     });
   });
 

@@ -1,6 +1,11 @@
 import { PaymentLedgerService } from '../../src/payment/payment-ledger.service';
 import { PrismaService } from '../../src/prisma/prisma.service';
-import { createCustomer, createRequest, truncateAll } from './factories';
+import {
+  createCustomer,
+  createOperator,
+  createRequest,
+  truncateAll,
+} from './factories';
 
 /**
  * The protocol's correctness is its ORDERING, and ordering is only
@@ -26,7 +31,10 @@ describe('PaymentLedgerService (integration)', () => {
 
   async function pending() {
     const customer = await createCustomer(prisma);
-    const request = await createRequest(prisma, customer.id);
+    const operator = await createOperator(prisma);
+    const request = await createRequest(prisma, customer.id, {
+      assignedOperatorId: operator.id,
+    });
     const payment = await ledger.create({
       rescueRequestId: request.id,
       type: 'DEPOSIT',

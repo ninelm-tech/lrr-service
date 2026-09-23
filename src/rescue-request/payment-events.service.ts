@@ -12,7 +12,12 @@ import { TwilioService } from '../integrations/twilio/twilio.service';
 import { PayoutService } from '../payout/payout.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
-import { Payment, Prisma, RescueRequestStatus } from '@prisma/client';
+import {
+  DispatchOfferStatus,
+  Payment,
+  Prisma,
+  RescueRequestStatus,
+} from '@prisma/client';
 import { toWhatsAppAddress } from '../common/phone.util';
 import { formatVehicleType } from './domain/vehicle-truck-mapping';
 import { formatJobRef } from './domain/rescue-request-formatting';
@@ -21,7 +26,6 @@ import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { PaymentLedgerService } from '../payment/payment-ledger.service';
 import { PaystackCustomerService } from '../payment/paystack-customer.service';
 import { BalancePaymentTarget } from './dto/balance-payment-target.dto';
-import { DispatchService } from './dispatch.service';
 // A real two-way dependency with this service
 // (WhatsAppCustomerFlowService needs
 // markJobCompleted for its CONFIRM branch) — forwardRef required on both sides.
@@ -36,7 +40,6 @@ export class PaymentEventsService {
     private readonly payoutService: PayoutService,
     private readonly sessionStore: WhatsAppSessionStore,
     private readonly sharedService: RescueRequestSharedService,
-    private readonly dispatchService: DispatchService,
     @Inject(forwardRef(() => WhatsAppCustomerFlowService))
     private readonly customerFlowService: WhatsAppCustomerFlowService,
     private readonly paymentLedger: PaymentLedgerService,
@@ -90,6 +93,60 @@ export class PaymentEventsService {
 
     const customerId = rescueRequest.customerId;
     const customerPhone = rescueRequest.customer.phoneNumber;
+    const operator = rescueRequest.assignedOperator;
+
+    if (!operator) {
+      Sentry.captureMessage('Deposit confirmed without an assigned operator', {
+        level: 'error',
+        extra: {
+          rescueRequestId: rescueRequest.id,
+          paymentId: payment.id,
+        },
+      });
+
+      await this.prisma.rescueRequest.update({
+        where: { id: rescueRequest.id },
+        data: { status: RescueRequestStatus.CANCELLED },
+      });
+      await this.prisma.dispatchOffer.updateMany({
+        where: {
+          rescueRequestId: rescueRequest.id,
+          status: {
+            in: [
+              DispatchOfferStatus.PENDING,
+              DispatchOfferStatus.SELECTED_PENDING_PAYMENT,
+            ],
+          },
+        },
+        data: {
+          status: DispatchOfferStatus.TIMED_OUT,
+          respondedAt: new Date(),
+        },
+      });
+      await this.prisma.dispatchOffer.updateMany({
+        where: {
+          rescueRequestId: rescueRequest.id,
+          status: DispatchOfferStatus.QUOTED,
+        },
+        data: {
+          status: DispatchOfferStatus.NOT_SELECTED,
+          respondedAt: new Date(),
+        },
+      });
+
+      await this.sessionStore.update(customerId, {
+        state: WhatsAppFlowState.IDLE,
+        rescueRequestId: undefined,
+      });
+      if (customerPhone) {
+        await this.twilioService.sendWhatsAppMessage(
+          customerPhone,
+          `Your deposit was received before an operator was assigned, so we've cancelled the request and flagged it for refund. Our support team will follow up.`,
+        );
+      }
+
+      return;
+    }
 
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequest.id },
@@ -109,8 +166,6 @@ export class PaymentEventsService {
       });
     }
 
-    const operator = rescueRequest.assignedOperator;
-
     // Customer: confirmed with operator details
     await this.sessionStore.update(customerId, {
       state: WhatsAppFlowState.REQUEST_CONFIRMED,
@@ -124,29 +179,24 @@ export class PaymentEventsService {
       );
     }
 
-    if (operator) {
-      // Operator: job is now live — send customer location + details
-      const opUser = await this.sharedService.findOrCreateCustomer(
-        operator.phoneNumber!,
-      );
-      await this.sessionStore.update(opUser.id, {
-        state: WhatsAppFlowState.OPERATOR_ON_JOB,
-        rescueRequestId: rescueRequest.id,
-      });
-      const lat = Number(rescueRequest.latitude);
-      const lon = Number(rescueRequest.longitude);
-      const locationSection = await this.sharedService.formatLocationSection(
-        lat,
-        lon,
-      );
-      await this.twilioService.sendWhatsAppMessage(
-        toWhatsAppAddress(operator.phoneNumber!),
-        `💰 *Payment confirmed — job is live!* — ${formatJobRef(rescueRequest.id)}\n\nCustomer: ${customerPhone}\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType) : 'Unknown'}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
-      );
-    } else {
-      // Edge case: no operator was pre-assigned (e.g. admin manually sent a payment link)
-      void this.dispatchService.startDispatch(rescueRequest.id, customerId);
-    }
+    // Operator: job is now live — send customer location + details
+    const opUser = await this.sharedService.findOrCreateCustomer(
+      operator.phoneNumber!,
+    );
+    await this.sessionStore.update(opUser.id, {
+      state: WhatsAppFlowState.OPERATOR_ON_JOB,
+      rescueRequestId: rescueRequest.id,
+    });
+    const lat = Number(rescueRequest.latitude);
+    const lon = Number(rescueRequest.longitude);
+    const locationSection = await this.sharedService.formatLocationSection(
+      lat,
+      lon,
+    );
+    await this.twilioService.sendWhatsAppMessage(
+      toWhatsAppAddress(operator.phoneNumber!),
+      `💰 *Payment confirmed — job is live!* — ${formatJobRef(rescueRequest.id)}\n\nCustomer: ${customerPhone}\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType) : 'Unknown'}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
+    );
   }
 
   /**

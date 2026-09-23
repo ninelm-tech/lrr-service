@@ -90,8 +90,12 @@ describe('PaymentVerifyCheck (integration)', () => {
 
   async function seedRequest(overrides: Record<string, unknown> = {}) {
     const customer = await createCustomer(prisma);
-    const request = await createRequest(prisma, customer.id, overrides);
-    return { customer, request };
+    const operator = await createOperator(prisma);
+    const request = await createRequest(prisma, customer.id, {
+      assignedOperatorId: operator.id,
+      ...overrides,
+    });
+    return { customer, operator, request };
   }
 
   async function pendingPayment(

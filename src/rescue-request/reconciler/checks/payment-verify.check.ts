@@ -144,6 +144,15 @@ export class PaymentVerifyCheck implements ReconcilerCheck {
     }
 
     const isDeposit = payment.type === PaymentType.DEPOSIT;
+    if (isDeposit && !request.assignedOperatorId) {
+      this.escalate(payment, 'recovered deposit has no assigned operator');
+      await this.paymentLedger.recordRejection(
+        payment.id,
+        'Cannot initiate deposit before an operator is assigned',
+      );
+      return;
+    }
+
     // Never build the identity email inline — see PaystackCustomerService.
     const { email } = await this.paystackCustomerService.customerFor(
       request.customerId,
