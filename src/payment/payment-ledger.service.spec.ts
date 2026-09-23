@@ -52,6 +52,7 @@ describe('PaymentLedgerService', () => {
     it('refuses a DEPOSIT for a request whose customer is deleted', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
         customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
       });
       prisma.user.updateMany.mockResolvedValue({ count: 0 });
 
@@ -65,6 +66,26 @@ describe('PaymentLedgerService', () => {
         'Cannot create this payment: the customer has been deleted.',
       );
 
+      expect(prisma.payment.create).not.toHaveBeenCalled();
+    });
+
+    it('refuses a DEPOSIT before an operator is assigned', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        customerId: 'cust-1',
+        assignedOperatorId: null,
+      });
+
+      await expect(
+        service.create({
+          rescueRequestId: 'req-1',
+          type: 'DEPOSIT',
+          amount: 500000,
+        }),
+      ).rejects.toThrow(
+        'Cannot create a deposit payment before an operator is assigned.',
+      );
+
+      expect(prisma.user.updateMany).not.toHaveBeenCalled();
       expect(prisma.payment.create).not.toHaveBeenCalled();
     });
 

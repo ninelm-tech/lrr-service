@@ -141,6 +141,48 @@ describe('PaymentEventsService', () => {
       );
     });
 
+    it('cancels a paid deposit with no preassigned operator instead of dispatching after payment', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: null,
+        status: 'WAITING_FOR_DEPOSIT',
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: null,
+      });
+
+      await service.confirmDeposit(paymentFor('req-1'));
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { status: 'CANCELLED' },
+      });
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
+        state: 'IDLE',
+        rescueRequestId: undefined,
+      });
+      expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith({
+        where: {
+          rescueRequestId: 'req-1',
+          status: { in: ['PENDING', 'SELECTED_PENDING_PAYMENT'] },
+        },
+        data: { status: 'TIMED_OUT', respondedAt: expect.any(Date) },
+      });
+      expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith({
+        where: { rescueRequestId: 'req-1', status: 'QUOTED' },
+        data: { status: 'NOT_SELECTED', respondedAt: expect.any(Date) },
+      });
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        '+2341',
+        expect.stringContaining('flagged it for refund'),
+      );
+      expect(dispatchService.startDispatch).not.toHaveBeenCalled();
+      expect(Sentry.captureMessage).toHaveBeenCalledWith(
+        'Deposit confirmed without an assigned operator',
+        expect.objectContaining({ level: 'error' }),
+      );
+    });
+
     it('routes to handleLateDeposit for a CANCELLED request, and writes nothing — eligibility is derived', async () => {
       prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
         id: 'req-1',

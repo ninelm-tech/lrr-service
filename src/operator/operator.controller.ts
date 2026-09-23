@@ -187,6 +187,23 @@ export class OperatorController {
   }
 
   /**
+   * Flag/unflag an operator as a test operator — routes it to test-customer
+   * requests only (see OperatorService.findAndRankCandidates), never real
+   * ones. SUPER_ADMIN only, unlike status/availability below: this changes
+   * which customers can reach this operator at all, not just its own state.
+   */
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles(UserRole.SUPER_ADMIN)
+  @Patch(':id/is-test')
+  async setIsTest(@Param('id') id: string, @Body('isTest') isTest: boolean) {
+    const operator = await this.operatorService.setIsTest(id, Boolean(isTest));
+    return {
+      message: `Operator marked as ${isTest ? 'test' : 'real'}`,
+      data: operator,
+    };
+  }
+
+  /**
    * Toggle operator availability — any member of this operator, or admin.
    */
   @UseGuards(AuthGuard)

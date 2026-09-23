@@ -3,7 +3,12 @@ import { PaymentLedgerService } from '../../src/payment/payment-ledger.service';
 import { PrismaService } from '../../src/prisma/prisma.service';
 import { PaystackRefundResult } from '../../src/integrations/paystack/dto/paystack-outcome.dto';
 import { deriveRefundStatus } from '../../src/rescue-request/domain/derive-payment-state';
-import { createCustomer, createRequest, truncateAll } from './factories';
+import {
+  createCustomer,
+  createOperator,
+  createRequest,
+  truncateAll,
+} from './factories';
 
 /**
  * Refunds, against a real database.
@@ -64,9 +69,11 @@ describe('Refund submission protocol (integration)', () => {
   /** A CANCELLED request with a succeeded deposit — the eligible case. */
   async function refundableRequest() {
     const customer = await createCustomer(prisma);
+    const operator = await createOperator(prisma);
     const request = await createRequest(prisma, customer.id, {
       status: 'CANCELLED',
       depositAmount: DEPOSIT,
+      assignedOperatorId: operator.id,
     });
     const deposit = await ledger.create({
       rescueRequestId: request.id,
@@ -219,8 +226,10 @@ describe('Refund submission protocol (integration)', () => {
 
   it('creates no Payment row when the request was never CANCELLED, even with a succeeded deposit', async () => {
     const customer = await createCustomer(prisma);
+    const operator = await createOperator(prisma);
     const request = await createRequest(prisma, customer.id, {
       status: 'COMPLETED',
+      assignedOperatorId: operator.id,
     });
     await ledger.create({
       rescueRequestId: request.id,

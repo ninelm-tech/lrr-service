@@ -123,6 +123,31 @@ describe('OperatorService', () => {
     });
   });
 
+  describe('setIsTest', () => {
+    it('flags an operator as a test operator', async () => {
+      prisma.operator.update.mockResolvedValue({ id: 'op-1', isTest: true });
+
+      const result = await service.setIsTest('op-1', true);
+
+      expect(prisma.operator.update).toHaveBeenCalledWith({
+        where: { id: 'op-1' },
+        data: { isTest: true },
+      });
+      expect(result).toEqual({ id: 'op-1', isTest: true });
+    });
+
+    it('unflags an operator back to real', async () => {
+      prisma.operator.update.mockResolvedValue({ id: 'op-1', isTest: false });
+
+      await service.setIsTest('op-1', false);
+
+      expect(prisma.operator.update).toHaveBeenCalledWith({
+        where: { id: 'op-1' },
+        data: { isTest: false },
+      });
+    });
+  });
+
   describe('saveBankDetails', () => {
     it('resolves the account, creates a recipient, and saves only display-safe fields', async () => {
       paystackMock.resolveAccountNumber.mockResolvedValue({

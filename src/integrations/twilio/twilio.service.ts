@@ -3,6 +3,17 @@ import { ConfigService } from '@nestjs/config';
 import * as Sentry from '@sentry/node';
 import { Twilio } from 'twilio';
 
+export class TwilioMediaDownloadError extends Error {
+  constructor(
+    readonly url: string,
+    readonly status: number,
+    readonly statusText: string,
+  ) {
+    super(`Failed to download Twilio media: ${status}`);
+    this.name = 'TwilioMediaDownloadError';
+  }
+}
+
 @Injectable()
 export class TwilioService {
   private readonly client: Twilio;
@@ -110,7 +121,11 @@ export class TwilioService {
     });
 
     if (!response.ok) {
-      throw new Error(`Failed to download Twilio media: ${response.status}`);
+      throw new TwilioMediaDownloadError(
+        url,
+        response.status,
+        response.statusText,
+      );
     }
 
     const arrayBuffer = await response.arrayBuffer();

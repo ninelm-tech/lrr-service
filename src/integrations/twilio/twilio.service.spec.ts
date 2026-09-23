@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
-import { TwilioService } from './twilio.service';
+import { TwilioMediaDownloadError, TwilioService } from './twilio.service';
 
 describe('TwilioService', () => {
   let service: TwilioService;
@@ -60,11 +60,14 @@ describe('TwilioService', () => {
     it('throws if the fetch response is not ok', async () => {
       global.fetch = jest
         .fn()
-        .mockResolvedValue({ ok: false, status: 404 }) as any;
+        .mockResolvedValue({ ok: false, status: 404, statusText: 'Not Found' });
 
       await expect(
         service.downloadMedia('https://api.twilio.com/media/missing'),
-      ).rejects.toThrow();
+      ).rejects.toMatchObject({
+        name: 'TwilioMediaDownloadError',
+        status: 404,
+      } satisfies Partial<TwilioMediaDownloadError>);
     });
   });
 });

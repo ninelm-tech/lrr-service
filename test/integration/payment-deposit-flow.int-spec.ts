@@ -186,6 +186,10 @@ describe('Deposit submission protocol (integration)', () => {
     // PENDING too — a row that was created and then abandoned before its
     // claim still represents an attempt nobody has resolved.
     const { operator, request } = await dispatchingRequest();
+    await prisma.rescueRequest.update({
+      where: { id: request.id },
+      data: { assignedOperatorId: operator.id },
+    });
     await new PaymentLedgerService(prisma).create({
       rescueRequestId: request.id,
       type: 'DEPOSIT',

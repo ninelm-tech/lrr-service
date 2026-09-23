@@ -143,3 +143,64 @@ describe('PaymentVerifyCheck — SUBMITTED collection still pending at Paystack'
     expect(paymentLedger.backOff).toHaveBeenCalledWith('pay-4', now);
   });
 });
+
+describe('PaymentVerifyCheck — PENDING deposit recovery', () => {
+  it('rejects a recovered deposit before Paystack when no operator is assigned', async () => {
+    const now = new Date('2026-09-16T12:00:00Z');
+    const prisma = {
+      payment: {
+        findMany: jest
+          .fn()
+          .mockResolvedValue([{ id: 'pay-1', status: 'PENDING' }]),
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'pay-1',
+          type: 'DEPOSIT',
+          status: 'PENDING',
+          amount: 500000,
+          rescueRequestId: 'req-1',
+        }),
+      },
+      rescueRequest: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'req-1',
+          customerId: 'cust-1',
+          assignedOperatorId: null,
+          customer: { phoneNumber: '+15551234567' },
+        }),
+      },
+    };
+    const paystackService = { initializePayment: jest.fn() };
+    const paymentLedger = {
+      claimForSubmission: jest.fn().mockResolvedValue(true),
+      recordRejection: jest.fn().mockResolvedValue(undefined),
+      referenceFor: jest.fn(),
+    };
+    const paystackCustomerService = { customerFor: jest.fn() };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        PaymentVerifyCheck,
+        { provide: PrismaService, useValue: prisma },
+        { provide: PaystackService, useValue: paystackService },
+        {
+          provide: TwilioService,
+          useValue: { sendWhatsAppMessage: jest.fn() },
+        },
+        { provide: PaymentLedgerService, useValue: paymentLedger },
+        { provide: PaymentEventsService, useValue: {} },
+        { provide: PayoutService, useValue: {} },
+        { provide: PaystackCustomerService, useValue: paystackCustomerService },
+      ],
+    }).compile();
+
+    await module.get(PaymentVerifyCheck).run(now);
+
+    expect(paymentLedger.claimForSubmission).toHaveBeenCalledWith('pay-1', now);
+    expect(paymentLedger.recordRejection).toHaveBeenCalledWith(
+      'pay-1',
+      'Cannot initiate deposit before an operator is assigned',
+    );
+    expect(paystackCustomerService.customerFor).not.toHaveBeenCalled();
+    expect(paystackService.initializePayment).not.toHaveBeenCalled();
+  });
+});
