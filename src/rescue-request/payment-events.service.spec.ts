@@ -39,7 +39,10 @@ describe('PaymentEventsService', () => {
   };
   let payoutServiceMock: { createAndProcessPayout: jest.Mock };
   let sessionStore: { update: jest.Mock };
-  let twilioService: { sendWhatsAppMessage: jest.Mock };
+  let twilioService: {
+    sendWhatsAppMessage: jest.Mock;
+    sendWhatsAppTemplateMessage: jest.Mock;
+  };
   let sharedService: {
     findOrCreateCustomer: jest.Mock;
     formatLocationSection: jest.Mock;
@@ -76,7 +79,10 @@ describe('PaymentEventsService', () => {
     };
     payoutServiceMock = { createAndProcessPayout: jest.fn() };
     sessionStore = { update: jest.fn() };
-    twilioService = { sendWhatsAppMessage: jest.fn() };
+    twilioService = {
+      sendWhatsAppMessage: jest.fn(),
+      sendWhatsAppTemplateMessage: jest.fn(),
+    };
     sharedService = {
       findOrCreateCustomer: jest.fn().mockResolvedValue({ id: 'op-user-1' }),
       formatLocationSection: jest
@@ -118,6 +124,59 @@ describe('PaymentEventsService', () => {
     // guarantees confirmDeposit is reached at most once per settlement, and
     // that CAS is already covered in payment-ledger.int-spec.ts. This
     // method now trusts its caller and always proceeds when called.
+
+    const originalArrivedSid = process.env.TWILIO_ARRIVED_PROMPT_TEMPLATE_SID;
+    beforeEach(() => {
+      delete process.env.TWILIO_ARRIVED_PROMPT_TEMPLATE_SID;
+    });
+    afterEach(() => {
+      if (originalArrivedSid === undefined)
+        delete process.env.TWILIO_ARRIVED_PROMPT_TEMPLATE_SID;
+      else process.env.TWILIO_ARRIVED_PROMPT_TEMPLATE_SID = originalArrivedSid;
+    });
+
+    it('sends the operator the freeform "send ARRIVED" prompt when no template SID is configured', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        status: 'WAITING_FOR_DEPOSIT',
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+      });
+
+      await service.confirmDeposit(paymentFor('req-1'));
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('2342'),
+        expect.stringContaining('send *ARRIVED*'),
+      );
+      expect(twilioService.sendWhatsAppTemplateMessage).not.toHaveBeenCalled();
+    });
+
+    it('sends the operator a real ARRIVED button via the Content Template when the SID is configured', async () => {
+      process.env.TWILIO_ARRIVED_PROMPT_TEMPLATE_SID = 'HXarrived123';
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        status: 'WAITING_FOR_DEPOSIT',
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+      });
+
+      await service.confirmDeposit(paymentFor('req-1'));
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        expect.stringContaining('2342'),
+        'HXarrived123',
+        expect.any(Object),
+      );
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
+        expect.stringContaining('2342'),
+        expect.anything(),
+      );
+    });
 
     it('assigns the operator and confirms for a WAITING_FOR_DEPOSIT request', async () => {
       prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({

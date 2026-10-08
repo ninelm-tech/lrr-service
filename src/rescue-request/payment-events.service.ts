@@ -193,10 +193,34 @@ export class PaymentEventsService {
       lat,
       lon,
     );
-    await this.twilioService.sendWhatsAppMessage(
-      toWhatsAppAddress(operator.phoneNumber!),
-      `💰 *Payment confirmed — job is live!* — ${formatJobRef(rescueRequest.id)}\n\nCustomer: ${customerPhone}\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType) : 'Unknown'}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
-    );
+    const operatorPhone = toWhatsAppAddress(operator.phoneNumber!);
+    const vehicleLine = rescueRequest.vehicleType
+      ? formatVehicleType(rescueRequest.vehicleType)
+      : 'Unknown';
+    // This is a quick-reply (ARRIVED) template sent inside an active
+    // session with the operator — no Meta approval needed, so there's no
+    // live template to verify variable order against yet (see
+    // sendDispatchOfferMessage's comment for what that looks like once one
+    // exists). Whoever creates `arrived_prompt` in the Twilio console must
+    // declare exactly these 4 variables, in this order.
+    const arrivedTemplateSid = process.env.TWILIO_ARRIVED_PROMPT_TEMPLATE_SID;
+    if (arrivedTemplateSid) {
+      await this.twilioService.sendWhatsAppTemplateMessage(
+        operatorPhone,
+        arrivedTemplateSid,
+        {
+          '1': formatJobRef(rescueRequest.id),
+          '2': customerPhone ?? 'N/A',
+          '3': vehicleLine,
+          '4': locationSection,
+        },
+      );
+    } else {
+      await this.twilioService.sendWhatsAppMessage(
+        operatorPhone,
+        `💰 *Payment confirmed — job is live!* — ${formatJobRef(rescueRequest.id)}\n\nCustomer: ${customerPhone}\nVehicle: ${vehicleLine}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
+      );
+    }
   }
 
   /**

@@ -6,6 +6,7 @@ import { PaystackService } from '../integrations/paystack/paystack.service';
 import { OtpService } from '../otp/otp.service';
 import { TruckClass } from '@prisma/client';
 import { CreateOperatorDto } from './dto/create-operator.dto';
+import { AdminCreateOperatorDto } from './dto/admin-create-operator.dto';
 import { OperatorMembershipService } from './operator-membership.service';
 
 describe('OperatorService', () => {
@@ -739,6 +740,107 @@ describe('OperatorService', () => {
         );
         expect(otpService.findValidTokenRow).not.toHaveBeenCalled();
       });
+    });
+  });
+
+  describe('adminCreate', () => {
+    const baseDto = (): AdminCreateOperatorDto => ({
+      name: 'Jane Doe',
+      businessName: 'Acme Towing',
+      contactName: 'Jane Doe',
+      phoneNumber: '+2348012345678',
+      businessPhoneNumber: '+2348012345679',
+      address: '1 Test Street',
+      latitude: 6.5,
+      longitude: 3.4,
+      truckClasses: [TruckClass.LOW_BED],
+    });
+
+    beforeEach(() => {
+      prisma.user.findUnique.mockResolvedValue(null);
+      prisma.user.findFirst.mockResolvedValue(null);
+      prisma.operator.findUnique.mockResolvedValue(null);
+      prisma.user.create.mockResolvedValue({ id: 'u-new' });
+      prisma.operator.create.mockResolvedValue({
+        id: 'op-new',
+        status: 'ACTIVE',
+      });
+      prisma.operatorMember.create.mockResolvedValue({ id: 'om-new' });
+    });
+
+    it('requires no phoneVerificationToken and never calls otpService', async () => {
+      await service.adminCreate(baseDto());
+
+      expect(otpService.findValidTokenRow).not.toHaveBeenCalled();
+    });
+
+    it('creates the operator ACTIVE immediately, not PENDING', async () => {
+      await service.adminCreate(baseDto());
+
+      expect(prisma.operator.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'ACTIVE' }),
+        }),
+      );
+    });
+
+    it('creates the user with passwordHash: null when no password is given', async () => {
+      await service.adminCreate(baseDto());
+
+      expect(prisma.user.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ passwordHash: null }),
+        }),
+      );
+    });
+
+    it('hashes and stores a password when one is given', async () => {
+      await service.adminCreate({ ...baseDto(), password: 'password123' });
+
+      const call = prisma.user.create.mock.calls[0][0];
+      expect(call.data.passwordHash).toBeTruthy();
+      expect(call.data.passwordHash).not.toBe('password123');
+    });
+
+    it('creates an OWNER operatorMember linking the new user to the new operator', async () => {
+      await service.adminCreate(baseDto());
+
+      expect(prisma.operatorMember.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            userId: 'u-new',
+            operatorId: 'op-new',
+            role: 'OWNER',
+          }),
+        }),
+      );
+    });
+
+    it('throws BadRequestException when truckClasses is missing', async () => {
+      const dto = baseDto();
+      delete (dto as Partial<AdminCreateOperatorDto>).truckClasses;
+
+      await expect(service.adminCreate(dto)).rejects.toThrow(
+        BadRequestException,
+      );
+    });
+
+    it('throws ConflictException when the phone number already belongs to any existing account', async () => {
+      prisma.user.findUnique.mockResolvedValue({ id: 'existing-user' });
+
+      await expect(service.adminCreate(baseDto())).rejects.toThrow(
+        'Email or phone number already registered',
+      );
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('throws ConflictException when the business phone number is already a registered customer account', async () => {
+      prisma.user.findFirst.mockResolvedValue({ id: 'existing-customer' });
+
+      await expect(service.adminCreate(baseDto())).rejects.toThrow(
+        'This business phone number is already registered as a customer account. Use a different number for your business line.',
+      );
+      expect(prisma.$transaction).not.toHaveBeenCalled();
     });
   });
 });
