@@ -1,3 +1,5 @@
+import { BadRequestException } from '@nestjs/common';
+
 /**
  * Normalises a Nigerian phone number to E.164 (+234XXXXXXXXXX).
  *
@@ -11,10 +13,12 @@
  *   "2348012345678"  → "+2348012345678"  (missing +)
  *   "+2348012345678" → "+2348012345678"  (already correct — no-op)
  *
- * Throws if the result is not a valid Nigerian number (+234 + 10 digits).
+ * Throws BadRequestException (not a plain Error) if the result is not a
+ * valid Nigerian number (+234 + 10 digits) — most call sites don't wrap
+ * this, so a plain Error would escape as a bare 500 instead of a clean 400.
  */
 export function normalizePhone(raw: string): string {
-  if (!raw) throw new Error('Phone number is required');
+  if (!raw) throw new BadRequestException('Phone number is required');
 
   let phone = raw.trim();
   const hasPlus = phone.startsWith('+');
@@ -33,7 +37,9 @@ export function normalizePhone(raw: string): string {
   }
 
   if (!/^\+234\d{10}$/.test(phone)) {
-    throw new Error(`Invalid Nigerian phone number: "${raw}" → "${phone}"`);
+    throw new BadRequestException(
+      `Invalid Nigerian phone number: "${raw}" → "${phone}"`,
+    );
   }
 
   return phone;
