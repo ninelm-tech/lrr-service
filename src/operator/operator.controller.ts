@@ -14,6 +14,7 @@ import {
 } from '@nestjs/common';
 import { OperatorService } from './operator.service';
 import { CreateOperatorDto } from './dto/create-operator.dto';
+import { AdminCreateOperatorDto } from './dto/admin-create-operator.dto';
 import { UpdateOperatorProfileDto } from './dto/update-operator-profile.dto';
 import { SaveBankDetailsDto } from './dto/save-bank-details.dto';
 import { OperatorMemberRole, OperatorStatus, UserRole } from '@prisma/client';
@@ -37,6 +38,27 @@ export class OperatorController {
     const result = await this.operatorService.create(dto);
     return {
       message: 'Operator registered successfully. Pending approval.',
+      data: {
+        userId: result.user.id,
+        operatorId: result.operator.id,
+        status: result.operator.status,
+      },
+    };
+  }
+
+  /**
+   * Staff onboarding from a physical intake form in the field — no OTP,
+   * optional password (operator sets one later via "Forgot password" if
+   * none is given), active immediately. Must be declared before `:id`
+   * routes to avoid param shadowing, same reasoning as all-stats below.
+   */
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.PRODUCT)
+  @Post('admin-create')
+  async adminCreate(@Body() dto: AdminCreateOperatorDto) {
+    const result = await this.operatorService.adminCreate(dto);
+    return {
+      message: 'Operator onboarded and active.',
       data: {
         userId: result.user.id,
         operatorId: result.operator.id,

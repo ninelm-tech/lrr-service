@@ -392,11 +392,33 @@ export class WhatsAppOperatorFlowService {
           rescueRequestId: session.rescueRequestId,
         },
       );
+      // TwiML's <Message> verb has no contentSid attribute — a button can
+      // only go out via the async REST call, so the template branch sends
+      // that and acks the webhook empty instead of replying with text.
+      const arrivedReminderSid =
+        process.env.TWILIO_ARRIVED_REMINDER_TEMPLATE_SID;
+      if (arrivedReminderSid) {
+        await this.twilioService.sendWhatsAppTemplateMessage(
+          phoneNumber,
+          arrivedReminderSid,
+          { '1': formatJobRef(session.rescueRequestId!) },
+        );
+        return this.xmlOk();
+      }
       return this.reply(
         `📍 ${formatJobRef(session.rescueRequestId!)} — Send *ARRIVED* when you reach the customer location so we can notify them.`,
       );
     }
     if (session.state === WhatsAppFlowState.OPERATOR_AT_LOCATION) {
+      const doneReminderSid = process.env.TWILIO_DONE_REMINDER_TEMPLATE_SID;
+      if (doneReminderSid) {
+        await this.twilioService.sendWhatsAppTemplateMessage(
+          phoneNumber,
+          doneReminderSid,
+          { '1': formatJobRef(session.rescueRequestId!) },
+        );
+        return this.xmlOk();
+      }
       return this.reply(
         `✅ ${formatJobRef(session.rescueRequestId!)} — Send *DONE* when the job is complete. The customer will confirm and you'll both be notified.`,
       );
@@ -597,6 +619,15 @@ export class WhatsAppOperatorFlowService {
       );
     }
 
+    const donePromptSid = process.env.TWILIO_DONE_PROMPT_TEMPLATE_SID;
+    if (donePromptSid) {
+      await this.twilioService.sendWhatsAppTemplateMessage(
+        operatorPhone,
+        donePromptSid,
+        { '1': formatJobRef(rescueRequestId) },
+      );
+      return this.xmlOk();
+    }
     return this.reply(
       `✅ ${formatJobRef(rescueRequestId)} — Arrival confirmed! The customer has been notified.\n\nSend *DONE* when the job is complete.`,
     );

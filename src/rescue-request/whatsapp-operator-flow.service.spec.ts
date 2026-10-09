@@ -528,6 +528,228 @@ describe('WhatsAppOperatorFlowService', () => {
     });
   });
 
+  describe('ARRIVED/DONE prompts — real button via Content Template when configured', () => {
+    let service: WhatsAppOperatorFlowService;
+    let prisma: {
+      rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
+    };
+    let sessionStore: { update: jest.Mock };
+    let twilioService: {
+      sendWhatsAppMessage: jest.Mock;
+      sendWhatsAppTemplateMessage: jest.Mock;
+    };
+
+    const operatorPhone = '+2348011112222';
+    const customerPhone = '+2348012345678';
+    const operator = {
+      id: 'op-1',
+      businessName: 'Swift Towing',
+      phoneNumber: operatorPhone,
+    };
+
+    const originalArrivedReminderSid =
+      process.env.TWILIO_ARRIVED_REMINDER_TEMPLATE_SID;
+    const originalDoneReminderSid =
+      process.env.TWILIO_DONE_REMINDER_TEMPLATE_SID;
+    const originalDonePromptSid = process.env.TWILIO_DONE_PROMPT_TEMPLATE_SID;
+
+    afterEach(() => {
+      const restore = (key: string, original: string | undefined) => {
+        if (original === undefined) delete process.env[key];
+        else process.env[key] = original;
+      };
+      restore(
+        'TWILIO_ARRIVED_REMINDER_TEMPLATE_SID',
+        originalArrivedReminderSid,
+      );
+      restore('TWILIO_DONE_REMINDER_TEMPLATE_SID', originalDoneReminderSid);
+      restore('TWILIO_DONE_PROMPT_TEMPLATE_SID', originalDonePromptSid);
+    });
+
+    beforeEach(async () => {
+      delete process.env.TWILIO_ARRIVED_REMINDER_TEMPLATE_SID;
+      delete process.env.TWILIO_DONE_REMINDER_TEMPLATE_SID;
+      delete process.env.TWILIO_DONE_PROMPT_TEMPLATE_SID;
+
+      prisma = {
+        rescueRequest: {
+          findUnique: jest.fn(),
+          update: jest.fn().mockResolvedValue({}),
+        },
+      };
+      sessionStore = { update: jest.fn() };
+      twilioService = {
+        sendWhatsAppMessage: jest.fn(),
+        sendWhatsAppTemplateMessage: jest.fn(),
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppOperatorFlowService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: DispatchService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppCustomerFlowService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: PlatformConfigService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppOperatorFlowService>(
+        WhatsAppOperatorFlowService,
+      );
+    });
+
+    describe('ON_JOB reminder (unrecognized message while en route)', () => {
+      const session = {
+        state: WhatsAppFlowState.OPERATOR_ON_JOB,
+        rescueRequestId: 'req-1',
+      } as any;
+
+      it('replies with the freeform "Send ARRIVED" text when no template SID is configured', async () => {
+        const twiml = await service.handleOperatorMessage(
+          operatorPhone,
+          'op-user-1',
+          'huh',
+          'huh',
+          session,
+          operator,
+          {},
+        );
+
+        expect(twiml).toContain('Send *ARRIVED*');
+        expect(
+          twilioService.sendWhatsAppTemplateMessage,
+        ).not.toHaveBeenCalled();
+      });
+
+      it('sends a real ARRIVED button via the Content Template, with an empty TwiML ack, when the SID is configured', async () => {
+        process.env.TWILIO_ARRIVED_REMINDER_TEMPLATE_SID = 'HXarrivedreminder';
+
+        const twiml = await service.handleOperatorMessage(
+          operatorPhone,
+          'op-user-1',
+          'huh',
+          'huh',
+          session,
+          operator,
+          {},
+        );
+
+        expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+          operatorPhone,
+          'HXarrivedreminder',
+          expect.any(Object),
+        );
+        expect(twiml).not.toContain('<Message>');
+      });
+    });
+
+    describe('AT_LOCATION reminder (unrecognized message on site)', () => {
+      const session = {
+        state: WhatsAppFlowState.OPERATOR_AT_LOCATION,
+        rescueRequestId: 'req-1',
+      } as any;
+
+      it('replies with the freeform "Send DONE" text when no template SID is configured', async () => {
+        const twiml = await service.handleOperatorMessage(
+          operatorPhone,
+          'op-user-1',
+          'huh',
+          'huh',
+          session,
+          operator,
+          {},
+        );
+
+        expect(twiml).toContain('Send *DONE*');
+        expect(
+          twilioService.sendWhatsAppTemplateMessage,
+        ).not.toHaveBeenCalled();
+      });
+
+      it('sends a real DONE button via the Content Template, with an empty TwiML ack, when the SID is configured', async () => {
+        process.env.TWILIO_DONE_REMINDER_TEMPLATE_SID = 'HXdonereminder';
+
+        const twiml = await service.handleOperatorMessage(
+          operatorPhone,
+          'op-user-1',
+          'huh',
+          'huh',
+          session,
+          operator,
+          {},
+        );
+
+        expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+          operatorPhone,
+          'HXdonereminder',
+          expect.any(Object),
+        );
+        expect(twiml).not.toContain('<Message>');
+      });
+    });
+
+    describe('arrival confirmed — prompt for DONE', () => {
+      const session = {
+        state: WhatsAppFlowState.OPERATOR_ON_JOB,
+        rescueRequestId: 'req-1',
+      } as any;
+
+      beforeEach(() => {
+        prisma.rescueRequest.findUnique.mockResolvedValue({
+          id: 'req-1',
+          status: 'OPERATOR_ASSIGNED',
+          customer: { phoneNumber: customerPhone },
+        });
+      });
+
+      it('replies with the freeform "Send DONE" text when no template SID is configured', async () => {
+        const twiml = await service.handleOperatorMessage(
+          operatorPhone,
+          'op-user-1',
+          'arrived',
+          'ARRIVED',
+          session,
+          operator,
+          {},
+        );
+
+        expect(twiml).toContain('Send *DONE*');
+        expect(
+          twilioService.sendWhatsAppTemplateMessage,
+        ).not.toHaveBeenCalled();
+      });
+
+      it('sends a real DONE button via the Content Template, with an empty TwiML ack, when the SID is configured', async () => {
+        process.env.TWILIO_DONE_PROMPT_TEMPLATE_SID = 'HXdoneprompt';
+
+        const twiml = await service.handleOperatorMessage(
+          operatorPhone,
+          'op-user-1',
+          'arrived',
+          'ARRIVED',
+          session,
+          operator,
+          {},
+        );
+
+        expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+          operatorPhone,
+          'HXdoneprompt',
+          expect.any(Object),
+        );
+        expect(twiml).not.toContain('<Message>');
+        // The customer-facing "arrived" notification is unaffected either way.
+        expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+          customerPhone,
+          expect.stringContaining('arrived'),
+        );
+      });
+    });
+  });
+
   describe('handleOperatorMessage — completion evidence', () => {
     let service: WhatsAppOperatorFlowService;
     let prisma: {

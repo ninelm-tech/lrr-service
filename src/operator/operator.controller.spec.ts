@@ -8,10 +8,10 @@ import { UserRole } from '@prisma/client';
 
 describe('OperatorController', () => {
   let controller: OperatorController;
-  let operatorService: { setIsTest: jest.Mock };
+  let operatorService: { setIsTest: jest.Mock; adminCreate: jest.Mock };
 
   beforeEach(async () => {
-    operatorService = { setIsTest: jest.fn() };
+    operatorService = { setIsTest: jest.fn(), adminCreate: jest.fn() };
 
     const module: TestingModule = await Test.createTestingModule({
       controllers: [OperatorController],
@@ -63,6 +63,49 @@ describe('OperatorController', () => {
       expect(result).toEqual({
         message: 'Operator marked as test',
         data: { id: 'op-1', isTest: true },
+      });
+    });
+  });
+
+  describe('adminCreate', () => {
+    it('is restricted to ADMIN, SUPER_ADMIN, and PRODUCT', () => {
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const handler = OperatorController.prototype.adminCreate;
+      const roles = new Reflector().get<UserRole[]>(ROLES_KEY, handler);
+      expect(roles).toEqual(
+        expect.arrayContaining([
+          UserRole.ADMIN,
+          UserRole.SUPER_ADMIN,
+          UserRole.PRODUCT,
+        ]),
+      );
+      expect(roles).toHaveLength(3);
+    });
+
+    it('forwards to OperatorService.adminCreate and reports the outcome', async () => {
+      operatorService.adminCreate.mockResolvedValue({
+        user: { id: 'u-new' },
+        operator: { id: 'op-new', status: 'ACTIVE' },
+        operatorMember: { id: 'om-new' },
+      });
+      const dto = {
+        name: 'Jane Doe',
+        businessName: 'Acme Towing',
+        contactName: 'Jane Doe',
+        phoneNumber: '+2348012345678',
+        businessPhoneNumber: '+2348012345679',
+        address: '1 Test Street',
+        latitude: 6.5,
+        longitude: 3.4,
+        truckClasses: [],
+      } as never;
+
+      const result = await controller.adminCreate(dto);
+
+      expect(operatorService.adminCreate).toHaveBeenCalledWith(dto);
+      expect(result).toEqual({
+        message: 'Operator onboarded and active.',
+        data: { userId: 'u-new', operatorId: 'op-new', status: 'ACTIVE' },
       });
     });
   });

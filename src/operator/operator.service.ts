@@ -18,6 +18,7 @@ import * as bcrypt from 'bcrypt';
 import { normalizePhone } from '../common/phone.util';
 import { claimOnce } from '../common/claim-once.util';
 import { CreateOperatorDto } from './dto/create-operator.dto';
+import { AdminCreateOperatorDto } from './dto/admin-create-operator.dto';
 import { UpdateOperatorProfileDto } from './dto/update-operator-profile.dto';
 import { SaveBankDetailsDto } from './dto/save-bank-details.dto';
 import { PaystackService } from '../integrations/paystack/paystack.service';
@@ -300,6 +301,126 @@ export class OperatorService {
         userId: user.id,
         operatorId: operator.id,
       });
+      return { user, operator, operatorMember };
+    });
+  }
+
+  /**
+   * Staff onboarding from a physical intake form in the field — no OTP
+   * phone verification (staff already verified identity in person) and no
+   * upgrade-path consideration (that path exists specifically to pair with
+   * OTP ownership proof, which doesn't happen here). Active immediately:
+   * the physical form IS the vetting step, so a second PENDING approval
+   * would just be the same admin re-approving their own intake.
+   */
+  async adminCreate(data: AdminCreateOperatorDto) {
+    if (!Array.isArray(data.truckClasses) || data.truckClasses.length === 0) {
+      throw new BadRequestException(
+        'truckClasses is required and must be a non-empty array',
+      );
+    }
+    const invalidTruckClasses = data.truckClasses.filter(
+      (tc) => !Object.values(TruckClass).includes(tc),
+    );
+    if (invalidTruckClasses.length > 0) {
+      throw new BadRequestException(
+        `Invalid truck class(es): ${invalidTruckClasses.join(', ')}`,
+      );
+    }
+
+    const personalPhone = normalizePhone(data.phoneNumber);
+    const businessPhone = normalizePhone(data.businessPhoneNumber);
+
+    // No OTP ownership proof on this path, so no upgrade case either — any
+    // existing account on this number is a conflict, full stop.
+    const existingByPhone = await this.prisma.user.findUnique({
+      where: { phoneNumber: personalPhone },
+    });
+    if (existingByPhone) {
+      throw new ConflictException('Email or phone number already registered');
+    }
+    const existingByEmail = data.email
+      ? await this.prisma.user.findUnique({ where: { email: data.email } })
+      : null;
+    if (existingByEmail) {
+      throw new ConflictException('Email or phone number already registered');
+    }
+
+    const personalPhoneClaimedByOperator =
+      await this.prisma.operator.findUnique({
+        where: { phoneNumber: personalPhone },
+      });
+    if (personalPhoneClaimedByOperator) {
+      throw new ConflictException(
+        'This phone number is already registered as a business dispatch line.',
+      );
+    }
+
+    const businessPhoneClaimedByOperator =
+      await this.prisma.operator.findUnique({
+        where: { phoneNumber: businessPhone },
+      });
+    if (businessPhoneClaimedByOperator) {
+      throw new ConflictException(
+        'This business phone number is already registered.',
+      );
+    }
+
+    const businessPhoneClaimedByCustomer = await this.prisma.user.findFirst({
+      where: { phoneNumber: businessPhone },
+    });
+    if (businessPhoneClaimedByCustomer) {
+      throw new ConflictException(
+        'This business phone number is already registered as a customer account. Use a different number for your business line.',
+      );
+    }
+
+    const passwordHash = data.password
+      ? await bcrypt.hash(data.password, 10)
+      : null;
+
+    return this.prisma.$transaction(async (tx) => {
+      const user = await tx.user.create({
+        data: {
+          email: data.email,
+          passwordHash,
+          name: data.name,
+          phoneNumber: personalPhone,
+          role: UserRole.OPERATOR,
+        },
+      });
+
+      const operator = await tx.operator.create({
+        data: {
+          type: data.type ?? OperatorType.TOW_TRUCK,
+          truckClasses: data.truckClasses,
+          businessName: data.businessName,
+          contactName: data.contactName,
+          phoneNumber: businessPhone,
+          email: data.email,
+          address: data.address,
+          latitude: data.latitude,
+          longitude: data.longitude,
+          serviceRadius: data.serviceRadius ?? 10,
+          status: OperatorStatus.ACTIVE,
+        },
+      });
+
+      const operatorMember = await tx.operatorMember.create({
+        data: {
+          userId: user.id,
+          operatorId: operator.id,
+          role: OperatorMemberRole.OWNER,
+        },
+      });
+
+      logger.info(
+        'operator.adminCreate: onboarded by staff, active immediately',
+        {
+          userId: user.id,
+          operatorId: operator.id,
+        },
+      );
       return { user, operator, operatorMember };
     });
   }
