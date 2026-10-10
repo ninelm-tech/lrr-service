@@ -170,13 +170,19 @@ export class RescueRequestAdminService {
       (dto.priceKobo * config.serviceFeePercent) / 100,
     );
     const total = dto.priceKobo + serviceFeeAmount;
-    const depositAmount = Math.round((total * config.depositPercent) / 100);
+    // Live-resolved, unlike deliverQuoteShortlist's frozen snapshot — this
+    // staff-triggered path has no prior shortlist to freeze a percentage
+    // onto, so it always reads the operator's CURRENT override.
+    const depositPercent = Number(
+      operator.depositPercentOverride ?? config.depositPercent,
+    );
+    const depositAmount = Math.round((total * depositPercent) / 100);
     const balanceAmount = total - depositAmount;
 
     const MANUAL_ASSIGN_WINDOW_MS = 30 * 60 * 1000;
     const batchId = crypto.randomUUID();
     const depositWindowExpiresAt = new Date(Date.now() + DEPOSIT_WINDOW_MS);
-    let payment: Payment;
+    let payment: Payment | null;
     try {
       payment = await this.prisma.$transaction(async (tx) => {
         const customerStillActive = await tx.user.updateMany({
@@ -207,12 +213,16 @@ export class RescueRequestAdminService {
           },
           data: {
             assignedOperatorId: dto.operatorId,
-            status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
+            status:
+              depositAmount === 0
+                ? RescueRequestStatus.OPERATOR_ASSIGNED
+                : RescueRequestStatus.WAITING_FOR_DEPOSIT,
             serviceFeeAmount,
             depositAmount,
             balanceAmount,
-            depositWindowExpiresAt,
-            depositRemindersSent: 0,
+            ...(depositAmount === 0
+              ? {}
+              : { depositWindowExpiresAt, depositRemindersSent: 0 }),
           },
         });
         if (claimed.count === 0) {
@@ -225,7 +235,8 @@ export class RescueRequestAdminService {
           data: {
             rescueRequestId: id,
             operatorId: dto.operatorId,
-            status: 'SELECTED_PENDING_PAYMENT',
+            status:
+              depositAmount === 0 ? 'ACCEPTED' : 'SELECTED_PENDING_PAYMENT',
             quotedPrice: dto.priceKobo,
             respondedAt: new Date(),
             expiresAt: new Date(Date.now() + MANUAL_ASSIGN_WINDOW_MS),
@@ -233,6 +244,12 @@ export class RescueRequestAdminService {
             dispatchRound: request.dispatchRound,
           },
         });
+
+        if (depositAmount === 0) {
+          // No Payment row to create — there's nothing to pay. The offer
+          // above was already created as ACCEPTED.
+          return null;
+        }
 
         return this.paymentLedger.create({
           rescueRequestId: id,
@@ -251,6 +268,48 @@ export class RescueRequestAdminService {
         );
       }
       throw error;
+    }
+
+    if (depositAmount === 0) {
+      // Send the customer's own "operator assigned" notification FIRST —
+      // same failure-isolation as PaymentEventsService.confirmDeposit
+      // (Task 4) and handleQuoteSelected's 0%-deposit branch (Task 5): a
+      // failure inside activateAssignedJob (operator lookup, location
+      // formatting, the operator's own Twilio send) must not silently
+      // swallow this notification.
+      const customerPhone = toWhatsAppAddress(request.customer.phoneNumber);
+      void this.twilioService.sendWhatsAppMessage(
+        customerPhone,
+        `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\n\nNo deposit required — you'll pay the full ₦${(total / 100).toLocaleString()} once the job is complete.`,
+      );
+
+      // The offer was already created as ACCEPTED above, so
+      // activateAssignedJob's own offer-flip is a no-op here — it's still
+      // the thing that moves both sessions into their on-job states and
+      // sends the operator their job-is-live message, same as a paid
+      // deposit would.
+      await this.paymentEventsService.activateAssignedJob(id);
+
+      const updated = await this.prisma.rescueRequest.findUniqueOrThrow({
+        where: { id },
+        include: {
+          customer: true,
+          assignedOperator: true,
+          payments: { select: { id: true, type: true, status: true } },
+        },
+      });
+
+      return { data: this.mapToDetailDto(updated, true) };
+    }
+
+    if (!payment) {
+      // Defensive: depositAmount > 0 on this path, so the transaction above
+      // always returned a real Payment row (see the depositAmount === 0
+      // branch's early return above, which is the only case that returns
+      // null).
+      throw new BadRequestException(
+        'Expected a payment row for a nonzero deposit.',
+      );
     }
     if (
       !(await this.paymentLedger.claimForSubmission(payment.id, new Date()))
