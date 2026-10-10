@@ -17,6 +17,7 @@ describe('OperatorController', () => {
     updateProfile: jest.Mock;
     saveBankDetails: jest.Mock;
     clearBankDetails: jest.Mock;
+    setDepositPercent: jest.Mock;
   };
   let auditLogService: { record: jest.Mock };
   const req = { user: { userId: 'prod-1', role: 'PRODUCT' } };
@@ -25,11 +26,16 @@ describe('OperatorController', () => {
     operatorService = {
       setIsTest: jest.fn(),
       adminCreate: jest.fn(),
+      // Shared by updateProfile/saveBankDetails/clearBankDetails (member
+      // management) and setDepositPercent (same permission as bank
+      // details) — resolves by default so existing tests of handlers that
+      // don't go through this check are unaffected.
       assertCanManageOperator: jest.fn().mockResolvedValue(undefined),
       assertCanOnboardOperator: jest.fn().mockResolvedValue(undefined),
       updateProfile: jest.fn().mockResolvedValue({ id: 'op-1' }),
       saveBankDetails: jest.fn(),
       clearBankDetails: jest.fn().mockResolvedValue({ id: 'op-1' }),
+      setDepositPercent: jest.fn(),
     };
     auditLogService = { record: jest.fn().mockResolvedValue(undefined) };
 
@@ -226,6 +232,34 @@ describe('OperatorController', () => {
       ).rejects.toThrow('nope');
       expect(operatorService.saveBankDetails).not.toHaveBeenCalled();
       expect(auditLogService.record).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('setDepositPercent', () => {
+    it('forwards to OperatorService.setDepositPercent with the body and the whole acting user (role included)', async () => {
+      operatorService.setDepositPercent = jest.fn().mockResolvedValue({
+        id: 'op-1',
+        depositPercentOverride: 25,
+      });
+      const req = { user: { userId: 'admin-1', role: 'ADMIN' } } as never;
+
+      const result = await controller.setDepositPercent(req, 'op-1', {
+        depositPercentOverride: 25,
+      });
+
+      expect(operatorService.assertCanManageOperator).toHaveBeenCalledWith(
+        { userId: 'admin-1', role: 'ADMIN' },
+        'op-1',
+      );
+      expect(operatorService.setDepositPercent).toHaveBeenCalledWith(
+        'op-1',
+        25,
+        { userId: 'admin-1', role: 'ADMIN' },
+      );
+      expect(result).toEqual({
+        message: 'Deposit percentage updated',
+        data: { id: 'op-1', depositPercentOverride: 25 },
+      });
     });
   });
 });

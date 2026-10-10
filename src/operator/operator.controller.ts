@@ -17,6 +17,7 @@ import { CreateOperatorDto } from './dto/create-operator.dto';
 import { AdminCreateOperatorDto } from './dto/admin-create-operator.dto';
 import { UpdateOperatorProfileDto } from './dto/update-operator-profile.dto';
 import { SaveBankDetailsDto } from './dto/save-bank-details.dto';
+import { SetDepositPercentDto } from './dto/set-deposit-percent.dto';
 import { OperatorMemberRole, OperatorStatus, UserRole } from '@prisma/client';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
@@ -226,6 +227,31 @@ export class OperatorController {
       actorId: req.user.userId,
     });
     return { message: 'Payout bank details removed', data: operator };
+  }
+
+  /**
+   * Set or clear an operator's own deposit percentage override. Same
+   * permission check as bank details — admins, or OWNER/MANAGER members of
+   * this specific operator. null clears the override back to the platform
+   * default. Passes req.user whole (not just userId) because
+   * setDepositPercent's own transactional lock needs the role for its
+   * admin bypass — same shape every other mutating endpoint on this
+   * controller already uses.
+   */
+  @UseGuards(AuthGuard)
+  @Patch(':id/deposit-percent')
+  async setDepositPercent(
+    @Req() req: AuthenticatedOperatorRequest,
+    @Param('id') id: string,
+    @Body() dto: SetDepositPercentDto,
+  ) {
+    await this.operatorService.assertCanManageOperator(req.user, id);
+    const operator = await this.operatorService.setDepositPercent(
+      id,
+      dto.depositPercentOverride,
+      req.user,
+    );
+    return { message: 'Deposit percentage updated', data: operator };
   }
 
   /**
