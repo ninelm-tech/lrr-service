@@ -153,13 +153,10 @@ export class PaymentEventsService {
       data: { status: RescueRequestStatus.OPERATOR_ASSIGNED },
     });
 
-    await this.activateAssignedJob(rescueRequest.id);
-
-    // Customer: confirmed with operator details. The session transition
-    // itself now lives in activateAssignedJob — this is only the
-    // message, which is worded around an actual payment having landed
-    // (the 0%-deposit callers of activateAssignedJob have their own,
-    // differently-worded customer message instead).
+    // Send the customer's own confirmation first - independent of whatever
+    // happens next in activateAssignedJob, same failure-isolation the
+    // pre-extraction code had (a failure activating the operator side must
+    // not silently swallow the customer's own confirmation).
     if (customerPhone) {
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
@@ -168,6 +165,8 @@ export class PaymentEventsService {
           : `✅ Deposit confirmed! Finding the nearest tow operator...`,
       );
     }
+
+    await this.activateAssignedJob(rescueRequest.id);
   }
 
   /**
@@ -198,8 +197,8 @@ export class PaymentEventsService {
     const operator = rescueRequest.assignedOperator;
     if (!operator) return;
 
-    // The offer is only actually awarded now that payment is confirmed —
-    // selection alone (Task 8) only reached SELECTED_PENDING_PAYMENT.
+    // The offer is only actually awarded once the job is confirmed —
+    // selection alone leaves it at SELECTED_PENDING_PAYMENT.
     if (rescueRequest.assignedOperatorId) {
       await this.prisma.dispatchOffer.updateMany({
         where: {
