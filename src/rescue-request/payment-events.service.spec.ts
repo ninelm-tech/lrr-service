@@ -200,6 +200,29 @@ describe('PaymentEventsService', () => {
       );
     });
 
+    it('moves the customer session to REQUEST_CONFIRMED as part of the normal paid-deposit activation', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        status: 'WAITING_FOR_DEPOSIT',
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+      });
+
+      await service.confirmDeposit(paymentFor('req-1'));
+
+      // This is a new assertion, not a pre-existing one — confirmDeposit's
+      // existing tests in this block never checked the session transition
+      // directly, only the messages it sends. It exists as a named anchor
+      // for the activateAssignedJob extraction below: if this still passes
+      // once confirmDeposit delegates to it, the extraction preserved the
+      // real behavior.
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
+        state: 'REQUEST_CONFIRMED',
+      });
+    });
+
     it('cancels a paid deposit with no preassigned operator instead of dispatching after payment', async () => {
       prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
         id: 'req-1',
@@ -278,6 +301,87 @@ describe('PaymentEventsService', () => {
         'Deposit confirmed in unexpected (non-CANCELLED) status',
         expect.objectContaining({ level: 'error' }),
       );
+    });
+  });
+
+  describe('activateAssignedJob', () => {
+    it('flips a SELECTED_PENDING_PAYMENT offer to ACCEPTED', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+      });
+
+      await service.activateAssignedJob('req-1');
+
+      expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith({
+        where: {
+          rescueRequestId: 'req-1',
+          operatorId: 'op-1',
+          status: 'SELECTED_PENDING_PAYMENT',
+        },
+        data: { status: 'ACCEPTED' },
+      });
+    });
+
+    it('moves the customer session to REQUEST_CONFIRMED and the operator session to OPERATOR_ON_JOB', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+      });
+
+      await service.activateAssignedJob('req-1');
+
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
+        state: 'REQUEST_CONFIRMED',
+      });
+      expect(sessionStore.update).toHaveBeenCalledWith('op-user-1', {
+        state: 'OPERATOR_ON_JOB',
+        rescueRequestId: 'req-1',
+      });
+    });
+
+    it('sends the operator their job-is-live details, honoring the ARRIVED template SID the same way confirmDeposit does', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+      });
+
+      await service.activateAssignedJob('req-1');
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('2342'),
+        expect.stringContaining('send *ARRIVED*'),
+      );
+    });
+
+    it('does nothing when the request has no assigned operator', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: null,
+        assignedOperator: null,
+        customer: { phoneNumber: '+2341' },
+      });
+
+      await service.activateAssignedJob('req-1');
+
+      expect(sessionStore.update).not.toHaveBeenCalled();
+      expect(prisma.dispatchOffer.updateMany).not.toHaveBeenCalled();
     });
   });
 
