@@ -336,6 +336,24 @@ export class OperatorService {
       );
     }
 
+    // Same manual check as setDepositPercent — no global ValidationPipe, so
+    // DTO decorators alone don't run. Unlike setDepositPercent's dedicated
+    // endpoint, `undefined` is fine here: this is one optional field among
+    // many on a creation DTO, so omitting it just means "no override set at
+    // creation," not an error.
+    if (
+      data.depositPercentOverride !== undefined &&
+      data.depositPercentOverride !== null &&
+      (typeof data.depositPercentOverride !== 'number' ||
+        !Number.isFinite(data.depositPercentOverride) ||
+        data.depositPercentOverride < 0 ||
+        data.depositPercentOverride > 100)
+    ) {
+      throw new BadRequestException(
+        'depositPercentOverride must be between 0 and 100',
+      );
+    }
+
     const personalPhone = normalizePhone(data.phoneNumber);
     const businessPhone = normalizePhone(data.businessPhoneNumber);
 
@@ -411,6 +429,7 @@ export class OperatorService {
           longitude: data.longitude,
           serviceRadius: data.serviceRadius ?? 10,
           status: OperatorStatus.ACTIVE,
+          depositPercentOverride: data.depositPercentOverride ?? null,
         },
       });
 

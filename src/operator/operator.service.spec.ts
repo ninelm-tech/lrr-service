@@ -964,6 +964,40 @@ describe('OperatorService', () => {
       );
       expect(prisma.$transaction).not.toHaveBeenCalled();
     });
+
+    it('accepts and persists depositPercentOverride: 0 — not skipped as falsy', async () => {
+      // Captured via a typed mockImplementation callback, not `mock.calls[0][0]`
+      // indexing — the latter reads back through this file's bare `jest.Mock`
+      // typing as `any`, which trips no-unsafe-assignment/member-access.
+      let capturedData: { depositPercentOverride?: number | null } | undefined;
+      prisma.operator.create.mockImplementation(
+        (args: { data: { depositPercentOverride?: number | null } }) => {
+          capturedData = args.data;
+          return Promise.resolve({ id: 'op-new', status: 'ACTIVE' });
+        },
+      );
+
+      await service.adminCreate({ ...baseDto(), depositPercentOverride: 0 });
+
+      expect(capturedData?.depositPercentOverride).toBe(0);
+    });
+
+    it('throws BadRequestException when depositPercentOverride is above 100', async () => {
+      await expect(
+        service.adminCreate({ ...baseDto(), depositPercentOverride: 101 }),
+      ).rejects.toThrow('depositPercentOverride must be between 0 and 100');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('throws BadRequestException when depositPercentOverride is not a number', async () => {
+      await expect(
+        service.adminCreate({
+          ...baseDto(),
+          depositPercentOverride: 'abc' as unknown as number,
+        }),
+      ).rejects.toThrow('depositPercentOverride must be between 0 and 100');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
   });
 
   describe('setDepositPercent', () => {
