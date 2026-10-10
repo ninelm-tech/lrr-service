@@ -612,6 +612,7 @@ describe('WhatsAppCustomerFlowService', () => {
     let paystackService: { initializePayment: jest.Mock };
     let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
     let paymentEventsService: { activateAssignedJob: jest.Mock };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
 
     const session = {
       state: WhatsAppFlowState.WAITING_FOR_QUOTE_SELECTION,
@@ -685,6 +686,7 @@ describe('WhatsAppCustomerFlowService', () => {
         update: jest.fn(),
       };
       paymentEventsService = { activateAssignedJob: jest.fn() };
+      twilioService = { sendWhatsAppMessage: jest.fn() };
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
@@ -697,7 +699,7 @@ describe('WhatsAppCustomerFlowService', () => {
           },
           {
             provide: TwilioService,
-            useValue: { sendWhatsAppMessage: jest.fn() },
+            useValue: twilioService,
           },
           { provide: S3Service, useValue: {} },
           { provide: GeocodingService, useValue: {} },
@@ -851,6 +853,9 @@ describe('WhatsAppCustomerFlowService', () => {
       ];
       expect(data.status).toBe('OPERATOR_ASSIGNED');
       expect(data.depositAmount).toBe(0);
+      const [{ data: offerData }] = prisma.dispatchOffer.update.mock
+        .calls[0] as [{ data: Record<string, unknown> }];
+      expect(offerData.status).toBe('ACCEPTED');
       expect(paymentEventsService.activateAssignedJob).toHaveBeenCalledWith(
         'req-1',
       );
@@ -863,6 +868,24 @@ describe('WhatsAppCustomerFlowService', () => {
         'user-1',
         expect.objectContaining({ state: 'OPERATOR_FOUND_WAITING_PAYMENT' }),
       );
+      // Failure isolation (same as Task 4's confirmDeposit fix): the
+      // customer's own confirmation must be sent BEFORE activateAssignedJob
+      // runs, so a failure inside activation can't silently swallow it.
+      // Index by the customer's own phone number rather than assuming
+      // call [0], in case the "notify losing operators" step above ever
+      // also lands a call on this same mock.
+      const customerMessageCallIndex =
+        twilioService.sendWhatsAppMessage.mock.calls.findIndex(
+          (call: unknown[]) => call[0] === '+2348000000000',
+        );
+      expect(customerMessageCallIndex).toBeGreaterThanOrEqual(0);
+      const customerMessageOrder =
+        twilioService.sendWhatsAppMessage.mock.invocationCallOrder[
+          customerMessageCallIndex
+        ];
+      const activationOrder =
+        paymentEventsService.activateAssignedJob.mock.invocationCallOrder[0];
+      expect(customerMessageOrder).toBeLessThan(activationOrder);
     });
 
     it('rounds a very small total at a nonzero percentage down to the 0%-deposit branch', async () => {

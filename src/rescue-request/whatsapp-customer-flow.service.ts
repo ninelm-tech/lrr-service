@@ -1111,7 +1111,9 @@ export class WhatsAppCustomerFlowService {
       // always returned a real Payment row (see the depositAmount === 0
       // branch's early return above, which is the only case that returns
       // null).
-      throw new Error('Expected a payment row for a nonzero deposit.');
+      throw new BadRequestException(
+        'Expected a payment row for a nonzero deposit.',
+      );
     }
 
     await this.sessionStore.update(userId, {
