@@ -611,6 +611,7 @@ describe('WhatsAppCustomerFlowService', () => {
     let paymentLedger: ReturnType<typeof createPaymentLedgerMock>;
     let paystackService: { initializePayment: jest.Mock };
     let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
+    let paymentEventsService: { activateAssignedJob: jest.Mock };
 
     const session = {
       state: WhatsAppFlowState.WAITING_FOR_QUOTE_SELECTION,
@@ -683,6 +684,7 @@ describe('WhatsAppCustomerFlowService', () => {
         getOrCreate: jest.fn().mockResolvedValue(session),
         update: jest.fn(),
       };
+      paymentEventsService = { activateAssignedJob: jest.fn() };
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
@@ -716,7 +718,7 @@ describe('WhatsAppCustomerFlowService', () => {
           },
           { provide: DispatchService, useValue: {} },
           { provide: DisputeService, useValue: {} },
-          { provide: PaymentEventsService, useValue: {} },
+          { provide: PaymentEventsService, useValue: paymentEventsService },
           { provide: WhatsAppSessionStore, useValue: sessionStore },
           { provide: RescueRequestSharedService, useValue: {} },
         ],
@@ -783,6 +785,123 @@ describe('WhatsAppCustomerFlowService', () => {
       expect(prisma.dispatchOffer.update).not.toHaveBeenCalled();
       expect(paymentLedger.create).not.toHaveBeenCalled();
       expect(paystackService.initializePayment).not.toHaveBeenCalled();
+    });
+
+    it("charges the snapshotted percentage, not the operator's current setting", async () => {
+      // The offer carries a frozen depositPercentSnapshot of 15% from
+      // deliverQuoteShortlist (Task 3) — deliberately different from both
+      // the live platform default (config.depositPercent: 20, from this
+      // block's beforeEach) and the operator's live depositPercentOverride
+      // (50%, changed since the shortlist was frozen). Neither of those
+      // other two values must be read here; only the frozen snapshot should
+      // drive the calculation.
+      prisma.dispatchOffer.findMany.mockResolvedValue([
+        {
+          id: 'offer-1',
+          rescueRequestId: 'req-1',
+          operatorId: 'op-1',
+          status: 'QUOTED',
+          quotedPrice: 100_000,
+          depositPercentSnapshot: 15,
+          operator: {
+            id: 'op-1',
+            businessName: 'Swift Towing',
+            phoneNumber: '+2348011111111',
+            latitude: 6.5,
+            longitude: 3.4,
+            depositPercentOverride: 50,
+          },
+        },
+      ]);
+
+      await service['handleQuoteSelected']('+2348000000000', 'user-1', 1);
+
+      // total = 100,000 + 10% service fee (10,000) = 110,000.
+      // 15% of 110,000 = 16,500. (config's 20% would be 22,000; the
+      // operator's live 50% would be 55,000 — neither must win.)
+      const [{ data }] = prisma.rescueRequest.updateMany.mock.calls[0] as [
+        { data: Record<string, unknown> },
+      ];
+      expect(data.depositAmount).toBe(16_500);
+    });
+
+    it('skips the Paystack deposit step and activates the job directly when the snapshot resolves to 0%', async () => {
+      prisma.dispatchOffer.findMany.mockResolvedValue([
+        {
+          id: 'offer-1',
+          rescueRequestId: 'req-1',
+          operatorId: 'op-1',
+          status: 'QUOTED',
+          quotedPrice: 100_000,
+          depositPercentSnapshot: 0,
+          operator: {
+            id: 'op-1',
+            businessName: 'Swift Towing',
+            phoneNumber: '+2348011111111',
+            latitude: 6.5,
+            longitude: 3.4,
+          },
+        },
+      ]);
+
+      await service['handleQuoteSelected']('+2348000000000', 'user-1', 1);
+
+      const [{ data }] = prisma.rescueRequest.updateMany.mock.calls[0] as [
+        { data: Record<string, unknown> },
+      ];
+      expect(data.status).toBe('OPERATOR_ASSIGNED');
+      expect(data.depositAmount).toBe(0);
+      expect(paymentEventsService.activateAssignedJob).toHaveBeenCalledWith(
+        'req-1',
+      );
+      expect(paymentLedger.create).not.toHaveBeenCalled();
+      expect(paystackService.initializePayment).not.toHaveBeenCalled();
+      // The customer's session must NOT be left at OPERATOR_FOUND_WAITING_PAYMENT
+      // — there is no payment link coming, so a later message from the
+      // customer must not be met with "please pay using the link we sent you".
+      expect(sessionStore.update).not.toHaveBeenCalledWith(
+        'user-1',
+        expect.objectContaining({ state: 'OPERATOR_FOUND_WAITING_PAYMENT' }),
+      );
+    });
+
+    it('rounds a very small total at a nonzero percentage down to the 0%-deposit branch', async () => {
+      // quotedPrice = 4 kobo. serviceFeeAmount = Math.round(4 * 10 / 100) = 0,
+      // so total = 4. depositPercentSnapshot = 1 (NOT literally 0), but
+      // Math.round(4 * 1 / 100) = Math.round(0.04) = 0 — the branch must key
+      // off the computed depositAmount, not the raw stored percentage.
+      prisma.dispatchOffer.findMany.mockResolvedValue([
+        {
+          id: 'offer-1',
+          rescueRequestId: 'req-1',
+          operatorId: 'op-1',
+          status: 'QUOTED',
+          quotedPrice: 4,
+          depositPercentSnapshot: 1,
+          operator: {
+            id: 'op-1',
+            businessName: 'Swift Towing',
+            phoneNumber: '+2348011111111',
+            latitude: 6.5,
+            longitude: 3.4,
+          },
+        },
+      ]);
+
+      await service['handleQuoteSelected']('+2348000000000', 'user-1', 1);
+
+      const [{ data }] = prisma.rescueRequest.updateMany.mock.calls[0] as [
+        { data: Record<string, unknown> },
+      ];
+      expect(data.status).toBe('OPERATOR_ASSIGNED');
+      expect(data.depositAmount).toBe(0);
+      const [{ data: offerData }] = prisma.dispatchOffer.update.mock
+        .calls[0] as [{ data: Record<string, unknown> }];
+      expect(offerData.status).toBe('ACCEPTED');
+      expect(paymentLedger.create).not.toHaveBeenCalled();
+      expect(paymentEventsService.activateAssignedJob).toHaveBeenCalledWith(
+        'req-1',
+      );
     });
   });
 
