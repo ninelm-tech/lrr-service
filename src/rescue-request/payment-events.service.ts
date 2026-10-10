@@ -286,8 +286,23 @@ export class PaymentEventsService {
    * the caller's own claim on the Payment row won.
    */
   async confirmBalance(payment: Payment): Promise<void> {
+    return this.finalizeJobSettlement(payment.rescueRequestId);
+  }
+
+  /**
+   * Everything that happens once a job's balance is actually settled —
+   * status, chat relay, customer/operator notifications and rating
+   * prompts, payout. Called from confirmBalance (a real BALANCE Payment
+   * settled via the Paystack webhook) and from sendBalancePaymentLink
+   * below (a 100%-deposit job, where balanceAmount is legitimately 0 and
+   * no Payment row is ever created) — fetches its own data rather than
+   * trusting a caller-provided object, since the two callers have access
+   * to structurally different things (see BalancePaymentTarget's own
+   * comment for why that type deliberately excludes assignedOperator).
+   */
+  async finalizeJobSettlement(rescueRequestId: string): Promise<void> {
     const rescueRequest = await this.prisma.rescueRequest.findUniqueOrThrow({
-      where: { id: payment.rescueRequestId },
+      where: { id: rescueRequestId },
       include: { customer: true, assignedOperator: true },
     });
 
@@ -420,7 +435,7 @@ Reply with a number from 1 to 5 to rate your experience with the operator.${port
     if (!customerPhone) return;
 
     const balanceAmount = rescueRequest.balanceAmount;
-    if (!balanceAmount) {
+    if (balanceAmount == null) {
       console.error(
         'No balanceAmount persisted for rescue request:',
         rescueRequest.id,
@@ -429,6 +444,13 @@ Reply with a number from 1 to 5 to rate your experience with the operator.${port
         `sendBalancePaymentLink: missing balanceAmount for ${rescueRequest.id}`,
         'error',
       );
+      return;
+    }
+    if (balanceAmount === 0) {
+      // 100% deposit — there is no balance to collect. Run the same
+      // settlement finalization a real balance payment would trigger,
+      // instead of ever attempting a ₦0 Paystack charge.
+      await this.finalizeJobSettlement(rescueRequest.id);
       return;
     }
 

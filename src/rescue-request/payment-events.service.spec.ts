@@ -475,6 +475,122 @@ describe('PaymentEventsService', () => {
         expect.stringContaining('/login'),
       );
     });
+
+    it('is equivalent to finalizeJobSettlement for the ordinary non-zero-balance case', async () => {
+      await service.confirmBalance(paymentFor('req-1'));
+
+      // Every existing assertion in this describe block already proves
+      // confirmBalance's observable behavior (status update, payout trigger,
+      // customer/operator notifications, rating-prompt sessions, relay
+      // release) — this test exists as a named anchor for the extraction
+      // described in this task, not new behavior. If every other test in
+      // this block still passes after confirmBalance becomes a one-line
+      // wrapper around finalizeJobSettlement, this one needs no body beyond
+      // confirming the call doesn't throw.
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { status: 'COMPLETED' },
+      });
+    });
+  });
+
+  describe('sendBalancePaymentLink — balanceAmount === 0 (100% deposit)', () => {
+    const ZERO_BALANCE_TARGET = {
+      id: 'req-1',
+      customerId: 'cust-1',
+      balanceAmount: 0,
+      customer: { phoneNumber: '+2348012345678', email: null },
+    };
+
+    it('finalizes the job settlement instead of attempting a Paystack call', async () => {
+      const paystackService = { initializePayment: jest.fn() };
+      (
+        service as unknown as { paystackService: typeof paystackService }
+      ).paystackService = paystackService;
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        balanceAmount: 0,
+        depositAmount: 500000,
+        serviceFeeAmount: 25000,
+        assignedOperatorId: 'op-1',
+        customer: { phoneNumber: '+2348012345678' },
+        assignedOperator: {
+          id: 'op-1',
+          businessName: 'Swift Towing',
+          phoneNumber: '+2349012345678',
+        },
+      });
+
+      await service.sendBalancePaymentLink(ZERO_BALANCE_TARGET);
+
+      expect(paystackService.initializePayment).not.toHaveBeenCalled();
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { status: 'COMPLETED' },
+      });
+    });
+
+    it('still triggers the payout — same formula as a real settled balance', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        balanceAmount: 0,
+        depositAmount: 500000,
+        serviceFeeAmount: 25000,
+        assignedOperatorId: 'op-1',
+        customer: { phoneNumber: '+2348012345678' },
+        assignedOperator: {
+          id: 'op-1',
+          businessName: 'Swift Towing',
+          phoneNumber: '+2349012345678',
+        },
+      });
+
+      await service.sendBalancePaymentLink(ZERO_BALANCE_TARGET);
+
+      expect(payoutServiceMock.createAndProcessPayout).toHaveBeenCalledWith(
+        'req-1',
+        'op-1',
+        475000, // depositAmount(500000) + balanceAmount(0) - serviceFeeAmount(25000)
+      );
+    });
+
+    it('does not fire the "missing balanceAmount" Sentry error for a legitimate zero', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        balanceAmount: 0,
+        depositAmount: 500000,
+        serviceFeeAmount: 25000,
+        assignedOperatorId: 'op-1',
+        customer: { phoneNumber: '+2348012345678' },
+        assignedOperator: {
+          id: 'op-1',
+          businessName: 'Swift Towing',
+          phoneNumber: '+2349012345678',
+        },
+      });
+
+      await service.sendBalancePaymentLink(ZERO_BALANCE_TARGET);
+
+      expect(Sentry.captureMessage).not.toHaveBeenCalledWith(
+        expect.stringContaining('missing balanceAmount'),
+        expect.anything(),
+      );
+    });
+
+    it('still treats a genuinely missing (null) balanceAmount as the existing error case', async () => {
+      await service.sendBalancePaymentLink({
+        ...ZERO_BALANCE_TARGET,
+        balanceAmount: null,
+      });
+
+      expect(Sentry.captureMessage).toHaveBeenCalledWith(
+        expect.stringContaining('missing balanceAmount'),
+        'error',
+      );
+    });
   });
 
   describe('markJobCompleted', () => {
