@@ -1082,6 +1082,39 @@ describe('RescueRequestAdminService', () => {
       const activationOrder =
         paymentEventsService.activateAssignedJob.mock.invocationCallOrder[0];
       expect(customerMessageOrder).toBeLessThan(activationOrder);
+      // The operator's phone number must be included so the customer can
+      // actually reach them — the same information the paid-deposit path's
+      // equivalent customer message already carries (confirmDeposit).
+      const [, customerMessageBody] = twilioService.sendWhatsAppMessage.mock
+        .calls[customerMessageCallIndex] as [string, string];
+      expect(customerMessageBody).toContain(operator.phoneNumber);
+    });
+
+    it('still activates the job (offer flip, session transitions) even when the customer-message send rejects, in the 0%-deposit branch', async () => {
+      // A Twilio failure sending the customer's own "operator assigned"
+      // notification must never prevent activateAssignedJob from running —
+      // that's the actual operationally-important work. Only the customer
+      // not getting one WhatsApp message is at stake, and that must be
+      // logged, not allowed to swallow the rest.
+      prisma.operator.findUnique.mockResolvedValue({
+        ...operator,
+        depositPercentOverride: 0,
+      });
+      twilioService.sendWhatsAppMessage.mockImplementation((to: string) => {
+        if (to === 'whatsapp:+2348022222222') {
+          return Promise.reject(new Error('Twilio down'));
+        }
+        return Promise.resolve();
+      });
+
+      await assignService.assignOperator('req-1', {
+        operatorId: 'op-1',
+        priceKobo: 100_000,
+      });
+
+      expect(paymentEventsService.activateAssignedJob).toHaveBeenCalledWith(
+        'req-1',
+      );
     });
   });
 

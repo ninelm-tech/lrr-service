@@ -233,10 +233,21 @@ export class WhatsAppCustomerFlowService {
             await this.paymentEventsService.markJobCompleted(
               session.rescueRequestId,
             );
-            await this.sessionStore.update(userId, {
-              state: WhatsAppFlowState.IDLE,
-              rescueRequestId: undefined,
-            });
+            // A 100%-deposit job reaches finalizeJobSettlement
+            // synchronously inside markJobCompleted (no balance payment to
+            // wait for), which moves this session to WAITING_FOR_RATING —
+            // re-fetch before resetting so that doesn't get clobbered back
+            // to IDLE, which would silently drop the customer's rating
+            // reply. For every other job, settlement happens later via the
+            // Paystack webhook, so this re-fetch still sees the pre-reset
+            // state here and the IDLE reset below proceeds as before.
+            const refreshed = await this.sessionStore.getOrCreate(userId);
+            if (refreshed.state !== WhatsAppFlowState.WAITING_FOR_RATING) {
+              await this.sessionStore.update(userId, {
+                state: WhatsAppFlowState.IDLE,
+                rescueRequestId: undefined,
+              });
+            }
           } catch (err) {
             // Typically: this request was disputed. "still under review" if
             // unresolved, or "check the payment link we already sent" if
@@ -1097,11 +1108,28 @@ export class WhatsAppCustomerFlowService {
       //
       // Send the customer's own message first — same failure-isolation as
       // confirmDeposit (Task 4): a failure inside activateAssignedJob must
-      // not silently swallow this notification.
-      await this.twilioService.sendWhatsAppMessage(
-        phoneNumber,
-        `✅ *Operator confirmed!*\n\nBusiness: ${operator.businessName}\n\nNo deposit required — you'll pay the full ₦${(total / 100).toLocaleString()} once the job is complete.`,
-      );
+      // not silently swallow this notification. The reverse must also
+      // hold — caught and logged rather than rethrown, so a Twilio failure
+      // sending THIS message can't swallow activateAssignedJob below, which
+      // is what actually matters operationally (offer flip, both session
+      // transitions, the operator's job-is-live message).
+      try {
+        await this.twilioService.sendWhatsAppMessage(
+          phoneNumber,
+          `✅ *Operator confirmed!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nNo deposit required — you'll pay the full ₦${(total / 100).toLocaleString()} once the job is complete.`,
+        );
+      } catch (error) {
+        console.error(
+          `handleQuoteSelected ${rescueRequestId}: failed to send the customer's "operator confirmed" message:`,
+          error,
+        );
+        Sentry.captureException(error, {
+          extra: {
+            rescueRequestId,
+            stage: 'quote-selected-customer-message',
+          },
+        });
+      }
       await this.paymentEventsService.activateAssignedJob(rescueRequestId);
       return this.xmlOk();
     }

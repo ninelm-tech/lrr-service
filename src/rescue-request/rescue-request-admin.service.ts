@@ -276,12 +276,28 @@ export class RescueRequestAdminService {
       // (Task 4) and handleQuoteSelected's 0%-deposit branch (Task 5): a
       // failure inside activateAssignedJob (operator lookup, location
       // formatting, the operator's own Twilio send) must not silently
-      // swallow this notification.
+      // swallow this notification. The reverse must also hold — caught and
+      // logged rather than left to reject unhandled, so a Twilio failure
+      // sending THIS message can't swallow activateAssignedJob below, which
+      // is what actually matters operationally.
       const customerPhone = toWhatsAppAddress(request.customer.phoneNumber);
-      void this.twilioService.sendWhatsAppMessage(
-        customerPhone,
-        `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\n\nNo deposit required — you'll pay the full ₦${(total / 100).toLocaleString()} once the job is complete.`,
-      );
+      try {
+        await this.twilioService.sendWhatsAppMessage(
+          customerPhone,
+          `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nNo deposit required — you'll pay the full ₦${(total / 100).toLocaleString()} once the job is complete.`,
+        );
+      } catch (error) {
+        console.error(
+          `assignOperator ${id}: failed to send the customer's "operator assigned" message:`,
+          error,
+        );
+        Sentry.captureException(error, {
+          extra: {
+            rescueRequestId: id,
+            stage: 'assign-operator-customer-message',
+          },
+        });
+      }
 
       // The offer was already created as ACCEPTED above, so
       // activateAssignedJob's own offer-flip is a no-op here — it's still

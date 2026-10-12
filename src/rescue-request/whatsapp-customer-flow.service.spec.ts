@@ -886,6 +886,50 @@ describe('WhatsAppCustomerFlowService', () => {
       const activationOrder =
         paymentEventsService.activateAssignedJob.mock.invocationCallOrder[0];
       expect(customerMessageOrder).toBeLessThan(activationOrder);
+      // The operator's phone number must be included so the customer can
+      // actually reach them — the same information the paid-deposit path's
+      // equivalent customer message already carries (confirmDeposit).
+      const [, customerMessageBody] = twilioService.sendWhatsAppMessage.mock
+        .calls[customerMessageCallIndex] as [string, string];
+      expect(customerMessageBody).toContain('+2348011111111');
+    });
+
+    it('still activates the job (offer flip, session transitions) even when the customer-message send rejects, in the 0%-deposit branch', async () => {
+      // A Twilio failure sending the customer's own "operator confirmed"
+      // notification must never prevent activateAssignedJob from running —
+      // that's the offer flip and both session transitions, which is what
+      // actually matters operationally. Only the customer not getting one
+      // WhatsApp message is at stake here, and that must be logged, not
+      // allowed to swallow the rest.
+      prisma.dispatchOffer.findMany.mockResolvedValue([
+        {
+          id: 'offer-1',
+          rescueRequestId: 'req-1',
+          operatorId: 'op-1',
+          status: 'QUOTED',
+          quotedPrice: 100_000,
+          depositPercentSnapshot: 0,
+          operator: {
+            id: 'op-1',
+            businessName: 'Swift Towing',
+            phoneNumber: '+2348011111111',
+            latitude: 6.5,
+            longitude: 3.4,
+          },
+        },
+      ]);
+      twilioService.sendWhatsAppMessage.mockImplementation((to: string) => {
+        if (to === '+2348000000000') {
+          return Promise.reject(new Error('Twilio down'));
+        }
+        return Promise.resolve();
+      });
+
+      await service['handleQuoteSelected']('+2348000000000', 'user-1', 1);
+
+      expect(paymentEventsService.activateAssignedJob).toHaveBeenCalledWith(
+        'req-1',
+      );
     });
 
     it('rounds a very small total at a nonzero percentage down to the 0%-deposit branch', async () => {
@@ -1197,13 +1241,23 @@ describe('WhatsAppCustomerFlowService', () => {
   describe('CONFIRM on an already-terminal request', () => {
     let service: WhatsAppCustomerFlowService;
     let prisma: { rescueRequest: { findUnique: jest.Mock } };
-    let sessionStore: { update: jest.Mock };
+    let sessionStore: { update: jest.Mock; getOrCreate: jest.Mock };
     let paymentEventsService: { markJobCompleted: jest.Mock };
     let disputeService: { raiseDispute: jest.Mock };
 
     beforeEach(async () => {
       prisma = { rescueRequest: { findUnique: jest.fn() } };
-      sessionStore = { update: jest.fn() };
+      sessionStore = {
+        update: jest.fn(),
+        // Defaults to IDLE — the normal (non-100%-deposit) case, where
+        // settlement hasn't touched the session yet when CONFIRM re-fetches
+        // it. Individual tests override this to simulate the 100%-deposit
+        // case, where markJobCompleted's own side effect already moved the
+        // session to WAITING_FOR_RATING by the time this is read.
+        getOrCreate: jest
+          .fn()
+          .mockResolvedValue({ state: WhatsAppFlowState.IDLE }),
+      };
       paymentEventsService = { markJobCompleted: jest.fn() };
       disputeService = { raiseDispute: jest.fn() };
 
@@ -1298,11 +1352,14 @@ describe('WhatsAppCustomerFlowService', () => {
       expect(result).toContain('already ended');
     });
 
-    it('proceeds normally when the request is still active', async () => {
+    it('proceeds normally when the request is still active, and still resets to IDLE for an ordinary (non-100%-deposit) job', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
         status: 'ARRIVED',
         disputeResolvedAt: null,
       });
+      // Normal job: markJobCompleted resolves without touching the session
+      // itself — settlement (and any WAITING_FOR_RATING transition) happens
+      // later, asynchronously, once the customer actually pays the balance.
       paymentEventsService.markJobCompleted.mockResolvedValue(undefined);
       const session = {
         state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
@@ -1324,6 +1381,61 @@ describe('WhatsAppCustomerFlowService', () => {
       expect(paymentEventsService.markJobCompleted).toHaveBeenCalledWith(
         'req-1',
       );
+      // This must remain behavior-preserving for every non-100%-deposit
+      // job: the IDLE reset still happens exactly as before the fix.
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
+        state: WhatsAppFlowState.IDLE,
+        rescueRequestId: undefined,
+      });
+    });
+
+    it('does NOT clobber the WAITING_FOR_RATING transition a 100%-deposit settlement already made', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        status: 'ARRIVED',
+        disputeResolvedAt: null,
+      });
+      // 100%-deposit job: markJobCompleted's call chain reaches
+      // finalizeJobSettlement synchronously (there's no balance to pay),
+      // which moves the session straight to WAITING_FOR_RATING before this
+      // resolves — mirrored here by having the mock itself call
+      // sessionStore.update, same as the real settlement path does.
+      paymentEventsService.markJobCompleted.mockImplementation(async () => {
+        await sessionStore.update('cust-1', {
+          state: WhatsAppFlowState.WAITING_FOR_RATING,
+        });
+      });
+      sessionStore.getOrCreate.mockResolvedValue({
+        state: WhatsAppFlowState.WAITING_FOR_RATING,
+      });
+      const session: WhatsAppSession = {
+        userId: 'cust-1',
+        state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
+        rescueRequestId: 'req-1',
+        updatedAt: new Date(),
+      };
+
+      await service.handleCustomerMessage(
+        '+2348012345678',
+        'cust-1',
+        'confirm',
+        'confirm',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {},
+      );
+
+      expect(paymentEventsService.markJobCompleted).toHaveBeenCalledWith(
+        'req-1',
+      );
+      // The CONFIRM handler must never overwrite WAITING_FOR_RATING back to
+      // IDLE once settlement has already moved the session there — doing so
+      // would silently lose the customer's subsequent rating reply.
+      expect(sessionStore.update).not.toHaveBeenCalledWith('cust-1', {
+        state: WhatsAppFlowState.IDLE,
+        rescueRequestId: undefined,
+      });
     });
 
     it('DISPUTE self-heals a stale session pointed at a CANCELLED request instead of reopening the dispute', async () => {
