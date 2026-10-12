@@ -67,4 +67,11 @@ export class AdminCreateOperatorDto {
   @IsArray()
   @IsEnum(TruckClass, { each: true })
   truckClasses: TruckClass[];
+
+  // Decorators here are documentation only — see OperatorService.adminCreate,
+  // which validates this by hand the same way it already validates
+  // truckClasses (no global ValidationPipe is wired up in this app).
+  @IsNumber()
+  @IsOptional()
+  depositPercentOverride?: number | null;
 }

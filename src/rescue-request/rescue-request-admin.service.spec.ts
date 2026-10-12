@@ -663,6 +663,7 @@ describe('RescueRequestAdminService', () => {
       operator: { findUnique: jest.Mock; updateMany: jest.Mock };
       rescueRequest: {
         findUnique: jest.Mock;
+        findUniqueOrThrow: jest.Mock;
         update: jest.Mock;
         updateMany: jest.Mock;
       };
@@ -679,6 +680,7 @@ describe('RescueRequestAdminService', () => {
     let platformConfigService: { getConfig: jest.Mock };
     let dispatchService: { startDispatch: jest.Mock };
     let sharedService: { scheduleDepositWindow: jest.Mock };
+    let paymentEventsService: { activateAssignedJob: jest.Mock };
 
     const operator = {
       id: 'op-1',
@@ -705,6 +707,13 @@ describe('RescueRequestAdminService', () => {
         },
         rescueRequest: {
           findUnique: jest.fn().mockResolvedValue(request),
+          findUniqueOrThrow: jest.fn().mockResolvedValue({
+            ...request,
+            assignedOperatorId: 'op-1',
+            status: 'OPERATOR_ASSIGNED',
+            assignedOperator: operator,
+            payments: [],
+          }),
           update: jest
             .fn()
             .mockImplementation(
@@ -746,6 +755,7 @@ describe('RescueRequestAdminService', () => {
         startDispatch: jest.fn().mockResolvedValue(undefined),
       };
       sharedService = { scheduleDepositWindow: jest.fn() };
+      paymentEventsService = { activateAssignedJob: jest.fn() };
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
@@ -763,7 +773,7 @@ describe('RescueRequestAdminService', () => {
           { provide: PaystackService, useValue: paystackService },
           { provide: TwilioService, useValue: twilioService },
           { provide: PlatformConfigService, useValue: platformConfigService },
-          { provide: PaymentEventsService, useValue: {} },
+          { provide: PaymentEventsService, useValue: paymentEventsService },
           { provide: DispatchService, useValue: dispatchService },
           { provide: RescueRequestSharedService, useValue: sharedService },
           { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
@@ -986,6 +996,125 @@ describe('RescueRequestAdminService', () => {
 
       expect(transactionFinished).toBe(true);
       expect(paystackService.initializePayment).toHaveBeenCalledTimes(1);
+    });
+
+    it("charges the operator's current override percentage, not the platform default", async () => {
+      prisma.operator.findUnique.mockResolvedValue({
+        ...operator,
+        depositPercentOverride: 30,
+      });
+
+      // price 100_000 kobo, 10% fee -> total 110_000. Operator override is
+      // 30% -> 33_000 deposit. Config's own 20% default would give 22_000 —
+      // asserting the exact figure (not just expect.any(Number)) is what
+      // actually distinguishes "used the override" from "ignored it".
+      await assignService.assignOperator('req-1', {
+        operatorId: 'op-1',
+        priceKobo: 100_000,
+      });
+
+      const [{ data }] = prisma.rescueRequest.updateMany.mock.calls[0] as [
+        { data: Record<string, unknown> },
+      ];
+      expect(data.depositAmount).toBe(33_000);
+      expect(paystackService.initializePayment).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 33_000 }),
+      );
+    });
+
+    it('creates the offer as ACCEPTED (not SELECTED_PENDING_PAYMENT) and activates the job when the override resolves to 0%', async () => {
+      prisma.operator.findUnique.mockResolvedValue({
+        ...operator,
+        depositPercentOverride: 0,
+      });
+
+      await assignService.assignOperator('req-1', {
+        operatorId: 'op-1',
+        priceKobo: 500_000,
+      });
+
+      const [{ data }] = prisma.rescueRequest.updateMany.mock.calls[0] as [
+        { data: Record<string, unknown> },
+      ];
+      expect(data.status).toBe('OPERATOR_ASSIGNED');
+      expect(data.depositAmount).toBe(0);
+      // No deposit window to track when there's nothing to collect.
+      expect(data).not.toHaveProperty('depositWindowExpiresAt');
+      expect(data).not.toHaveProperty('depositRemindersSent');
+      const [{ data: offerData }] = prisma.dispatchOffer.create.mock
+        .calls[0] as [{ data: Record<string, unknown> }];
+      expect(offerData.status).toBe('ACCEPTED');
+      expect(paymentEventsService.activateAssignedJob).toHaveBeenCalledWith(
+        'req-1',
+      );
+      expect(paymentLedger.create).not.toHaveBeenCalled();
+      expect(paystackService.initializePayment).not.toHaveBeenCalled();
+    });
+
+    it('sends the customer their "operator assigned" message before activating the job, in the 0%-deposit branch', async () => {
+      prisma.operator.findUnique.mockResolvedValue({
+        ...operator,
+        depositPercentOverride: 0,
+      });
+
+      await assignService.assignOperator('req-1', {
+        operatorId: 'op-1',
+        priceKobo: 100_000,
+      });
+
+      // Failure isolation (same as Task 4's confirmDeposit fix and Task 5's
+      // 0%-deposit branch in handleQuoteSelected): the customer's own
+      // "operator assigned" notification must be sent BEFORE
+      // activateAssignedJob runs, so a failure inside activation (operator
+      // lookup, location formatting, the operator's own Twilio send) can't
+      // silently swallow it. Indexed by the customer's own WhatsApp address
+      // rather than assumed to be call [0], in case another message ever
+      // lands on this same mock first.
+      const customerMessageCallIndex =
+        twilioService.sendWhatsAppMessage.mock.calls.findIndex(
+          (call: unknown[]) => call[0] === 'whatsapp:+2348022222222',
+        );
+      expect(customerMessageCallIndex).toBeGreaterThanOrEqual(0);
+      const customerMessageOrder =
+        twilioService.sendWhatsAppMessage.mock.invocationCallOrder[
+          customerMessageCallIndex
+        ];
+      const activationOrder =
+        paymentEventsService.activateAssignedJob.mock.invocationCallOrder[0];
+      expect(customerMessageOrder).toBeLessThan(activationOrder);
+      // The operator's phone number must be included so the customer can
+      // actually reach them — the same information the paid-deposit path's
+      // equivalent customer message already carries (confirmDeposit).
+      const [, customerMessageBody] = twilioService.sendWhatsAppMessage.mock
+        .calls[customerMessageCallIndex] as [string, string];
+      expect(customerMessageBody).toContain(operator.phoneNumber);
+    });
+
+    it('still activates the job (offer flip, session transitions) even when the customer-message send rejects, in the 0%-deposit branch', async () => {
+      // A Twilio failure sending the customer's own "operator assigned"
+      // notification must never prevent activateAssignedJob from running —
+      // that's the actual operationally-important work. Only the customer
+      // not getting one WhatsApp message is at stake, and that must be
+      // logged, not allowed to swallow the rest.
+      prisma.operator.findUnique.mockResolvedValue({
+        ...operator,
+        depositPercentOverride: 0,
+      });
+      twilioService.sendWhatsAppMessage.mockImplementation((to: string) => {
+        if (to === 'whatsapp:+2348022222222') {
+          return Promise.reject(new Error('Twilio down'));
+        }
+        return Promise.resolve();
+      });
+
+      await assignService.assignOperator('req-1', {
+        operatorId: 'op-1',
+        priceKobo: 100_000,
+      });
+
+      expect(paymentEventsService.activateAssignedJob).toHaveBeenCalledWith(
+        'req-1',
+      );
     });
   });
 

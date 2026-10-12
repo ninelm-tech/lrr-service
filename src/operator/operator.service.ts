@@ -8,6 +8,7 @@ import {
 import { logger } from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
 import {
+  Operator,
   OperatorStatus,
   OperatorType,
   UserRole,
@@ -29,6 +30,7 @@ import {
   OPERATOR_ADMIN_ROLES,
   OPERATOR_ONBOARDING_ROLES,
 } from './domain/operator-staff-roles';
+import { AuditLogService } from '../audit-log/audit-log.service';
 
 // ── Scoring weights ────────────────────────────────────────────────────────────
 // Distance is the dominant factor but reliability and speed matter.
@@ -79,6 +81,7 @@ export class OperatorService {
     private readonly paystackService: PaystackService,
     private readonly otpService: OtpService,
     private readonly operatorMembershipService: OperatorMembershipService,
+    private readonly auditLogService: AuditLogService,
   ) {}
 
   // ══════════════════════════════════════════════════════
@@ -333,6 +336,24 @@ export class OperatorService {
       );
     }
 
+    // Same manual check as setDepositPercent — no global ValidationPipe, so
+    // DTO decorators alone don't run. Unlike setDepositPercent's dedicated
+    // endpoint, `undefined` is fine here: this is one optional field among
+    // many on a creation DTO, so omitting it just means "no override set at
+    // creation," not an error.
+    if (
+      data.depositPercentOverride !== undefined &&
+      data.depositPercentOverride !== null &&
+      (typeof data.depositPercentOverride !== 'number' ||
+        !Number.isFinite(data.depositPercentOverride) ||
+        data.depositPercentOverride < 0 ||
+        data.depositPercentOverride > 100)
+    ) {
+      throw new BadRequestException(
+        'depositPercentOverride must be between 0 and 100',
+      );
+    }
+
     const personalPhone = normalizePhone(data.phoneNumber);
     const businessPhone = normalizePhone(data.businessPhoneNumber);
 
@@ -408,6 +429,7 @@ export class OperatorService {
           longitude: data.longitude,
           serviceRadius: data.serviceRadius ?? 10,
           status: OperatorStatus.ACTIVE,
+          depositPercentOverride: data.depositPercentOverride ?? null,
         },
       });
 
@@ -872,6 +894,91 @@ export class OperatorService {
         },
       });
     });
+  }
+
+  /**
+   * `undefined` means the field was missing from the request body — that's
+   * rejected outright, not treated as "no change": without this check a
+   * `{}` body would reach Prisma as `data: { depositPercentOverride:
+   * undefined }`, which Prisma silently treats as "don't touch this
+   * field," returning 200 having changed nothing and logging a
+   * meaningless audit entry. `null` is the one legitimate way to clear the
+   * override back to the platform default — distinct from, and allowed
+   * where `undefined` is not.
+   *
+   * DTO decorators on SetDepositPercentDto are documentation only — this
+   * app has no global ValidationPipe, so they never run; the real
+   * enforcement is here, the same way saveBankDetails checks
+   * accountNumber's format by hand instead of trusting its DTO.
+   */
+  async setDepositPercent(
+    id: string,
+    depositPercentOverride: number | null | undefined,
+    actingUser: { userId: string; role: string },
+  ): Promise<Operator> {
+    if (depositPercentOverride === undefined) {
+      throw new BadRequestException(
+        'depositPercentOverride is required in the request body (pass null to clear it)',
+      );
+    }
+    // typeof/isFinite first: with no global ValidationPipe, `depositPercentOverride`
+    // is whatever the JSON body actually contained — a string, an object, NaN
+    // via Infinity arithmetic, anything — not just a number out of range. A
+    // bare `< 0 || > 100` comparison against a non-number coerces to false on
+    // both sides and would let it through to Prisma unvalidated.
+    if (
+      depositPercentOverride !== null &&
+      (typeof depositPercentOverride !== 'number' ||
+        !Number.isFinite(depositPercentOverride) ||
+        depositPercentOverride < 0 ||
+        depositPercentOverride > 100)
+    ) {
+      throw new BadRequestException(
+        'depositPercentOverride must be between 0 and 100',
+      );
+    }
+
+    const { operator, before } = await this.prisma.$transaction(async (tx) => {
+      await this.operatorMembershipService.lockActiveMembership(
+        tx,
+        actingUser,
+        id,
+      );
+      const before = await tx.operator.findUnique({
+        where: { id },
+        select: { depositPercentOverride: true },
+      });
+      if (!before) throw new NotFoundException('Operator not found');
+
+      const operator = await tx.operator.update({
+        where: { id },
+        data: { depositPercentOverride },
+      });
+      return { operator, before };
+    });
+
+    // AuditLogService has no transaction-aware overload, so this write
+    // happens just after the transaction commits, not atomically with it —
+    // an acceptable gap for a best-effort audit trail (same tradeoff this
+    // app already accepts elsewhere; see the AuditLogService module itself
+    // for precedent).
+    await this.auditLogService.record({
+      category: 'deposit_percent_changed',
+      message: `Deposit percent changed for operator ${id}`,
+      details: {
+        targetType: 'Operator',
+        targetId: id,
+        operatorId: id,
+        before:
+          before.depositPercentOverride != null
+            ? Number(before.depositPercentOverride)
+            : null,
+        after: depositPercentOverride,
+      },
+      actorId: actingUser.userId,
+    });
+
+    return operator;
   }
 
   /** Removes the stored payout account. Does not touch the Paystack recipient itself, only our reference to it. */

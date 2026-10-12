@@ -16,6 +16,7 @@ import { OperatorController } from '../../src/operator/operator.controller';
 import { OperatorMembershipService } from '../../src/operator/operator-membership.service';
 import { OperatorService } from '../../src/operator/operator.service';
 import { OtpService } from '../../src/otp/otp.service';
+import { PlatformConfigService } from '../../src/platform-config/platform-config.service';
 import { PrismaService } from '../../src/prisma/prisma.service';
 import { StaffController } from '../../src/staff/staff.controller';
 import { StaffService } from '../../src/staff/staff.service';
@@ -54,6 +55,7 @@ describe('Role permissions over HTTP (integration)', () => {
         { provide: PrismaService, useValue: prisma },
         OperatorService,
         OperatorMembershipService,
+        PlatformConfigService,
         StaffService,
         CustomersService,
         AccountDeletionService,

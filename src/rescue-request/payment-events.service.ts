@@ -153,8 +153,70 @@ export class PaymentEventsService {
       data: { status: RescueRequestStatus.OPERATOR_ASSIGNED },
     });
 
-    // The offer is only actually awarded now that payment is confirmed —
-    // selection alone (Task 8) only reached SELECTED_PENDING_PAYMENT.
+    // Send the customer's own confirmation first - independent of whatever
+    // happens next in activateAssignedJob, same failure-isolation the
+    // pre-extraction code had (a failure activating the operator side must
+    // not silently swallow the customer's own confirmation). The reverse
+    // must also hold: caught and logged rather than rethrown, so a Twilio
+    // failure sending THIS message can't swallow activateAssignedJob below
+    // — the offer flip and both session transitions are what actually
+    // matters operationally, and must run regardless of whether this one
+    // customer message got through.
+    if (customerPhone) {
+      try {
+        await this.twilioService.sendWhatsAppMessage(
+          customerPhone,
+          operator
+            ? `✅ *Payment confirmed — operator is on the way!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType) : 'Unknown'}\n\nYou'll be notified when they arrive.`
+            : `✅ Deposit confirmed! Finding the nearest tow operator...`,
+        );
+      } catch (error) {
+        console.error(
+          `confirmDeposit ${rescueRequest.id}: failed to send the customer's confirmation message:`,
+          error,
+        );
+        Sentry.captureException(error, {
+          extra: {
+            rescueRequestId: rescueRequest.id,
+            stage: 'confirm-deposit-customer-message',
+          },
+        });
+      }
+    }
+
+    await this.activateAssignedJob(rescueRequest.id);
+  }
+
+  /**
+   * Everything that happens once a job is confirmed and the operator is
+   * actively working it: flips a pending offer to ACCEPTED, moves both
+   * parties into their on-job session states, and sends the operator
+   * their job-is-live details (customer phone, vehicle, location — the
+   * same ARRIVED-button message a paid deposit triggers). Called from
+   * confirmDeposit for the normal paid-deposit path, and directly from the
+   * 0%-deposit branches in handleQuoteSelected and assignOperator, which
+   * skip payment entirely but still need the same activation — this
+   * stands in for "payment confirmed" when there was never a payment to
+   * confirm. Fetches its own data rather than trusting a caller-provided
+   * object, since the three callers have differently-shaped data at their
+   * own call sites (same rationale as finalizeJobSettlement, Task 7).
+   *
+   * Deliberately does NOT send anything to the customer or touch
+   * RescueRequest.status — those differ by caller (confirmDeposit's
+   * customer message references the payment; the 0%-deposit callers have
+   * no payment to reference, and have already set status inside their own
+   * transaction) and stay with each caller.
+   */
+  async activateAssignedJob(rescueRequestId: string): Promise<void> {
+    const rescueRequest = await this.prisma.rescueRequest.findUniqueOrThrow({
+      where: { id: rescueRequestId },
+      include: { customer: true, assignedOperator: true },
+    });
+    const operator = rescueRequest.assignedOperator;
+    if (!operator) return;
+
+    // The offer is only actually awarded once the job is confirmed —
+    // selection alone leaves it at SELECTED_PENDING_PAYMENT.
     if (rescueRequest.assignedOperatorId) {
       await this.prisma.dispatchOffer.updateMany({
         where: {
@@ -166,23 +228,20 @@ export class PaymentEventsService {
       });
     }
 
-    // Customer: confirmed with operator details
-    await this.sessionStore.update(customerId, {
+    await this.sessionStore.update(rescueRequest.customerId, {
       state: WhatsAppFlowState.REQUEST_CONFIRMED,
     });
-    if (customerPhone) {
-      await this.twilioService.sendWhatsAppMessage(
-        customerPhone,
-        operator
-          ? `✅ *Payment confirmed — operator is on the way!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nVehicle: ${rescueRequest.vehicleType ? formatVehicleType(rescueRequest.vehicleType) : 'Unknown'}\n\nYou'll be notified when they arrive.`
-          : `✅ Deposit confirmed! Finding the nearest tow operator...`,
-      );
-    }
 
     // Operator: job is now live — send customer location + details
     const opUser = await this.sharedService.findOrCreateCustomer(
       operator.phoneNumber!,
     );
+    // An operator who has never sent an inbound WhatsApp message (e.g. one
+    // just adminCreate'd and immediately assigned a job) has no session row
+    // yet, and update() is a plain Prisma update that throws (P2025) when
+    // there's nothing to update. getOrCreate is an idempotent upsert, so
+    // this is always safe and a no-op for an operator who already has one.
+    await this.sessionStore.getOrCreate(opUser.id);
     await this.sessionStore.update(opUser.id, {
       state: WhatsAppFlowState.OPERATOR_ON_JOB,
       rescueRequestId: rescueRequest.id,
@@ -193,6 +252,7 @@ export class PaymentEventsService {
       lat,
       lon,
     );
+    const customerPhone = rescueRequest.customer?.phoneNumber ?? 'N/A';
     const operatorPhone = toWhatsAppAddress(operator.phoneNumber!);
     const vehicleLine = rescueRequest.vehicleType
       ? formatVehicleType(rescueRequest.vehicleType)
@@ -210,7 +270,7 @@ export class PaymentEventsService {
         arrivedTemplateSid,
         {
           '1': formatJobRef(rescueRequest.id),
-          '2': customerPhone ?? 'N/A',
+          '2': customerPhone,
           '3': vehicleLine,
           '4': locationSection,
         },
@@ -218,7 +278,7 @@ export class PaymentEventsService {
     } else {
       await this.twilioService.sendWhatsAppMessage(
         operatorPhone,
-        `💰 *Payment confirmed — job is live!* — ${formatJobRef(rescueRequest.id)}\n\nCustomer: ${customerPhone}\nVehicle: ${vehicleLine}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
+        `🚗 *Job is live!* — ${formatJobRef(rescueRequest.id)}\n\nCustomer: ${customerPhone}\nVehicle: ${vehicleLine}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
       );
     }
   }
@@ -250,8 +310,23 @@ export class PaymentEventsService {
    * the caller's own claim on the Payment row won.
    */
   async confirmBalance(payment: Payment): Promise<void> {
+    return this.finalizeJobSettlement(payment.rescueRequestId);
+  }
+
+  /**
+   * Everything that happens once a job's balance is actually settled —
+   * status, chat relay, customer/operator notifications and rating
+   * prompts, payout. Called from confirmBalance (a real BALANCE Payment
+   * settled via the Paystack webhook) and from sendBalancePaymentLink
+   * below (a 100%-deposit job, where balanceAmount is legitimately 0 and
+   * no Payment row is ever created) — fetches its own data rather than
+   * trusting a caller-provided object, since the two callers have access
+   * to structurally different things (see BalancePaymentTarget's own
+   * comment for why that type deliberately excludes assignedOperator).
+   */
+  async finalizeJobSettlement(rescueRequestId: string): Promise<void> {
     const rescueRequest = await this.prisma.rescueRequest.findUniqueOrThrow({
-      where: { id: payment.rescueRequestId },
+      where: { id: rescueRequestId },
       include: { customer: true, assignedOperator: true },
     });
 
@@ -273,15 +348,16 @@ export class PaymentEventsService {
     // Notify customer — payment confirmed, then prompt to rate the operator
     const customerId = rescueRequest.customerId;
     const customerPhone = rescueRequest.customer.phoneNumber;
-    const balanceNaira = (
-      (rescueRequest.balanceAmount ?? 0) / 100
-    ).toLocaleString();
+    const balanceAmount = rescueRequest.balanceAmount ?? 0;
+    const balanceNaira = (balanceAmount / 100).toLocaleString();
     const operator = rescueRequest.assignedOperator;
     const jobRef = formatJobRef(rescueRequest.id);
     if (customerPhone) {
       await this.twilioService.sendWhatsAppMessage(
         customerPhone,
-        `✅ Payment of ₦${balanceNaira} confirmed! Thank you for using Local Roadside Rescue 🙏`,
+        balanceAmount === 0
+          ? `✅ Job complete! Your deposit covered the full amount — thank you for using Local Roadside Rescue 🙏`
+          : `✅ Payment of ₦${balanceNaira} confirmed! Thank you for using Local Roadside Rescue 🙏`,
       );
       const operatorName = operator?.businessName ?? 'your operator';
       const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
@@ -311,7 +387,9 @@ Reply with a number from 1 to 5 to rate your experience with the operator.${port
     if (operator?.phoneNumber) {
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(operator.phoneNumber),
-        `💵 *Payment received!* — ${jobRef}\n\nThe customer has paid the ₦${balanceNaira} balance in full.\n\n✅ You may now *release the vehicle*. Job complete — well done!\n\nYour payment will be remitted within 24 hours.`,
+        balanceAmount === 0
+          ? `💵 *Job complete!* — ${jobRef}\n\nThe deposit covered the full job amount.\n\n✅ You may now *release the vehicle*. Job complete — well done!\n\nYour payment will be remitted within 24 hours.`
+          : `💵 *Payment received!* — ${jobRef}\n\nThe customer has paid the ₦${balanceNaira} balance in full.\n\n✅ You may now *release the vehicle*. Job complete — well done!\n\nYour payment will be remitted within 24 hours.`,
       );
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(operator.phoneNumber),
@@ -331,11 +409,18 @@ Reply with a number from 1 to 5 to rate your experience with the operator.${port
         (rescueRequest.depositAmount ?? 0) +
         (rescueRequest.balanceAmount ?? 0) -
         (rescueRequest.serviceFeeAmount ?? 0);
-      await this.payoutService.createAndProcessPayout(
-        rescueRequest.id,
-        rescueRequest.assignedOperatorId,
-        payoutAmount,
-      );
+      // Same guard as the admin cancellation-settlement path
+      // (resolveCancellationSettlement): a low deposit percentage combined
+      // with a dispute adjustment can drive this to zero or negative, and
+      // Paystack would reject a non-positive transfer anyway — skip the
+      // call rather than leave a junk payout row.
+      if (payoutAmount > 0) {
+        await this.payoutService.createAndProcessPayout(
+          rescueRequest.id,
+          rescueRequest.assignedOperatorId,
+          payoutAmount,
+        );
+      }
     }
 
     console.log(
@@ -384,7 +469,7 @@ Reply with a number from 1 to 5 to rate your experience with the operator.${port
     if (!customerPhone) return;
 
     const balanceAmount = rescueRequest.balanceAmount;
-    if (!balanceAmount) {
+    if (balanceAmount == null) {
       console.error(
         'No balanceAmount persisted for rescue request:',
         rescueRequest.id,
@@ -393,6 +478,13 @@ Reply with a number from 1 to 5 to rate your experience with the operator.${port
         `sendBalancePaymentLink: missing balanceAmount for ${rescueRequest.id}`,
         'error',
       );
+      return;
+    }
+    if (balanceAmount === 0) {
+      // 100% deposit — there is no balance to collect. Run the same
+      // settlement finalization a real balance payment would trigger,
+      // instead of ever attempting a ₦0 Paystack charge.
+      await this.finalizeJobSettlement(rescueRequest.id);
       return;
     }
 

@@ -21,6 +21,7 @@ const paymentFor = (rescueRequestId: string, id = 'pay-1'): Payment =>
 
 jest.mock('@sentry/node', () => ({
   captureMessage: jest.fn(),
+  captureException: jest.fn(),
   logger: { info: jest.fn() },
 }));
 
@@ -38,7 +39,7 @@ describe('PaymentEventsService', () => {
     payment: { update: jest.Mock };
   };
   let payoutServiceMock: { createAndProcessPayout: jest.Mock };
-  let sessionStore: { update: jest.Mock };
+  let sessionStore: { update: jest.Mock; getOrCreate: jest.Mock };
   let twilioService: {
     sendWhatsAppMessage: jest.Mock;
     sendWhatsAppTemplateMessage: jest.Mock;
@@ -78,7 +79,10 @@ describe('PaymentEventsService', () => {
       payment: { update: jest.fn() },
     };
     payoutServiceMock = { createAndProcessPayout: jest.fn() };
-    sessionStore = { update: jest.fn() };
+    sessionStore = {
+      update: jest.fn(),
+      getOrCreate: jest.fn().mockResolvedValue({ state: 'IDLE' }),
+    };
     twilioService = {
       sendWhatsAppMessage: jest.fn(),
       sendWhatsAppTemplateMessage: jest.fn(),
@@ -200,6 +204,62 @@ describe('PaymentEventsService', () => {
       );
     });
 
+    it('still activates the job (offer flip, both session transitions) even when sending the customer confirmation rejects', async () => {
+      // The reverse of the failure-isolation this method already has: a
+      // Twilio failure sending the customer's OWN message must not swallow
+      // activateAssignedJob below it — that's the real operational work
+      // (offer flip, both session transitions, operator's job-is-live
+      // message), and it must run regardless of whether this one customer
+      // message got through. The failure itself must be caught and logged,
+      // not rethrown.
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        status: 'WAITING_FOR_DEPOSIT',
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+      });
+      twilioService.sendWhatsAppMessage.mockImplementation((to: string) => {
+        if (to === '+2341') return Promise.reject(new Error('Twilio down'));
+        return Promise.resolve();
+      });
+
+      await expect(
+        service.confirmDeposit(paymentFor('req-1')),
+      ).resolves.toBeUndefined();
+
+      // activateAssignedJob's own work must have run — e.g. the operator's
+      // session move to OPERATOR_ON_JOB, which only happens inside it.
+      expect(sessionStore.update).toHaveBeenCalledWith('op-user-1', {
+        state: 'OPERATOR_ON_JOB',
+        rescueRequestId: 'req-1',
+      });
+    });
+
+    it('moves the customer session to REQUEST_CONFIRMED as part of the normal paid-deposit activation', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        status: 'WAITING_FOR_DEPOSIT',
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+      });
+
+      await service.confirmDeposit(paymentFor('req-1'));
+
+      // This is a new assertion, not a pre-existing one — confirmDeposit's
+      // existing tests in this block never checked the session transition
+      // directly, only the messages it sends. It exists as a named anchor
+      // for the activateAssignedJob extraction below: if this still passes
+      // once confirmDeposit delegates to it, the extraction preserved the
+      // real behavior.
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
+        state: 'REQUEST_CONFIRMED',
+      });
+    });
+
     it('cancels a paid deposit with no preassigned operator instead of dispatching after payment', async () => {
       prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
         id: 'req-1',
@@ -281,6 +341,116 @@ describe('PaymentEventsService', () => {
     });
   });
 
+  describe('activateAssignedJob', () => {
+    it('flips a SELECTED_PENDING_PAYMENT offer to ACCEPTED', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+      });
+
+      await service.activateAssignedJob('req-1');
+
+      expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith({
+        where: {
+          rescueRequestId: 'req-1',
+          operatorId: 'op-1',
+          status: 'SELECTED_PENDING_PAYMENT',
+        },
+        data: { status: 'ACCEPTED' },
+      });
+    });
+
+    it('moves the customer session to REQUEST_CONFIRMED and the operator session to OPERATOR_ON_JOB', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+      });
+
+      await service.activateAssignedJob('req-1');
+
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
+        state: 'REQUEST_CONFIRMED',
+      });
+      expect(sessionStore.update).toHaveBeenCalledWith('op-user-1', {
+        state: 'OPERATOR_ON_JOB',
+        rescueRequestId: 'req-1',
+      });
+    });
+
+    it("ensures the operator's session row exists before updating it — a freshly adminCreate'd operator with no inbound WhatsApp history has no row yet, and update() alone throws P2025 for that case", async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+      });
+
+      await service.activateAssignedJob('req-1');
+
+      expect(sessionStore.getOrCreate).toHaveBeenCalledWith('op-user-1');
+      // getOrCreate (an idempotent upsert) must run BEFORE the plain
+      // update() call for that same user — that ordering is the fix: it
+      // guarantees a row exists by the time update() runs, instead of
+      // update() throwing P2025 against an operator who has never sent an
+      // inbound WhatsApp message.
+      const getOrCreateOrder =
+        sessionStore.getOrCreate.mock.invocationCallOrder[0];
+      const operatorUpdateCallIndex = sessionStore.update.mock.calls.findIndex(
+        (call: unknown[]) => call[0] === 'op-user-1',
+      );
+      const operatorUpdateOrder =
+        sessionStore.update.mock.invocationCallOrder[operatorUpdateCallIndex];
+      expect(getOrCreateOrder).toBeLessThan(operatorUpdateOrder);
+    });
+
+    it('sends the operator their job-is-live details, honoring the ARRIVED template SID the same way confirmDeposit does', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+      });
+
+      await service.activateAssignedJob('req-1');
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('2342'),
+        expect.stringContaining('send *ARRIVED*'),
+      );
+    });
+
+    it('does nothing when the request has no assigned operator', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: null,
+        assignedOperator: null,
+        customer: { phoneNumber: '+2341' },
+      });
+
+      await service.activateAssignedJob('req-1');
+
+      expect(sessionStore.update).not.toHaveBeenCalled();
+      expect(prisma.dispatchOffer.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
   describe('confirmBalance — payout trigger', () => {
     // As with confirmDeposit: redelivery/race idempotency is the caller's
     // claim on the Payment row, not this method's job any more.
@@ -322,6 +492,32 @@ describe('PaymentEventsService', () => {
         'op-1',
         225000,
       );
+    });
+
+    it('skips the payout call when the computed payoutAmount is zero — same guard as the admin cancellation-settlement path', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        ...BALANCE_REQUEST_FIXTURE,
+        depositAmount: 25000,
+        balanceAmount: 0,
+        serviceFeeAmount: 25000, // payoutAmount = 25000 + 0 - 25000 = 0
+      });
+
+      await service.confirmBalance(paymentFor('req-1'));
+
+      expect(payoutServiceMock.createAndProcessPayout).not.toHaveBeenCalled();
+    });
+
+    it('skips the payout call when the computed payoutAmount is negative — a low deposit percentage plus a dispute adjustment can drive this below zero', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        ...BALANCE_REQUEST_FIXTURE,
+        depositAmount: 10000,
+        balanceAmount: 0,
+        serviceFeeAmount: 25000, // payoutAmount = 10000 + 0 - 25000 = -15000
+      });
+
+      await service.confirmBalance(paymentFor('req-1'));
+
+      expect(payoutServiceMock.createAndProcessPayout).not.toHaveBeenCalled();
     });
 
     it('invites a phone-only customer to create a portal account', async () => {
@@ -369,6 +565,184 @@ describe('PaymentEventsService', () => {
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
         '+2348012345678',
         expect.stringContaining('/login'),
+      );
+    });
+
+    it('is equivalent to finalizeJobSettlement for the ordinary non-zero-balance case', async () => {
+      await service.confirmBalance(paymentFor('req-1'));
+
+      // Every existing assertion in this describe block already proves
+      // confirmBalance's observable behavior (status update, payout trigger,
+      // customer/operator notifications, rating-prompt sessions, relay
+      // release) — this test exists as a named anchor for the extraction
+      // described in this task, not new behavior. If every other test in
+      // this block still passes after confirmBalance becomes a one-line
+      // wrapper around finalizeJobSettlement, this one needs no body beyond
+      // confirming the call doesn't throw.
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { status: 'COMPLETED' },
+      });
+    });
+  });
+
+  describe('sendBalancePaymentLink — balanceAmount === 0 (100% deposit)', () => {
+    const ZERO_BALANCE_TARGET = {
+      id: 'req-1',
+      customerId: 'cust-1',
+      balanceAmount: 0,
+      customer: { phoneNumber: '+2348012345678', email: null },
+    };
+
+    it('finalizes the job settlement instead of attempting a Paystack call', async () => {
+      const paystackService = { initializePayment: jest.fn() };
+      (
+        service as unknown as { paystackService: typeof paystackService }
+      ).paystackService = paystackService;
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        balanceAmount: 0,
+        depositAmount: 500000,
+        serviceFeeAmount: 25000,
+        assignedOperatorId: 'op-1',
+        customer: { phoneNumber: '+2348012345678' },
+        assignedOperator: {
+          id: 'op-1',
+          businessName: 'Swift Towing',
+          phoneNumber: '+2349012345678',
+        },
+      });
+
+      await service.sendBalancePaymentLink(ZERO_BALANCE_TARGET);
+
+      expect(paystackService.initializePayment).not.toHaveBeenCalled();
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { status: 'COMPLETED' },
+      });
+    });
+
+    it('still triggers the payout — same formula as a real settled balance', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        balanceAmount: 0,
+        depositAmount: 500000,
+        serviceFeeAmount: 25000,
+        assignedOperatorId: 'op-1',
+        customer: { phoneNumber: '+2348012345678' },
+        assignedOperator: {
+          id: 'op-1',
+          businessName: 'Swift Towing',
+          phoneNumber: '+2349012345678',
+        },
+      });
+
+      await service.sendBalancePaymentLink(ZERO_BALANCE_TARGET);
+
+      expect(payoutServiceMock.createAndProcessPayout).toHaveBeenCalledWith(
+        'req-1',
+        'op-1',
+        475000, // depositAmount(500000) + balanceAmount(0) - serviceFeeAmount(25000)
+      );
+    });
+
+    it('tells the customer the deposit covered everything, instead of a confusing "₦0" message', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        balanceAmount: 0,
+        depositAmount: 500000,
+        serviceFeeAmount: 25000,
+        assignedOperatorId: 'op-1',
+        customer: { phoneNumber: '+2348012345678' },
+        assignedOperator: {
+          id: 'op-1',
+          businessName: 'Swift Towing',
+          phoneNumber: '+2349012345678',
+        },
+      });
+
+      await service.sendBalancePaymentLink(ZERO_BALANCE_TARGET);
+
+      const customerMessages = twilioService.sendWhatsAppMessage.mock.calls
+        .filter((call: unknown[]) => call[0] === '+2348012345678')
+        .map((call: unknown[]) => call[1] as string);
+      expect(customerMessages.some((body) => body.includes('₦0'))).toBe(false);
+      expect(
+        customerMessages.some((body) =>
+          body.includes(
+            '✅ Job complete! Your deposit covered the full amount — thank you for using Local Roadside Rescue 🙏',
+          ),
+        ),
+      ).toBe(true);
+    });
+
+    it('tells the operator the deposit covered the full job amount, instead of a confusing "₦0 balance" message', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        balanceAmount: 0,
+        depositAmount: 500000,
+        serviceFeeAmount: 25000,
+        assignedOperatorId: 'op-1',
+        customer: { phoneNumber: '+2348012345678' },
+        assignedOperator: {
+          id: 'op-1',
+          businessName: 'Swift Towing',
+          phoneNumber: '+2349012345678',
+        },
+      });
+
+      await service.sendBalancePaymentLink(ZERO_BALANCE_TARGET);
+
+      const operatorMessages = twilioService.sendWhatsAppMessage.mock.calls
+        .filter((call: unknown[]) => call[0] === 'whatsapp:+2349012345678')
+        .map((call: unknown[]) => call[1] as string);
+      expect(operatorMessages.some((body) => body.includes('₦0'))).toBe(false);
+      expect(
+        operatorMessages.some((body) =>
+          body.includes(
+            '💵 *Job complete!* — Job #REQ-1\n\nThe deposit covered the full job amount.',
+          ),
+        ),
+      ).toBe(true);
+    });
+
+    it('does not fire the "missing balanceAmount" Sentry error for a legitimate zero', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        balanceAmount: 0,
+        depositAmount: 500000,
+        serviceFeeAmount: 25000,
+        assignedOperatorId: 'op-1',
+        customer: { phoneNumber: '+2348012345678' },
+        assignedOperator: {
+          id: 'op-1',
+          businessName: 'Swift Towing',
+          phoneNumber: '+2349012345678',
+        },
+      });
+
+      await service.sendBalancePaymentLink(ZERO_BALANCE_TARGET);
+
+      expect(Sentry.captureMessage).not.toHaveBeenCalledWith(
+        expect.stringContaining('missing balanceAmount'),
+        expect.anything(),
+      );
+    });
+
+    it('still treats a genuinely missing (null) balanceAmount as the existing error case', async () => {
+      await service.sendBalancePaymentLink({
+        ...ZERO_BALANCE_TARGET,
+        balanceAmount: null,
+      });
+
+      expect(Sentry.captureMessage).toHaveBeenCalledWith(
+        expect.stringContaining('missing balanceAmount'),
+        'error',
       );
     });
   });

@@ -13,10 +13,12 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { OperatorService } from './operator.service';
+import { PlatformConfigService } from '../platform-config/platform-config.service';
 import { CreateOperatorDto } from './dto/create-operator.dto';
 import { AdminCreateOperatorDto } from './dto/admin-create-operator.dto';
 import { UpdateOperatorProfileDto } from './dto/update-operator-profile.dto';
 import { SaveBankDetailsDto } from './dto/save-bank-details.dto';
+import { SetDepositPercentDto } from './dto/set-deposit-percent.dto';
 import { OperatorMemberRole, OperatorStatus, UserRole } from '@prisma/client';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
@@ -32,6 +34,7 @@ export class OperatorController {
   constructor(
     private readonly operatorService: OperatorService,
     private readonly auditLogService: AuditLogService,
+    private readonly platformConfigService: PlatformConfigService,
   ) {}
 
   /**
@@ -97,6 +100,19 @@ export class OperatorController {
   /**
    * Get the operator record for the currently authenticated user.
    * Used by the operator dashboard to load their own operator profile.
+   *
+   * Also includes the platform-wide default deposit percent so the
+   * operator-facing frontend can show "using the platform default (X%)"
+   * when depositPercentOverride is unset — the same number staff see via
+   * GET /admin/settings, which is SUPER_ADMIN-only and unreachable by the
+   * operator themselves. Fetched directly here rather than through
+   * OperatorService: every other PlatformConfigService consumer in this
+   * codebase is a service using the value in actual business logic, but
+   * this is pure response-shaping for display, and this endpoint's own
+   * handler already composes multiple sources (see rescue-request and
+   * webhooks controllers for the same controller-level composition
+   * pattern), so adding it here keeps OperatorService's dependency list
+   * free of a field it never otherwise needs.
    */
   @UseGuards(AuthGuard)
   @Get('me')
@@ -104,7 +120,11 @@ export class OperatorController {
     const operator = await this.operatorService.findByUserId(req.user.userId);
     if (!operator)
       throw new NotFoundException('No operator account found for this user');
-    return { data: operator };
+    const config = await this.platformConfigService.getConfig();
+    return {
+      data: operator,
+      platformDefaultDepositPercent: Number(config.depositPercent),
+    };
   }
 
   /**
@@ -226,6 +246,31 @@ export class OperatorController {
       actorId: req.user.userId,
     });
     return { message: 'Payout bank details removed', data: operator };
+  }
+
+  /**
+   * Set or clear an operator's own deposit percentage override. Same
+   * permission check as bank details — admins, or OWNER/MANAGER members of
+   * this specific operator. null clears the override back to the platform
+   * default. Passes req.user whole (not just userId) because
+   * setDepositPercent's own transactional lock needs the role for its
+   * admin bypass — same shape every other mutating endpoint on this
+   * controller already uses.
+   */
+  @UseGuards(AuthGuard)
+  @Patch(':id/deposit-percent')
+  async setDepositPercent(
+    @Req() req: AuthenticatedOperatorRequest,
+    @Param('id') id: string,
+    @Body() dto: SetDepositPercentDto,
+  ) {
+    await this.operatorService.assertCanManageOperator(req.user, id);
+    const operator = await this.operatorService.setDepositPercent(
+      id,
+      dto.depositPercentOverride,
+      req.user,
+    );
+    return { message: 'Deposit percentage updated', data: operator };
   }
 
   /**

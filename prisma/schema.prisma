@@ -152,6 +152,8 @@ model Operator {
   verifiedAt DateTime?
   notes      String?
 
+  depositPercentOverride Decimal?
+
   // Payout bank details, minimized: the full account number is sent to
   // Paystack to create a transfer recipient and then discarded — only
   // display-safe data and the resulting recipient code are kept.
@@ -353,11 +355,12 @@ model DispatchOffer {
   operatorId String
   operator   Operator @relation(fields: [operatorId], references: [id])
 
-  status      DispatchOfferStatus @default(PENDING)
-  quotedPrice Int?
-  offeredAt   DateTime            @default(now())
-  respondedAt DateTime?
-  expiresAt   DateTime
+  status                 DispatchOfferStatus @default(PENDING)
+  quotedPrice            Int?
+  depositPercentSnapshot Decimal?
+  offeredAt              DateTime            @default(now())
+  respondedAt            DateTime?
+  expiresAt              DateTime
 
   batchId String
 
