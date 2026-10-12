@@ -24,6 +24,11 @@ import { SaveBankDetailsDto } from './dto/save-bank-details.dto';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { OtpService } from '../otp/otp.service';
 import { OperatorMembershipService } from './operator-membership.service';
+import {
+  hasRole,
+  OPERATOR_ADMIN_ROLES,
+  OPERATOR_ONBOARDING_ROLES,
+} from './domain/operator-staff-roles';
 
 // ── Scoring weights ────────────────────────────────────────────────────────────
 // Distance is the dominant factor but reliability and speed matter.
@@ -748,8 +753,36 @@ export class OperatorService {
     user: { userId: string; role: string },
     operatorId: string,
   ): Promise<void> {
-    if (user.role === UserRole.ADMIN || user.role === UserRole.SUPER_ADMIN)
-      return;
+    await this.assertStaffOrOwnerManager(
+      user,
+      operatorId,
+      OPERATOR_ADMIN_ROLES,
+    );
+  }
+
+  /**
+   * Like assertCanManageOperator but PRODUCT staff also pass — day-to-day
+   * onboarding (profile, payout bank details). Member management and
+   * everything else keeps using assertCanManageOperator, so PRODUCT can't
+   * add/remove an operator's team.
+   */
+  async assertCanOnboardOperator(
+    user: { userId: string; role: string },
+    operatorId: string,
+  ): Promise<void> {
+    await this.assertStaffOrOwnerManager(
+      user,
+      operatorId,
+      OPERATOR_ONBOARDING_ROLES,
+    );
+  }
+
+  private async assertStaffOrOwnerManager(
+    user: { userId: string; role: string },
+    operatorId: string,
+    staffRoles: readonly UserRole[],
+  ): Promise<void> {
+    if (hasRole(user.role, staffRoles)) return;
 
     const membership = await this.prisma.operatorMember.findUnique({
       where: { userId_operatorId: { userId: user.userId, operatorId } },
@@ -765,13 +798,16 @@ export class OperatorService {
     }
   }
 
-  /** Like assertCanManageOperator but any membership counts (e.g. availability toggle). */
+  /**
+   * Like assertCanManageOperator but any membership counts (e.g. availability
+   * toggle), and PRODUCT staff pass too (onboarding). Also guards the
+   * read-only member list.
+   */
   async assertIsMemberOrAdmin(
     user: { userId: string; role: string },
     operatorId: string,
   ): Promise<void> {
-    if (user.role === UserRole.ADMIN || user.role === UserRole.SUPER_ADMIN)
-      return;
+    if (hasRole(user.role, OPERATOR_ONBOARDING_ROLES)) return;
 
     const membership = await this.prisma.operatorMember.findUnique({
       where: { userId_operatorId: { userId: user.userId, operatorId } },
@@ -809,6 +845,7 @@ export class OperatorService {
         tx,
         actingUser,
         id,
+        OPERATOR_ONBOARDING_ROLES,
       );
       const operator = await tx.operator.findUnique({ where: { id } });
       if (!operator) throw new NotFoundException('Operator not found');
@@ -847,6 +884,7 @@ export class OperatorService {
         tx,
         actingUser,
         id,
+        OPERATOR_ONBOARDING_ROLES,
       );
       const operator = await tx.operator.findUnique({ where: { id } });
       if (!operator) throw new NotFoundException('Operator not found');
@@ -878,6 +916,7 @@ export class OperatorService {
         tx,
         actingUser,
         id,
+        OPERATOR_ONBOARDING_ROLES,
       );
       const operator = await tx.operator.findUnique({ where: { id } });
       if (!operator) throw new NotFoundException('Operator not found');
@@ -997,6 +1036,7 @@ export class OperatorService {
         tx,
         actingUser,
         id,
+        OPERATOR_ONBOARDING_ROLES,
       );
       return tx.operator.update({
         where: { id },

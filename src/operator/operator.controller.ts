@@ -21,6 +21,7 @@ import { OperatorMemberRole, OperatorStatus, UserRole } from '@prisma/client';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { AuditLogService } from '../audit-log/audit-log.service';
 
 interface AuthenticatedOperatorRequest {
   user: { userId: string; role: string };
@@ -28,7 +29,10 @@ interface AuthenticatedOperatorRequest {
 
 @Controller('operators')
 export class OperatorController {
-  constructor(private readonly operatorService: OperatorService) {}
+  constructor(
+    private readonly operatorService: OperatorService,
+    private readonly auditLogService: AuditLogService,
+  ) {}
 
   /**
    * Register a new operator
@@ -128,7 +132,8 @@ export class OperatorController {
 
   /**
    * Update operator business profile.
-   * Allowed: admins, or OWNER/MANAGER members of this operator.
+   * Allowed: admins and PRODUCT staff (onboarding), or OWNER/MANAGER members
+   * of this operator.
    */
   @UseGuards(AuthGuard)
   @Patch(':id')
@@ -137,18 +142,34 @@ export class OperatorController {
     @Param('id') id: string,
     @Body() dto: UpdateOperatorProfileDto,
   ) {
-    await this.operatorService.assertCanManageOperator(req.user, id);
+    await this.operatorService.assertCanOnboardOperator(req.user, id);
     const operator = await this.operatorService.updateProfile(
       id,
       dto,
       req.user,
     );
+    // Names of the fields touched, never their values — phone/email/address
+    // are personal data, and this is how a payout-contact change gets traced.
+    await this.auditLogService.record({
+      category: 'operator_profile_updated',
+      message: `Updated profile for operator ${id}`,
+      details: {
+        operatorId: id,
+        changedFields: Object.entries(dto)
+          .filter(([, value]) => value !== undefined)
+          .map(([key]) => key),
+      },
+      actorId: req.user.userId,
+    });
     return { message: 'Operator profile updated', data: operator };
   }
 
   /**
-   * Save payout bank details. Allowed: admins, or OWNER/MANAGER members of
-   * this operator — same permission check as updateProfile.
+   * Save payout bank details. Allowed: admins and PRODUCT staff
+   * (onboarding), or OWNER/MANAGER members of this operator — same
+   * permission check as updateProfile. Audit-logged with the actor, since
+   * bank details are the payout-fraud vector; only display-safe fields
+   * (never the full account number) go in the entry.
    */
   @UseGuards(AuthGuard)
   @Patch(':id/bank-details')
@@ -157,7 +178,7 @@ export class OperatorController {
     @Param('id') id: string,
     @Body() dto: SaveBankDetailsDto,
   ) {
-    await this.operatorService.assertCanManageOperator(req.user, id);
+    await this.operatorService.assertCanOnboardOperator(req.user, id);
     if (
       !dto.bankCode?.trim() ||
       !dto.bankName?.trim() ||
@@ -172,6 +193,16 @@ export class OperatorController {
       dto,
       req.user,
     );
+    await this.auditLogService.record({
+      category: 'operator_bank_details_saved',
+      message: `Set payout bank details for operator ${id} (${operator.bankName} ••••${operator.accountNumberLast4})`,
+      details: {
+        operatorId: id,
+        bankName: operator.bankName,
+        accountNumberLast4: operator.accountNumberLast4,
+      },
+      actorId: req.user.userId,
+    });
     return { message: 'Payout bank details saved', data: operator };
   }
 
@@ -186,8 +217,14 @@ export class OperatorController {
     @Req() req: AuthenticatedOperatorRequest,
     @Param('id') id: string,
   ) {
-    await this.operatorService.assertCanManageOperator(req.user, id);
+    await this.operatorService.assertCanOnboardOperator(req.user, id);
     const operator = await this.operatorService.clearBankDetails(id, req.user);
+    await this.auditLogService.record({
+      category: 'operator_bank_details_cleared',
+      message: `Removed payout bank details for operator ${id}`,
+      details: { operatorId: id },
+      actorId: req.user.userId,
+    });
     return { message: 'Payout bank details removed', data: operator };
   }
 

@@ -3,6 +3,9 @@ import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../integrations/s3/s3.service';
 import { AccountDeletionService } from './account-deletion.service';
 
+// Typed once so asymmetric matchers don't surface as `any` assignments.
+const anyDate = expect.any(Date) as Date;
+
 describe('AccountDeletionService.deleteUser', () => {
   let service: AccountDeletionService;
   let tx: {
@@ -13,7 +16,7 @@ describe('AccountDeletionService.deleteUser', () => {
       update: jest.Mock;
     };
     rescueRequest: { findMany: jest.Mock; updateMany: jest.Mock };
-    operatorMember: { findMany: jest.Mock };
+    operatorMember: { findMany: jest.Mock; count: jest.Mock };
     requestMedia: { findMany: jest.Mock; deleteMany: jest.Mock };
     pendingMediaDeletion: { createMany: jest.Mock };
     auditLog: { create: jest.Mock };
@@ -40,7 +43,10 @@ describe('AccountDeletionService.deleteUser', () => {
         findMany: jest.fn().mockResolvedValue([]),
         updateMany: jest.fn(),
       },
-      operatorMember: { findMany: jest.fn().mockResolvedValue([]) },
+      operatorMember: {
+        findMany: jest.fn().mockResolvedValue([]),
+        count: jest.fn().mockResolvedValue(0),
+      },
       requestMedia: {
         findMany: jest.fn().mockResolvedValue([]),
         deleteMany: jest.fn(),
@@ -88,6 +94,14 @@ describe('AccountDeletionService.deleteUser', () => {
     [null, 'User not found'],
     [{ role: 'CUSTOMER', deletedAt: new Date() }, 'already been deleted'],
     [{ role: 'ADMIN', deletedAt: null }, 'Only customer and operator accounts'],
+    [
+      { role: 'SUPER_ADMIN', deletedAt: null },
+      'Only customer and operator accounts',
+    ],
+    [
+      { role: 'PRODUCT', deletedAt: null },
+      'Only customer and operator accounts',
+    ],
   ])('explains a failed parent lock for %p', async (user, message) => {
     tx.user.updateMany.mockResolvedValue({ count: 0 });
     tx.user.findUnique.mockResolvedValue(user);
@@ -96,6 +110,28 @@ describe('AccountDeletionService.deleteUser', () => {
       message,
     );
     expect(tx.rescueRequest.findMany).not.toHaveBeenCalled();
+  });
+
+  it('refuses a user who still belongs to an active operator, pointing at the Operators page', async () => {
+    tx.operatorMember.count.mockResolvedValue(1);
+
+    await expect(service.deleteUser('user-1', 'admin-1')).rejects.toThrow(
+      'delete the operator from the Operators page',
+    );
+    expect(tx.operatorMember.count).toHaveBeenCalledWith({
+      where: { userId: 'user-1', operator: { deletedAt: null } },
+    });
+    expect(tx.user.update).not.toHaveBeenCalled();
+  });
+
+  it('still deletes an orphan OPERATOR user with no active membership', async () => {
+    tx.operatorMember.count.mockResolvedValue(0);
+
+    await service.deleteUser('orphan-1', 'admin-1');
+
+    expect(tx.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 'orphan-1' } }),
+    );
   });
 
   it('blocks fresh active, disputed, or processing-payment requests', async () => {
@@ -352,6 +388,143 @@ describe('AccountDeletionService.deleteUser', () => {
         },
       });
       expect(s3Service.deleteObject).toHaveBeenCalledWith('operator-key');
+    });
+
+    describe('owner/member user cascade', () => {
+      const member = (userId: string) => ({ userId });
+      const asMembers = (...ids: string[]) =>
+        tx.operatorMember.findMany.mockResolvedValue(ids.map(member));
+
+      it('locks member users (in id order) BEFORE the operator row, so lock order matches lockActiveMembership', async () => {
+        asMembers('a-1', 'b-2');
+
+        await service.deleteOperator('op-1', 'admin-1');
+
+        const userLockOrder = tx.user.updateMany.mock.invocationCallOrder;
+        const operatorLockOrder =
+          tx.operator.updateMany.mock.invocationCallOrder;
+        expect(userLockOrder.length).toBeGreaterThanOrEqual(2);
+        expect(Math.max(...userLockOrder.slice(0, 2))).toBeLessThan(
+          operatorLockOrder[0],
+        );
+        expect(tx.operatorMember.findMany).toHaveBeenNthCalledWith(1, {
+          where: { operatorId: 'op-1' },
+          select: { userId: true },
+          orderBy: { userId: 'asc' },
+        });
+      });
+
+      it('anonymizes the user of a sole-membership OPERATOR in the same transaction', async () => {
+        asMembers('owner-1');
+        tx.operatorMember.count.mockResolvedValue(0);
+        tx.user.findUnique.mockResolvedValue({ role: 'OPERATOR' });
+
+        await service.deleteOperator('op-1', 'admin-1');
+
+        expect(tx.user.updateMany).toHaveBeenCalledWith({
+          where: { id: 'owner-1', deletedAt: null },
+          data: { updatedAt: anyDate },
+        });
+        expect(tx.user.update).toHaveBeenCalledWith({
+          where: { id: 'owner-1' },
+          data: expect.objectContaining({
+            name: 'Deleted User',
+            email: null,
+            phoneNumber: null,
+            passwordHash: null,
+            deletedAt: anyDate,
+          }) as Record<string, unknown>,
+        });
+        expect(tx.auditLog.create).toHaveBeenCalledWith({
+          data: {
+            category: 'account_deleted',
+            message: 'User owner-1 deleted',
+            actorId: 'admin-1',
+            details: {
+              targetType: 'User',
+              targetId: 'owner-1',
+              cascadedFromOperatorId: 'op-1',
+            },
+          },
+        });
+      });
+
+      it('counts other memberships only AFTER that user row is locked', async () => {
+        asMembers('owner-1');
+        tx.operatorMember.count.mockResolvedValue(0);
+        tx.user.findUnique.mockResolvedValue({ role: 'OPERATOR' });
+
+        await service.deleteOperator('op-1', 'admin-1');
+
+        expect(tx.user.updateMany.mock.invocationCallOrder[0]).toBeLessThan(
+          tx.operatorMember.count.mock.invocationCallOrder[0],
+        );
+      });
+
+      it('leaves a user who still belongs to another active operator', async () => {
+        asMembers('shared-1');
+        tx.operatorMember.count.mockResolvedValue(1);
+
+        await service.deleteOperator('op-1', 'admin-1');
+
+        expect(tx.operatorMember.count).toHaveBeenCalledWith({
+          where: {
+            userId: 'shared-1',
+            operatorId: { not: 'op-1' },
+            operator: { deletedAt: null },
+          },
+        });
+        expect(tx.user.update).not.toHaveBeenCalled();
+      });
+
+      it('skips a member who is not an OPERATOR-role user', async () => {
+        asMembers('cust-1');
+        tx.operatorMember.count.mockResolvedValue(0);
+        tx.user.findUnique.mockResolvedValue({ role: 'CUSTOMER' });
+
+        await service.deleteOperator('op-1', 'admin-1');
+
+        expect(tx.user.update).not.toHaveBeenCalled();
+      });
+
+      it('skips a member user who was already deleted', async () => {
+        asMembers('gone-1');
+        tx.user.updateMany.mockResolvedValue({ count: 0 });
+
+        await service.deleteOperator('op-1', 'admin-1');
+
+        expect(tx.user.update).not.toHaveBeenCalled();
+      });
+
+      it('aborts when someone joined the team between the first read and the operator lock', async () => {
+        tx.operatorMember.findMany
+          .mockResolvedValueOnce([member('a-1')])
+          .mockResolvedValueOnce([member('a-1'), member('late-2')]);
+        tx.operatorMember.count.mockResolvedValue(0);
+        tx.user.findUnique.mockResolvedValue({ role: 'OPERATOR' });
+
+        await expect(service.deleteOperator('op-1', 'admin-1')).rejects.toThrow(
+          'team changed while it was being deleted',
+        );
+      });
+
+      it('refuses the whole deletion when a member still has an active customer-side request', async () => {
+        asMembers('owner-1');
+        tx.operatorMember.count.mockResolvedValue(0);
+        tx.user.findUnique.mockResolvedValue({ role: 'OPERATOR' });
+        // operator guards: active, unsettled payouts, unsettled cancellations
+        // (all clear), then the member's own customer-side guard
+        tx.rescueRequest.findMany
+          .mockResolvedValueOnce([])
+          .mockResolvedValueOnce([])
+          .mockResolvedValueOnce([])
+          .mockResolvedValueOnce([{ id: 'req-9' }]);
+
+        await expect(service.deleteOperator('op-1', 'admin-1')).rejects.toThrow(
+          'still has 1 active',
+        );
+        expect(tx.user.update).not.toHaveBeenCalled();
+      });
     });
 
     it('keeps the operator-media outbox row when S3 fails', async () => {

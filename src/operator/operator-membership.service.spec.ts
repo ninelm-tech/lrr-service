@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { OperatorMembershipService } from './operator-membership.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { OPERATOR_ONBOARDING_ROLES } from './domain/operator-staff-roles';
 
 describe('OperatorMembershipService', () => {
   let service: OperatorMembershipService;
@@ -152,6 +153,65 @@ describe('OperatorMembershipService', () => {
         service.lockActiveMembership(tx, admin, 'op-1'),
       ).resolves.toBeUndefined();
       expect(t.operatorMember.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('does NOT bypass the membership check for PRODUCT by default — only onboarding callers opt in', async () => {
+      const t = tx as {
+        operatorMember: { findFirst: jest.Mock };
+        user: { updateMany: jest.Mock };
+        operator: { updateMany: jest.Mock };
+      };
+      t.user.updateMany.mockResolvedValue({ count: 1 });
+      t.operator.updateMany.mockResolvedValue({ count: 1 });
+      t.operatorMember.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.lockActiveMembership(
+          tx,
+          { userId: 'prod-1', role: 'PRODUCT' },
+          'op-1',
+        ),
+      ).rejects.toThrow('Not a member of this operator.');
+    });
+
+    it('skips the membership check for PRODUCT when the caller passes the onboarding roles', async () => {
+      const t = tx as {
+        operatorMember: { findFirst: jest.Mock };
+        user: { updateMany: jest.Mock };
+        operator: { updateMany: jest.Mock };
+      };
+      t.user.updateMany.mockResolvedValue({ count: 1 });
+      t.operator.updateMany.mockResolvedValue({ count: 1 });
+
+      await expect(
+        service.lockActiveMembership(
+          tx,
+          { userId: 'prod-1', role: 'PRODUCT' },
+          'op-1',
+          OPERATOR_ONBOARDING_ROLES,
+        ),
+      ).resolves.toBeUndefined();
+      expect(t.operatorMember.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('still requires membership for a plain OPERATOR even with the onboarding roles passed', async () => {
+      const t = tx as {
+        operatorMember: { findFirst: jest.Mock };
+        user: { updateMany: jest.Mock };
+        operator: { updateMany: jest.Mock };
+      };
+      t.user.updateMany.mockResolvedValue({ count: 1 });
+      t.operator.updateMany.mockResolvedValue({ count: 1 });
+      t.operatorMember.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.lockActiveMembership(
+          tx,
+          operatorStaff,
+          'op-1',
+          OPERATOR_ONBOARDING_ROLES,
+        ),
+      ).rejects.toThrow('Not a member of this operator.');
     });
 
     it('resolves when membership, user, and operator are all active', async () => {

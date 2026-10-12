@@ -9,6 +9,7 @@ import {
   OperatorStatus,
   PaymentStatus,
   PaymentType,
+  Prisma,
   RescueRequestStatus,
   UserRole,
 } from '@prisma/client';
@@ -75,6 +76,20 @@ export class AccountDeletionService {
         );
       }
 
+      // A user who still belongs to a live operator is removed by deleting
+      // that operator (which cascades to its users) — never from here. A
+      // user with no active membership (removed from the team, or left
+      // behind by an older operator delete) is an orphan and stays
+      // deletable here so their personal data isn't stranded.
+      const activeMemberships = await tx.operatorMember.count({
+        where: { userId: id, operator: { deletedAt: null } },
+      });
+      if (activeMemberships > 0) {
+        throw new BadRequestException(
+          'This user belongs to an active operator — delete the operator from the Operators page instead (that removes its user accounts too)',
+        );
+      }
+
       const blockingRequests = await tx.rescueRequest.findMany({
         where: { customerId: id, ...ACTIVE_OR_PENDING_REQUEST_FILTER },
         select: { id: true },
@@ -99,45 +114,7 @@ export class AccountDeletionService {
         );
       }
 
-      await tx.user.update({
-        where: { id },
-        data: {
-          name: 'Deleted User',
-          email: null,
-          phoneNumber: null,
-          passwordHash: null,
-          paystackCustomerCode: null,
-          paystackCustomerEmail: null,
-          deletedAt: new Date(),
-        },
-      });
-
-      const media = await tx.requestMedia.findMany({
-        where: {
-          rescueRequest: { customerId: id },
-          uploadedByRole: UserRole.CUSTOMER,
-        },
-        select: { id: true, s3Key: true },
-      });
-      if (media.length > 0) {
-        await tx.pendingMediaDeletion.createMany({
-          data: media.map(({ s3Key }) => ({ s3Key })),
-          skipDuplicates: true,
-        });
-      }
-      await tx.requestMedia.deleteMany({
-        where: { id: { in: media.map(({ id: mediaId }) => mediaId) } },
-      });
-      await tx.rescueRequest.updateMany({
-        where: { customerId: id },
-        data: {
-          latitude: null,
-          longitude: null,
-          destination: null,
-          customerDisputeStatement: null,
-          operatorDisputeStatement: null,
-        },
-      });
+      const mediaKeys = await this.anonymizeUserInTx(tx, id);
 
       await tx.auditLog.create({
         data: {
@@ -148,7 +125,7 @@ export class AccountDeletionService {
         },
       });
 
-      return media.map(({ s3Key }) => s3Key);
+      return mediaKeys;
     });
 
     for (const key of s3KeysToDelete) {
@@ -167,143 +144,280 @@ export class AccountDeletionService {
     }
   }
 
-  async deleteOperator(id: string, actorId: string): Promise<void> {
-    const s3KeysToDelete = await this.prisma.$transaction(async (tx) => {
-      const locked = await tx.operator.updateMany({
-        where: { id, deletedAt: null },
-        data: { updatedAt: new Date() },
-      });
-      if (locked.count === 0) {
-        const operator = await tx.operator.findUnique({
-          where: { id },
-          select: { deletedAt: true },
-        });
-        if (!operator) throw new NotFoundException('Operator not found');
-        throw new BadRequestException('This operator has already been deleted');
-      }
+  /**
+   * Anonymizes one User's identity and scrubs their customer-side request
+   * data, inside the caller's transaction. Returns the S3 keys now queued
+   * in the outbox — the caller deletes those AFTER commit. Callers must
+   * already hold the user row lock and have run the active-request guard.
+   */
+  private async anonymizeUserInTx(
+    tx: Prisma.TransactionClient,
+    id: string,
+  ): Promise<string[]> {
+    await tx.user.update({
+      where: { id },
+      data: {
+        name: 'Deleted User',
+        email: null,
+        phoneNumber: null,
+        passwordHash: null,
+        paystackCustomerCode: null,
+        paystackCustomerEmail: null,
+        deletedAt: new Date(),
+      },
+    });
 
-      const blockingRequests = await tx.rescueRequest.findMany({
-        where: {
-          assignedOperatorId: id,
-          OR: [
-            {
-              status: {
-                notIn: [
-                  RescueRequestStatus.COMPLETED,
-                  RescueRequestStatus.CANCELLED,
-                ],
+    const media = await tx.requestMedia.findMany({
+      where: {
+        rescueRequest: { customerId: id },
+        uploadedByRole: UserRole.CUSTOMER,
+      },
+      select: { id: true, s3Key: true },
+    });
+    if (media.length > 0) {
+      await tx.pendingMediaDeletion.createMany({
+        data: media.map(({ s3Key }) => ({ s3Key })),
+        skipDuplicates: true,
+      });
+    }
+    await tx.requestMedia.deleteMany({
+      where: { id: { in: media.map(({ id: mediaId }) => mediaId) } },
+    });
+    await tx.rescueRequest.updateMany({
+      where: { customerId: id },
+      data: {
+        latitude: null,
+        longitude: null,
+        destination: null,
+        customerDisputeStatement: null,
+        operatorDisputeStatement: null,
+      },
+    });
+
+    return media.map(({ s3Key }) => s3Key);
+  }
+
+  async deleteOperator(id: string, actorId: string): Promise<void> {
+    const s3KeysToDelete = await this.prisma.$transaction(
+      async (tx) => {
+        // Lock order is fixed platform-wide: User rows first, then the
+        // Operator row (see OperatorMembershipService.lockActiveMembership).
+        // Taking the Operator lock first and the members' User locks after
+        // would deadlock against a member's own request. Members are read
+        // unlocked here, locked in id order, and re-read once the Operator
+        // lock is held — anyone who joined in between aborts the delete.
+        const initialMembers = await tx.operatorMember.findMany({
+          where: { operatorId: id },
+          select: { userId: true },
+          orderBy: { userId: 'asc' },
+        });
+        const initialMemberIds = new Set(initialMembers.map((m) => m.userId));
+        const lockedUserIds = new Set<string>();
+        for (const { userId } of initialMembers) {
+          const userLock = await tx.user.updateMany({
+            where: { id: userId, deletedAt: null },
+            data: { updatedAt: new Date() },
+          });
+          if (userLock.count > 0) lockedUserIds.add(userId);
+        }
+
+        const locked = await tx.operator.updateMany({
+          where: { id, deletedAt: null },
+          data: { updatedAt: new Date() },
+        });
+        if (locked.count === 0) {
+          const operator = await tx.operator.findUnique({
+            where: { id },
+            select: { deletedAt: true },
+          });
+          if (!operator) throw new NotFoundException('Operator not found');
+          throw new BadRequestException(
+            'This operator has already been deleted',
+          );
+        }
+
+        const blockingRequests = await tx.rescueRequest.findMany({
+          where: {
+            assignedOperatorId: id,
+            OR: [
+              {
+                status: {
+                  notIn: [
+                    RescueRequestStatus.COMPLETED,
+                    RescueRequestStatus.CANCELLED,
+                  ],
+                },
+              },
+              { disputed: true, disputeResolvedAt: null },
+            ],
+          },
+          select: { id: true },
+        });
+        if (blockingRequests.length > 0) {
+          throw new BadRequestException(
+            `Cannot delete: ${blockingRequests.length} request(s) still active or disputed`,
+          );
+        }
+
+        const unsettledPayouts = await tx.rescueRequest.findMany({
+          where: {
+            assignedOperatorId: id,
+            status: RescueRequestStatus.COMPLETED,
+            payments: {
+              none: {
+                type: PaymentType.PAYOUT,
+                status: PaymentStatus.SUCCEEDED,
               },
             },
-            { disputed: true, disputeResolvedAt: null },
-          ],
-        },
-        select: { id: true },
-      });
-      if (blockingRequests.length > 0) {
-        throw new BadRequestException(
-          `Cannot delete: ${blockingRequests.length} request(s) still active or disputed`,
-        );
-      }
-
-      const unsettledPayouts = await tx.rescueRequest.findMany({
-        where: {
-          assignedOperatorId: id,
-          status: RescueRequestStatus.COMPLETED,
-          payments: {
-            none: {
-              type: PaymentType.PAYOUT,
-              status: PaymentStatus.SUCCEEDED,
-            },
           },
-        },
-        select: { id: true },
-      });
-      if (unsettledPayouts.length > 0) {
-        throw new BadRequestException(
-          `Cannot delete: ${unsettledPayouts.length} completed request(s) still have an unsettled payout`,
-        );
-      }
-
-      // A CANCELLED request with a paid deposit and no cancellation
-      // settlement yet still owes this operator their share of that
-      // deposit (see RescueRequestAdminService.resolveCancellationSettlement)
-      // — deleting nulls paystackRecipientCode below, which can never be
-      // restored, permanently stranding that payout. Distinct from the
-      // "active" check above, which deliberately excludes CANCELLED.
-      const unsettledCancellations = await tx.rescueRequest.findMany({
-        where: {
-          assignedOperatorId: id,
-          status: RescueRequestStatus.CANCELLED,
-          cancellationSettledAt: null,
-          payments: {
-            some: {
-              type: PaymentType.DEPOSIT,
-              status: PaymentStatus.SUCCEEDED,
-            },
-          },
-        },
-        select: { id: true },
-      });
-      if (unsettledCancellations.length > 0) {
-        throw new BadRequestException(
-          `Cannot delete: ${unsettledCancellations.length} cancelled request(s) still have an unsettled cancellation payout`,
-        );
-      }
-
-      await tx.operator.update({
-        where: { id },
-        data: {
-          businessName: 'Deleted Operator',
-          contactName: 'Deleted Operator',
-          phoneNumber: null,
-          email: null,
-          address: '',
-          bankName: null,
-          accountName: null,
-          accountNumberLast4: null,
-          paystackRecipientCode: null,
-          status: OperatorStatus.SUSPENDED,
-          isAvailable: false,
-          deletedAt: new Date(),
-        },
-      });
-
-      await tx.rescueRequest.updateMany({
-        where: { assignedOperatorId: id },
-        data: {
-          operatorDisputeStatement: null,
-          customerDisputeStatement: null,
-        },
-      });
-
-      const media = await tx.requestMedia.findMany({
-        where: {
-          rescueRequest: { assignedOperatorId: id },
-          uploadedByRole: UserRole.OPERATOR,
-        },
-        select: { id: true, s3Key: true },
-      });
-      if (media.length > 0) {
-        await tx.pendingMediaDeletion.createMany({
-          data: media.map(({ s3Key }) => ({ s3Key })),
-          skipDuplicates: true,
+          select: { id: true },
         });
-      }
-      await tx.requestMedia.deleteMany({
-        where: { id: { in: media.map(({ id: mediaId }) => mediaId) } },
-      });
+        if (unsettledPayouts.length > 0) {
+          throw new BadRequestException(
+            `Cannot delete: ${unsettledPayouts.length} completed request(s) still have an unsettled payout`,
+          );
+        }
 
-      await tx.auditLog.create({
-        data: {
-          category: 'account_deleted',
-          message: `Operator ${id} deleted`,
-          actorId,
-          details: { targetType: 'Operator', targetId: id },
-        },
-      });
+        // A CANCELLED request with a paid deposit and no cancellation
+        // settlement yet still owes this operator their share of that
+        // deposit (see RescueRequestAdminService.resolveCancellationSettlement)
+        // — deleting nulls paystackRecipientCode below, which can never be
+        // restored, permanently stranding that payout. Distinct from the
+        // "active" check above, which deliberately excludes CANCELLED.
+        const unsettledCancellations = await tx.rescueRequest.findMany({
+          where: {
+            assignedOperatorId: id,
+            status: RescueRequestStatus.CANCELLED,
+            cancellationSettledAt: null,
+            payments: {
+              some: {
+                type: PaymentType.DEPOSIT,
+                status: PaymentStatus.SUCCEEDED,
+              },
+            },
+          },
+          select: { id: true },
+        });
+        if (unsettledCancellations.length > 0) {
+          throw new BadRequestException(
+            `Cannot delete: ${unsettledCancellations.length} cancelled request(s) still have an unsettled cancellation payout`,
+          );
+        }
 
-      return media.map(({ s3Key }) => s3Key);
-    });
+        await tx.operator.update({
+          where: { id },
+          data: {
+            businessName: 'Deleted Operator',
+            contactName: 'Deleted Operator',
+            phoneNumber: null,
+            email: null,
+            address: '',
+            bankName: null,
+            accountName: null,
+            accountNumberLast4: null,
+            paystackRecipientCode: null,
+            status: OperatorStatus.SUSPENDED,
+            isAvailable: false,
+            deletedAt: new Date(),
+          },
+        });
+
+        await tx.rescueRequest.updateMany({
+          where: { assignedOperatorId: id },
+          data: {
+            operatorDisputeStatement: null,
+            customerDisputeStatement: null,
+          },
+        });
+
+        const media = await tx.requestMedia.findMany({
+          where: {
+            rescueRequest: { assignedOperatorId: id },
+            uploadedByRole: UserRole.OPERATOR,
+          },
+          select: { id: true, s3Key: true },
+        });
+        if (media.length > 0) {
+          await tx.pendingMediaDeletion.createMany({
+            data: media.map(({ s3Key }) => ({ s3Key })),
+            skipDuplicates: true,
+          });
+        }
+        await tx.requestMedia.deleteMany({
+          where: { id: { in: media.map(({ id: mediaId }) => mediaId) } },
+        });
+
+        // The operator's own login is part of the business being removed:
+        // anonymize each member user whose only active business this was.
+        // Anyone who still serves another active operator, or who isn't a
+        // live OPERATOR-role account, is left alone. User rows are already
+        // locked (above), so the checks below can't go stale.
+        const members = await tx.operatorMember.findMany({
+          where: { operatorId: id },
+          select: { userId: true },
+        });
+        const cascadedKeys: string[] = [];
+        for (const { userId } of members) {
+          if (!initialMemberIds.has(userId)) {
+            throw new BadRequestException(
+              "This operator's team changed while it was being deleted — please try again",
+            );
+          }
+          if (!lockedUserIds.has(userId)) continue; // already deleted
+
+          const otherActive = await tx.operatorMember.count({
+            where: {
+              userId,
+              operatorId: { not: id },
+              operator: { deletedAt: null },
+            },
+          });
+          if (otherActive > 0) continue;
+
+          const memberUser = await tx.user.findUnique({
+            where: { id: userId },
+            select: { role: true },
+          });
+          if (memberUser?.role !== UserRole.OPERATOR) continue;
+
+          const blocking = await tx.rescueRequest.findMany({
+            where: { customerId: userId, ...ACTIVE_OR_PENDING_REQUEST_FILTER },
+            select: { id: true },
+          });
+          if (blocking.length > 0) {
+            throw new BadRequestException(
+              `Cannot delete: a user on this operator still has ${blocking.length} active request(s) of their own, with an unresolved dispute or a payment still processing`,
+            );
+          }
+
+          cascadedKeys.push(...(await this.anonymizeUserInTx(tx, userId)));
+          await tx.auditLog.create({
+            data: {
+              category: 'account_deleted',
+              message: `User ${userId} deleted`,
+              actorId,
+              details: {
+                targetType: 'User',
+                targetId: userId,
+                cascadedFromOperatorId: id,
+              },
+            },
+          });
+        }
+
+        await tx.auditLog.create({
+          data: {
+            category: 'account_deleted',
+            message: `Operator ${id} deleted`,
+            actorId,
+            details: { targetType: 'Operator', targetId: id },
+          },
+        });
+
+        return [...media.map(({ s3Key }) => s3Key), ...cascadedKeys];
+      },
+      { timeout: 20_000 },
+    );
 
     for (const key of s3KeysToDelete) {
       try {
