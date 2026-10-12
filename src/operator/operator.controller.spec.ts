@@ -5,13 +5,33 @@ import { OperatorService } from './operator.service';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard, ROLES_KEY } from '../auth/guards/roles.guard';
 import { UserRole } from '@prisma/client';
+import { AuditLogService } from '../audit-log/audit-log.service';
 
 describe('OperatorController', () => {
   let controller: OperatorController;
-  let operatorService: { setIsTest: jest.Mock; adminCreate: jest.Mock };
+  let operatorService: {
+    setIsTest: jest.Mock;
+    adminCreate: jest.Mock;
+    assertCanManageOperator: jest.Mock;
+    assertCanOnboardOperator: jest.Mock;
+    updateProfile: jest.Mock;
+    saveBankDetails: jest.Mock;
+    clearBankDetails: jest.Mock;
+  };
+  let auditLogService: { record: jest.Mock };
+  const req = { user: { userId: 'prod-1', role: 'PRODUCT' } };
 
   beforeEach(async () => {
-    operatorService = { setIsTest: jest.fn(), adminCreate: jest.fn() };
+    operatorService = {
+      setIsTest: jest.fn(),
+      adminCreate: jest.fn(),
+      assertCanManageOperator: jest.fn().mockResolvedValue(undefined),
+      assertCanOnboardOperator: jest.fn().mockResolvedValue(undefined),
+      updateProfile: jest.fn().mockResolvedValue({ id: 'op-1' }),
+      saveBankDetails: jest.fn(),
+      clearBankDetails: jest.fn().mockResolvedValue({ id: 'op-1' }),
+    };
+    auditLogService = { record: jest.fn().mockResolvedValue(undefined) };
 
     const module: TestingModule = await Test.createTestingModule({
       controllers: [OperatorController],
@@ -20,6 +40,7 @@ describe('OperatorController', () => {
           provide: OperatorService,
           useValue: operatorService,
         },
+        { provide: AuditLogService, useValue: auditLogService },
       ],
     })
       .overrideGuard(AuthGuard)
@@ -107,6 +128,104 @@ describe('OperatorController', () => {
         message: 'Operator onboarded and active.',
         data: { userId: 'u-new', operatorId: 'op-new', status: 'ACTIVE' },
       });
+    });
+  });
+
+  describe('onboarding mutations (PRODUCT allowed)', () => {
+    it('updateProfile uses the onboarding permission check, not the member-management one', async () => {
+      await controller.updateProfile(req, 'op-1', {});
+
+      expect(operatorService.assertCanOnboardOperator).toHaveBeenCalledWith(
+        req.user,
+        'op-1',
+      );
+      expect(operatorService.assertCanManageOperator).not.toHaveBeenCalled();
+    });
+
+    it('updateProfile audit-logs which fields changed (names only, not values)', async () => {
+      await controller.updateProfile(req, 'op-1', {
+        phoneNumber: '+2348012345678',
+        email: undefined,
+        address: '1 Secret Street',
+      });
+
+      expect(auditLogService.record).toHaveBeenCalledWith({
+        category: 'operator_profile_updated',
+        message: expect.any(String) as string,
+        details: {
+          operatorId: 'op-1',
+          changedFields: ['phoneNumber', 'address'],
+        },
+        actorId: 'prod-1',
+      });
+      const logged = JSON.stringify(auditLogService.record.mock.calls);
+      expect(logged).not.toContain('2348012345678');
+      expect(logged).not.toContain('Secret Street');
+    });
+
+    it('saveBankDetails checks onboarding permission and audit-logs without the account number', async () => {
+      operatorService.saveBankDetails.mockResolvedValue({
+        id: 'op-1',
+        bankName: 'GTBank',
+        accountName: 'JOHN DOE',
+        accountNumberLast4: '6789',
+      });
+
+      await controller.saveBankDetails(req, 'op-1', {
+        bankCode: '058',
+        bankName: 'GTBank',
+        accountNumber: '0123456789',
+      });
+
+      expect(operatorService.assertCanOnboardOperator).toHaveBeenCalledWith(
+        req.user,
+        'op-1',
+      );
+      expect(operatorService.assertCanManageOperator).not.toHaveBeenCalled();
+      expect(auditLogService.record).toHaveBeenCalledWith({
+        category: 'operator_bank_details_saved',
+        message: expect.stringContaining('GTBank') as string,
+        details: {
+          operatorId: 'op-1',
+          bankName: 'GTBank',
+          accountNumberLast4: '6789',
+        },
+        actorId: 'prod-1',
+      });
+      expect(JSON.stringify(auditLogService.record.mock.calls)).not.toContain(
+        '0123456789',
+      );
+    });
+
+    it('clearBankDetails checks onboarding permission and audit-logs the removal', async () => {
+      await controller.clearBankDetails(req, 'op-1');
+
+      expect(operatorService.assertCanOnboardOperator).toHaveBeenCalledWith(
+        req.user,
+        'op-1',
+      );
+      expect(auditLogService.record).toHaveBeenCalledWith({
+        category: 'operator_bank_details_cleared',
+        message: expect.any(String) as string,
+        details: { operatorId: 'op-1' },
+        actorId: 'prod-1',
+      });
+    });
+
+    it('does not audit-log when the permission check rejects', async () => {
+      operatorService.assertCanOnboardOperator.mockRejectedValue(
+        new Error('nope'),
+      );
+
+      await expect(
+        controller.saveBankDetails(req, 'op-1', {
+          bankCode: '058',
+          bankName: 'GTBank',
+          accountNumber: '0123456789',
+        }),
+      ).rejects.toThrow('nope');
+      expect(operatorService.saveBankDetails).not.toHaveBeenCalled();
+      expect(auditLogService.record).not.toHaveBeenCalled();
     });
   });
 });

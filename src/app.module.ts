@@ -16,6 +16,8 @@ import { PlatformConfigModule } from './platform-config/platform-config.module';
 import { RatingModule } from './rating/rating.module';
 import { OtpModule } from './otp/otp.module';
 import { AccountDeletionModule } from './account-deletion/account-deletion.module';
+import { StaffModule } from './staff/staff.module';
+import { CustomersModule } from './customers/customers.module';
 
 @Module({
   imports: [
@@ -42,6 +44,8 @@ import { AccountDeletionModule } from './account-deletion/account-deletion.modul
     RatingModule,
     OtpModule,
     AccountDeletionModule,
+    StaffModule,
+    CustomersModule,
   ],
   controllers: [AppController],
   providers: [

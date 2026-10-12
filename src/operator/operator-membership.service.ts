@@ -1,5 +1,6 @@
 import { ForbiddenException, Injectable } from '@nestjs/common';
 import { Prisma, UserRole } from '@prisma/client';
+import { hasRole, OPERATOR_ADMIN_ROLES } from './domain/operator-staff-roles';
 import { PrismaService } from '../prisma/prisma.service';
 
 @Injectable()
@@ -53,13 +54,18 @@ export class OperatorMembershipService {
    * neither party has been deleted since that check ran, it does not
    * re-derive the authorization decision itself).
    *
-   * `actingUser.role` matters: `assertCanManageOperator`/
-   * `assertIsMemberOrAdmin` both let an ADMIN/SUPER_ADMIN through with no
-   * `OperatorMember` row at all — an admin managing an operator is never
-   * expected to BE a member of that operator's business. This method must
-   * recognize the same bypass, or an admin who legitimately passed the
+   * `actingUser.role` matters: the controller pre-checks
+   * (`assertCanManageOperator`, `assertCanOnboardOperator`,
+   * `assertIsMemberOrAdmin`) let platform staff through with no
+   * `OperatorMember` row at all — staff acting on an operator are never
+   * expected to BE members of that operator's business. This method must
+   * recognize the same bypass, or staff who legitimately passed the
    * pre-check would fail here purely for not being a member of a business
-   * they were never meant to join.
+   * they were never meant to join. `bypassRoles` defaults to
+   * ADMIN/SUPER_ADMIN; only the onboarding mutations (profile, bank
+   * details, availability) pass OPERATOR_ONBOARDING_ROLES to include
+   * PRODUCT. Both the pre-check and this bypass read the role from the
+   * login token, not the database.
    *
    * **Lock order matters and is fixed: User, then Operator, then — only
    * once both locks are held — read the membership row.** An earlier
@@ -77,6 +83,7 @@ export class OperatorMembershipService {
     tx: Prisma.TransactionClient,
     actingUser: { userId: string; role: string },
     operatorId: string,
+    bypassRoles: readonly UserRole[] = OPERATOR_ADMIN_ROLES,
   ): Promise<void> {
     const userStillActive = await tx.user.updateMany({
       where: { id: actingUser.userId, deletedAt: null },
@@ -94,10 +101,7 @@ export class OperatorMembershipService {
       throw new ForbiddenException('This operator has been deleted.');
     }
 
-    const isPrivilegedAdmin =
-      actingUser.role === UserRole.ADMIN ||
-      actingUser.role === UserRole.SUPER_ADMIN;
-    if (!isPrivilegedAdmin) {
+    if (!hasRole(actingUser.role, bypassRoles)) {
       const membership = await tx.operatorMember.findFirst({
         where: { userId: actingUser.userId, operatorId },
       });

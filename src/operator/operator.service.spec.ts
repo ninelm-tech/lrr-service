@@ -8,6 +8,7 @@ import { TruckClass } from '@prisma/client';
 import { CreateOperatorDto } from './dto/create-operator.dto';
 import { AdminCreateOperatorDto } from './dto/admin-create-operator.dto';
 import { OperatorMembershipService } from './operator-membership.service';
+import { OPERATOR_ONBOARDING_ROLES } from './domain/operator-staff-roles';
 
 describe('OperatorService', () => {
   let service: OperatorService;
@@ -252,6 +253,123 @@ describe('OperatorService', () => {
       ).rejects.toThrow('Operator not found');
       expect(prisma.operator.update).not.toHaveBeenCalled();
     });
+  });
+
+  describe('PRODUCT onboarding permissions', () => {
+    const product = { userId: 'prod-1', role: 'PRODUCT' };
+
+    it('assertCanOnboardOperator lets PRODUCT through with no membership row', async () => {
+      await expect(
+        service.assertCanOnboardOperator(product, 'op-1'),
+      ).resolves.toBeUndefined();
+      expect(prisma.operatorMember.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('assertCanOnboardOperator still requires OWNER/MANAGER for a plain OPERATOR', async () => {
+      prisma.operatorMember.findUnique.mockResolvedValue({ role: 'STAFF' });
+      await expect(
+        service.assertCanOnboardOperator(actingUser, 'op-1'),
+      ).rejects.toThrow('You do not have permission to manage this operator');
+
+      prisma.operatorMember.findUnique.mockResolvedValue({ role: 'MANAGER' });
+      await expect(
+        service.assertCanOnboardOperator(actingUser, 'op-1'),
+      ).resolves.toBeUndefined();
+    });
+
+    it('assertCanManageOperator (member management) still rejects PRODUCT', async () => {
+      prisma.operatorMember.findUnique.mockResolvedValue(null);
+      await expect(
+        service.assertCanManageOperator(product, 'op-1'),
+      ).rejects.toThrow('You do not have permission to manage this operator');
+    });
+
+    it('assertIsMemberOrAdmin lets PRODUCT through (availability toggle)', async () => {
+      await expect(
+        service.assertIsMemberOrAdmin(product, 'op-1'),
+      ).resolves.toBeUndefined();
+    });
+
+    it.each([
+      [
+        'saveBankDetails',
+        (u: typeof product) =>
+          service.saveBankDetails(
+            'op-1',
+            {
+              bankCode: '058',
+              bankName: 'GTBank',
+              accountNumber: '0123456789',
+            },
+            u,
+          ),
+      ],
+      [
+        'clearBankDetails',
+        (u: typeof product) => service.clearBankDetails('op-1', u),
+      ],
+      [
+        'updateProfile',
+        (u: typeof product) => service.updateProfile('op-1', {}, u),
+      ],
+      [
+        'setAvailability',
+        (u: typeof product) => service.setAvailability('op-1', true, u),
+      ],
+    ])(
+      '%s asks the membership lock to bypass for the onboarding roles',
+      async (_name, call) => {
+        paystackMock.resolveAccountNumber.mockResolvedValue({
+          accountName: 'X',
+        });
+        paystackMock.createTransferRecipient.mockResolvedValue({
+          recipientCode: 'RCP_1',
+        });
+        prisma.operator.findUnique.mockResolvedValue({
+          id: 'op-1',
+          businessName: 'B',
+        });
+        prisma.operator.update.mockResolvedValue({ id: 'op-1' });
+
+        await call(product);
+
+        expect(
+          operatorMembershipService.lockActiveMembership,
+        ).toHaveBeenCalledWith(
+          expect.anything(),
+          product,
+          'op-1',
+          OPERATOR_ONBOARDING_ROLES,
+        );
+      },
+    );
+
+    it.each([
+      [
+        'addMember',
+        (u: typeof product) =>
+          service.addMember('op-1', { userId: 't', role: 'STAFF' } as never, u),
+      ],
+      [
+        'removeMember',
+        (u: typeof product) => service.removeMember('op-1', 'm-1', u),
+      ],
+    ])(
+      '%s keeps the default (admin-only) bypass — never the onboarding roles',
+      async (_name, call) => {
+        prisma.operatorMember.findUnique.mockResolvedValue(null);
+        prisma.operatorMember.findFirst.mockResolvedValue(null);
+        prisma.user.findUnique.mockResolvedValue(null);
+        prisma.user.findFirst.mockResolvedValue(null);
+        prisma.user.updateMany.mockResolvedValue({ count: 0 });
+        await call(product).catch(() => undefined);
+
+        for (const args of operatorMembershipService.lockActiveMembership.mock
+          .calls as unknown[][]) {
+          expect(args[3]).toBeUndefined();
+        }
+      },
+    );
   });
 
   describe('deletion locks for operator mutations', () => {
