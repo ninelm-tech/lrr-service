@@ -66,7 +66,7 @@ export class StaffService {
    * yourself out or strip the last super admin by this path.
    *
    * Note the role change takes effect when the person's current session
-   * token expires (the role lives in the JWT; login tokens last 7 days).
+   * token expires (the role lives in the JWT; login tokens last 24 hours).
    */
   async update(
     id: string,

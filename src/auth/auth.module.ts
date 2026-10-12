@@ -6,6 +6,7 @@ import { ThrottlerGuard } from '@nestjs/throttler';
 import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
 import { JwtStrategy } from './strategies/jwt.strategy';
+import { buildJwtOptions } from './jwt-options';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { RolesGuard } from './guards/roles.guard';
 import { PrismaModule } from '../prisma/prisma.module';
@@ -20,12 +21,10 @@ import { AuditLogModule } from '../audit-log/audit-log.module';
     PassportModule.register({ defaultStrategy: 'jwt' }),
     JwtModule.registerAsync({
       imports: [ConfigModule],
-      useFactory: (configService: ConfigService) => ({
-        secret: configService.get<string>('JWT_SECRET') || 'your-secret-key',
-        signOptions: {
-          expiresIn: '7d',
-        },
-      }),
+      useFactory: (configService: ConfigService) =>
+        buildJwtOptions(
+          configService.get<string>('JWT_SECRET') || 'your-secret-key',
+        ),
       inject: [ConfigService],
     }),
   ],
