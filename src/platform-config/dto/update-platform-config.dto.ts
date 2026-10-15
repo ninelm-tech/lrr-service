@@ -17,7 +17,7 @@ export class UpdatePlatformConfigDto {
 
   @IsNumber()
   @Min(0)
-  @Max(100)
+  @Max(50)
   @IsOptional()
   depositPercent?: number;
 

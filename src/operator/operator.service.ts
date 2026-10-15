@@ -31,6 +31,7 @@ import {
   OPERATOR_ONBOARDING_ROLES,
 } from './domain/operator-staff-roles';
 import { AuditLogService } from '../audit-log/audit-log.service';
+import { PlatformConfigService } from '../platform-config/platform-config.service';
 
 // ── Scoring weights ────────────────────────────────────────────────────────────
 // Distance is the dominant factor but reliability and speed matter.
@@ -42,6 +43,13 @@ const WEIGHT_RESPONSE_SPEED = 0.2;
 
 // Look-back window for computing operator stats
 const STATS_LOOKBACK_DAYS = 30;
+
+// Ceiling on an operator's deposit-percent override (setDepositPercent,
+// adminCreate). The floor is the platform's current default
+// (PlatformConfigService.getConfig().depositPercent, fetched live) — an
+// operator can pitch something easier than the platform standard, never
+// below it. This ceiling is a separate, fixed platform rule.
+const MAX_OPERATOR_DEPOSIT_PERCENT = 50;
 
 export interface ScoredOperator {
   id: string;
@@ -82,6 +90,7 @@ export class OperatorService {
     private readonly otpService: OtpService,
     private readonly operatorMembershipService: OperatorMembershipService,
     private readonly auditLogService: AuditLogService,
+    private readonly platformConfigService: PlatformConfigService,
   ) {}
 
   // ══════════════════════════════════════════════════════
@@ -343,15 +352,20 @@ export class OperatorService {
     // creation," not an error.
     if (
       data.depositPercentOverride !== undefined &&
-      data.depositPercentOverride !== null &&
-      (typeof data.depositPercentOverride !== 'number' ||
-        !Number.isFinite(data.depositPercentOverride) ||
-        data.depositPercentOverride < 0 ||
-        data.depositPercentOverride > 100)
+      data.depositPercentOverride !== null
     ) {
-      throw new BadRequestException(
-        'depositPercentOverride must be between 0 and 100',
-      );
+      const { depositPercent: minDepositPercent } =
+        await this.platformConfigService.getConfig();
+      if (
+        typeof data.depositPercentOverride !== 'number' ||
+        !Number.isFinite(data.depositPercentOverride) ||
+        data.depositPercentOverride < minDepositPercent ||
+        data.depositPercentOverride > MAX_OPERATOR_DEPOSIT_PERCENT
+      ) {
+        throw new BadRequestException(
+          `depositPercentOverride must be between ${minDepositPercent} and ${MAX_OPERATOR_DEPOSIT_PERCENT}`,
+        );
+      }
     }
 
     const personalPhone = normalizePhone(data.phoneNumber);
@@ -924,18 +938,22 @@ export class OperatorService {
     // typeof/isFinite first: with no global ValidationPipe, `depositPercentOverride`
     // is whatever the JSON body actually contained — a string, an object, NaN
     // via Infinity arithmetic, anything — not just a number out of range. A
-    // bare `< 0 || > 100` comparison against a non-number coerces to false on
-    // both sides and would let it through to Prisma unvalidated.
-    if (
-      depositPercentOverride !== null &&
-      (typeof depositPercentOverride !== 'number' ||
+    // bare `< minDepositPercent || > MAX` comparison against a non-number
+    // coerces to false on both sides and would let it through to Prisma
+    // unvalidated.
+    if (depositPercentOverride !== null) {
+      const { depositPercent: minDepositPercent } =
+        await this.platformConfigService.getConfig();
+      if (
+        typeof depositPercentOverride !== 'number' ||
         !Number.isFinite(depositPercentOverride) ||
-        depositPercentOverride < 0 ||
-        depositPercentOverride > 100)
-    ) {
-      throw new BadRequestException(
-        'depositPercentOverride must be between 0 and 100',
-      );
+        depositPercentOverride < minDepositPercent ||
+        depositPercentOverride > MAX_OPERATOR_DEPOSIT_PERCENT
+      ) {
+        throw new BadRequestException(
+          `depositPercentOverride must be between ${minDepositPercent} and ${MAX_OPERATOR_DEPOSIT_PERCENT}`,
+        );
+      }
     }
 
     const { operator, before } = await this.prisma.$transaction(async (tx) => {
