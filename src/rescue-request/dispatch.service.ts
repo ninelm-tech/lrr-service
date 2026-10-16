@@ -1232,6 +1232,39 @@ export class DispatchService {
     const lat = Number(rescueRequest.latitude);
     const lon = Number(rescueRequest.longitude);
 
+    const config = await this.platformConfigService.getConfig();
+
+    // Freeze the percentage now, before anything is shown — handleQuoteSelected
+    // reads this snapshot later, never the operator's current setting, so what
+    // the customer sees here is what they end up charged regardless of what
+    // changes afterward. Overwritten on every call (multiple dispatch rounds
+    // can call this more than once for the same request) — the last write
+    // before the customer actually reads the message is the one that counts.
+    //
+    // Kept in a side map keyed by offerId rather than added as a field on the
+    // ranked objects: RankedQuote (domain/quote-ranking.ts) extends a closed
+    // QuoteForRanking interface plus `score` — it is not generic, so a
+    // `depositPercent` field riding along on the object quotedOffers.map(...)
+    // produces would NOT be visible on rankQuotes' return type, and reading
+    // it back off `ranked` would fail tsc. rankQuotes also has exactly one
+    // other caller (handleQuoteSelected's own forRanking, in
+    // whatsapp-customer-flow.service.ts), which has no use for the
+    // percentage on the ranked object at all — so the shared type stays
+    // untouched here rather than widened for one caller.
+    const depositPercentByOfferId = new Map<string, number>();
+    await Promise.all(
+      quotedOffers.map((offer) => {
+        const depositPercent = Number(
+          offer.operator.depositPercentOverride ?? config.depositPercent,
+        );
+        depositPercentByOfferId.set(offer.id, depositPercent);
+        return this.prisma.dispatchOffer.update({
+          where: { id: offer.id },
+          data: { depositPercentSnapshot: depositPercent },
+        });
+      }),
+    );
+
     const forRanking = quotedOffers.map((offer) => {
       const distance = this.operatorService['calculateDistance'](
         lat,
@@ -1250,7 +1283,6 @@ export class DispatchService {
 
     const ranked = rankQuotes(forRanking); // ranks by raw quotedPrice — markup is a uniform % and never changes order
 
-    const config = await this.platformConfigService.getConfig();
     const lines = ranked.map((q, i) => {
       const numberEmoji = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'][i] ?? `${i + 1}.`;
       // Motorist-facing amount is ALWAYS quotedPrice + service fee — never the raw quote.
@@ -1260,7 +1292,8 @@ export class DispatchService {
         q.quotedPrice +
         Math.round((q.quotedPrice * config.serviceFeePercent) / 100);
       const priceNaira = (displayTotal / 100).toLocaleString();
-      return `${numberEmoji} ₦${priceNaira} · ETA ${q.etaMinutes} min · ${q.businessName}`;
+      const depositPercent = depositPercentByOfferId.get(q.offerId)!;
+      return `${numberEmoji} ₦${priceNaira} · ETA ${q.etaMinutes} min · Deposit ${depositPercent}% · ${q.businessName}`;
     });
 
     const customerPhone = rescueRequest.customer.phoneNumber;

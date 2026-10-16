@@ -9,6 +9,8 @@ import { CreateOperatorDto } from './dto/create-operator.dto';
 import { AdminCreateOperatorDto } from './dto/admin-create-operator.dto';
 import { OperatorMembershipService } from './operator-membership.service';
 import { OPERATOR_ONBOARDING_ROLES } from './domain/operator-staff-roles';
+import { AuditLogService } from '../audit-log/audit-log.service';
+import { PlatformConfigService } from '../platform-config/platform-config.service';
 
 describe('OperatorService', () => {
   let service: OperatorService;
@@ -44,6 +46,8 @@ describe('OperatorService', () => {
   };
   let otpService: { findValidTokenRow: jest.Mock };
   let operatorMembershipService: { lockActiveMembership: jest.Mock };
+  let auditLogService: { record: jest.Mock; review: jest.Mock };
+  let platformConfigService: { getConfig: jest.Mock };
   const actingUser = { userId: 'user-1', role: 'OPERATOR' };
 
   beforeEach(async () => {
@@ -86,6 +90,20 @@ describe('OperatorService', () => {
     operatorMembershipService = {
       lockActiveMembership: jest.fn().mockResolvedValue(undefined),
     };
+    auditLogService = { record: jest.fn(), review: jest.fn() };
+    // Matches the schema default (PlatformConfig.depositPercent @default(10.0))
+    // so tests that don't care about the floor still exercise realistic values.
+    platformConfigService = {
+      getConfig: jest.fn().mockResolvedValue({
+        serviceFeePercent: 10,
+        depositPercent: 10,
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        quoteCollectionMinutes: 5,
+        disputeAlertPhoneNumber: null,
+        testCustomerPhoneNumbers: [],
+      }),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -97,6 +115,8 @@ describe('OperatorService', () => {
           provide: OperatorMembershipService,
           useValue: operatorMembershipService,
         },
+        { provide: AuditLogService, useValue: auditLogService },
+        { provide: PlatformConfigService, useValue: platformConfigService },
       ],
     }).compile();
 
@@ -959,6 +979,270 @@ describe('OperatorService', () => {
         'This business phone number is already registered as a customer account. Use a different number for your business line.',
       );
       expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('accepts and persists depositPercentOverride: 0 — not skipped as falsy', async () => {
+      // Platform floor dropped to 0 for this test specifically: it exists to
+      // prove a real 0 isn't skipped by falsy coercion, which only happens
+      // to be a valid value when the floor itself is 0.
+      platformConfigService.getConfig.mockResolvedValue({
+        serviceFeePercent: 10,
+        depositPercent: 0,
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        quoteCollectionMinutes: 5,
+        disputeAlertPhoneNumber: null,
+        testCustomerPhoneNumbers: [],
+      });
+      // Captured via a typed mockImplementation callback, not `mock.calls[0][0]`
+      // indexing — the latter reads back through this file's bare `jest.Mock`
+      // typing as `any`, which trips no-unsafe-assignment/member-access.
+      let capturedData: { depositPercentOverride?: number | null } | undefined;
+      prisma.operator.create.mockImplementation(
+        (args: { data: { depositPercentOverride?: number | null } }) => {
+          capturedData = args.data;
+          return Promise.resolve({ id: 'op-new', status: 'ACTIVE' });
+        },
+      );
+
+      await service.adminCreate({ ...baseDto(), depositPercentOverride: 0 });
+
+      expect(capturedData?.depositPercentOverride).toBe(0);
+    });
+
+    it('accepts depositPercentOverride at exactly the platform floor (10, from the mocked default)', async () => {
+      let capturedData: { depositPercentOverride?: number | null } | undefined;
+      prisma.operator.create.mockImplementation(
+        (args: { data: { depositPercentOverride?: number | null } }) => {
+          capturedData = args.data;
+          return Promise.resolve({ id: 'op-new', status: 'ACTIVE' });
+        },
+      );
+
+      await service.adminCreate({ ...baseDto(), depositPercentOverride: 10 });
+
+      expect(capturedData?.depositPercentOverride).toBe(10);
+    });
+
+    it('throws BadRequestException when depositPercentOverride is below the platform floor', async () => {
+      await expect(
+        service.adminCreate({ ...baseDto(), depositPercentOverride: 9 }),
+      ).rejects.toThrow('depositPercentOverride must be between 10 and 50');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('accepts depositPercentOverride at exactly the 50% ceiling', async () => {
+      let capturedData: { depositPercentOverride?: number | null } | undefined;
+      prisma.operator.create.mockImplementation(
+        (args: { data: { depositPercentOverride?: number | null } }) => {
+          capturedData = args.data;
+          return Promise.resolve({ id: 'op-new', status: 'ACTIVE' });
+        },
+      );
+
+      await service.adminCreate({ ...baseDto(), depositPercentOverride: 50 });
+
+      expect(capturedData?.depositPercentOverride).toBe(50);
+    });
+
+    it('throws BadRequestException when depositPercentOverride is above 50', async () => {
+      await expect(
+        service.adminCreate({ ...baseDto(), depositPercentOverride: 51 }),
+      ).rejects.toThrow('depositPercentOverride must be between 10 and 50');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('throws BadRequestException when depositPercentOverride is not a number', async () => {
+      await expect(
+        service.adminCreate({
+          ...baseDto(),
+          depositPercentOverride: 'abc' as unknown as number,
+        }),
+      ).rejects.toThrow('depositPercentOverride must be between 10 and 50');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('setDepositPercent', () => {
+    const actor = { userId: 'admin-1', role: 'ADMIN' };
+
+    it('persists the override and returns the updated operator', async () => {
+      prisma.operator.findUnique.mockResolvedValue({
+        depositPercentOverride: null,
+      });
+      prisma.operator.update.mockResolvedValue({
+        id: 'op-1',
+        depositPercentOverride: 25,
+      });
+
+      const result = await service.setDepositPercent('op-1', 25, actor);
+
+      expect(
+        operatorMembershipService.lockActiveMembership,
+      ).toHaveBeenCalledWith(prisma, actor, 'op-1');
+      expect(prisma.operator.update).toHaveBeenCalledWith({
+        where: { id: 'op-1' },
+        data: { depositPercentOverride: 25 },
+      });
+      expect(result).toEqual({ id: 'op-1', depositPercentOverride: 25 });
+    });
+
+    it('persists exactly 0 — not skipped as falsy — when the platform floor is 0', async () => {
+      // Floor dropped to 0 for this test specifically: it exists to prove a
+      // real 0 isn't skipped by falsy coercion, which only happens to be a
+      // valid value when the floor itself is 0.
+      platformConfigService.getConfig.mockResolvedValue({
+        serviceFeePercent: 10,
+        depositPercent: 0,
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        quoteCollectionMinutes: 5,
+        disputeAlertPhoneNumber: null,
+        testCustomerPhoneNumbers: [],
+      });
+      prisma.operator.findUnique.mockResolvedValue({
+        depositPercentOverride: 25,
+      });
+      prisma.operator.update.mockResolvedValue({
+        id: 'op-1',
+        depositPercentOverride: 0,
+      });
+
+      await service.setDepositPercent('op-1', 0, actor);
+
+      expect(prisma.operator.update).toHaveBeenCalledWith({
+        where: { id: 'op-1' },
+        data: { depositPercentOverride: 0 },
+      });
+    });
+
+    it('clears the override back to the platform default when given null', async () => {
+      prisma.operator.findUnique.mockResolvedValue({
+        depositPercentOverride: 25,
+      });
+      prisma.operator.update.mockResolvedValue({
+        id: 'op-1',
+        depositPercentOverride: null,
+      });
+
+      await service.setDepositPercent('op-1', null, actor);
+
+      expect(prisma.operator.update).toHaveBeenCalledWith({
+        where: { id: 'op-1' },
+        data: { depositPercentOverride: null },
+      });
+    });
+
+    it('rejects a missing value (undefined) — e.g. an empty request body — instead of silently no-opping', async () => {
+      await expect(
+        service.setDepositPercent('op-1', undefined, actor),
+      ).rejects.toThrow('depositPercentOverride is required');
+      expect(prisma.operator.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects a value below the platform floor (10, from the mocked default)', async () => {
+      await expect(service.setDepositPercent('op-1', 9, actor)).rejects.toThrow(
+        'depositPercentOverride must be between 10 and 50',
+      );
+      expect(prisma.operator.update).not.toHaveBeenCalled();
+    });
+
+    it('accepts a value at exactly the platform floor', async () => {
+      prisma.operator.findUnique.mockResolvedValue({
+        depositPercentOverride: null,
+      });
+      prisma.operator.update.mockResolvedValue({
+        id: 'op-1',
+        depositPercentOverride: 10,
+      });
+
+      await service.setDepositPercent('op-1', 10, actor);
+
+      expect(prisma.operator.update).toHaveBeenCalledWith({
+        where: { id: 'op-1' },
+        data: { depositPercentOverride: 10 },
+      });
+    });
+
+    it('accepts a value at exactly the 50% ceiling', async () => {
+      prisma.operator.findUnique.mockResolvedValue({
+        depositPercentOverride: null,
+      });
+      prisma.operator.update.mockResolvedValue({
+        id: 'op-1',
+        depositPercentOverride: 50,
+      });
+
+      await service.setDepositPercent('op-1', 50, actor);
+
+      expect(prisma.operator.update).toHaveBeenCalledWith({
+        where: { id: 'op-1' },
+        data: { depositPercentOverride: 50 },
+      });
+    });
+
+    it('rejects a value above 50', async () => {
+      await expect(
+        service.setDepositPercent('op-1', 51, actor),
+      ).rejects.toThrow('depositPercentOverride must be between 10 and 50');
+      expect(prisma.operator.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects a non-numeric value (e.g. a string body field) instead of reaching Prisma', async () => {
+      await expect(
+        service.setDepositPercent('op-1', 'abc' as unknown as number, actor),
+      ).rejects.toThrow('depositPercentOverride must be between 10 and 50');
+      expect(prisma.operator.update).not.toHaveBeenCalled();
+    });
+
+    it('writes an audit log entry recording a real 0, not a falsy-coerced null, when the prior value was 0', async () => {
+      prisma.operator.findUnique.mockResolvedValue({
+        depositPercentOverride: 0,
+      });
+      prisma.operator.update.mockResolvedValue({
+        id: 'op-1',
+        depositPercentOverride: 25,
+      });
+
+      await service.setDepositPercent('op-1', 25, actor);
+
+      expect(auditLogService.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          category: 'deposit_percent_changed',
+          actorId: 'admin-1',
+          details: {
+            targetType: 'Operator',
+            targetId: 'op-1',
+            operatorId: 'op-1',
+            before: 0,
+            after: 25,
+          },
+        }),
+      );
+    });
+
+    it('writes an audit log entry with before: null when there was no prior override', async () => {
+      prisma.operator.findUnique.mockResolvedValue({
+        depositPercentOverride: null,
+      });
+      prisma.operator.update.mockResolvedValue({
+        id: 'op-1',
+        depositPercentOverride: 25,
+      });
+
+      await service.setDepositPercent('op-1', 25, actor);
+
+      expect(auditLogService.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          details: {
+            targetType: 'Operator',
+            targetId: 'op-1',
+            operatorId: 'op-1',
+            before: null,
+            after: 25,
+          },
+        }),
+      );
     });
   });
 });

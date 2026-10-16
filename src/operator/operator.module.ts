@@ -7,6 +7,7 @@ import { AuthModule } from '../auth/auth.module';
 import { PaystackModule } from '../integrations/paystack/paystack.module';
 import { OtpModule } from '../otp/otp.module';
 import { AuditLogModule } from '../audit-log/audit-log.module';
+import { PlatformConfigModule } from '../platform-config/platform-config.module';
 
 @Module({
   imports: [
@@ -15,6 +16,7 @@ import { AuditLogModule } from '../audit-log/audit-log.module';
     PaystackModule,
     OtpModule,
     AuditLogModule,
+    PlatformConfigModule,
   ],
   providers: [OperatorService, OperatorMembershipService],
   controllers: [OperatorController],

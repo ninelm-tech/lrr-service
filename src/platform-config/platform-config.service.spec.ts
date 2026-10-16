@@ -104,10 +104,32 @@ describe('PlatformConfigService', () => {
       ).rejects.toThrow(BadRequestException);
     });
 
-    it('rejects a depositPercent above 100', async () => {
+    it('rejects a depositPercent above 50', async () => {
       await expect(
-        service.updateConfig({ depositPercent: 101 }),
+        service.updateConfig({ depositPercent: 51 }),
       ).rejects.toThrow(BadRequestException);
+    });
+
+    it('accepts a depositPercent of exactly 50', async () => {
+      prisma.platformConfig.findFirst.mockResolvedValue({ id: 'default' });
+      prisma.platformConfig.update.mockResolvedValue({
+        id: 'default',
+        serviceFeePercent: { toNumber: () => 10 },
+        depositPercent: { toNumber: () => 50 },
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        quoteCollectionMinutes: 5,
+        disputeAlertPhoneNumber: null,
+        testCustomerPhoneNumbers: [],
+      });
+
+      const result = await service.updateConfig({ depositPercent: 50 });
+
+      expect(prisma.platformConfig.update).toHaveBeenCalledWith({
+        where: { id: 'default' },
+        data: { depositPercent: 50 },
+      });
+      expect(result.depositPercent).toBe(50);
     });
 
     it('rejects a dispatchWindowMinutes outside 1-60', async () => {

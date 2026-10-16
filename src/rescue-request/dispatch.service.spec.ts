@@ -1662,7 +1662,7 @@ describe('DispatchService', () => {
     let service: DispatchService;
     let prisma: {
       rescueRequest: { findUnique: jest.Mock };
-      dispatchOffer: { findMany: jest.Mock };
+      dispatchOffer: { findMany: jest.Mock; update: jest.Mock };
     };
     let operatorService: { calculateDistance: jest.Mock };
     let platformConfigService: { getConfig: jest.Mock };
@@ -1690,14 +1690,18 @@ describe('DispatchService', () => {
                 businessName: 'Acme Towing',
                 latitude: 6.5,
                 longitude: 3.4,
+                depositPercentOverride: null,
               },
             },
           ]),
+          update: jest.fn(),
         },
       };
       operatorService = { calculateDistance: jest.fn().mockReturnValue(0) };
       platformConfigService = {
-        getConfig: jest.fn().mockResolvedValue({ serviceFeePercent: 10 }),
+        getConfig: jest
+          .fn()
+          .mockResolvedValue({ serviceFeePercent: 10, depositPercent: 10 }),
       };
       twilioService = { sendWhatsAppMessage: jest.fn() };
       sessionStore = { update: jest.fn() };
@@ -1723,7 +1727,7 @@ describe('DispatchService', () => {
 
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
         '+2348000000000',
-        '🚗 *Operator quotes received!*\n⏰ You have 5 minutes to choose before this request is cancelled.\n\n1️⃣ ₦11,000 · ETA 0 min · Acme Towing\n\n⚠️ *ACTION NEEDED* — reply with the number of your choice (e.g. "1") to select an operator.',
+        '🚗 *Operator quotes received!*\n⏰ You have 5 minutes to choose before this request is cancelled.\n\n1️⃣ ₦11,000 · ETA 0 min · Deposit 10% · Acme Towing\n\n⚠️ *ACTION NEEDED* — reply with the number of your choice (e.g. "1") to select an operator.',
       );
     });
 
@@ -1741,6 +1745,127 @@ describe('DispatchService', () => {
       expect(prisma.dispatchOffer.findMany).not.toHaveBeenCalled();
       expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
       expect(sessionStore.update).not.toHaveBeenCalled();
+    });
+
+    it('writes the effective deposit percentage onto every quoted offer before sending', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: '+2348000000000' },
+      });
+      prisma.dispatchOffer.findMany.mockResolvedValue([
+        {
+          id: 'offer-1',
+          operatorId: 'op-1',
+          quotedPrice: 25000,
+          operator: {
+            id: 'op-1',
+            businessName: 'Swift Towing',
+            latitude: 6.5,
+            longitude: 3.4,
+            depositPercentOverride: 20,
+          },
+        },
+        {
+          id: 'offer-2',
+          operatorId: 'op-2',
+          quotedPrice: 26000,
+          operator: {
+            id: 'op-2',
+            businessName: 'Raheem Towing',
+            latitude: 6.5,
+            longitude: 3.4,
+            depositPercentOverride: null,
+          },
+        },
+      ]);
+      platformConfigService.getConfig.mockResolvedValue({
+        serviceFeePercent: 10,
+        depositPercent: 10,
+      });
+
+      await service.deliverQuoteShortlist('req-1', 'cust-1');
+
+      expect(prisma.dispatchOffer.update).toHaveBeenCalledWith({
+        where: { id: 'offer-1' },
+        data: { depositPercentSnapshot: 20 },
+      });
+      expect(prisma.dispatchOffer.update).toHaveBeenCalledWith({
+        where: { id: 'offer-2' },
+        data: { depositPercentSnapshot: 10 },
+      });
+    });
+
+    it('includes the deposit percentage in each shortlist line', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: '+2348000000000' },
+      });
+      prisma.dispatchOffer.findMany.mockResolvedValue([
+        {
+          id: 'offer-1',
+          operatorId: 'op-1',
+          quotedPrice: 25000,
+          operator: {
+            id: 'op-1',
+            businessName: 'Swift Towing',
+            latitude: 6.5,
+            longitude: 3.4,
+            depositPercentOverride: 20,
+          },
+        },
+      ]);
+      platformConfigService.getConfig.mockResolvedValue({
+        serviceFeePercent: 10,
+        depositPercent: 10,
+      });
+
+      await service.deliverQuoteShortlist('req-1', 'cust-1');
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        '+2348000000000',
+        expect.stringContaining('Deposit 20%'),
+      );
+    });
+
+    it('writes a fresh snapshot every call, not just the first — overwriting any prior value', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: '+2348000000000' },
+      });
+      prisma.dispatchOffer.findMany.mockResolvedValue([
+        {
+          id: 'offer-1',
+          operatorId: 'op-1',
+          quotedPrice: 25000,
+          operator: {
+            id: 'op-1',
+            businessName: 'Swift Towing',
+            latitude: 6.5,
+            longitude: 3.4,
+            depositPercentOverride: 30, // changed since an earlier round's delivery
+          },
+        },
+      ]);
+      platformConfigService.getConfig.mockResolvedValue({
+        serviceFeePercent: 10,
+        depositPercent: 10,
+      });
+
+      await service.deliverQuoteShortlist('req-1', 'cust-1');
+
+      expect(prisma.dispatchOffer.update).toHaveBeenCalledWith({
+        where: { id: 'offer-1' },
+        data: { depositPercentSnapshot: 30 },
+      });
     });
   });
 

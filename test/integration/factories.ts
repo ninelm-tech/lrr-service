@@ -36,6 +36,7 @@ export async function createCustomer(
 export async function createOperator(
   prisma: PrismaService,
   phoneNumber?: string,
+  overrides: Record<string, unknown> = {},
 ) {
   return prisma.operator.create({
     data: {
@@ -47,6 +48,7 @@ export async function createOperator(
       longitude: 3.4219,
       status: 'ACTIVE',
       isAvailable: true,
+      ...overrides,
     },
   });
 }
