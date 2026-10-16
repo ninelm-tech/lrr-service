@@ -27,7 +27,7 @@ describe('StalledConfirmationCheck (integration)', () => {
     config = {
       getConfig: jest
         .fn()
-        .mockResolvedValue({ disputeAlertPhoneNumber: '+2348000000000' }),
+        .mockResolvedValue({ disputeAlertPhoneNumbers: ['+2348000000000'] }),
     };
     check = new StalledConfirmationCheck(
       prisma,
@@ -95,11 +95,49 @@ describe('StalledConfirmationCheck (integration)', () => {
   });
 
   it('stays silent when no alert number is configured, rather than throwing', async () => {
-    config.getConfig.mockResolvedValue({ disputeAlertPhoneNumber: null });
+    config.getConfig.mockResolvedValue({ disputeAlertPhoneNumbers: [] });
     await awaitingConfirmation(-60_000);
 
     await expect(check.run(new Date())).resolves.toBe(1);
 
     expect(twilio.sendWhatsAppMessage).not.toHaveBeenCalled();
+  });
+
+  it('alerts every configured staff number', async () => {
+    config.getConfig.mockResolvedValue({
+      disputeAlertPhoneNumbers: ['+2348000000000', '+2348000000001'],
+    });
+    await awaitingConfirmation(-60_000);
+
+    await check.run(new Date());
+
+    expect(twilio.sendWhatsAppMessage).toHaveBeenCalledTimes(2);
+    expect(twilio.sendWhatsAppMessage).toHaveBeenCalledWith(
+      expect.stringContaining('+2348000000000'),
+      expect.any(String),
+    );
+    expect(twilio.sendWhatsAppMessage).toHaveBeenCalledWith(
+      expect.stringContaining('+2348000000001'),
+      expect.any(String),
+    );
+  });
+
+  it('alerting one bad staff number does not block alerting the rest, and still counts as acted', async () => {
+    config.getConfig.mockResolvedValue({
+      disputeAlertPhoneNumbers: ['+2348000000000', '+2348000000001'],
+    });
+    twilio.sendWhatsAppMessage.mockImplementation((to: string) => {
+      if (to.includes('+2348000000000'))
+        return Promise.reject(new Error('send failed'));
+      return Promise.resolve();
+    });
+    await awaitingConfirmation(-60_000);
+
+    await expect(check.run(new Date())).resolves.toBe(1);
+
+    expect(twilio.sendWhatsAppMessage).toHaveBeenCalledWith(
+      expect.stringContaining('+2348000000001'),
+      expect.any(String),
+    );
   });
 });

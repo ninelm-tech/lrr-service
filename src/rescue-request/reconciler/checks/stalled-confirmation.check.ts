@@ -59,11 +59,21 @@ export class StalledConfirmationCheck implements ReconcilerCheck {
 
       try {
         const config = await this.platformConfigService.getConfig();
-        if (config.disputeAlertPhoneNumber) {
-          await this.twilioService.sendWhatsAppMessage(
-            toWhatsAppAddress(config.disputeAlertPhoneNumber),
-            `⏱ ${formatJobRef(id)}: customer hasn't confirmed completion 30 minutes after the operator marked it DONE. Please check on them.`,
-          );
+        for (const phoneNumber of config.disputeAlertPhoneNumbers) {
+          try {
+            await this.twilioService.sendWhatsAppMessage(
+              toWhatsAppAddress(phoneNumber),
+              `⏱ ${formatJobRef(id)}: customer hasn't confirmed completion 30 minutes after the operator marked it DONE. Please check on them.`,
+            );
+          } catch (error) {
+            console.error('Stalled-confirmation alert failed:', error);
+            Sentry.captureException(error, {
+              extra: {
+                rescueRequestId: id,
+                stage: 'stalled-confirmation-notify',
+              },
+            });
+          }
         }
       } catch (error) {
         console.error('Stalled-confirmation alert failed:', error);

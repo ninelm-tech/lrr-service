@@ -33,7 +33,7 @@ describe('PlatformConfigService', () => {
         dispatchWindowMinutes: 10,
         dispatchBatchSize: 3,
         quoteCollectionMinutes: 5,
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
         testCustomerPhoneNumbers: [],
       });
 
@@ -45,7 +45,7 @@ describe('PlatformConfigService', () => {
         dispatchWindowMinutes: 10,
         dispatchBatchSize: 3,
         quoteCollectionMinutes: 5,
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
         testCustomerPhoneNumbers: [],
       });
     });
@@ -58,7 +58,7 @@ describe('PlatformConfigService', () => {
         dispatchWindowMinutes: 10,
         dispatchBatchSize: 3,
         quoteCollectionMinutes: 5,
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
         testCustomerPhoneNumbers: ['+2348012345678'],
       });
 
@@ -75,25 +75,47 @@ describe('PlatformConfigService', () => {
         dispatchWindowMinutes: 10,
         dispatchBatchSize: 3,
         quoteCollectionMinutes: 7,
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
       });
 
       expect((await service.getConfig()).quoteCollectionMinutes).toBe(7);
     });
 
-    it('includes disputeAlertPhoneNumber, null when unset', async () => {
+    it('includes disputeAlertPhoneNumbers, empty when unset', async () => {
       prisma.platformConfig.findFirst.mockResolvedValue({
         id: 'cfg-1',
         serviceFeePercent: { toNumber: () => 10 },
         depositPercent: { toNumber: () => 10 },
         dispatchWindowMinutes: 10,
         dispatchBatchSize: 3,
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
+        newRequestAlertPhoneNumbers: [],
       });
 
       const result = await service.getConfig();
 
-      expect(result.disputeAlertPhoneNumber).toBeNull();
+      expect(result.disputeAlertPhoneNumbers).toEqual([]);
+      expect(result.newRequestAlertPhoneNumbers).toEqual([]);
+    });
+
+    it('includes disputeAlertPhoneNumbers and newRequestAlertPhoneNumbers from the row', async () => {
+      prisma.platformConfig.findFirst.mockResolvedValue({
+        id: 'cfg-1',
+        serviceFeePercent: { toNumber: () => 10 },
+        depositPercent: { toNumber: () => 10 },
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        disputeAlertPhoneNumbers: ['+2348012345678', '+2348012345679'],
+        newRequestAlertPhoneNumbers: ['+2348012345680'],
+      });
+
+      const result = await service.getConfig();
+
+      expect(result.disputeAlertPhoneNumbers).toEqual([
+        '+2348012345678',
+        '+2348012345679',
+      ]);
+      expect(result.newRequestAlertPhoneNumbers).toEqual(['+2348012345680']);
     });
   });
 
@@ -119,7 +141,7 @@ describe('PlatformConfigService', () => {
         dispatchWindowMinutes: 10,
         dispatchBatchSize: 3,
         quoteCollectionMinutes: 5,
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
         testCustomerPhoneNumbers: [],
       });
 
@@ -168,7 +190,7 @@ describe('PlatformConfigService', () => {
         dispatchWindowMinutes: 10,
         dispatchBatchSize: 3,
         quoteCollectionMinutes: 8,
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
       });
 
       const result = await service.updateConfig({ quoteCollectionMinutes: 8 });
@@ -188,7 +210,7 @@ describe('PlatformConfigService', () => {
         depositPercent: { toNumber: () => 10 },
         dispatchWindowMinutes: 15,
         dispatchBatchSize: 3,
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
         testCustomerPhoneNumbers: [],
       });
 
@@ -206,7 +228,7 @@ describe('PlatformConfigService', () => {
         depositPercent: 10,
         dispatchWindowMinutes: 15,
         dispatchBatchSize: 3,
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
         testCustomerPhoneNumbers: [],
       });
     });
@@ -219,7 +241,7 @@ describe('PlatformConfigService', () => {
         depositPercent: { toNumber: () => 10 },
         dispatchWindowMinutes: 10,
         dispatchBatchSize: 5,
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
       });
 
       const result = await service.updateConfig({ dispatchBatchSize: 5 });
@@ -231,7 +253,7 @@ describe('PlatformConfigService', () => {
       expect(result.dispatchBatchSize).toBe(5);
     });
 
-    it('persists a new disputeAlertPhoneNumber', async () => {
+    it('normalizes disputeAlertPhoneNumbers to E.164 before persisting', async () => {
       prisma.platformConfig.findFirst.mockResolvedValue({ id: 'cfg-1' });
       prisma.platformConfig.update.mockResolvedValue({
         id: 'cfg-1',
@@ -239,18 +261,120 @@ describe('PlatformConfigService', () => {
         depositPercent: { toNumber: () => 10 },
         dispatchWindowMinutes: 10,
         dispatchBatchSize: 3,
-        disputeAlertPhoneNumber: '+2348012345678',
+        disputeAlertPhoneNumbers: ['+2348012345678'],
       });
 
       const result = await service.updateConfig({
-        disputeAlertPhoneNumber: '+2348012345678',
+        disputeAlertPhoneNumbers: ['08012345678'],
       });
 
       expect(prisma.platformConfig.update).toHaveBeenCalledWith({
         where: { id: 'cfg-1' },
-        data: { disputeAlertPhoneNumber: '+2348012345678' },
+        data: { disputeAlertPhoneNumbers: ['+2348012345678'] },
       });
-      expect(result.disputeAlertPhoneNumber).toBe('+2348012345678');
+      expect(result.disputeAlertPhoneNumbers).toEqual(['+2348012345678']);
+    });
+
+    it('rejects an invalid number in disputeAlertPhoneNumbers', async () => {
+      await expect(
+        service.updateConfig({ disputeAlertPhoneNumbers: ['not-a-phone'] }),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('rejects more than 10 disputeAlertPhoneNumbers', async () => {
+      const elevenNumbers = Array.from(
+        { length: 11 },
+        (_, i) => `+23480123456${i.toString().padStart(2, '0')}`,
+      );
+
+      await expect(
+        service.updateConfig({ disputeAlertPhoneNumbers: elevenNumbers }),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('accepts exactly 10 disputeAlertPhoneNumbers', async () => {
+      const tenNumbers = Array.from(
+        { length: 10 },
+        (_, i) => `+23480123456${i.toString().padStart(2, '0')}`,
+      );
+      prisma.platformConfig.findFirst.mockResolvedValue({ id: 'cfg-1' });
+      prisma.platformConfig.update.mockResolvedValue({
+        id: 'cfg-1',
+        serviceFeePercent: { toNumber: () => 10 },
+        depositPercent: { toNumber: () => 10 },
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        disputeAlertPhoneNumbers: tenNumbers,
+      });
+
+      const result = await service.updateConfig({
+        disputeAlertPhoneNumbers: tenNumbers,
+      });
+
+      expect(result.disputeAlertPhoneNumbers).toEqual(tenNumbers);
+    });
+
+    it('normalizes newRequestAlertPhoneNumbers to E.164 before persisting', async () => {
+      prisma.platformConfig.findFirst.mockResolvedValue({ id: 'cfg-1' });
+      prisma.platformConfig.update.mockResolvedValue({
+        id: 'cfg-1',
+        serviceFeePercent: { toNumber: () => 10 },
+        depositPercent: { toNumber: () => 10 },
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        newRequestAlertPhoneNumbers: ['+2348012345678'],
+      });
+
+      const result = await service.updateConfig({
+        newRequestAlertPhoneNumbers: ['08012345678'],
+      });
+
+      expect(prisma.platformConfig.update).toHaveBeenCalledWith({
+        where: { id: 'cfg-1' },
+        data: { newRequestAlertPhoneNumbers: ['+2348012345678'] },
+      });
+      expect(result.newRequestAlertPhoneNumbers).toEqual(['+2348012345678']);
+    });
+
+    it('rejects an invalid number in newRequestAlertPhoneNumbers', async () => {
+      await expect(
+        service.updateConfig({
+          newRequestAlertPhoneNumbers: ['not-a-phone'],
+        }),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('rejects more than 10 newRequestAlertPhoneNumbers', async () => {
+      const elevenNumbers = Array.from(
+        { length: 11 },
+        (_, i) => `+23480123456${i.toString().padStart(2, '0')}`,
+      );
+
+      await expect(
+        service.updateConfig({ newRequestAlertPhoneNumbers: elevenNumbers }),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('accepts exactly 10 newRequestAlertPhoneNumbers', async () => {
+      const tenNumbers = Array.from(
+        { length: 10 },
+        (_, i) => `+23480123456${i.toString().padStart(2, '0')}`,
+      );
+      prisma.platformConfig.findFirst.mockResolvedValue({ id: 'cfg-1' });
+      prisma.platformConfig.update.mockResolvedValue({
+        id: 'cfg-1',
+        serviceFeePercent: { toNumber: () => 10 },
+        depositPercent: { toNumber: () => 10 },
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        newRequestAlertPhoneNumbers: tenNumbers,
+      });
+
+      const result = await service.updateConfig({
+        newRequestAlertPhoneNumbers: tenNumbers,
+      });
+
+      expect(result.newRequestAlertPhoneNumbers).toEqual(tenNumbers);
     });
 
     it('normalizes testCustomerPhoneNumbers to E.164 before persisting', async () => {
@@ -261,7 +385,7 @@ describe('PlatformConfigService', () => {
         depositPercent: { toNumber: () => 10 },
         dispatchWindowMinutes: 10,
         dispatchBatchSize: 3,
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
         testCustomerPhoneNumbers: ['+2348012345678'],
       });
 

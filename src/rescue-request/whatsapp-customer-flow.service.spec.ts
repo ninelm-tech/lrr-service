@@ -175,7 +175,7 @@ describe('WhatsAppCustomerFlowService', () => {
       platformConfigService = {
         getConfig: jest
           .fn()
-          .mockResolvedValue({ disputeAlertPhoneNumber: '+2348099999999' }),
+          .mockResolvedValue({ disputeAlertPhoneNumbers: ['+2348099999999'] }),
       };
 
       const module: TestingModule = await Test.createTestingModule({
@@ -249,9 +249,9 @@ describe('WhatsAppCustomerFlowService', () => {
       expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
     });
 
-    it('skips the alert cleanly when disputeAlertPhoneNumber is unset', async () => {
+    it('skips the alert cleanly when disputeAlertPhoneNumbers is empty', async () => {
       platformConfigService.getConfig.mockResolvedValue({
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
       });
 
       await service.handleRatingReply(
@@ -262,6 +262,205 @@ describe('WhatsAppCustomerFlowService', () => {
       );
 
       expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+
+    it('alerts every configured staff number on a low rating', async () => {
+      platformConfigService.getConfig.mockResolvedValue({
+        disputeAlertPhoneNumbers: ['+2348099999999', '+2348088888888'],
+      });
+
+      await service.handleRatingReply(
+        'cust-1',
+        '1',
+        'req-1',
+        'MOTORIST_TO_OPERATOR',
+      );
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348099999999'),
+        expect.stringContaining('Customer rated the operator'),
+      );
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348088888888'),
+        expect.stringContaining('Customer rated the operator'),
+      );
+    });
+
+    it('alerting one bad staff number does not block alerting the rest', async () => {
+      platformConfigService.getConfig.mockResolvedValue({
+        disputeAlertPhoneNumbers: ['+2348099999999', '+2348088888888'],
+      });
+      twilioService.sendWhatsAppMessage.mockImplementation((to: string) => {
+        if (to.includes('+2348099999999'))
+          return Promise.reject(new Error('send failed'));
+        return Promise.resolve();
+      });
+
+      await service.handleRatingReply(
+        'cust-1',
+        '1',
+        'req-1',
+        'MOTORIST_TO_OPERATOR',
+      );
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348088888888'),
+        expect.stringContaining('Customer rated the operator'),
+      );
+    });
+  });
+
+  describe('WAITING_FOR_MEDIA — new-request staff alert', () => {
+    let service: WhatsAppCustomerFlowService;
+    let prisma: {
+      requestMedia: { count: jest.Mock };
+      user: { findUnique: jest.Mock };
+      rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
+    };
+    let sessionStore: { update: jest.Mock };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
+    let platformConfigService: { getConfig: jest.Mock };
+    let dispatchService: { startDispatch: jest.Mock };
+    const phoneNumber = '+2348012345678';
+    const userId = 'user-1';
+    const session = {
+      state: WhatsAppFlowState.WAITING_FOR_MEDIA,
+      rescueRequestId: 'req-1',
+    } as WhatsAppSession;
+
+    beforeEach(async () => {
+      prisma = {
+        requestMedia: { count: jest.fn().mockResolvedValue(1) },
+        user: {
+          findUnique: jest.fn().mockResolvedValue({ id: userId, name: null }),
+        },
+        rescueRequest: {
+          findUnique: jest.fn().mockResolvedValue({
+            id: 'req-1',
+            vehicleType: 'SEDAN',
+            destination: 'Lekki Phase 1',
+            issueType: 'BREAKDOWN',
+          }),
+          update: jest.fn().mockResolvedValue({}),
+        },
+      };
+      sessionStore = { update: jest.fn() };
+      twilioService = { sendWhatsAppMessage: jest.fn() };
+      platformConfigService = {
+        getConfig: jest
+          .fn()
+          .mockResolvedValue({ newRequestAlertPhoneNumbers: [] }),
+      };
+      dispatchService = { startDispatch: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppCustomerFlowService,
+          { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PaystackService, useValue: {} },
+          { provide: PlatformConfigService, useValue: platformConfigService },
+          { provide: OperatorService, useValue: {} },
+          { provide: DispatchService, useValue: dispatchService },
+          { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppCustomerFlowService>(
+        WhatsAppCustomerFlowService,
+      );
+    });
+
+    async function continueToDispatch() {
+      return service.handleCustomerMessage(
+        phoneNumber,
+        userId,
+        '2',
+        '2',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {},
+      );
+    }
+
+    it('does not alert staff when no new-request alert number is configured', async () => {
+      await continueToDispatch();
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledTimes(1);
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        expect.stringContaining('Searching for nearby tow operators'),
+      );
+    });
+
+    it('alerts every configured staff number once a request becomes dispatch-ready', async () => {
+      platformConfigService.getConfig.mockResolvedValue({
+        newRequestAlertPhoneNumbers: ['+2348077777777', '+2348066666666'],
+      });
+
+      await continueToDispatch();
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348077777777'),
+        expect.stringContaining('Lekki Phase 1'),
+      );
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348066666666'),
+        expect.stringContaining('Lekki Phase 1'),
+      );
+    });
+
+    it('alerting one bad staff number does not block alerting the rest or the customer confirmation', async () => {
+      platformConfigService.getConfig.mockResolvedValue({
+        newRequestAlertPhoneNumbers: ['+2348077777777', '+2348066666666'],
+      });
+      twilioService.sendWhatsAppMessage.mockImplementation((to: string) => {
+        if (to.includes('+2348077777777'))
+          return Promise.reject(new Error('send failed'));
+        return Promise.resolve();
+      });
+
+      await continueToDispatch();
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348066666666'),
+        expect.stringContaining('Lekki Phase 1'),
+      );
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        expect.stringContaining('Searching for nearby tow operators'),
+      );
+      expect(dispatchService.startDispatch).toHaveBeenCalled();
+    });
+
+    it('a failing config fetch for the staff alert never blocks the customer confirmation or dispatch start', async () => {
+      platformConfigService.getConfig.mockRejectedValue(
+        new Error('config unavailable'),
+      );
+
+      await continueToDispatch();
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        expect.stringContaining('Searching for nearby tow operators'),
+      );
+      expect(dispatchService.startDispatch).toHaveBeenCalled();
     });
   });
 

@@ -3,6 +3,12 @@ import { PrismaService } from '../prisma/prisma.service';
 import { UpdatePlatformConfigDto } from './dto/update-platform-config.dto';
 import { normalizePhone } from '../common/phone.util';
 
+// Both alert lists fan out a synchronous WhatsApp send per number on a hot
+// path (every dispute/low-rating/stalled-confirmation, or every single new
+// request) — this caps the blast radius of an admin accidentally pasting a
+// large list (e.g. the wrong clipboard contents) into either field.
+const MAX_ALERT_PHONE_NUMBERS = 10;
+
 export interface PlatformConfigValues {
   serviceFeePercent: number;
   depositPercent: number;
@@ -10,9 +16,11 @@ export interface PlatformConfigValues {
   dispatchBatchSize: number;
   /** Phase 2: how long quote collection runs from the FIRST quote. */
   quoteCollectionMinutes: number;
-  disputeAlertPhoneNumber: string | null;
+  disputeAlertPhoneNumbers: string[];
   /** Customers routed to isTest operators only — see findAndRankCandidates. */
   testCustomerPhoneNumbers: string[];
+  /** Alerted whenever a request becomes dispatch-ready — see handleMediaFinished. */
+  newRequestAlertPhoneNumbers: string[];
 }
 
 @Injectable()
@@ -27,8 +35,9 @@ export class PlatformConfigService {
       dispatchWindowMinutes: row!.dispatchWindowMinutes,
       dispatchBatchSize: row!.dispatchBatchSize,
       quoteCollectionMinutes: row!.quoteCollectionMinutes,
-      disputeAlertPhoneNumber: row!.disputeAlertPhoneNumber,
+      disputeAlertPhoneNumbers: row!.disputeAlertPhoneNumbers,
       testCustomerPhoneNumbers: row!.testCustomerPhoneNumbers,
+      newRequestAlertPhoneNumbers: row!.newRequestAlertPhoneNumbers,
     };
   }
 
@@ -91,6 +100,46 @@ export class PlatformConfigService {
       }
     }
 
+    if (
+      dto.disputeAlertPhoneNumbers !== undefined &&
+      dto.disputeAlertPhoneNumbers.length > MAX_ALERT_PHONE_NUMBERS
+    ) {
+      throw new BadRequestException(
+        `disputeAlertPhoneNumbers cannot have more than ${MAX_ALERT_PHONE_NUMBERS} numbers`,
+      );
+    }
+    let normalizedDisputeAlertNumbers: string[] | undefined;
+    if (dto.disputeAlertPhoneNumbers !== undefined) {
+      try {
+        normalizedDisputeAlertNumbers =
+          dto.disputeAlertPhoneNumbers.map(normalizePhone);
+      } catch (error) {
+        throw new BadRequestException(
+          error instanceof Error ? error.message : 'Invalid phone number',
+        );
+      }
+    }
+
+    if (
+      dto.newRequestAlertPhoneNumbers !== undefined &&
+      dto.newRequestAlertPhoneNumbers.length > MAX_ALERT_PHONE_NUMBERS
+    ) {
+      throw new BadRequestException(
+        `newRequestAlertPhoneNumbers cannot have more than ${MAX_ALERT_PHONE_NUMBERS} numbers`,
+      );
+    }
+    let normalizedNewRequestAlertNumbers: string[] | undefined;
+    if (dto.newRequestAlertPhoneNumbers !== undefined) {
+      try {
+        normalizedNewRequestAlertNumbers =
+          dto.newRequestAlertPhoneNumbers.map(normalizePhone);
+      } catch (error) {
+        throw new BadRequestException(
+          error instanceof Error ? error.message : 'Invalid phone number',
+        );
+      }
+    }
+
     const existing = await this.prisma.platformConfig.findFirst();
 
     const data: Record<string, number | string | string[]> = {};
@@ -104,10 +153,12 @@ export class PlatformConfigService {
       data.dispatchBatchSize = dto.dispatchBatchSize;
     if (dto.quoteCollectionMinutes !== undefined)
       data.quoteCollectionMinutes = dto.quoteCollectionMinutes;
-    if (dto.disputeAlertPhoneNumber !== undefined)
-      data.disputeAlertPhoneNumber = dto.disputeAlertPhoneNumber;
     if (normalizedTestNumbers !== undefined)
       data.testCustomerPhoneNumbers = normalizedTestNumbers;
+    if (normalizedDisputeAlertNumbers !== undefined)
+      data.disputeAlertPhoneNumbers = normalizedDisputeAlertNumbers;
+    if (normalizedNewRequestAlertNumbers !== undefined)
+      data.newRequestAlertPhoneNumbers = normalizedNewRequestAlertNumbers;
 
     const updated = await this.prisma.platformConfig.update({
       where: { id: existing!.id },
@@ -120,8 +171,9 @@ export class PlatformConfigService {
       dispatchWindowMinutes: updated.dispatchWindowMinutes,
       dispatchBatchSize: updated.dispatchBatchSize,
       quoteCollectionMinutes: updated.quoteCollectionMinutes,
-      disputeAlertPhoneNumber: updated.disputeAlertPhoneNumber,
+      disputeAlertPhoneNumbers: updated.disputeAlertPhoneNumbers,
       testCustomerPhoneNumbers: updated.testCustomerPhoneNumbers,
+      newRequestAlertPhoneNumbers: updated.newRequestAlertPhoneNumbers,
     };
   }
 }
