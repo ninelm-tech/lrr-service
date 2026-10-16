@@ -285,23 +285,29 @@ model RescueRequest {
 // Read fresh at quote-selection time; never cached, never re-read after a
 // job's amounts are persisted onto its RescueRequest.
 model PlatformConfig {
-  id                      String   @id @default(cuid())
-  serviceFeePercent       Decimal  @default(10.0)
-  depositPercent          Decimal  @default(10.0)
+  id                          String   @id @default(cuid())
+  serviceFeePercent           Decimal  @default(10.0)
+  depositPercent              Decimal  @default(10.0)
   // How long (minutes) each batch of offered operators has to respond
   // (quote or decline) before the round expires and dispatch retries.
-  dispatchWindowMinutes   Int      @default(10)
-  // WhatsApp number staff disputes are alerted to. Optional — unset means
-  // the staff alert step is skipped, not an error.
-  disputeAlertPhoneNumber String?
-  quoteCollectionMinutes  Int      @default(5)
-  dispatchBatchSize       Int      @default(3)
+  dispatchWindowMinutes       Int      @default(10)
+  // WhatsApp numbers staff disputes/low-ratings/stalled-confirmations are
+  // alerted to. Empty means the staff alert step is skipped, not an error.
+  disputeAlertPhoneNumbers    String[] @default([])
+  quoteCollectionMinutes      Int      @default(5)
+  dispatchBatchSize           Int      @default(3)
   // Customers whose requests should be routed to isTest operators only
   // (and never to real ones), for exercising the full production flow —
   // real Paystack, real payout — without touching real traffic. Stored as
   // E.164, same format as User.phoneNumber.
-  testCustomerPhoneNumbers String[] @default([])
-  updatedAt               DateTime @updatedAt
+  testCustomerPhoneNumbers    String[] @default([])
+  // WhatsApp numbers alerted whenever a customer's request becomes
+  // dispatch-ready (media attached). Separate from disputeAlertPhoneNumbers
+  // deliberately: that list is for exceptions (low volume, something's
+  // wrong); this one fires on every single request (routine, high volume),
+  // and mixing them would bury the exception alerts in noise.
+  newRequestAlertPhoneNumbers String[] @default([])
+  updatedAt                   DateTime @updatedAt
 }
 
 enum MediaContext {
