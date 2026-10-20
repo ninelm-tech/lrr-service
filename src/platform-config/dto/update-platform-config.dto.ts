@@ -1,4 +1,5 @@
 import {
+  ArrayMaxSize,
   IsArray,
   IsInt,
   IsNumber,
@@ -39,12 +40,20 @@ export class UpdatePlatformConfigDto {
   @IsOptional()
   quoteCollectionMinutes?: number;
 
-  @IsString()
+  @IsArray()
+  @ArrayMaxSize(10)
+  @IsString({ each: true })
   @IsOptional()
-  disputeAlertPhoneNumber?: string;
+  disputeAlertPhoneNumbers?: string[];
 
   @IsArray()
   @IsString({ each: true })
   @IsOptional()
   testCustomerPhoneNumbers?: string[];
+
+  @IsArray()
+  @ArrayMaxSize(10)
+  @IsString({ each: true })
+  @IsOptional()
+  newRequestAlertPhoneNumbers?: string[];
 }

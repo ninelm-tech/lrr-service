@@ -100,7 +100,8 @@ describe('OperatorService', () => {
         dispatchWindowMinutes: 10,
         dispatchBatchSize: 3,
         quoteCollectionMinutes: 5,
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
+        newRequestAlertPhoneNumbers: [],
         testCustomerPhoneNumbers: [],
       }),
     };
@@ -991,7 +992,8 @@ describe('OperatorService', () => {
         dispatchWindowMinutes: 10,
         dispatchBatchSize: 3,
         quoteCollectionMinutes: 5,
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
+        newRequestAlertPhoneNumbers: [],
         testCustomerPhoneNumbers: [],
       });
       // Captured via a typed mockImplementation callback, not `mock.calls[0][0]`
@@ -1097,7 +1099,8 @@ describe('OperatorService', () => {
         dispatchWindowMinutes: 10,
         dispatchBatchSize: 3,
         quoteCollectionMinutes: 5,
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
+        newRequestAlertPhoneNumbers: [],
         testCustomerPhoneNumbers: [],
       });
       prisma.operator.findUnique.mockResolvedValue({

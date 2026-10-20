@@ -26,7 +26,11 @@ import {
   formatVehicleType,
 } from './domain/vehicle-truck-mapping';
 import { estimateEtaMinutes, rankQuotes } from './domain/quote-ranking';
-import { formatStatus, formatJobRef } from './domain/rescue-request-formatting';
+import {
+  formatStatus,
+  formatJobRef,
+  formatIssueType,
+} from './domain/rescue-request-formatting';
 import {
   classifyMediaType,
   getExtensionFromContentType,
@@ -816,6 +820,26 @@ export class WhatsAppCustomerFlowService {
       `${greet}🔍 Searching for nearby tow operators...\n\nVehicle: ${formatVehicleType(vehicleType)}\nDestination: ${destination}\n\nOperators will submit their price and ETA — you'll get a shortlist to choose from shortly. Reply CANCEL at any time.`,
     );
 
+    // Best-effort — a failed staff alert never blocks the customer's own
+    // confirmation above, and one bad/unreachable number never blocks
+    // alerting the rest.
+    try {
+      const config = await this.platformConfigService.getConfig();
+      const issueType = rescueRequestRow.issueType as IssueType;
+      for (const staffPhoneNumber of config.newRequestAlertPhoneNumbers) {
+        try {
+          await this.twilioService.sendWhatsAppMessage(
+            toWhatsAppAddress(staffPhoneNumber),
+            `🆕 New request ${formatJobRef(rescueRequestId)}: ${formatVehicleType(vehicleType)}, ${formatIssueType(issueType)} → ${destination}. Customer: ${phoneNumber}.`,
+          );
+        } catch (error) {
+          console.error('Failed to send new-request staff alert:', error);
+        }
+      }
+    } catch (error) {
+      console.error('Failed to send new-request staff alert:', error);
+    }
+
     void this.dispatchService.startDispatch(rescueRequestId, customer.id);
     return this.xmlOk();
   }
@@ -880,19 +904,24 @@ export class WhatsAppCustomerFlowService {
     // Low rating (either direction) — alert staff so someone actually looks
     // at what went wrong, rather than the score just sitting in the DB
     // unnoticed. Best-effort: a failed alert never blocks the reviewer's
-    // own reply.
+    // own reply, and one bad/unreachable number never blocks alerting the
+    // rest.
     if (score <= 2) {
       try {
         const config = await this.platformConfigService.getConfig();
-        if (config.disputeAlertPhoneNumber) {
-          const who =
-            direction === RatingDirection.MOTORIST_TO_OPERATOR
-              ? 'Customer rated the operator'
-              : 'Operator rated the customer';
-          await this.twilioService.sendWhatsAppMessage(
-            toWhatsAppAddress(config.disputeAlertPhoneNumber),
-            `⚠️ Low rating (${score}/5) on ${formatJobRef(rescueRequestId)} — ${who} low. Please review.`,
-          );
+        const who =
+          direction === RatingDirection.MOTORIST_TO_OPERATOR
+            ? 'Customer rated the operator'
+            : 'Operator rated the customer';
+        for (const phoneNumber of config.disputeAlertPhoneNumbers) {
+          try {
+            await this.twilioService.sendWhatsAppMessage(
+              toWhatsAppAddress(phoneNumber),
+              `⚠️ Low rating (${score}/5) on ${formatJobRef(rescueRequestId)} — ${who} low. Please review.`,
+            );
+          } catch (error) {
+            console.error('Failed to send low-rating staff alert:', error);
+          }
         }
       } catch (error) {
         console.error('Failed to send low-rating staff alert:', error);

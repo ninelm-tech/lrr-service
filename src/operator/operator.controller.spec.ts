@@ -254,7 +254,8 @@ describe('OperatorController', () => {
         dispatchWindowMinutes: 5,
         dispatchBatchSize: 3,
         quoteCollectionMinutes: 10,
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
+        newRequestAlertPhoneNumbers: [],
         testCustomerPhoneNumbers: [],
       });
       const req = { user: { userId: 'user-1', role: 'OPERATOR' } } as never;

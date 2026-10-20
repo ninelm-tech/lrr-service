@@ -127,8 +127,11 @@ export class DisputeService {
     }
 
     const config = await this.platformConfigService.getConfig();
-    const callLine = config.disputeAlertPhoneNumber
-      ? ` Or call us directly: ${config.disputeAlertPhoneNumber}.`
+    // Several numbers can be configured for staff alerts, but only one
+    // number should be published to customers as "the" support line — the
+    // first configured number is treated as the primary/public one.
+    const callLine = config.disputeAlertPhoneNumbers[0]
+      ? ` Or call us directly: ${config.disputeAlertPhoneNumbers[0]}.`
       : '';
 
     await this.twilioService.sendWhatsAppMessage(
@@ -176,7 +179,8 @@ export class DisputeService {
 
   /**
    * Best-effort — a failed staff alert never blocks the customer-facing
-   * flow. This is always a business-initiated message (staff never texts
+   * flow, and one bad/unreachable number never blocks alerting the rest.
+   * This is always a business-initiated message (staff never texts
    * first), so on a real (non-sandbox) number it MUST go through the
    * approved `dispute_raised_alert` Content Template — a freeform body
    * gets rejected by Meta outside a session window. Falls back to a
@@ -186,27 +190,33 @@ export class DisputeService {
   private async sendStaffDisputeAlert(rescueRequest: any) {
     try {
       const config = await this.platformConfigService.getConfig();
-      if (!config.disputeAlertPhoneNumber) return;
+      if (config.disputeAlertPhoneNumbers.length === 0) return;
 
       const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
       const jobRef = formatJobRef(rescueRequest.id); // "Job #A1B2C3"
       const dashboardLink = `${frontendUrl}/requests?highlight=${rescueRequest.id}`;
       const templateSid = process.env.TWILIO_DISPUTE_TEMPLATE_SID;
 
-      if (templateSid) {
-        // Template body is "...Job {{1}}. Log in to review: {{2}} now." —
-        // {{1}} needs the bare ref, "Job " is already static text in the
-        // approved template itself.
-        await this.twilioService.sendWhatsAppTemplateMessage(
-          toWhatsAppAddress(config.disputeAlertPhoneNumber),
-          templateSid,
-          { '1': jobRef.replace('Job #', ''), '2': dashboardLink },
-        );
-      } else {
-        await this.twilioService.sendWhatsAppMessage(
-          toWhatsAppAddress(config.disputeAlertPhoneNumber),
-          `🚨 New dispute raised — ${jobRef}\n\nLog in to view: ${dashboardLink}`,
-        );
+      for (const phoneNumber of config.disputeAlertPhoneNumbers) {
+        try {
+          if (templateSid) {
+            // Template body is "...Job {{1}}. Log in to review: {{2}} now." —
+            // {{1}} needs the bare ref, "Job " is already static text in the
+            // approved template itself.
+            await this.twilioService.sendWhatsAppTemplateMessage(
+              toWhatsAppAddress(phoneNumber),
+              templateSid,
+              { '1': jobRef.replace('Job #', ''), '2': dashboardLink },
+            );
+          } else {
+            await this.twilioService.sendWhatsAppMessage(
+              toWhatsAppAddress(phoneNumber),
+              `🚨 New dispute raised — ${jobRef}\n\nLog in to view: ${dashboardLink}`,
+            );
+          }
+        } catch (error) {
+          console.error('Failed to send dispute staff alert:', error);
+        }
       }
     } catch (error) {
       console.error('Failed to send dispute staff alert:', error);

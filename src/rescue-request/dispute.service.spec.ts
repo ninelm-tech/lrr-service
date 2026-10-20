@@ -48,7 +48,7 @@ describe('DisputeService', () => {
       sendWhatsAppTemplateMessage: jest.fn(),
     };
     platformConfigService = {
-      getConfig: jest.fn().mockResolvedValue({ disputeAlertPhoneNumber: null }),
+      getConfig: jest.fn().mockResolvedValue({ disputeAlertPhoneNumbers: [] }),
     };
     sessionStore = { update: jest.fn() };
     sharedService = {
@@ -93,7 +93,7 @@ describe('DisputeService', () => {
         customer: { phoneNumber: customerPhone },
       });
       platformConfigService.getConfig.mockResolvedValue({
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
       });
 
       await service.raiseDispute(rescueRequestId, customerPhone);
@@ -171,7 +171,7 @@ describe('DisputeService', () => {
         customer: { id: 'cust-1', phoneNumber: customerPhone },
       });
       platformConfigService.getConfig.mockResolvedValue({
-        disputeAlertPhoneNumber: '+2348099999999',
+        disputeAlertPhoneNumbers: ['+2348099999999'],
       });
 
       await service.raiseDispute(rescueRequestId, customerPhone, 'cust-1');
@@ -181,6 +181,102 @@ describe('DisputeService', () => {
       );
       expect(customerCall?.[1]).toContain('what happened');
       expect(customerCall?.[1]).toContain('+2348099999999');
+    });
+
+    it('shows only the first configured number in the call-in line when several are configured', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: rescueRequestId,
+        disputed: false,
+        disputeResolvedAt: null,
+        status: 'ARRIVED',
+        assignedOperator: null,
+        balanceAmount: 22500,
+        depositAmount: 2500,
+        customer: { id: 'cust-1', phoneNumber: customerPhone },
+      });
+      platformConfigService.getConfig.mockResolvedValue({
+        disputeAlertPhoneNumbers: ['+2348099999999', '+2348088888888'],
+      });
+
+      await service.raiseDispute(rescueRequestId, customerPhone, 'cust-1');
+
+      const calls = twilioService.sendWhatsAppMessage.mock.calls as [
+        string,
+        string,
+      ][];
+      const customerCall = calls.find(([to]) => to.includes(customerPhone));
+      expect(customerCall?.[1]).toContain('+2348099999999');
+      expect(customerCall?.[1]).not.toContain('+2348088888888');
+    });
+
+    it('alerts every configured staff number of the new dispute', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: rescueRequestId,
+        disputed: false,
+        disputeResolvedAt: null,
+        status: 'ARRIVED',
+        assignedOperator: null,
+        balanceAmount: 22500,
+        depositAmount: 2500,
+        customer: { id: 'cust-1', phoneNumber: customerPhone },
+      });
+      platformConfigService.getConfig.mockResolvedValue({
+        disputeAlertPhoneNumbers: ['+2348099999999', '+2348088888888'],
+      });
+
+      await service.raiseDispute(rescueRequestId, customerPhone, 'cust-1');
+
+      const calls = twilioService.sendWhatsAppMessage.mock.calls as [
+        string,
+        string,
+      ][];
+      const staffCalls = calls.filter(([, body]) =>
+        body.includes('New dispute raised'),
+      );
+      expect(staffCalls.map(([to]) => to)).toEqual([
+        expect.stringContaining('+2348099999999'),
+        expect.stringContaining('+2348088888888'),
+      ]);
+    });
+
+    it('alerting one bad staff number does not block alerting the rest', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: rescueRequestId,
+        disputed: false,
+        disputeResolvedAt: null,
+        status: 'ARRIVED',
+        assignedOperator: null,
+        balanceAmount: 22500,
+        depositAmount: 2500,
+        customer: { id: 'cust-1', phoneNumber: customerPhone },
+      });
+      platformConfigService.getConfig.mockResolvedValue({
+        disputeAlertPhoneNumbers: ['+2348099999999', '+2348088888888'],
+      });
+      twilioService.sendWhatsAppMessage.mockImplementation(
+        (to: string, body: string) => {
+          if (
+            to.includes('+2348099999999') &&
+            body.includes('New dispute raised')
+          ) {
+            return Promise.reject(new Error('send failed'));
+          }
+          return Promise.resolve();
+        },
+      );
+
+      await service.raiseDispute(rescueRequestId, customerPhone, 'cust-1');
+
+      const calls = twilioService.sendWhatsAppMessage.mock.calls as [
+        string,
+        string,
+      ][];
+      const staffCalls = calls.filter(([, body]) =>
+        body.includes('New dispute raised'),
+      );
+      expect(staffCalls.map(([to]) => to)).toEqual(
+        expect.arrayContaining([expect.stringContaining('+2348088888888')]),
+      );
     });
 
     it('first raise: warns the operator (not the customer) to withhold the vehicle', async () => {
@@ -198,7 +294,7 @@ describe('DisputeService', () => {
         customer: { id: 'cust-1', phoneNumber: customerPhone },
       });
       platformConfigService.getConfig.mockResolvedValue({
-        disputeAlertPhoneNumber: null,
+        disputeAlertPhoneNumbers: [],
       });
 
       await service.raiseDispute(rescueRequestId, customerPhone, 'cust-1');
@@ -247,7 +343,7 @@ describe('DisputeService', () => {
         customer: { id: 'cust-1', phoneNumber: customerPhone },
       });
       platformConfigService.getConfig.mockResolvedValue({
-        disputeAlertPhoneNumber: '+2348099999999',
+        disputeAlertPhoneNumbers: ['+2348099999999'],
       });
 
       await service.raiseDispute(rescueRequestId, customerPhone, 'cust-1');
