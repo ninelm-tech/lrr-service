@@ -368,6 +368,17 @@ model DispatchOffer {
   respondedAt            DateTime?
   expiresAt              DateTime
 
+  // Set once the send resolves with a SID (Task 3) — nullable because
+  // historical rows predate this feature and some sends may never resolve.
+  twilioMessageSid String?
+  // Twilio's own status string, verbatim (sent/delivered/read/undelivered/
+  // failed/...) — not an enum, so a future Twilio status needs no code
+  // change to keep recording. Set by the status-callback webhook (Task 4).
+  deliveryStatus String?
+  // Twilio's numeric error code (e.g. 63024) when deliveryStatus is
+  // undelivered/failed — lets staff debug without a Twilio console trip.
+  deliveryErrorCode Int?
+
   batchId String
 
   // Which dispatch round this offer belongs to. Deliberately has no default:
