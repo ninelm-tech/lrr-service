@@ -109,6 +109,10 @@ for that one row — independent per offer, so one update failing doesn't
 block persisting the others (same `allSettled` discipline already used for
 the sends themselves).
 
+That same `offerId` is also embedded in the `statusCallback` URL passed to
+Twilio at send time (Section 3) — it's what the webhook uses to find its
+way back to the row, not the Twilio SID.
+
 ### 3. Webhook
 
 New route, separate from the existing inbound-message webhook:
@@ -117,19 +121,43 @@ New route, separate from the existing inbound-message webhook:
 POST /webhooks/twilio-status
 ```
 
-Registered as the `statusCallback` parameter **only** on dispatch-offer
-sends (`sendDispatchOfferMessage`'s `client.messages.create(...)` call),
-built from the existing `API_BASE_URL` env var
-(`${API_BASE_URL}/webhooks/twilio-status`) — not a Twilio Console-level
-default, so only the sends we decided to track ever hit it.
+Like every route in this app, actually served under the global prefix
+`main.ts` sets via `app.setGlobalPrefix('api/v1')` — so the real path is
+`/api/v1/webhooks/twilio-status`. Registered as the `statusCallback`
+parameter **only** on dispatch-offer sends (`sendDispatchOfferMessage`'s
+`client.messages.create(...)` call), built as:
+
+```
+${API_BASE_URL}/api/v1/webhooks/twilio-status?offerId=<DispatchOffer.id>
+```
+
+— not a Twilio Console-level default, so only the sends we decided to
+track ever hit it.
+
+**Correlating a callback to its offer — by `offerId`, not the Twilio
+SID.** The `DispatchOffer` row's own primary key is known *before* the
+send (it's created in the same transaction that writes the batch — see
+Section 2), so it's embedded directly in the `statusCallback` URL rather
+than correlating by `twilioMessageSid` after the fact. This removes a real
+race: a fast callback (exactly the near-instant failures, e.g. error
+63024, this feature exists to catch) could otherwise arrive before its SID
+is even persisted, and would be silently dropped as unmatched. It also
+means this lookup needs no new index — it updates by primary key, which is
+already indexed, rather than by `twilioMessageSid`. The SID is still
+captured and persisted (Section 2) as a secondary debugging aid for
+cross-referencing Twilio's own dashboard, but nothing about correctness
+depends on that write landing before any callback arrives.
 
 **Signature validation:** Twilio's own `twilio.validateRequest(authToken,
 signatureHeader, url, params)` — unlike Paystack's HMAC-over-raw-bytes
 check, this validates against the *parsed* form params plus the exact
-callback URL, so no raw-body middleware is needed (the global `rawBody:
-true` in `main.ts` is irrelevant here; `@Body()` is enough). `url` must be
-the exact public URL Twilio was given, i.e. built from the same
-`API_BASE_URL` used to register the callback.
+callback URL (query string included, so `offerId` can't be tampered with
+by anything that doesn't also hold the Twilio auth token), so no raw-body
+middleware is needed (the global `rawBody: true` in `main.ts` is
+irrelevant here; `@Body()` is enough). `url` must be the exact public URL
+Twilio was given — including `/api/v1` and the `?offerId=...` query
+param — built from the same `API_BASE_URL` used to register the callback,
+not whatever host/protocol the request happens to arrive with.
 
 **Payload fields read:** `MessageSid`, `MessageStatus`, `ErrorCode`
 (present only on failure statuses).
@@ -137,14 +165,25 @@ the exact public URL Twilio was given, i.e. built from the same
 **Handler logic:**
 1. Validate the signature; reject (and `Sentry.captureMessage`, mirroring
    the Paystack webhook's handling of an invalid signature) if it fails.
-2. Look up the `DispatchOffer` by `twilioMessageSid = MessageSid`. If none
-   is found (e.g. a stale/retried callback, or a SID from before this
-   feature shipped), no-op — not an error.
-3. Update `deliveryStatus` and `deliveryErrorCode` on that row.
+2. Look up the `DispatchOffer` by the `offerId` query param (its primary
+   key). If none is found (e.g. a stale/retried callback, or an id from
+   before this feature shipped), no-op — not an error.
+3. Update `deliveryStatus` and `deliveryErrorCode` on that row —
+   atomically, guarded (in the write's own `WHERE` clause, not a separate
+   read then a conditional write) against an out-of-order callback
+   overwriting a more-advanced status, e.g. a delayed `sent` arriving
+   after `delivered` already landed. Twilio's lifecycle stages are ranked
+   so a callback can only move a status forward; a status this app
+   doesn't yet recognize (a future Twilio value) is never ranked against
+   anything in either direction — it's always recorded when it arrives,
+   and it never blocks a later recognized status from overwriting it
+   either.
 4. If `MessageStatus` is `undelivered` or `failed`, `Sentry.captureMessage`
    (or `captureException` with a constructed error) tagged with the offer's
    `rescueRequestId` and `operatorId`, matching the existing alert pattern
-   in `deliverOffers`/`sendStaffDisputeAlert`.
+   in `deliverOffers`/`sendStaffDisputeAlert` — only when step 3's write
+   actually took effect; a callback step 3 rejected as out-of-order never
+   alerts.
 
 ### 4. Admin UI (lrr-web)
 
