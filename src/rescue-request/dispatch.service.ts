@@ -47,6 +47,36 @@ const MAX_ROUNDS_BEFORE_AUTO_CANCEL = Number(
 ); // ~RETRY*MAX min total
 const RADIUS_EXPANSION_KM = 2;
 
+// Ranks a Twilio delivery-status callback's lifecycle stage, so an
+// out-of-order callback (arriving late over the network) can never
+// overwrite a more-advanced, more-informative status already recorded —
+// see handleDeliveryStatusUpdate. Terminal states (read/undelivered/
+// failed) share the top rank; nothing legitimately follows any of them.
+// A status not in this map (incoming OR already-recorded) is never ranked
+// against anything — see handleDeliveryStatusUpdate's own comment on why
+// guessing a rank for an unrecognized status is worse than not comparing
+// it at all.
+const DELIVERY_STATUS_RANK: Record<string, number> = {
+  queued: 0,
+  accepted: 0,
+  sending: 0,
+  sent: 1,
+  delivered: 2,
+  read: 3,
+  undelivered: 3,
+  failed: 3,
+};
+// The highest rank in the map above — read/undelivered/failed today.
+// Sharing this rank means "equally final," not "equally overwritable":
+// multi-llm review caught that allowing same-rank overwrites let a late
+// or redelivered terminal callback silently replace a DIFFERENT terminal
+// status already recorded (e.g. a redelivered 'failed' erasing a
+// confirmed 'read'). See handleDeliveryStatusUpdate's guard, which allows
+// a same-rank overwrite everywhere except at this top tier.
+const TERMINAL_DELIVERY_STATUS_RANK = Math.max(
+  ...Object.values(DELIVERY_STATUS_RANK),
+);
+
 /**
  * What prepareNextRound found. `exhausted: false` always carries at least one
  * offer; `exhausted: true` always carries no offers and a reason, and
@@ -86,6 +116,12 @@ export class DispatchService {
    */
   private async sendDispatchOfferMessage(
     operatorPhone: string,
+    // The DispatchOffer row's own id — embedded in the statusCallback URL
+    // below so the webhook can find the right row with zero dependency on
+    // whether/when its Twilio SID gets persisted. See Task 3's design
+    // note in the implementation plan for why this beats correlating by
+    // the Twilio SID alone.
+    offerId: string,
     variables: {
       jobRef: string;
       vehicle: string;
@@ -101,11 +137,43 @@ export class DispatchService {
       etaLine: string;
       window: string;
     },
-  ): Promise<void> {
+  ): Promise<{ sid: string }> {
     // Full definition: TWILIO_CONTENT_TEMPLATES.new_rescue_job in
     // src/integrations/twilio/twilio-content-templates.ts.
     const templateSid = process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
     const to = toWhatsAppAddress(operatorPhone);
+    // Best-effort, same pattern as every other API_BASE_URL use in this
+    // file: if it's unset (e.g. local/sandbox), the send still goes out,
+    // just without delivery-status tracking. /api/v1 matches main.ts's
+    // app.setGlobalPrefix('api/v1') — every route in this app, including
+    // this webhook, is actually served under that prefix; omitting it
+    // here means Twilio POSTs to a 404 and no status is ever recorded.
+    // Twilio signs the full callback URL including the query string, so
+    // offerId can't be tampered with by anything that doesn't also hold
+    // the Twilio auth token.
+    const apiBaseUrl = process.env.API_BASE_URL;
+    if (!apiBaseUrl) {
+      // Best-effort degrades the send, not the tracking visibility of
+      // that degradation — multi-llm review noted a misconfigured
+      // production env would otherwise lose delivery-status tracking for
+      // every dispatch offer with no signal anything was wrong.
+      console.warn(
+        '⚠️ API_BASE_URL is not set — dispatch offer sent without delivery-status tracking',
+      );
+    }
+    // Deliberately a plain string, not `{ statusCallback } | undefined` —
+    // whether the TwilioService call below gets a 3rd argument AT ALL is
+    // decided per-call just below, not by passing `undefined` as a real
+    // argument. A mock called with an explicit trailing `undefined` is a
+    // 3-argument call as far as Jest's `toHaveBeenCalledWith` is
+    // concerned — it does not match a 2-argument assertion.
+    // Trailing slash stripped so a misconfigured API_BASE_URL (e.g.
+    // "https://api.example.com/") can't produce a "//api/v1" double
+    // slash — this exact string must match what webhooks.controller.ts
+    // reconstructs for signature verification, byte for byte.
+    const statusCallback = apiBaseUrl
+      ? `${apiBaseUrl.replace(/\/+$/, '')}/api/v1/webhooks/twilio-status?offerId=${offerId}`
+      : undefined;
 
     if (templateSid) {
       // Mapping is dictated by the live template (`new_rescue_job`), which
@@ -147,20 +215,29 @@ export class DispatchService {
         templateVariables[key] =
           sanitizeTemplateVariable(templateVariables[key]) || '—';
       }
-      await this.twilioService.sendWhatsAppTemplateMessage(
-        to,
-        templateSid,
-        templateVariables,
-      );
+      return statusCallback
+        ? this.twilioService.sendWhatsAppTemplateMessage(
+            to,
+            templateSid,
+            templateVariables,
+            { statusCallback },
+          )
+        : this.twilioService.sendWhatsAppTemplateMessage(
+            to,
+            templateSid,
+            templateVariables,
+          );
     } else {
       // Matches the original freeform layout exactly: Distance sits right
       // after Destination (before Location); ETA is its own line after the
       // bid prompt (before "Reply NO") — do not reorder these to "tidy up"
       // the message, the wording/order is what's already familiar to operators.
-      await this.twilioService.sendWhatsAppMessage(
-        to,
-        `🚨 *NEW RESCUE JOB* — Job #${variables.jobRef}\n\nVehicle: ${variables.vehicle}\nDestination: ${variables.destination}\n${variables.issueLine}${variables.distanceLine}Location: ${variables.location}${variables.mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\n${variables.etaLine}Reply *NO* to decline.\nYou have ${variables.window} to respond.\n\n📌 If you have more than one job open at once, reply "${variables.jobRef} 25000" instead of just the price, so we know which job you mean.`,
-      );
+      const message = `🚨 *NEW RESCUE JOB* — Job #${variables.jobRef}\n\nVehicle: ${variables.vehicle}\nDestination: ${variables.destination}\n${variables.issueLine}${variables.distanceLine}Location: ${variables.location}${variables.mediaSection}\n\n⚠️ *ACTION NEEDED* — reply with your price to bid, e.g. "25000".\n${variables.etaLine}Reply *NO* to decline.\nYou have ${variables.window} to respond.\n\n📌 If you have more than one job open at once, reply "${variables.jobRef} 25000" instead of just the price, so we know which job you mean.`;
+      return statusCallback
+        ? this.twilioService.sendWhatsAppMessage(to, message, {
+            statusCallback,
+          })
+        : this.twilioService.sendWhatsAppMessage(to, message);
     }
   }
 
@@ -677,6 +754,29 @@ export class DispatchService {
       })),
     });
 
+    // createMany doesn't return the created rows, and no DispatchOffer.id
+    // exists until this point — deliverOffers (after this transaction
+    // commits) needs each row's own id to persist its Twilio SID onto the
+    // right one. batchId is a fresh UUID generated above, unique to this
+    // call, so this find can only return the rows just created.
+    const createdOffers = await tx.dispatchOffer.findMany({
+      where: { rescueRequestId, batchId },
+      select: { id: true, operatorId: true },
+    });
+    const offerIdByOperatorId = new Map(
+      createdOffers.map((o) => [o.operatorId, o.id]),
+    );
+    // Multi-llm review: the `!` below relied entirely on this invariant
+    // holding with no runtime check — a mismatch (e.g. a duplicate
+    // operatorId in `batch`) would silently produce `offerId: undefined`
+    // for one operator instead of failing loudly at the one point that
+    // can actually diagnose it.
+    if (createdOffers.length !== batch.length) {
+      throw new Error(
+        `writeRound: expected ${batch.length} created offers, found ${createdOffers.length} for rescueRequestId=${rescueRequestId} batchId=${batchId}`,
+      );
+    }
+
     // Same transaction, and `push` rather than a read-modify-write so a
     // concurrent append (an admin's manual offer) cannot be lost.
     await tx.rescueRequest.update({
@@ -712,6 +812,9 @@ export class DispatchService {
     const jobRef = formatJobRef(rescueRequestId);
 
     return batch.map((op) => ({
+      // Non-null: offerIdByOperatorId was built from the exact rows
+      // createMany just inserted for this batch, keyed by the same op.id.
+      offerId: offerIdByOperatorId.get(op.id)!,
       operatorId: op.id,
       operatorPhone: op.phoneNumber,
       jobRef: jobRef.replace('Job #', ''),
@@ -739,23 +842,144 @@ export class DispatchService {
   async deliverOffers(offers: PendingOffer[]): Promise<void> {
     const results = await Promise.allSettled(
       offers.map((offer) =>
-        this.sendDispatchOfferMessage(offer.operatorPhone, offer),
+        this.sendDispatchOfferMessage(
+          offer.operatorPhone,
+          offer.offerId,
+          offer,
+        ),
       ),
     );
-    results.forEach((result, i) => {
-      if (result.status === 'rejected') {
-        console.error(
-          `Failed to send dispatch offer to operator ${offers[i].operatorId}:`,
-          result.reason,
-        );
-        Sentry.captureException(result.reason, {
-          extra: {
-            rescueRequestId: offers[i].jobRef,
-            operatorId: offers[i].operatorId,
-          },
-        });
-      }
+    await Promise.all(
+      results.map(async (result, i) => {
+        if (result.status === 'rejected') {
+          console.error(
+            `Failed to send dispatch offer to operator ${offers[i].operatorId}:`,
+            result.reason,
+          );
+          Sentry.captureException(result.reason, {
+            extra: {
+              rescueRequestId: offers[i].jobRef,
+              operatorId: offers[i].operatorId,
+            },
+          });
+          return;
+        }
+        // Independent per offer — one row's update failing (e.g. a
+        // transient DB error) must not stop the SID being persisted for
+        // the others.
+        try {
+          await this.prisma.dispatchOffer.update({
+            where: { id: offers[i].offerId },
+            data: { twilioMessageSid: result.value.sid },
+          });
+        } catch (error) {
+          console.error(
+            `Failed to persist Twilio SID for offer ${offers[i].offerId}:`,
+            error,
+          );
+          Sentry.captureException(error, {
+            extra: {
+              rescueRequestId: offers[i].jobRef,
+              operatorId: offers[i].operatorId,
+              offerId: offers[i].offerId,
+            },
+          });
+        }
+      }),
+    );
+  }
+
+  /**
+   * Called by the /webhooks/twilio-status route once Twilio reports a
+   * dispatch offer's async delivery outcome. Visibility only — this never
+   * changes dispatch behavior (no retry, no reroute, no radius expansion).
+   * Looked up by the offer's own id (embedded in the statusCallback URL at
+   * send time, see sendDispatchOfferMessage), not the Twilio SID — no
+   * timing dependency on when/whether that SID gets persisted. An id
+   * matching no offer (a stale/replayed callback, or one predating this
+   * feature) is not an error.
+   */
+  async handleDeliveryStatusUpdate(
+    offerId: string,
+    messageSid: string,
+    status: string,
+    errorCode: number | undefined,
+  ): Promise<void> {
+    const offer = await this.prisma.dispatchOffer.findUnique({
+      where: { id: offerId },
+      select: { id: true, rescueRequestId: true, operatorId: true },
     });
+    if (!offer) return;
+
+    const incomingRank = DELIVERY_STATUS_RANK[status];
+    // No ranking constraint at all when the incoming status itself isn't
+    // one we recognize — see this step's design note above. When it IS
+    // recognized, the existing row can only be overwritten if its current
+    // deliveryStatus is null, is itself a recognized status ranked BELOW
+    // the incoming one (or tied with it, EXCEPT at the terminal tier,
+    // where a tie means two different terminal statuses and nothing
+    // legitimately overwrites another terminal status — see
+    // TERMINAL_DELIVERY_STATUS_RANK above), or is a status we don't
+    // recognize (can't rank it, so don't let it permanently block future
+    // writes).
+    const guard =
+      incomingRank === undefined
+        ? {}
+        : {
+            OR: [
+              { deliveryStatus: null },
+              {
+                deliveryStatus: {
+                  in: Object.entries(DELIVERY_STATUS_RANK)
+                    .filter(
+                      ([, rank]) =>
+                        rank < incomingRank ||
+                        (rank === incomingRank &&
+                          incomingRank !== TERMINAL_DELIVERY_STATUS_RANK),
+                    )
+                    .map(([recognizedStatus]) => recognizedStatus),
+                },
+              },
+              {
+                deliveryStatus: {
+                  notIn: Object.keys(DELIVERY_STATUS_RANK),
+                },
+              },
+            ],
+          };
+
+    // Atomic: the guard is part of the WHERE clause itself, so two
+    // concurrent callbacks for the same offer can never both read a stale
+    // deliveryStatus and race each other — only one write can ever match a
+    // given row's current state at a time.
+    const result = await this.prisma.dispatchOffer.updateMany({
+      where: { id: offerId, ...guard },
+      data: {
+        twilioMessageSid: messageSid,
+        deliveryStatus: status,
+        deliveryErrorCode: errorCode ?? null,
+      },
+    });
+    // count: 0 means the guard rejected this write — a stale/out-of-order
+    // callback, or the offerId didn't exist in the window between the
+    // findUnique above and this update (vanishingly unlikely, never a
+    // reason to alert). Nothing was written, so nothing to alert about.
+    if (result.count === 0) return;
+
+    if (status === 'undelivered' || status === 'failed') {
+      Sentry.captureMessage(
+        `Dispatch offer ${status} — ${formatJobRef(offer.rescueRequestId)}`,
+        {
+          level: 'error',
+          extra: {
+            rescueRequestId: offer.rescueRequestId,
+            operatorId: offer.operatorId,
+            messageSid,
+            errorCode,
+          },
+        },
+      );
+    }
   }
 
   /**
@@ -1115,13 +1339,13 @@ export class DispatchService {
     // commit together. A crash between them leaves the two disagreeing about
     // who has been asked, and the next automatic round re-offers the same
     // job to an operator the admin already contacted.
-    await this.prisma.$transaction(async (tx) => {
+    const createdOffer = await this.prisma.$transaction(async (tx) => {
       const { dispatchRound } = await tx.rescueRequest.findUniqueOrThrow({
         where: { id: rescueRequestId },
         select: { dispatchRound: true },
       });
 
-      await tx.dispatchOffer.create({
+      const offer = await tx.dispatchOffer.create({
         data: {
           rescueRequestId,
           operatorId,
@@ -1138,6 +1362,8 @@ export class DispatchService {
         where: { id: rescueRequestId },
         data: { offeredOperatorIds: { push: [operatorId] } },
       });
+
+      return offer;
     });
 
     const lat = Number(rescueRequest.latitude);
@@ -1165,18 +1391,23 @@ export class DispatchService {
       lon,
     );
 
+    let sid: string;
     try {
-      await this.sendDispatchOfferMessage(operator.phoneNumber!, {
-        jobRef: formatJobRef(rescueRequestId).replace('Job #', ''),
-        vehicle: vehicleLabel,
-        destination: destinationLabel,
-        distanceLine: '', // not computed for a manual single-operator offer
-        issueLine,
-        location: locationSection,
-        mediaSection,
-        etaLine: '', // not computed for a manual single-operator offer
-        window: this.formatRemaining(expiresAt), // true remaining time, clamped or not
-      });
+      ({ sid } = await this.sendDispatchOfferMessage(
+        operator.phoneNumber!,
+        createdOffer.id,
+        {
+          jobRef: formatJobRef(rescueRequestId).replace('Job #', ''),
+          vehicle: vehicleLabel,
+          destination: destinationLabel,
+          distanceLine: '', // not computed for a manual single-operator offer
+          issueLine,
+          location: locationSection,
+          mediaSection,
+          etaLine: '', // not computed for a manual single-operator offer
+          window: this.formatRemaining(expiresAt), // true remaining time, clamped or not
+        },
+      ));
     } catch (error) {
       // Unlike the batch path (allSettled — a failed send must not block
       // the other operators in the round), this is a single admin-triggered
@@ -1190,6 +1421,27 @@ export class DispatchService {
         extra: { rescueRequestId, operatorId },
       });
       throw error;
+    }
+
+    // Deliberately its own try/catch, not nested inside the send's — the
+    // send already succeeded by this point, so a failure persisting the
+    // SID (visibility-only, same as handleDeliveryStatusUpdate below) must
+    // never surface as "the offer failed to send." Multi-llm review: the
+    // previous nesting made that separation an accident of which catch
+    // ran, not a structural guarantee.
+    try {
+      await this.prisma.dispatchOffer.update({
+        where: { id: createdOffer.id },
+        data: { twilioMessageSid: sid },
+      });
+    } catch (error) {
+      console.error(
+        `Failed to persist Twilio SID for manual offer ${createdOffer.id}:`,
+        error,
+      );
+      Sentry.captureException(error, {
+        extra: { rescueRequestId, operatorId, offerId: createdOffer.id },
+      });
     }
 
     // No timer. The offer's own expiresAt is the whole mechanism now:

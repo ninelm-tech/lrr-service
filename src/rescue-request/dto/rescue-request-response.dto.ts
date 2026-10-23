@@ -66,6 +66,10 @@ export class DispatchOfferAdminDto {
   motoristFacingTotal?: number;
   offeredAt: Date;
   respondedAt?: Date;
+  /** Twilio's own status string (delivered/read/undelivered/failed/...),
+   * verbatim — undefined until a status-callback has arrived for this offer. */
+  deliveryStatus?: string;
+  deliveryErrorCode?: number;
 }
 
 export class DispatchBoardRowDto {
