@@ -155,10 +155,16 @@ describe('WhatsAppCustomerFlowService', () => {
     let prisma: { rescueRequest: { findUnique: jest.Mock } };
     let sessionStore: { update: jest.Mock };
     let ratingServiceMock: { create: jest.Mock };
-    let twilioService: { sendWhatsAppMessage: jest.Mock };
+    let twilioService: {
+      sendWhatsAppMessage: jest.Mock;
+      sendWhatsAppTemplateMessage: jest.Mock;
+    };
     let platformConfigService: { getConfig: jest.Mock };
+    const originalTemplateSid =
+      process.env.TWILIO_LOW_RATING_ALERT_TEMPLATE_SID;
 
     beforeEach(async () => {
+      delete process.env.TWILIO_LOW_RATING_ALERT_TEMPLATE_SID;
       prisma = {
         rescueRequest: {
           findUnique: jest.fn().mockResolvedValue({
@@ -171,7 +177,10 @@ describe('WhatsAppCustomerFlowService', () => {
       ratingServiceMock = {
         create: jest.fn().mockResolvedValue({ id: 'rating-1' }),
       };
-      twilioService = { sendWhatsAppMessage: jest.fn() };
+      twilioService = {
+        sendWhatsAppMessage: jest.fn(),
+        sendWhatsAppTemplateMessage: jest.fn(),
+      };
       platformConfigService = {
         getConfig: jest
           .fn()
@@ -208,6 +217,13 @@ describe('WhatsAppCustomerFlowService', () => {
       service = module.get<WhatsAppCustomerFlowService>(
         WhatsAppCustomerFlowService,
       );
+    });
+
+    afterEach(() => {
+      if (originalTemplateSid === undefined)
+        delete process.env.TWILIO_LOW_RATING_ALERT_TEMPLATE_SID;
+      else
+        process.env.TWILIO_LOW_RATING_ALERT_TEMPLATE_SID = originalTemplateSid;
     });
 
     it('alerts staff on a 1-2 star rating from the customer', async () => {
@@ -308,6 +324,80 @@ describe('WhatsAppCustomerFlowService', () => {
         expect.stringContaining('Customer rated the operator'),
       );
     });
+
+    it('sends via the approved Content Template, not freeform, when TWILIO_LOW_RATING_ALERT_TEMPLATE_SID is set', async () => {
+      // Staff alert recipients are the least likely to have an open 24h
+      // session with the business number — a freeform body gets rejected
+      // by Meta outside one, same reasoning as DisputeService's own
+      // sendStaffDisputeAlert.
+      process.env.TWILIO_LOW_RATING_ALERT_TEMPLATE_SID = 'HXlowrating123';
+
+      await service.handleRatingReply(
+        'cust-1',
+        '1',
+        'req-1',
+        'MOTORIST_TO_OPERATOR',
+      );
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348099999999'),
+        'HXlowrating123',
+        // formatJobRef('req-1') → 'Job #REQ-1'; {{2}} is the bare ref,
+        // matching DisputeService.sendStaffDisputeAlert's own convention
+        // ("Job " is static text in the approved template itself).
+        { '1': '1', '2': 'REQ-1', '3': 'Customer rated the operator' },
+      );
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+
+    it('one bad staff number via the template does not block alerting the rest', async () => {
+      process.env.TWILIO_LOW_RATING_ALERT_TEMPLATE_SID = 'HXlowrating123';
+      platformConfigService.getConfig.mockResolvedValue({
+        disputeAlertPhoneNumbers: ['+2348099999999', '+2348088888888'],
+      });
+      twilioService.sendWhatsAppTemplateMessage.mockImplementation(
+        (to: string) => {
+          if (to.includes('+2348099999999'))
+            return Promise.reject(new Error('send failed'));
+          return Promise.resolve();
+        },
+      );
+
+      await service.handleRatingReply(
+        'cust-1',
+        '1',
+        'req-1',
+        'MOTORIST_TO_OPERATOR',
+      );
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348088888888'),
+        'HXlowrating123',
+        expect.anything(),
+      );
+    });
+
+    it("a failing config fetch for the staff alert never blocks the reviewer's own rating from being recorded", async () => {
+      platformConfigService.getConfig.mockRejectedValue(
+        new Error('config unavailable'),
+      );
+
+      await service.handleRatingReply(
+        'cust-1',
+        '1',
+        'req-1',
+        'MOTORIST_TO_OPERATOR',
+      );
+
+      // The rating itself is created before the staff-alert block runs, so
+      // this also proves the outer try/catch around the alert never stops
+      // the reviewer's own flow from completing.
+      expect(ratingServiceMock.create).toHaveBeenCalledWith(
+        expect.objectContaining({ score: 1 }),
+      );
+      expect(twilioService.sendWhatsAppTemplateMessage).not.toHaveBeenCalled();
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
   });
 
   describe('WAITING_FOR_MEDIA — new-request staff alert', () => {
@@ -318,7 +408,10 @@ describe('WhatsAppCustomerFlowService', () => {
       rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
     };
     let sessionStore: { update: jest.Mock };
-    let twilioService: { sendWhatsAppMessage: jest.Mock };
+    let twilioService: {
+      sendWhatsAppMessage: jest.Mock;
+      sendWhatsAppTemplateMessage: jest.Mock;
+    };
     let platformConfigService: { getConfig: jest.Mock };
     let dispatchService: { startDispatch: jest.Mock };
     const phoneNumber = '+2348012345678';
@@ -327,8 +420,11 @@ describe('WhatsAppCustomerFlowService', () => {
       state: WhatsAppFlowState.WAITING_FOR_MEDIA,
       rescueRequestId: 'req-1',
     } as WhatsAppSession;
+    const originalTemplateSid =
+      process.env.TWILIO_NEW_REQUEST_ALERT_TEMPLATE_SID;
 
     beforeEach(async () => {
+      delete process.env.TWILIO_NEW_REQUEST_ALERT_TEMPLATE_SID;
       prisma = {
         requestMedia: { count: jest.fn().mockResolvedValue(1) },
         user: {
@@ -345,7 +441,10 @@ describe('WhatsAppCustomerFlowService', () => {
         },
       };
       sessionStore = { update: jest.fn() };
-      twilioService = { sendWhatsAppMessage: jest.fn() };
+      twilioService = {
+        sendWhatsAppMessage: jest.fn(),
+        sendWhatsAppTemplateMessage: jest.fn(),
+      };
       platformConfigService = {
         getConfig: jest
           .fn()
@@ -383,6 +482,13 @@ describe('WhatsAppCustomerFlowService', () => {
       service = module.get<WhatsAppCustomerFlowService>(
         WhatsAppCustomerFlowService,
       );
+    });
+
+    afterEach(() => {
+      if (originalTemplateSid === undefined)
+        delete process.env.TWILIO_NEW_REQUEST_ALERT_TEMPLATE_SID;
+      else
+        process.env.TWILIO_NEW_REQUEST_ALERT_TEMPLATE_SID = originalTemplateSid;
     });
 
     async function continueToDispatch() {
@@ -461,6 +567,106 @@ describe('WhatsAppCustomerFlowService', () => {
         expect.stringContaining('Searching for nearby tow operators'),
       );
       expect(dispatchService.startDispatch).toHaveBeenCalled();
+    });
+
+    it('sends via the approved Content Template, not freeform, when TWILIO_NEW_REQUEST_ALERT_TEMPLATE_SID is set', async () => {
+      // Same reasoning as DisputeService.sendStaffDisputeAlert: staff alert
+      // recipients are the least likely to have an open 24h session with
+      // the business number, so a freeform body gets rejected by Meta.
+      process.env.TWILIO_NEW_REQUEST_ALERT_TEMPLATE_SID = 'HXnewrequest123';
+      platformConfigService.getConfig.mockResolvedValue({
+        newRequestAlertPhoneNumbers: ['+2348077777777'],
+      });
+
+      await continueToDispatch();
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348077777777'),
+        'HXnewrequest123',
+        // formatJobRef('req-1') → 'Job #REQ-1'; {{1}} is the bare ref,
+        // matching DisputeService.sendStaffDisputeAlert's own convention.
+        {
+          '1': 'REQ-1',
+          '2': 'Sedan',
+          '3': 'Breakdown',
+          '4': 'Lekki Phase 1',
+          '5': phoneNumber,
+        },
+      );
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledTimes(1); // only the customer confirmation
+    });
+
+    it('sanitizes a multi-line destination before sending via the template, so Twilio 21656 can never fire', async () => {
+      // destination is customer-typed free text (WAITING_FOR_DESTINATION
+      // accepts anything) — an unsanitized newline/tab/space-run inside a
+      // template variable fails the WHOLE send with Twilio error 21656,
+      // silently dropping the staff alert.
+      process.env.TWILIO_NEW_REQUEST_ALERT_TEMPLATE_SID = 'HXnewrequest123';
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki Phase 1\n\tnear  the  bridge',
+        issueType: 'BREAKDOWN',
+      });
+      platformConfigService.getConfig.mockResolvedValue({
+        newRequestAlertPhoneNumbers: ['+2348077777777'],
+      });
+
+      await continueToDispatch();
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348077777777'),
+        'HXnewrequest123',
+        expect.objectContaining({ '4': 'Lekki Phase 1 · near the bridge' }),
+      );
+    });
+
+    it('still alerts staff when destination is null, instead of throwing and dropping the alert to every number', async () => {
+      // destination is nullable in the schema (RescueRequest.destination
+      // String?) — an unguarded `.trim()` inside sanitizeTemplateVariable
+      // would throw on null, and since this runs per staff number inside
+      // the same try/catch, that'd silently drop the alert to ALL of
+      // them, not just one.
+      process.env.TWILIO_NEW_REQUEST_ALERT_TEMPLATE_SID = 'HXnewrequest123';
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        vehicleType: 'SEDAN',
+        destination: null,
+        issueType: 'BREAKDOWN',
+      });
+      platformConfigService.getConfig.mockResolvedValue({
+        newRequestAlertPhoneNumbers: ['+2348077777777'],
+      });
+
+      await continueToDispatch();
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348077777777'),
+        'HXnewrequest123',
+        expect.objectContaining({ '4': '—' }),
+      );
+    });
+
+    it('one bad staff number via the template does not block alerting the rest', async () => {
+      process.env.TWILIO_NEW_REQUEST_ALERT_TEMPLATE_SID = 'HXnewrequest123';
+      platformConfigService.getConfig.mockResolvedValue({
+        newRequestAlertPhoneNumbers: ['+2348077777777', '+2348066666666'],
+      });
+      twilioService.sendWhatsAppTemplateMessage.mockImplementation(
+        (to: string) => {
+          if (to.includes('+2348077777777'))
+            return Promise.reject(new Error('send failed'));
+          return Promise.resolve();
+        },
+      );
+
+      await continueToDispatch();
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348066666666'),
+        'HXnewrequest123',
+        expect.anything(),
+      );
     });
   });
 

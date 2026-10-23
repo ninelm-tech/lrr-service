@@ -8,6 +8,7 @@ import * as Sentry from '@sentry/node';
 import { logger } from '@sentry/node';
 import * as crypto from 'crypto';
 import { toWhatsAppAddress } from '../common/phone.util';
+import { sanitizeTemplateVariable } from '../common/template-variable.util';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { IssueType, WhatsAppFlowState } from './state/whatsapp-session.types';
 import { PrismaService } from '../prisma/prisma.service';
@@ -822,16 +823,60 @@ export class WhatsAppCustomerFlowService {
 
     // Best-effort — a failed staff alert never blocks the customer's own
     // confirmation above, and one bad/unreachable number never blocks
-    // alerting the rest.
+    // alerting the rest. Staff numbers are the least likely to have an
+    // open 24h session with the business number, so on a real (non-sandbox)
+    // number this MUST go through the approved `new_request_staff_alert`
+    // Content Template — a freeform body gets rejected by Meta outside a
+    // session window. Falls back to freeform only when
+    // TWILIO_NEW_REQUEST_ALERT_TEMPLATE_SID isn't configured (e.g.
+    // local/sandbox testing before the template exists) — same pattern as
+    // DisputeService.sendStaffDisputeAlert's dispute_raised_alert.
     try {
       const config = await this.platformConfigService.getConfig();
       const issueType = rescueRequestRow.issueType as IssueType;
+      const jobRef = formatJobRef(rescueRequestId);
+      // Full definition: TWILIO_CONTENT_TEMPLATES.new_request_staff_alert
+      // in src/integrations/twilio/twilio-content-templates.ts.
+      const templateSid = process.env.TWILIO_NEW_REQUEST_ALERT_TEMPLATE_SID;
       for (const staffPhoneNumber of config.newRequestAlertPhoneNumbers) {
         try {
-          await this.twilioService.sendWhatsAppMessage(
-            toWhatsAppAddress(staffPhoneNumber),
-            `🆕 New request ${formatJobRef(rescueRequestId)}: ${formatVehicleType(vehicleType)}, ${formatIssueType(issueType)} → ${destination}. Customer: ${phoneNumber}.`,
-          );
+          if (templateSid) {
+            // Template body is "...Job {{1}}: {{2}}, {{3}} → {{4}}.
+            // Customer: {{5}}." — {{1}} needs the bare ref, "Job " is
+            // already static text in the approved template itself.
+            // destination is customer-typed free text — every value goes
+            // through sanitizeTemplateVariable the same way
+            // dispatch.service.ts's template sends do: Twilio 21656 fires
+            // on a newline/tab/space-run OR an empty value, hence the
+            // non-empty fallback.
+            const rawTemplateVariables: Record<string, string> = {
+              '1': jobRef.replace('Job #', ''),
+              '2': formatVehicleType(vehicleType),
+              '3': formatIssueType(issueType),
+              // destination is nullable (RescueRequest.destination
+              // String?) — sanitizeTemplateVariable's .trim() throws on
+              // null, which (inside this per-number try/catch) would
+              // otherwise drop the alert to every staff number, not just
+              // one.
+              '4': destination ?? '',
+              '5': phoneNumber,
+            };
+            const templateVariables: Record<string, string> = {};
+            for (const key of Object.keys(rawTemplateVariables)) {
+              templateVariables[key] =
+                sanitizeTemplateVariable(rawTemplateVariables[key]) || '—';
+            }
+            await this.twilioService.sendWhatsAppTemplateMessage(
+              toWhatsAppAddress(staffPhoneNumber),
+              templateSid,
+              templateVariables,
+            );
+          } else {
+            await this.twilioService.sendWhatsAppMessage(
+              toWhatsAppAddress(staffPhoneNumber),
+              `🆕 New request ${jobRef}: ${formatVehicleType(vehicleType)}, ${formatIssueType(issueType)} → ${destination}. Customer: ${phoneNumber}.`,
+            );
+          }
         } catch (error) {
           console.error('Failed to send new-request staff alert:', error);
         }
@@ -905,7 +950,14 @@ export class WhatsAppCustomerFlowService {
     // at what went wrong, rather than the score just sitting in the DB
     // unnoticed. Best-effort: a failed alert never blocks the reviewer's
     // own reply, and one bad/unreachable number never blocks alerting the
-    // rest.
+    // rest. Staff numbers are the least likely to have an open 24h session
+    // with the business number, so on a real (non-sandbox) number this
+    // MUST go through the approved `low_rating_staff_alert` Content
+    // Template — a freeform body gets rejected by Meta outside a session
+    // window. Falls back to freeform only when
+    // TWILIO_LOW_RATING_ALERT_TEMPLATE_SID isn't configured (e.g.
+    // local/sandbox testing before the template exists) — same pattern as
+    // DisputeService.sendStaffDisputeAlert's dispute_raised_alert.
     if (score <= 2) {
       try {
         const config = await this.platformConfigService.getConfig();
@@ -913,12 +965,31 @@ export class WhatsAppCustomerFlowService {
           direction === RatingDirection.MOTORIST_TO_OPERATOR
             ? 'Customer rated the operator'
             : 'Operator rated the customer';
+        const jobRef = formatJobRef(rescueRequestId);
+        // Full definition: TWILIO_CONTENT_TEMPLATES.low_rating_staff_alert
+        // in src/integrations/twilio/twilio-content-templates.ts.
+        const templateSid = process.env.TWILIO_LOW_RATING_ALERT_TEMPLATE_SID;
         for (const phoneNumber of config.disputeAlertPhoneNumbers) {
           try {
-            await this.twilioService.sendWhatsAppMessage(
-              toWhatsAppAddress(phoneNumber),
-              `⚠️ Low rating (${score}/5) on ${formatJobRef(rescueRequestId)} — ${who} low. Please review.`,
-            );
+            if (templateSid) {
+              // Template body is "...({{1}}/5) on Job {{2}} — {{3}} low.
+              // Please review." — {{2}} needs the bare ref, "Job " is
+              // already static text in the approved template itself.
+              await this.twilioService.sendWhatsAppTemplateMessage(
+                toWhatsAppAddress(phoneNumber),
+                templateSid,
+                {
+                  '1': String(score),
+                  '2': jobRef.replace('Job #', ''),
+                  '3': who,
+                },
+              );
+            } else {
+              await this.twilioService.sendWhatsAppMessage(
+                toWhatsAppAddress(phoneNumber),
+                `⚠️ Low rating (${score}/5) on ${jobRef} — ${who} low. Please review.`,
+              );
+            }
           } catch (error) {
             console.error('Failed to send low-rating staff alert:', error);
           }

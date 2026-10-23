@@ -477,6 +477,8 @@ export class PayoutService {
     // Pin the locale — an unpinned toLocaleString formats per the container's
     // default, so the same payout could render differently across environments.
     const naira = (amount / 100).toLocaleString('en-NG');
+    // Full definition: TWILIO_CONTENT_TEMPLATES.payout_sent in
+    // src/integrations/twilio/twilio-content-templates.ts.
     const templateSid = process.env.TWILIO_PAYOUT_SENT_TEMPLATE_SID;
 
     try {
@@ -510,6 +512,8 @@ export class PayoutService {
     // default, so the same payout could render differently across environments.
     const naira = (amount / 100).toLocaleString('en-NG');
     const settingsUrl = `${process.env.FRONTEND_URL ?? 'http://localhost:3001'}/settings`;
+    // Full definition: TWILIO_CONTENT_TEMPLATES.payout_bank_details_needed
+    // in src/integrations/twilio/twilio-content-templates.ts.
     const templateSid = process.env.TWILIO_PAYOUT_BANK_DETAILS_TEMPLATE_SID;
 
     try {

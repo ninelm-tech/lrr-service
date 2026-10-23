@@ -7,6 +7,7 @@ import * as crypto from 'crypto';
 import * as Sentry from '@sentry/node';
 import { logger } from '@sentry/node';
 import { toWhatsAppAddress } from '../common/phone.util';
+import { sanitizeTemplateVariable } from '../common/template-variable.util';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { PrismaService } from '../prisma/prisma.service';
@@ -60,23 +61,6 @@ type PrepareNextRoundResult =
       round: number;
     };
 
-/**
- * WhatsApp rejects template *parameters* (not static body text) containing
- * newlines, tabs, or more than four consecutive spaces; Twilio surfaces
- * this as error 21656 — see https://www.twilio.com/docs/errors/21656.
- * Several of our values (distance+ETA, address+map link, media links) are
- * naturally multi-line, so collapse them onto a single line for the
- * template branch only. The freeform fallback keeps real line breaks.
- */
-function sanitizeTemplateVariable(value: string): string {
-  return value
-    .trim()
-    .replace(/[\t ]*[\r\n]+[\t ]*/g, ' · ') // line breaks → visible separator
-    .replace(/\t+/g, ' ') // stray tabs
-    .replace(/ {2,}/g, ' ') // runs of spaces (4+ consecutive is rejected)
-    .trim();
-}
-
 @Injectable()
 export class DispatchService {
   constructor(
@@ -118,6 +102,8 @@ export class DispatchService {
       window: string;
     },
   ): Promise<void> {
+    // Full definition: TWILIO_CONTENT_TEMPLATES.new_rescue_job in
+    // src/integrations/twilio/twilio-content-templates.ts.
     const templateSid = process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
     const to = toWhatsAppAddress(operatorPhone);
 
@@ -405,6 +391,8 @@ export class DispatchService {
     if (stillPending.length === 0) return;
 
     const remaining = this.formatRemaining(deadline);
+    // Full definition: TWILIO_CONTENT_TEMPLATES.quote_countdown in
+    // src/integrations/twilio/twilio-content-templates.ts.
     const templateSid = process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID;
     const jobRef = formatJobRef(rescueRequestId).replace('Job #', '');
 

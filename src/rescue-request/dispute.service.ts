@@ -195,6 +195,9 @@ export class DisputeService {
       const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
       const jobRef = formatJobRef(rescueRequest.id); // "Job #A1B2C3"
       const dashboardLink = `${frontendUrl}/requests?highlight=${rescueRequest.id}`;
+      // Full definition (body, variables, source confidence): see
+      // TWILIO_CONTENT_TEMPLATES.dispute_raised_alert in
+      // src/integrations/twilio/twilio-content-templates.ts.
       const templateSid = process.env.TWILIO_DISPUTE_TEMPLATE_SID;
 
       for (const phoneNumber of config.disputeAlertPhoneNumbers) {

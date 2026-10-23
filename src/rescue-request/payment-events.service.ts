@@ -263,6 +263,9 @@ export class PaymentEventsService {
     // sendDispatchOfferMessage's comment for what that looks like once one
     // exists). Whoever creates `arrived_prompt` in the Twilio console must
     // declare exactly these 4 variables, in this order.
+    // Full definition (confirmed against the live LRR Stage template
+    // 2026-10-22): TWILIO_CONTENT_TEMPLATES.arrived_prompt in
+    // src/integrations/twilio/twilio-content-templates.ts.
     const arrivedTemplateSid = process.env.TWILIO_ARRIVED_PROMPT_TEMPLATE_SID;
     if (arrivedTemplateSid) {
       await this.twilioService.sendWhatsAppTemplateMessage(

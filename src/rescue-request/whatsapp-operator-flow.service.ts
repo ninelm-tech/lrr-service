@@ -395,6 +395,8 @@ export class WhatsAppOperatorFlowService {
       // TwiML's <Message> verb has no contentSid attribute — a button can
       // only go out via the async REST call, so the template branch sends
       // that and acks the webhook empty instead of replying with text.
+      // Full definition: TWILIO_CONTENT_TEMPLATES.arrived_reminder in
+      // src/integrations/twilio/twilio-content-templates.ts.
       const arrivedReminderSid =
         process.env.TWILIO_ARRIVED_REMINDER_TEMPLATE_SID;
       if (arrivedReminderSid) {
@@ -410,6 +412,8 @@ export class WhatsAppOperatorFlowService {
       );
     }
     if (session.state === WhatsAppFlowState.OPERATOR_AT_LOCATION) {
+      // Full definition: TWILIO_CONTENT_TEMPLATES.done_reminder in
+      // src/integrations/twilio/twilio-content-templates.ts.
       const doneReminderSid = process.env.TWILIO_DONE_REMINDER_TEMPLATE_SID;
       if (doneReminderSid) {
         await this.twilioService.sendWhatsAppTemplateMessage(
@@ -619,6 +623,8 @@ export class WhatsAppOperatorFlowService {
       );
     }
 
+    // Full definition: TWILIO_CONTENT_TEMPLATES.done_prompt in
+    // src/integrations/twilio/twilio-content-templates.ts.
     const donePromptSid = process.env.TWILIO_DONE_PROMPT_TEMPLATE_SID;
     if (donePromptSid) {
       await this.twilioService.sendWhatsAppTemplateMessage(
