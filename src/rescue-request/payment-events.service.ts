@@ -258,11 +258,13 @@ export class PaymentEventsService {
       ? formatVehicleType(rescueRequest.vehicleType)
       : 'Unknown';
     // This is a quick-reply (ARRIVED) template sent inside an active
-    // session with the operator — no Meta approval needed, so there's no
-    // live template to verify variable order against yet (see
-    // sendDispatchOfferMessage's comment for what that looks like once one
-    // exists). Whoever creates `arrived_prompt` in the Twilio console must
-    // declare exactly these 4 variables, in this order.
+    // session with the operator — Meta's approval requirement is for
+    // business-initiated opens, not session replies, so this worked
+    // without it. Submitted for approval anyway on 2026-10-23 as a safety
+    // net for jobs that outlast the 24h session window (e.g. a long
+    // interstate tow) — see twilio-content-templates.ts's note above the
+    // arrived/done template group for the full reasoning. This call is
+    // unaffected either way.
     // Full definition (confirmed against the live LRR Stage template
     // 2026-10-22): TWILIO_CONTENT_TEMPLATES.arrived_prompt in
     // src/integrations/twilio/twilio-content-templates.ts.

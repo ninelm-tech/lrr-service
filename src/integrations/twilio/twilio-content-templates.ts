@@ -126,6 +126,22 @@ export const TWILIO_CONTENT_TEMPLATES: Record<
     source: 'reconstructed',
   },
 
+  // arrived_prompt/arrived_reminder/done_prompt/done_reminder: these 4 are
+  // always sent inside an active 24h WhatsApp session with the operator
+  // (they're job-in-progress follow-ups, not business-initiated opens —
+  // see sendWhatsAppTemplateMessage's own docs for the distinction), so
+  // Meta's template-approval requirement never applied to them and none
+  // were originally submitted for review. Submitted for approval anyway
+  // on 2026-10-23, as a safety net: a long interstate job can legitimately
+  // run past 24h between ACCEPTED and ARRIVED, or ARRIVED and DONE — the
+  // request is never auto-cancelled while in progress (confirmed: no
+  // reconciler check transitions OPERATOR_ASSIGNED/IN_PROGRESS/ARRIVED to
+  // CANCELLED on a timer) — and if the session window happens to close in
+  // that gap, an approved template still sends where an unapproved one
+  // would be rejected. Approval status doesn't change any code path here:
+  // sendWhatsAppTemplateMessage is called identically either way, so
+  // nothing needs updating once these clear review.
+
   arrived_prompt: {
     envVar: 'TWILIO_ARRIVED_PROMPT_TEMPLATE_SID',
     category: 'UTILITY',
@@ -195,12 +211,24 @@ export const TWILIO_CONTENT_TEMPLATES: Record<
     // Meta re-approval. Don't "fix" this to match the bare-ref convention
     // note at the top of this file without checking first.
     //
+    // The original template (SID HXa663e7a0af121b0780c7e450ca24c6cc,
+    // body: '🆕 New request Job {{1}}: {{2}}, {{3}} → {{4}}. Customer:
+    // {{5}}.') was REJECTED by WhatsApp on 2026-10-22: "This template has
+    // too many variables for its length. Reduce the number of variables
+    // or increase the message length." — also flagged ineligible for
+    // WhatsApp-business-initiated specifically, which this alert needs
+    // (staff haven't messaged first). Replaced below with the same 5
+    // variables, same order/meaning, more static text to dilute the
+    // variable-to-length ratio — no code change needed, only the SID.
+    // New SIDs: staging HX7226fad2f9310c33316ca09b87e3e58e, production
+    // HX467858004413d4197f9d6d6b07a162c6.
+    //
     // source is 'designed', not 'confirmed': this is the text that was
-    // handed off to create the real template, and the real SID exists —
-    // but no one has reopened the created template in the console to
-    // verify this is exactly what it says. Flip to 'confirmed' once
-    // someone has.
-    body: '🆕 New request Job {{1}}: {{2}}, {{3}} → {{4}}. Customer: {{5}}.',
+    // handed off to create the new template — no one has reopened it in
+    // the console to verify this is exactly what it says, or that it
+    // actually cleared WhatsApp review this time. Flip to 'confirmed'
+    // once someone has.
+    body: '🆕 A new rescue request just came in — Job {{1}}. Vehicle type: {{2}}. Issue reported: {{3}}. Heading to: {{4}}. Customer contact: {{5}}. Please review and assign as needed.',
     source: 'designed',
   },
 
