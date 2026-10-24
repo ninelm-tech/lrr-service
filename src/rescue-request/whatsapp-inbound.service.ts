@@ -64,6 +64,17 @@ export class WhatsAppInboundService {
     });
 
     if (operatorRecord) {
+      if (!operatorRecord.whatsappEnabled) {
+        // A registered operator who went off-platform (or never had
+        // WhatsApp) has no business driving operator commands — and must
+        // not fall through to the customer flow either, which would give
+        // this phone number a second, conflicting identity.
+        logger.info('whatsapp: blocked non-WhatsApp operator at the router', {
+          phoneNumber,
+          userId,
+        });
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n<Message>This operator line is not WhatsApp-enabled — please contact LRR staff.</Message>\n</Response>`;
+      }
       logger.info('whatsapp: routed to operator flow', {
         phoneNumber,
         userId,

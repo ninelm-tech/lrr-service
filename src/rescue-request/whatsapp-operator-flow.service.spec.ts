@@ -818,6 +818,167 @@ describe('WhatsAppOperatorFlowService', () => {
     });
   });
 
+  describe('notifyCustomerOperatorArrived', () => {
+    let service: WhatsAppOperatorFlowService;
+    let prisma: { rescueRequest: { findUnique: jest.Mock } };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = { rescueRequest: { findUnique: jest.fn() } };
+      twilioService = { sendWhatsAppMessage: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppOperatorFlowService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: DispatchService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppCustomerFlowService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppOperatorFlowService>(
+        WhatsAppOperatorFlowService,
+      );
+    });
+
+    it('notifies the customer — does NOT write status itself', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        customer: { phoneNumber: '+2348000000000' },
+        assignedOperator: { businessName: 'Swift Towing' },
+      });
+
+      await service.notifyCustomerOperatorArrived('req-1');
+
+      // Deliberately not asserted as `not.toHaveBeenCalled()` — this method
+      // is pure notification. The status write is each caller's own
+      // responsibility (see below): the WhatsApp path's unconditional write
+      // (already gated by its own session-state check) and the manual
+      // path's atomic conditional claim (Task 10) are NOT the same operation
+      // and must not be collapsed into one shared write here — doing so is
+      // exactly the bug an earlier draft of this plan had, where a shared
+      // unconditional write made the manual path's claim redundant-but-racy.
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        '+2348000000000',
+        expect.stringContaining('arrived'),
+      );
+    });
+
+    it('does nothing when the request no longer exists', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(null);
+
+      await service.notifyCustomerOperatorArrived('req-1');
+
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('startManualCompletionConfirmation', () => {
+    let service: WhatsAppOperatorFlowService;
+    let prisma: {
+      $transaction: jest.Mock;
+      rescueRequest: { updateMany: jest.Mock; findUnique: jest.Mock };
+      whatsAppSession: { updateMany: jest.Mock };
+    };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = {
+        $transaction: jest.fn((cb: (tx: unknown) => unknown) => cb(prisma)),
+        rescueRequest: { updateMany: jest.fn(), findUnique: jest.fn() },
+        whatsAppSession: { updateMany: jest.fn().mockResolvedValue({}) },
+      };
+      twilioService = { sendWhatsAppMessage: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppOperatorFlowService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: DispatchService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppCustomerFlowService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppOperatorFlowService>(
+        WhatsAppOperatorFlowService,
+      );
+    });
+
+    it('claims ARRIVED→confirmation atomically, moves the customer session, and sends the confirm prompt with no media check', async () => {
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        customerId: 'cust-1',
+        customer: { phoneNumber: '+2348000000000' },
+        assignedOperator: { businessName: 'Swift Towing' },
+      });
+
+      const result = await service.startManualCompletionConfirmation('req-1');
+
+      expect(result).toEqual({ claimed: true });
+      expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'req-1',
+          status: 'ARRIVED',
+          confirmationDueAt: null,
+          assignedOperator: { whatsappEnabled: false },
+        },
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- an expect.any(Date) value loses its generic inference when assigned to an object literal property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+        data: { confirmationDueAt: expect.any(Date) },
+      });
+      expect(prisma.whatsAppSession.updateMany).toHaveBeenCalledWith({
+        where: { userId: 'cust-1' },
+        data: {
+          state: 'AWAITING_COMPLETION_CONFIRM',
+          rescueRequestId: 'req-1',
+        },
+      });
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        '+2348000000000',
+        expect.stringContaining('CONFIRM'),
+      );
+    });
+
+    it('claims nothing and sends no notification when the status already moved on', async () => {
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 });
+
+      const result = await service.startManualCompletionConfirmation('req-1');
+
+      expect(result).toEqual({ claimed: false });
+      expect(prisma.whatsAppSession.updateMany).not.toHaveBeenCalled();
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+
+    it('does not re-claim (or re-send CONFIRM) on a second call while a confirmation is already pending — multi-llm review regression test', async () => {
+      // confirmationDueAt: null is part of the claim's own WHERE clause now,
+      // so a row that already has one set (the first call's own write) can
+      // never match a second time — this test proves that by mocking the
+      // real atomic behavior: the second updateMany call reports count: 0.
+      prisma.rescueRequest.updateMany
+        .mockResolvedValueOnce({ count: 1 })
+        .mockResolvedValueOnce({ count: 0 });
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        customerId: 'cust-1',
+        customer: { phoneNumber: '+2348000000000' },
+        assignedOperator: { businessName: 'Swift Towing' },
+      });
+
+      const first = await service.startManualCompletionConfirmation('req-1');
+      const second = await service.startManualCompletionConfirmation('req-1');
+
+      expect(first).toEqual({ claimed: true });
+      expect(second).toEqual({ claimed: false });
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('handleOperatorMessage — completion evidence', () => {
     let service: WhatsAppOperatorFlowService;
     let prisma: {

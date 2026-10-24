@@ -575,6 +575,99 @@ export class WhatsAppOperatorFlowService {
     );
   }
 
+  /**
+   * The customer-facing NOTIFICATION half of ARRIVED — deliberately does
+   * NOT write the ARRIVED status itself. Shared between the WhatsApp
+   * handler (which does its own unconditional status write, already gated
+   * by its own session-state check, immediately before calling this) and
+   * the manual-arrived controller action (Task 10, which does an atomic
+   * CONDITIONAL claim of that same status write before calling this) —
+   * those two callers need different concurrency guarantees for the write
+   * itself, so the write can't live in this shared method without collapsing
+   * that difference. Keeping this method to "read the current state, tell
+   * the customer" only is what lets both callers share it safely.
+   */
+  async notifyCustomerOperatorArrived(rescueRequestId: string): Promise<void> {
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      include: { customer: true, assignedOperator: true },
+    });
+    if (!rescueRequest) return;
+    const customerPhone = rescueRequest.customer.phoneNumber;
+    if (customerPhone) {
+      await this.twilioService.sendWhatsAppMessage(
+        customerPhone,
+        `🚗 Your tow operator has arrived!\n\nBusiness: *${rescueRequest.assignedOperator?.businessName}*\n\nThey're at your location. Please show them your vehicle.`,
+      );
+    }
+  }
+
+  /**
+   * The DONE-equivalent for a manual job — deliberately NOT gated on
+   * completion media: a non-WhatsApp job is exempt from the mandatory
+   * evidence rule by explicit product decision, verified by phone instead.
+   * `handleOperatorJobDone` (the WhatsApp path) is completely untouched by
+   * this method and still requires media first, exactly as today.
+   *
+   * Unlike `notifyCustomerOperatorArrived`, this one is NOT shared with any
+   * WhatsApp-path method (the WhatsApp DONE flow has no manual-only
+   * equivalent to share with), so it owns its own atomic conditional claim
+   * end to end — the claim (`status: ARRIVED` AND `confirmationDueAt: null`
+   * → sets `confirmationDueAt`) is the first statement inside its own
+   * transaction, closing the claim race a status-only condition would leave
+   * open (a second call re-claiming the same row and re-sending CONFIRM
+   * indefinitely), self-contained, with no separate claim helper needed
+   * elsewhere.
+   */
+  async startManualCompletionConfirmation(
+    rescueRequestId: string,
+  ): Promise<{ claimed: boolean }> {
+    const result = await this.prisma.$transaction(async (tx) => {
+      const claimed = await tx.rescueRequest.updateMany({
+        where: {
+          id: rescueRequestId,
+          status: RescueRequestStatus.ARRIVED,
+          confirmationDueAt: null,
+          assignedOperator: { whatsappEnabled: false },
+        },
+        data: {
+          confirmationDueAt: new Date(Date.now() + STALLED_CONFIRMATION_MS),
+        },
+      });
+      if (claimed.count === 0) return null;
+
+      const rescueRequest = await tx.rescueRequest.findUnique({
+        where: { id: rescueRequestId },
+        select: {
+          customerId: true,
+          customer: { select: { phoneNumber: true } },
+          assignedOperator: { select: { businessName: true } },
+        },
+      });
+      if (rescueRequest?.customerId) {
+        await tx.whatsAppSession.updateMany({
+          where: { userId: rescueRequest.customerId },
+          data: {
+            state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
+            rescueRequestId,
+          },
+        });
+      }
+      return rescueRequest;
+    });
+
+    if (!result) return { claimed: false };
+
+    const customerPhone = result.customer?.phoneNumber;
+    if (customerPhone) {
+      await this.twilioService.sendWhatsAppMessage(
+        customerPhone,
+        `🔧 ${result.assignedOperator?.businessName} says the job is done!\n\nReply *CONFIRM* to release your vehicle and receive the balance payment link.\n\nIf there's a problem, reply *DISPUTE* and our team will investigate.`,
+      );
+    }
+    return { claimed: true };
+  }
+
   private async handleOperatorArrived(
     operatorPhone: string,
     operatorUserId: string,
@@ -601,7 +694,11 @@ export class WhatsAppOperatorFlowService {
       );
     }
 
-    // Update request status to ARRIVED
+    // Update request status to ARRIVED — unconditional here, exactly as
+    // before this task: this path's own session-state check above
+    // (OPERATOR_ON_JOB) is what already guards this write; it does not need
+    // the manual path's atomic conditional claim, which exists specifically
+    // because the manual path has no session state to check instead.
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequestId },
       data: { status: RescueRequestStatus.ARRIVED },
@@ -612,14 +709,7 @@ export class WhatsAppOperatorFlowService {
       state: WhatsAppFlowState.OPERATOR_AT_LOCATION,
     });
 
-    // Notify customer
-    const customerPhone = rescueRequest.customer.phoneNumber;
-    if (customerPhone) {
-      await this.twilioService.sendWhatsAppMessage(
-        customerPhone,
-        `🚗 Your tow operator has arrived!\n\nBusiness: *${operator.businessName}*\n\nThey're at your location. Please show them your vehicle.`,
-      );
-    }
+    await this.notifyCustomerOperatorArrived(rescueRequestId);
 
     // Full definition: TWILIO_CONTENT_TEMPLATES.done_prompt in
     // src/integrations/twilio/twilio-content-templates.ts.

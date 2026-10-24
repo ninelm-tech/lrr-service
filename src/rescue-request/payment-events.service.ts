@@ -107,7 +107,10 @@ export class PaymentEventsService {
 
       await this.prisma.rescueRequest.update({
         where: { id: rescueRequest.id },
-        data: { status: RescueRequestStatus.CANCELLED },
+        data: {
+          status: RescueRequestStatus.CANCELLED,
+          needsManualAssignment: false,
+        },
       });
       await this.prisma.dispatchOffer.updateMany({
         where: {
@@ -244,97 +247,102 @@ export class PaymentEventsService {
       state: WhatsAppFlowState.REQUEST_CONFIRMED,
     });
 
-    // Operator: job is now live — send customer location + details
-    const opUser = await this.sharedService.findOrCreateCustomer(
-      operator.phoneNumber!,
-    );
-    // An operator who has never sent an inbound WhatsApp message (e.g. one
-    // just adminCreate'd and immediately assigned a job) has no session row
-    // yet, and update() is a plain Prisma update that throws (P2025) when
-    // there's nothing to update. getOrCreate is an idempotent upsert, so
-    // this is always safe and a no-op for an operator who already has one.
-    await this.sessionStore.getOrCreate(opUser.id);
-    await this.sessionStore.update(opUser.id, {
-      state: WhatsAppFlowState.OPERATOR_ON_JOB,
-      rescueRequestId: rescueRequest.id,
-    });
-    const lat = Number(rescueRequest.latitude);
-    const lon = Number(rescueRequest.longitude);
-    const locationSection = await this.sharedService.formatLocationSection(
-      lat,
-      lon,
-    );
-    const customerPhone = rescueRequest.customer?.phoneNumber ?? 'N/A';
-    const operatorPhone = toWhatsAppAddress(operator.phoneNumber!);
-    const vehicleLine = rescueRequest.vehicleType
-      ? formatVehicleType(rescueRequest.vehicleType)
-      : 'Unknown';
-    // This is a quick-reply (ARRIVED) template sent inside an active
-    // session with the operator — Meta's approval requirement is for
-    // business-initiated opens, not session replies, so this worked
-    // without it. Submitted for approval anyway on 2026-10-23 as a safety
-    // net for jobs that outlast the 24h session window (e.g. a long
-    // interstate tow) — see twilio-content-templates.ts's note above the
-    // arrived/done template group for the full reasoning. This call is
-    // unaffected either way.
-    // Full definition (confirmed against the live LRR Stage template
-    // 2026-10-22): TWILIO_CONTENT_TEMPLATES.arrived_prompt in
-    // src/integrations/twilio/twilio-content-templates.ts.
-    const arrivedTemplateSid = process.env.TWILIO_ARRIVED_PROMPT_TEMPLATE_SID;
-    const freeformJobLive = `🚗 *Job is live!* — ${formatJobRef(rescueRequest.id)}\n\nCustomer: ${customerPhone}\nVehicle: ${vehicleLine}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`;
-    // The operator hearing about the job is what matters here, and by this
-    // point the deposit is already confirmed and the job already activated
-    // — so a failed send must not 500 the payment webhook (Paystack would
-    // redeliver into a confirmDeposit that is not safe to run twice). Try
-    // the template, fall back to the freeform text, and if that fails too,
-    // report it rather than rethrow.
-    try {
-      if (arrivedTemplateSid) {
-        try {
-          await this.twilioService.sendWhatsAppTemplateMessage(
-            operatorPhone,
-            arrivedTemplateSid,
-            {
-              // WhatsApp rejects newlines in template parameters (Twilio
-              // 21656) and locationSection is "<address>\n📍 <link>", so
-              // collapse each value; the freeform text keeps its line breaks.
-              '1':
-                sanitizeTemplateVariable(formatJobRef(rescueRequest.id)) || '—',
-              '2': sanitizeTemplateVariable(customerPhone) || '—',
-              '3': sanitizeTemplateVariable(vehicleLine) || '—',
-              '4': sanitizeTemplateVariable(locationSection) || '—',
-            },
-          );
-        } catch (error) {
-          // TwilioService already reported this to Sentry with the Twilio
-          // error code and SID; just note that we're falling back.
-          console.error(
-            `activateAssignedJob ${rescueRequest.id}: arrived template send failed, falling back to freeform text:`,
-            error,
-          );
+    // Everything below is WhatsApp-specific — a non-WhatsApp operator has
+    // no channel to receive any of it, and no session to set up.
+    if (operator.whatsappEnabled) {
+      // Operator: job is now live — send customer location + details
+      const opUser = await this.sharedService.findOrCreateCustomer(
+        operator.phoneNumber!,
+      );
+      // An operator who has never sent an inbound WhatsApp message (e.g. one
+      // just adminCreate'd and immediately assigned a job) has no session row
+      // yet, and update() is a plain Prisma update that throws (P2025) when
+      // there's nothing to update. getOrCreate is an idempotent upsert, so
+      // this is always safe and a no-op for an operator who already has one.
+      await this.sessionStore.getOrCreate(opUser.id);
+      await this.sessionStore.update(opUser.id, {
+        state: WhatsAppFlowState.OPERATOR_ON_JOB,
+        rescueRequestId: rescueRequest.id,
+      });
+      const lat = Number(rescueRequest.latitude);
+      const lon = Number(rescueRequest.longitude);
+      const locationSection = await this.sharedService.formatLocationSection(
+        lat,
+        lon,
+      );
+      const customerPhone = rescueRequest.customer?.phoneNumber ?? 'N/A';
+      const operatorPhone = toWhatsAppAddress(operator.phoneNumber!);
+      const vehicleLine = rescueRequest.vehicleType
+        ? formatVehicleType(rescueRequest.vehicleType)
+        : 'Unknown';
+      // This is a quick-reply (ARRIVED) template sent inside an active
+      // session with the operator — Meta's approval requirement is for
+      // business-initiated opens, not session replies, so this worked
+      // without it. Submitted for approval anyway on 2026-10-23 as a safety
+      // net for jobs that outlast the 24h session window (e.g. a long
+      // interstate tow) — see twilio-content-templates.ts's note above the
+      // arrived/done template group for the full reasoning. This call is
+      // unaffected either way.
+      // Full definition (confirmed against the live LRR Stage template
+      // 2026-10-22): TWILIO_CONTENT_TEMPLATES.arrived_prompt in
+      // src/integrations/twilio/twilio-content-templates.ts.
+      const arrivedTemplateSid = process.env.TWILIO_ARRIVED_PROMPT_TEMPLATE_SID;
+      const freeformJobLive = `🚗 *Job is live!* — ${formatJobRef(rescueRequest.id)}\n\nCustomer: ${customerPhone}\nVehicle: ${vehicleLine}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`;
+      // The operator hearing about the job is what matters here, and by this
+      // point the deposit is already confirmed and the job already activated
+      // — so a failed send must not 500 the payment webhook (Paystack would
+      // redeliver into a confirmDeposit that is not safe to run twice). Try
+      // the template, fall back to the freeform text, and if that fails too,
+      // report it rather than rethrow.
+      try {
+        if (arrivedTemplateSid) {
+          try {
+            await this.twilioService.sendWhatsAppTemplateMessage(
+              operatorPhone,
+              arrivedTemplateSid,
+              {
+                // WhatsApp rejects newlines in template parameters (Twilio
+                // 21656) and locationSection is "<address>\n📍 <link>", so
+                // collapse each value; the freeform text keeps its line breaks.
+                '1':
+                  sanitizeTemplateVariable(formatJobRef(rescueRequest.id)) ||
+                  '—',
+                '2': sanitizeTemplateVariable(customerPhone) || '—',
+                '3': sanitizeTemplateVariable(vehicleLine) || '—',
+                '4': sanitizeTemplateVariable(locationSection) || '—',
+              },
+            );
+          } catch (error) {
+            // TwilioService already reported this to Sentry with the Twilio
+            // error code and SID; just note that we're falling back.
+            console.error(
+              `activateAssignedJob ${rescueRequest.id}: arrived template send failed, falling back to freeform text:`,
+              error,
+            );
+            await this.twilioService.sendWhatsAppMessage(
+              operatorPhone,
+              freeformJobLive,
+            );
+          }
+        } else {
           await this.twilioService.sendWhatsAppMessage(
             operatorPhone,
             freeformJobLive,
           );
         }
-      } else {
-        await this.twilioService.sendWhatsAppMessage(
-          operatorPhone,
-          freeformJobLive,
+      } catch (error) {
+        if (!options.swallowOperatorNotifyErrors) throw error;
+        console.error(
+          `activateAssignedJob ${rescueRequest.id}: failed to notify the operator the job is live:`,
+          error,
         );
+        Sentry.captureException(error, {
+          extra: {
+            rescueRequestId: rescueRequest.id,
+            stage: 'activate-assigned-job-operator-message',
+          },
+        });
       }
-    } catch (error) {
-      if (!options.swallowOperatorNotifyErrors) throw error;
-      console.error(
-        `activateAssignedJob ${rescueRequest.id}: failed to notify the operator the job is live:`,
-        error,
-      );
-      Sentry.captureException(error, {
-        extra: {
-          rescueRequestId: rescueRequest.id,
-          stage: 'activate-assigned-job-operator-message',
-        },
-      });
     }
   }
 
@@ -439,7 +447,9 @@ Reply with a number from 1 to 5 to rate your experience with the operator.${port
     // Both rating prompts carry the job ref so the score is clearly tied to
     // the completed request. This is especially important for operators, who
     // can have more than one job in flight (there is no busy filter).
-    if (operator?.phoneNumber) {
+    // whatsappEnabled guards the WhatsApp sends and rating-session setup
+    // specifically — a non-WhatsApp operator has no channel for either.
+    if (operator?.phoneNumber && operator.whatsappEnabled) {
       await this.twilioService.sendWhatsAppMessage(
         toWhatsAppAddress(operator.phoneNumber),
         balanceAmount === 0

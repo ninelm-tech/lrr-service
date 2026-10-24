@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { BadRequestException } from '@nestjs/common';
 import { RescueRequestAdminService } from './rescue-request-admin.service';
 import { DispatchService } from './dispatch.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -16,6 +17,7 @@ import { PaymentEventsService } from './payment-events.service';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { OperatorMembershipService } from '../operator/operator-membership.service';
+import { OperatorService } from '../operator/operator.service';
 import { PayoutService } from '../payout/payout.service';
 import { Prisma } from '@prisma/client';
 
@@ -66,6 +68,7 @@ describe('RescueRequestAdminService', () => {
             provide: OperatorMembershipService,
             useValue: operatorMembershipService,
           },
+          { provide: OperatorService, useValue: {} },
         ],
       }).compile();
 
@@ -269,6 +272,292 @@ describe('RescueRequestAdminService', () => {
         ),
       ).rejects.toThrow('You do not have access to this rescue request');
     });
+
+    it('detailForUser requests whatsappEnabled on the narrowed assignedOperator select', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        ...baseRaw,
+        customerId: 'cust-1',
+        assignedOperator: {
+          id: 'op-1',
+          businessName: 'B',
+          phoneNumber: 'p',
+          email: null,
+          whatsappEnabled: false,
+        },
+      });
+
+      await detailService.detailForUser(
+        { role: 'CUSTOMER', userId: 'cust-1' },
+        'req-1',
+      );
+
+      const [[args]] = prisma.rescueRequest.findUnique.mock.calls as [
+        {
+          include: { assignedOperator: { select: Record<string, boolean> } };
+        },
+      ][];
+      expect(args.include.assignedOperator.select.whatsappEnabled).toBe(true);
+    });
+
+    it('surfaces the top-level needsManualAssignment flag on the detail response', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        ...baseRaw,
+        customerId: 'cust-1',
+        needsManualAssignment: true,
+      });
+
+      const result = await detailService.detailForUser(
+        { role: 'CUSTOMER', userId: 'cust-1' },
+        'req-1',
+      );
+
+      expect(result.data.needsManualAssignment).toBe(true);
+    });
+  });
+
+  describe('operatorDetail', () => {
+    let service: RescueRequestAdminService;
+    let prisma: {
+      rescueRequest: { findUnique: jest.Mock };
+    };
+    let operatorMembershipService: {
+      findActiveOperatorIdsForUser: jest.Mock;
+    };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: { findUnique: jest.fn() },
+      };
+      operatorMembershipService = {
+        findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          {
+            provide: PayoutService,
+            useValue: { createAndProcessPayout: jest.fn() },
+          },
+          RescueRequestAdminService,
+          { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
+          {
+            provide: OperatorMembershipService,
+            useValue: operatorMembershipService,
+          },
+          { provide: OperatorService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<RescueRequestAdminService>(
+        RescueRequestAdminService,
+      );
+    });
+
+    it('operatorDetail requests whatsappEnabled on the narrowed assignedOperator select', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        assignedOperatorId: 'op-1',
+        customer: {},
+        assignedOperator: {
+          id: 'op-1',
+          businessName: 'B',
+          phoneNumber: 'p',
+          email: null,
+          whatsappEnabled: false,
+        },
+        payments: [],
+      });
+      operatorMembershipService.findActiveOperatorIdsForUser.mockResolvedValue([
+        'op-1',
+      ]);
+
+      await service.operatorDetail('user-1', 'req-1');
+
+      const [[args]] = prisma.rescueRequest.findUnique.mock.calls as [
+        {
+          include: { assignedOperator: { select: Record<string, boolean> } };
+        },
+      ][];
+      expect(args.include.assignedOperator.select.whatsappEnabled).toBe(true);
+    });
+  });
+
+  describe('manualCandidatesFor', () => {
+    let service: RescueRequestAdminService;
+    let prisma: {
+      rescueRequest: { findUnique: jest.Mock };
+    };
+    let platformConfigService: { getConfig: jest.Mock };
+    let operatorService: { findAndRankCandidates: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: { findUnique: jest.fn() },
+      };
+      platformConfigService = {
+        getConfig: jest
+          .fn()
+          .mockResolvedValue({ testCustomerPhoneNumbers: [] }),
+      };
+      operatorService = {
+        findAndRankCandidates: jest.fn().mockResolvedValue([]),
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          {
+            provide: PayoutService,
+            useValue: { createAndProcessPayout: jest.fn() },
+          },
+          RescueRequestAdminService,
+          { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: {} },
+          { provide: PlatformConfigService, useValue: platformConfigService },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: { clear: jest.fn() } },
+          {
+            provide: OperatorMembershipService,
+            useValue: {
+              findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
+            },
+          },
+          { provide: OperatorService, useValue: operatorService },
+        ],
+      }).compile();
+
+      service = module.get<RescueRequestAdminService>(
+        RescueRequestAdminService,
+      );
+    });
+
+    it('rejects when the request does not exist', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(null);
+
+      await expect(service.manualCandidatesFor('req-1')).rejects.toThrow(
+        'Rescue request not found',
+      );
+      expect(operatorService.findAndRankCandidates).not.toHaveBeenCalled();
+    });
+
+    it('rejects a request that is not currently flagged for manual assignment', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        status: 'DISPATCHING',
+        needsManualAssignment: false,
+        latitude: 6.5,
+        longitude: 3.4,
+        vehicleType: 'SEDAN',
+        offeredOperatorIds: [],
+        dispatchRound: 3,
+        customer: { phoneNumber: '+2348000000000' },
+      });
+
+      await expect(service.manualCandidatesFor('req-1')).rejects.toThrow(
+        'This request does not currently need manual assignment.',
+      );
+      expect(operatorService.findAndRankCandidates).not.toHaveBeenCalled();
+    });
+
+    it('rejects a request that has moved past DISPATCHING even if still flagged', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        status: 'WAITING_FOR_DEPOSIT',
+        needsManualAssignment: true,
+        latitude: 6.5,
+        longitude: 3.4,
+        vehicleType: 'SEDAN',
+        offeredOperatorIds: [],
+        dispatchRound: 3,
+        customer: { phoneNumber: '+2348000000000' },
+      });
+
+      await expect(service.manualCandidatesFor('req-1')).rejects.toThrow(
+        'This request does not currently need manual assignment.',
+      );
+    });
+
+    it('searches whatsappOnly: false with the radius matching what resolveExhaustion actually last searched, and returns the candidates', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        status: 'DISPATCHING',
+        needsManualAssignment: true,
+        latitude: 6.5,
+        longitude: 3.4,
+        vehicleType: 'SEDAN',
+        offeredOperatorIds: ['op-already-offered'],
+        dispatchRound: 5,
+        customer: { phoneNumber: '+2348000000000' },
+      });
+      const candidates = [{ id: 'op-1', businessName: 'Backup Towing' }];
+      operatorService.findAndRankCandidates.mockResolvedValue(candidates);
+
+      const result = await service.manualCandidatesFor('req-1');
+
+      // dispatchRound 5 → (5 - 2) * RADIUS_EXPANSION_KM(2) = 6.
+      expect(operatorService.findAndRankCandidates).toHaveBeenCalledWith(
+        6.5,
+        3.4,
+        ['op-already-offered'],
+        6,
+        undefined,
+        expect.any(Array),
+        false,
+        false,
+      );
+      expect(result).toEqual({ data: candidates });
+    });
+
+    it('marks the request isTestRequest when the customer phone is on the platform test-number list', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        status: 'DISPATCHING',
+        needsManualAssignment: true,
+        latitude: 6.5,
+        longitude: 3.4,
+        vehicleType: null,
+        offeredOperatorIds: [],
+        dispatchRound: 1,
+        customer: { phoneNumber: '+2348000000000' },
+      });
+      platformConfigService.getConfig.mockResolvedValue({
+        testCustomerPhoneNumbers: ['+2348000000000'],
+      });
+
+      await service.manualCandidatesFor('req-1');
+
+      expect(operatorService.findAndRankCandidates).toHaveBeenCalledWith(
+        6.5,
+        3.4,
+        [],
+        0,
+        undefined,
+        undefined,
+        true,
+        false,
+      );
+    });
   });
 
   describe('detailForUser — media gating', () => {
@@ -321,6 +610,7 @@ describe('RescueRequestAdminService', () => {
             provide: OperatorMembershipService,
             useValue: operatorMembershipService,
           },
+          { provide: OperatorService, useValue: {} },
         ],
       }).compile();
 
@@ -462,6 +752,7 @@ describe('RescueRequestAdminService', () => {
               findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
             },
           },
+          { provide: OperatorService, useValue: {} },
         ],
       }).compile();
 
@@ -701,6 +992,63 @@ describe('RescueRequestAdminService', () => {
         expect.objectContaining({ data: [], meta: expect.anything() }),
       );
     });
+
+    it('requests whatsappEnabled on the narrowed assignedOperator select', async () => {
+      prisma.rescueRequest.findMany.mockResolvedValue([]);
+      prisma.rescueRequest.count.mockResolvedValue(0);
+
+      await service.adminList({});
+
+      const [[args]] = prisma.rescueRequest.findMany.mock.calls as [
+        {
+          include: { assignedOperator: { select: Record<string, boolean> } };
+        },
+      ][];
+      expect(args.include.assignedOperator.select.whatsappEnabled).toBe(true);
+    });
+
+    it('surfaces needsManualAssignment and the assigned operator whatsappEnabled flag on each list item', async () => {
+      prisma.rescueRequest.findMany.mockResolvedValue([
+        {
+          id: 'req-1',
+          status: 'DISPATCHING',
+          vehicleType: null,
+          destination: 'Mainland',
+          latitude: null,
+          longitude: null,
+          depositAmount: null,
+          balanceAmount: null,
+          serviceFeeAmount: null,
+          needsManualAssignment: true,
+          payments: [],
+          customer: { id: 'cust-1', phoneNumber: '+2341' },
+          assignedOperator: {
+            id: 'op-1',
+            businessName: 'Backup Towing',
+            whatsappEnabled: false,
+          },
+          disputed: false,
+          disputeRaisedAt: null,
+          disputeResolvedAt: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ]);
+      prisma.rescueRequest.count.mockResolvedValue(1);
+
+      const result = await service.adminList({});
+
+      expect(result.data[0]).toEqual(
+        expect.objectContaining({
+          needsManualAssignment: true,
+          assignedOperator: {
+            id: 'op-1',
+            businessName: 'Backup Towing',
+            whatsappEnabled: false,
+          },
+        }),
+      );
+    });
   });
 
   describe('assignOperator', () => {
@@ -735,6 +1083,10 @@ describe('RescueRequestAdminService', () => {
       status: 'ACTIVE',
       businessName: 'Acme Towing',
       phoneNumber: '+2348011111111',
+      // Matches the schema's own default (Operator.whatsappEnabled
+      // @default(true)) — every existing test in this block relies on
+      // this fixture implicitly being a normal WhatsApp operator.
+      whatsappEnabled: true,
     };
     const request = {
       id: 'req-1',
@@ -743,6 +1095,7 @@ describe('RescueRequestAdminService', () => {
       customer: { id: 'cust-1', phoneNumber: '+2348022222222', email: null },
       assignedOperatorId: null,
       dispatchRound: 1,
+      needsManualAssignment: false,
     };
 
     beforeEach(async () => {
@@ -831,6 +1184,7 @@ describe('RescueRequestAdminService', () => {
               findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
             },
           },
+          { provide: OperatorService, useValue: {} },
         ],
       }).compile();
 
@@ -1164,6 +1518,104 @@ describe('RescueRequestAdminService', () => {
         'req-1',
       );
     });
+
+    it('rejects a non-WhatsApp operator when the request is not flagged for manual assignment', async () => {
+      prisma.operator.findUnique.mockResolvedValue({
+        ...operator,
+        whatsappEnabled: false,
+      });
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        ...request,
+        needsManualAssignment: false,
+      });
+
+      await expect(
+        assignService.assignOperator('req-1', {
+          operatorId: 'op-1',
+          priceKobo: 500000,
+        }),
+      ).rejects.toThrow(
+        'This operator has no WhatsApp on file — it can only be assigned to a request flagged for manual assignment.',
+      );
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('allows a non-WhatsApp operator once the request is flagged, and skips the operator WhatsApp send', async () => {
+      prisma.operator.findUnique.mockResolvedValue({
+        ...operator,
+        whatsappEnabled: false,
+      });
+      prisma.rescueRequest.findUnique.mockResolvedValueOnce({
+        ...request,
+        needsManualAssignment: true,
+        dispatchRound: 3,
+      });
+
+      await assignService.assignOperator('req-1', {
+        operatorId: 'op-1',
+        priceKobo: 500000,
+      });
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledTimes(1); // customer only
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
+        operator.phoneNumber,
+        expect.anything(),
+      );
+    });
+
+    it('clears needsManualAssignment on successful assignment', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        ...request,
+        needsManualAssignment: true,
+      });
+
+      await assignService.assignOperator('req-1', {
+        operatorId: 'op-1',
+        priceKobo: 500000,
+      });
+
+      expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+          data: expect.objectContaining({ needsManualAssignment: false }),
+        }),
+      );
+    });
+
+    it('does not assign when the manual flag is cleared between the pre-check and transactional claim', async () => {
+      prisma.operator.findUnique.mockResolvedValue({
+        ...operator,
+        whatsappEnabled: false,
+      });
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        ...request,
+        needsManualAssignment: true,
+      });
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        assignService.assignOperator('req-1', {
+          operatorId: 'op-1',
+          priceKobo: 500000,
+        }),
+      ).rejects.toThrow(BadRequestException);
+      expect(paymentLedger.create).not.toHaveBeenCalled();
+      expect(paystackService.initializePayment).not.toHaveBeenCalled();
+    });
+
+    it('is completely unaffected for a WhatsApp-enabled operator regardless of needsManualAssignment', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValueOnce({
+        ...request,
+        needsManualAssignment: false,
+      });
+
+      await expect(
+        assignService.assignOperator('req-1', {
+          operatorId: 'op-1',
+          priceKobo: 500000,
+        }),
+      ).resolves.toBeDefined();
+    });
   });
 
   describe('refundDeposit', () => {
@@ -1218,6 +1670,7 @@ describe('RescueRequestAdminService', () => {
               findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
             },
           },
+          { provide: OperatorService, useValue: {} },
         ],
       }).compile();
 
@@ -1477,6 +1930,7 @@ describe('RescueRequestAdminService', () => {
               findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
             },
           },
+          { provide: OperatorService, useValue: {} },
         ],
       }).compile();
 
@@ -1832,6 +2286,7 @@ describe('RescueRequestAdminService', () => {
               findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
             },
           },
+          { provide: OperatorService, useValue: {} },
         ],
       }).compile();
 
@@ -1925,6 +2380,7 @@ describe('RescueRequestAdminService', () => {
               findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
             },
           },
+          { provide: OperatorService, useValue: {} },
         ],
       }).compile();
 
@@ -1993,6 +2449,27 @@ describe('RescueRequestAdminService', () => {
       expect(quotedCall[0].data.status).toBe('NOT_SELECTED');
       expect(quotedCall[0].data.respondedAt).toBeInstanceOf(Date);
     });
+
+    it('clears a stale needsManualAssignment flag when cancelling', async () => {
+      prisma.rescueRequest.update.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        status: 'CANCELLED',
+        customer: { id: 'cust-1', phoneNumber: '+2348012345678' },
+        media: [],
+        dispatchOffers: [],
+        payments: [],
+      });
+
+      await service.cancel('req-1', {});
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'req-1' },
+          data: { status: 'CANCELLED', needsManualAssignment: false },
+        }),
+      );
+    });
   });
 
   describe('updateStatus', () => {
@@ -2003,7 +2480,7 @@ describe('RescueRequestAdminService', () => {
 
     let service: RescueRequestAdminService;
     let prisma: {
-      rescueRequest: { update: jest.Mock };
+      rescueRequest: { update: jest.Mock; findUnique: jest.Mock };
       dispatchOffer: {
         updateMany: jest.Mock<void, [DispatchOfferUpdateManyArgs]>;
       };
@@ -2011,7 +2488,7 @@ describe('RescueRequestAdminService', () => {
 
     beforeEach(async () => {
       prisma = {
-        rescueRequest: { update: jest.fn() },
+        rescueRequest: { update: jest.fn(), findUnique: jest.fn() },
         dispatchOffer: {
           updateMany: jest.fn<void, [DispatchOfferUpdateManyArgs]>(),
         },
@@ -2055,6 +2532,7 @@ describe('RescueRequestAdminService', () => {
               findActiveOperatorIdsForUser: jest.fn().mockResolvedValue([]),
             },
           },
+          { provide: OperatorService, useValue: {} },
         ],
       }).compile();
 
@@ -2090,6 +2568,85 @@ describe('RescueRequestAdminService', () => {
       });
       expect(quotedCall[0].data.status).toBe('NOT_SELECTED');
       expect(quotedCall[0].data.respondedAt).toBeInstanceOf(Date);
+    });
+
+    it('clears a stale needsManualAssignment flag when moving a request to CANCELLED', async () => {
+      prisma.rescueRequest.update.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        status: 'CANCELLED',
+        customer: { id: 'cust-1', phoneNumber: '+2348012345678' },
+        media: [],
+        dispatchOffers: [],
+        payments: [],
+      });
+
+      await service.updateStatus('req-1', { status: 'CANCELLED' });
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'req-1' },
+          data: { status: 'CANCELLED', needsManualAssignment: false },
+        }),
+      );
+    });
+
+    it('does not touch needsManualAssignment when moving to a non-cancelled status', async () => {
+      prisma.rescueRequest.update.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        status: 'IN_PROGRESS',
+        customer: { id: 'cust-1', phoneNumber: '+2348012345678' },
+        media: [],
+        dispatchOffers: [],
+        payments: [],
+      });
+
+      await service.updateStatus('req-1', { status: 'IN_PROGRESS' });
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'req-1' },
+          data: { status: 'IN_PROGRESS' },
+        }),
+      );
+    });
+
+    it('rejects ARRIVED/COMPLETED via the generic status endpoint when the assigned operator has no WhatsApp', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        assignedOperator: { whatsappEnabled: false },
+      });
+
+      await expect(
+        service.updateStatus('req-1', { status: 'ARRIVED' }),
+      ).rejects.toThrow(
+        'Use manual-arrived/manual-done for a non-WhatsApp operator, not the generic status endpoint.',
+      );
+      await expect(
+        service.updateStatus('req-1', { status: 'COMPLETED' }),
+      ).rejects.toThrow(/manual-arrived.*manual-done/);
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+    });
+
+    it('leaves every other status transition on this endpoint unaffected', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        assignedOperator: { whatsappEnabled: false },
+      });
+      prisma.rescueRequest.update.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        status: 'CANCELLED',
+        customer: { id: 'cust-1', phoneNumber: '+2348012345678' },
+        media: [],
+        dispatchOffers: [],
+        payments: [],
+      });
+
+      await expect(
+        service.updateStatus('req-1', { status: 'CANCELLED' }),
+      ).resolves.toBeDefined();
     });
   });
 });

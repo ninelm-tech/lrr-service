@@ -45,7 +45,7 @@ const MAX_FAILED_ROUNDS_BEFORE_ALERT = Number(
 const MAX_ROUNDS_BEFORE_AUTO_CANCEL = Number(
   process.env.DISPATCH_MAX_ROUNDS ?? 4,
 ); // ~RETRY*MAX min total
-const RADIUS_EXPANSION_KM = 2;
+export const RADIUS_EXPANSION_KM = 2;
 
 // Ranks a Twilio delivery-status callback's lifecycle stage, so an
 // out-of-order callback (arriving late over the network) can never
@@ -87,6 +87,16 @@ type PrepareNextRoundResult =
   | {
       offers: never[];
       exhausted: true;
+      reason: 'no-coverage' | 'rounds-exhausted';
+      round: number;
+      extraRadiusKm: number;
+      isTestRequest: boolean;
+    };
+
+export type ExhaustionResolution =
+  | { outcome: 'manual-fallback'; candidateId: string }
+  | {
+      outcome: 'cancelled';
       reason: 'no-coverage' | 'rounds-exhausted';
       round: number;
     };
@@ -461,10 +471,12 @@ export class DispatchService {
     rescueRequestId: string,
     deadline: Date,
   ) {
-    const stillPending = await this.prisma.dispatchOffer.findMany({
-      where: { rescueRequestId, status: 'PENDING' },
-      include: { operator: true },
-    });
+    const stillPending = (
+      await this.prisma.dispatchOffer.findMany({
+        where: { rescueRequestId, status: 'PENDING' },
+        include: { operator: true },
+      })
+    ).filter((offer) => offer.operator.whatsappEnabled);
     if (stillPending.length === 0) return;
 
     const remaining = this.formatRemaining(deadline);
@@ -594,7 +606,17 @@ export class DispatchService {
       include: { customer: { select: { phoneNumber: true } } },
     });
     if (!rescueRequest) {
-      return { offers: [], exhausted: true, reason: 'no-coverage', round };
+      // false is a defensive fallback, not a real determination — no
+      // customer row exists to check at this point. See resolveExhaustion's
+      // own handling of a vanished row.
+      return {
+        offers: [],
+        exhausted: true,
+        reason: 'no-coverage',
+        round,
+        extraRadiusKm: 0,
+        isTestRequest: false,
+      };
     }
 
     const lat = Number(rescueRequest.latitude);
@@ -639,6 +661,15 @@ export class DispatchService {
       });
 
       if (candidates.length > 0) {
+        // Clears a stale manual-fallback flag the moment automatic dispatch
+        // succeeds again — see the spec's own note on when this flag is
+        // supposed to clear. Same transaction as the round itself, so a
+        // request can never be both freshly re-dispatched AND still
+        // flagged as needing a call.
+        await tx.rescueRequest.update({
+          where: { id: rescueRequestId },
+          data: { needsManualAssignment: false },
+        });
         const offers = await this.writeRound(
           tx,
           rescueRequest,
@@ -673,6 +704,8 @@ export class DispatchService {
           exhausted: true,
           reason: 'no-coverage',
           round: attemptRound,
+          extraRadiusKm,
+          isTestRequest,
         };
       }
 
@@ -683,9 +716,144 @@ export class DispatchService {
           exhausted: true,
           reason: 'rounds-exhausted',
           round: attemptRound,
+          extraRadiusKm,
+          isTestRequest,
         };
       }
       extraRadiusKm += RADIUS_EXPANSION_KM;
+    }
+  }
+
+  /**
+   * What to do once prepareNextRound reports exhausted: true. Not private —
+   * BatchResolveCheck (a separate class) calls this on its own injected
+   * DispatchService the same way it already calls prepareNextRound. Must run
+   * as part of the SAME transaction that observed `exhausted`, for the same
+   * reason prepareNextRound's own docstring gives for cancelling in that
+   * transaction: nothing else will ever revisit a DISPATCHING request with no
+   * live offers and no flag set.
+   *
+   * `isTestRequest` is threaded through from prepareNextRound's own
+   * computation (its exhausted-result's new field), not recomputed here — the
+   * fallback search must respect the SAME test/real operator partition the
+   * automatic search was already using, and doing that via a second
+   * PlatformConfig fetch here would risk the two disagreeing if the config
+   * changed mid-request.
+   */
+  async resolveExhaustion(
+    tx: Prisma.TransactionClient,
+    rescueRequest: {
+      id: string;
+      latitude: unknown;
+      longitude: unknown;
+      vehicleType: string | null;
+      offeredOperatorIds: string[];
+      customerId: string;
+    },
+    exhausted: {
+      reason: 'no-coverage' | 'rounds-exhausted';
+      round: number;
+      extraRadiusKm: number;
+    },
+    isTestRequest: boolean,
+  ): Promise<ExhaustionResolution> {
+    const eligibleTruckClasses = rescueRequest.vehicleType
+      ? getEligibleTruckClasses(rescueRequest.vehicleType as VehicleType)
+      : undefined;
+
+    const backupCandidates = await this.operatorService.findAndRankCandidates(
+      Number(rescueRequest.latitude),
+      Number(rescueRequest.longitude),
+      rescueRequest.offeredOperatorIds,
+      exhausted.extraRadiusKm,
+      undefined,
+      eligibleTruckClasses,
+      isTestRequest,
+      false, // whatsappOnly — this is the manual-fallback search, by definition non-WhatsApp
+    );
+
+    if (backupCandidates.length > 0) {
+      await tx.rescueRequest.update({
+        where: { id: rescueRequest.id },
+        data: { needsManualAssignment: true, dispatchRound: exhausted.round },
+      });
+      return {
+        outcome: 'manual-fallback',
+        candidateId: backupCandidates[0].id,
+      };
+    }
+
+    await tx.rescueRequest.update({
+      where: { id: rescueRequest.id },
+      data: {
+        status: RescueRequestStatus.CANCELLED,
+        needsManualAssignment: false,
+        dispatchRound: exhausted.round,
+      },
+    });
+    await tx.dispatchOffer.updateMany({
+      where: { rescueRequestId: rescueRequest.id, status: 'PENDING' },
+      data: { status: 'TIMED_OUT', respondedAt: new Date() },
+    });
+    await tx.whatsAppSession.updateMany({
+      where: { userId: rescueRequest.customerId },
+      data: { state: 'IDLE', rescueRequestId: null },
+    });
+    return {
+      outcome: 'cancelled',
+      reason: exhausted.reason,
+      round: exhausted.round,
+    };
+  }
+
+  /**
+   * Tells staff a request fell through to manual (non-WhatsApp) fallback —
+   * see resolveExhaustion. Best-effort and outside any transaction,
+   * deliberately: a Twilio failure here must never roll back the flag that
+   * was already committed, and sending real messages from inside a DB
+   * transaction is the wrong shape regardless (same reasoning as every
+   * other post-transaction notification in this file).
+   */
+  /**
+   * Best-effort, same pattern as every other staff alert in this codebase
+   * (see DisputeService.sendStaffDisputeAlert) — a failed send to one
+   * number never blocks the others. This is always a business-initiated
+   * message (staff never texts first), so on a real (non-sandbox) number
+   * it MUST go through an approved Content Template — a freeform body
+   * gets rejected by Meta outside a session window. Falls back to a
+   * freeform send only when TWILIO_MANUAL_FALLBACK_ALERT_TEMPLATE_SID
+   * isn't configured (e.g. local/sandbox testing before the template
+   * exists, or before it's been submitted for approval at all).
+   */
+  async alertStaffManualFallback(
+    rescueRequestId: string,
+    round: number,
+  ): Promise<void> {
+    const config = await this.platformConfigService.getConfig();
+    // Full definition: TWILIO_CONTENT_TEMPLATES.manual_fallback_alert in
+    // src/integrations/twilio/twilio-content-templates.ts.
+    const templateSid = process.env.TWILIO_MANUAL_FALLBACK_ALERT_TEMPLATE_SID;
+    const jobRef = formatJobRef(rescueRequestId);
+    for (const phoneNumber of config.disputeAlertPhoneNumbers) {
+      try {
+        if (templateSid) {
+          await this.twilioService.sendWhatsAppTemplateMessage(
+            toWhatsAppAddress(phoneNumber),
+            templateSid,
+            { '1': jobRef.replace('Job #', ''), '2': String(round) },
+          );
+        } else {
+          await this.twilioService.sendWhatsAppMessage(
+            toWhatsAppAddress(phoneNumber),
+            `📞 ${jobRef} needs a manual call — no WhatsApp-capable operator left after round ${round}. Check the Requests tab for candidates.`,
+          );
+        }
+      } catch (error) {
+        console.error('Manual-fallback staff alert failed:', error);
+        Sentry.captureException(error, {
+          extra: { rescueRequestId, stage: 'manual-fallback-staff-alert' },
+        });
+      }
     }
   }
 
@@ -1046,7 +1214,14 @@ export class DispatchService {
   async startDispatch(rescueRequestId: string, customerId: string) {
     const rescueRequest = await this.prisma.rescueRequest.findUnique({
       where: { id: rescueRequestId },
-      select: { status: true, dispatchRound: true },
+      select: {
+        status: true,
+        dispatchRound: true,
+        latitude: true,
+        longitude: true,
+        vehicleType: true,
+        offeredOperatorIds: true,
+      },
     });
     if (!rescueRequest) return;
     if (
@@ -1079,30 +1254,34 @@ export class DispatchService {
       );
       if (!next.exhausted) return next;
 
-      await tx.rescueRequest.update({
-        where: { id: rescueRequestId },
-        data: {
-          status: RescueRequestStatus.CANCELLED,
-          dispatchRound: next.round,
+      const resolution = await this.resolveExhaustion(
+        tx,
+        { id: rescueRequestId, customerId, ...rescueRequest },
+        {
+          reason: next.reason,
+          round: next.round,
+          extraRadiusKm: next.extraRadiusKm,
         },
-      });
-      // Every operator already offered this job is still sitting on an
-      // unanswered PENDING offer — being already-offered is exactly why this
-      // path ran out of candidates. Without this sweep the job stays "open"
-      // in their list until each offer's own expiresAt passes, long after
-      // the request itself is dead.
-      await tx.dispatchOffer.updateMany({
-        where: { rescueRequestId, status: 'PENDING' },
-        data: { status: 'TIMED_OUT', respondedAt: new Date() },
-      });
-      await tx.whatsAppSession.updateMany({
-        where: { userId: customerId },
-        data: { state: 'IDLE', rescueRequestId: null },
-      });
-      return next;
+        next.isTestRequest,
+      );
+      return { ...next, resolution };
     });
 
     if (outcome.exhausted) {
+      if (outcome.resolution.outcome === 'manual-fallback') {
+        console.warn(
+          `Request ${rescueRequestId} flagged for manual assignment after round ${outcome.round} (no WhatsApp-capable operators left).`,
+        );
+        Sentry.captureMessage(
+          'Request flagged for manual (non-WhatsApp) assignment',
+          {
+            level: 'info',
+            extra: { rescueRequestId, round: outcome.round },
+          },
+        );
+        await this.alertStaffManualFallback(rescueRequestId, outcome.round);
+        return;
+      }
       await this.notifyNoOperatorAvailable(
         rescueRequestId,
         customerId,
@@ -1311,6 +1490,11 @@ export class DispatchService {
     });
     if (!operator || operator.status !== 'ACTIVE') {
       throw new BadRequestException('Target is not an active operator');
+    }
+    if (!operator.whatsappEnabled) {
+      throw new BadRequestException(
+        'This operator has no WhatsApp on file — use "Assign this operator" instead of offering.',
+      );
     }
 
     // As with expandRadiusNow: existing offers are left alone. This adds one
@@ -1683,6 +1867,7 @@ export class DispatchService {
       round: r.dispatchRound,
       createdAt: r.createdAt,
       quoteCollectionDeadline: r.quoteCollectionDeadline ?? undefined,
+      needsManualAssignment: r.needsManualAssignment,
       offers: r.dispatchOffers.map((o) => ({
         operatorId: o.operatorId,
         businessName: o.operator.businessName,

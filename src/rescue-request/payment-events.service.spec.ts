@@ -72,6 +72,7 @@ describe('PaymentEventsService', () => {
             id: 'op-1',
             businessName: 'Swift Towing',
             phoneNumber: '+2349012345678',
+            whatsappEnabled: true,
           },
         }),
       },
@@ -146,7 +147,11 @@ describe('PaymentEventsService', () => {
         assignedOperatorId: 'op-1',
         status: 'WAITING_FOR_DEPOSIT',
         customer: { phoneNumber: '+2341' },
-        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+        assignedOperator: {
+          businessName: 'Swift',
+          phoneNumber: '+2342',
+          whatsappEnabled: true,
+        },
       });
 
       await service.confirmDeposit(paymentFor('req-1'));
@@ -166,7 +171,11 @@ describe('PaymentEventsService', () => {
         assignedOperatorId: 'op-1',
         status: 'WAITING_FOR_DEPOSIT',
         customer: { phoneNumber: '+2341' },
-        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+        assignedOperator: {
+          businessName: 'Swift',
+          phoneNumber: '+2342',
+          whatsappEnabled: true,
+        },
       });
 
       await service.confirmDeposit(paymentFor('req-1'));
@@ -196,7 +205,11 @@ describe('PaymentEventsService', () => {
         assignedOperatorId: 'op-1',
         status: 'WAITING_FOR_DEPOSIT',
         customer: { phoneNumber: null },
-        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+        assignedOperator: {
+          businessName: 'Swift',
+          phoneNumber: '+2342',
+          whatsappEnabled: true,
+        },
       });
 
       await service.confirmDeposit(paymentFor('req-1'));
@@ -220,7 +233,11 @@ describe('PaymentEventsService', () => {
         assignedOperatorId: 'op-1',
         status: 'WAITING_FOR_DEPOSIT',
         customer: { phoneNumber: '+2341' },
-        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+        assignedOperator: {
+          businessName: 'Swift',
+          phoneNumber: '+2342',
+          whatsappEnabled: true,
+        },
       };
 
       beforeEach(() => {
@@ -275,7 +292,11 @@ describe('PaymentEventsService', () => {
         assignedOperatorId: 'op-1',
         status: 'WAITING_FOR_DEPOSIT',
         customer: { phoneNumber: '+2341' },
-        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+        assignedOperator: {
+          businessName: 'Swift',
+          phoneNumber: '+2342',
+          whatsappEnabled: true,
+        },
       });
 
       await service.confirmDeposit(paymentFor('req-1'));
@@ -304,7 +325,11 @@ describe('PaymentEventsService', () => {
         assignedOperatorId: 'op-1',
         status: 'WAITING_FOR_DEPOSIT',
         customer: { phoneNumber: '+2341' },
-        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+        assignedOperator: {
+          businessName: 'Swift',
+          phoneNumber: '+2342',
+          whatsappEnabled: true,
+        },
       });
       twilioService.sendWhatsAppMessage.mockImplementation((to: string) => {
         if (to === '+2341') return Promise.reject(new Error('Twilio down'));
@@ -330,7 +355,11 @@ describe('PaymentEventsService', () => {
         assignedOperatorId: 'op-1',
         status: 'WAITING_FOR_DEPOSIT',
         customer: { phoneNumber: '+2341' },
-        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+        assignedOperator: {
+          businessName: 'Swift',
+          phoneNumber: '+2342',
+          whatsappEnabled: true,
+        },
       });
 
       await service.confirmDeposit(paymentFor('req-1'));
@@ -360,7 +389,7 @@ describe('PaymentEventsService', () => {
 
       expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
         where: { id: 'req-1' },
-        data: { status: 'CANCELLED' },
+        data: { status: 'CANCELLED', needsManualAssignment: false },
       });
       expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
         state: 'IDLE',
@@ -441,7 +470,11 @@ describe('PaymentEventsService', () => {
         latitude: 6.5,
         longitude: 3.4,
         customer: { phoneNumber: '+2341' },
-        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+        assignedOperator: {
+          businessName: 'Swift',
+          phoneNumber: '+2342',
+          whatsappEnabled: true,
+        },
       });
       twilioService.sendWhatsAppMessage.mockRejectedValue(
         new Error('session window closed'),
@@ -460,7 +493,11 @@ describe('PaymentEventsService', () => {
         latitude: 6.5,
         longitude: 3.4,
         customer: { phoneNumber: '+2341' },
-        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+        assignedOperator: {
+          businessName: 'Swift',
+          phoneNumber: '+2342',
+          whatsappEnabled: true,
+        },
       });
 
       await service.activateAssignedJob('req-1');
@@ -483,7 +520,11 @@ describe('PaymentEventsService', () => {
         latitude: 6.5,
         longitude: 3.4,
         customer: { phoneNumber: '+2341' },
-        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+        assignedOperator: {
+          businessName: 'Swift',
+          phoneNumber: '+2342',
+          whatsappEnabled: true,
+        },
       });
 
       await service.activateAssignedJob('req-1');
@@ -505,7 +546,11 @@ describe('PaymentEventsService', () => {
         latitude: 6.5,
         longitude: 3.4,
         customer: { phoneNumber: '+2341' },
-        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+        assignedOperator: {
+          businessName: 'Swift',
+          phoneNumber: '+2342',
+          whatsappEnabled: true,
+        },
       });
 
       await service.activateAssignedJob('req-1');
@@ -534,7 +579,11 @@ describe('PaymentEventsService', () => {
         latitude: 6.5,
         longitude: 3.4,
         customer: { phoneNumber: '+2341' },
-        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+        assignedOperator: {
+          businessName: 'Swift',
+          phoneNumber: '+2342',
+          whatsappEnabled: true,
+        },
       });
 
       await service.activateAssignedJob('req-1');
@@ -559,6 +608,64 @@ describe('PaymentEventsService', () => {
       expect(sessionStore.update).not.toHaveBeenCalled();
       expect(prisma.dispatchOffer.updateMany).not.toHaveBeenCalled();
     });
+
+    it('skips the operator WhatsApp notification and session setup when the operator has no WhatsApp on file', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: {
+          businessName: 'Swift',
+          phoneNumber: '+2342',
+          whatsappEnabled: false,
+        },
+      });
+
+      await service.activateAssignedJob('req-1');
+
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
+        expect.stringContaining('2342'),
+        expect.anything(),
+      );
+      expect(twilioService.sendWhatsAppTemplateMessage).not.toHaveBeenCalled();
+      expect(sessionStore.update).not.toHaveBeenCalledWith(
+        'op-user-1',
+        expect.anything(),
+      );
+    });
+
+    it('still flips the offer status and moves the customer session regardless of whatsappEnabled — those are not WhatsApp side effects', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: {
+          businessName: 'Swift',
+          phoneNumber: '+2342',
+          whatsappEnabled: false,
+        },
+      });
+
+      await service.activateAssignedJob('req-1');
+
+      expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith({
+        where: {
+          rescueRequestId: 'req-1',
+          operatorId: 'op-1',
+          status: 'SELECTED_PENDING_PAYMENT',
+        },
+        data: { status: 'ACCEPTED' },
+      });
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
+        state: 'REQUEST_CONFIRMED',
+      });
+    });
   });
 
   describe('confirmBalance — payout trigger', () => {
@@ -576,6 +683,7 @@ describe('PaymentEventsService', () => {
         id: 'op-1',
         businessName: 'Swift Towing',
         phoneNumber: '+2349012345678',
+        whatsappEnabled: true,
       },
     };
 
@@ -694,6 +802,29 @@ describe('PaymentEventsService', () => {
         data: { status: 'COMPLETED' },
       });
     });
+
+    it('skips the operator WhatsApp notification and rating-session setup when the operator has no WhatsApp on file', async () => {
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        ...BALANCE_REQUEST_FIXTURE,
+        assignedOperator: {
+          ...BALANCE_REQUEST_FIXTURE.assignedOperator,
+          whatsappEnabled: false,
+        },
+      });
+
+      await service.confirmBalance(paymentFor('req-1'));
+
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
+        'whatsapp:+2349012345678',
+        expect.anything(),
+      );
+      // Customer-directed sends (status confirmation, rating prompt) must
+      // still fire — only the operator side is guarded.
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        '+2348012345678',
+        expect.anything(),
+      );
+    });
   });
 
   describe('sendBalancePaymentLink — balanceAmount === 0 (100% deposit)', () => {
@@ -721,6 +852,7 @@ describe('PaymentEventsService', () => {
           id: 'op-1',
           businessName: 'Swift Towing',
           phoneNumber: '+2349012345678',
+          whatsappEnabled: true,
         },
       });
 
@@ -746,6 +878,7 @@ describe('PaymentEventsService', () => {
           id: 'op-1',
           businessName: 'Swift Towing',
           phoneNumber: '+2349012345678',
+          whatsappEnabled: true,
         },
       });
 
@@ -771,6 +904,7 @@ describe('PaymentEventsService', () => {
           id: 'op-1',
           businessName: 'Swift Towing',
           phoneNumber: '+2349012345678',
+          whatsappEnabled: true,
         },
       });
 
@@ -802,6 +936,7 @@ describe('PaymentEventsService', () => {
           id: 'op-1',
           businessName: 'Swift Towing',
           phoneNumber: '+2349012345678',
+          whatsappEnabled: true,
         },
       });
 
@@ -833,6 +968,7 @@ describe('PaymentEventsService', () => {
           id: 'op-1',
           businessName: 'Swift Towing',
           phoneNumber: '+2349012345678',
+          whatsappEnabled: true,
         },
       });
 

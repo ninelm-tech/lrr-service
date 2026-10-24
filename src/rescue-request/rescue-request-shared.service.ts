@@ -83,7 +83,13 @@ export class RescueRequestSharedService {
           request.assignedOperator.phoneNumber,
         );
         userIds.push(operatorUser.id);
-        phones.push(request.assignedOperator.phoneNumber);
+        // The relay side still gets cleared below regardless — a non-
+        // WhatsApp operator can never have actually opened one (Task 7's
+        // CHAT DRIVER guard), so this is a defensive no-op for them, not a
+        // behavior change. Only the "chat ended" message itself is gated.
+        if (request.assignedOperator.whatsappEnabled) {
+          phones.push(request.assignedOperator.phoneNumber);
+        }
       }
 
       const cleared = await this.sessionStore.clearRelayTargets(userIds);

@@ -84,6 +84,29 @@ describe('QuoteSelectionTimeoutCheck (integration)', () => {
     expect(session?.rescueRequestId).toBeNull();
   });
 
+  it('clears a stale needsManualAssignment flag when it times out the request', async () => {
+    const customer = await createCustomer(prisma);
+    const operator = await createOperator(prisma);
+    const request = await createRequest(prisma, customer.id, {
+      status: 'DISPATCHING',
+      quoteSelectionExpiresAt: new Date(Date.now() - 60_000),
+      needsManualAssignment: true,
+    });
+    await createOffer(prisma, request.id, operator.id, {
+      status: 'QUOTED',
+      quotedPrice: 2_000_000,
+      dispatchRound: 0,
+    });
+
+    await check.run(new Date());
+
+    const after = await prisma.rescueRequest.findUnique({
+      where: { id: request.id },
+    });
+    expect(after?.status).toBe('CANCELLED');
+    expect(after?.needsManualAssignment).toBe(false);
+  });
+
   it('does nothing before the deadline', async () => {
     const { request } = await awaitingSelection(60_000);
     await check.run(new Date());

@@ -566,6 +566,46 @@ describe('OperatorService', () => {
     });
   });
 
+  describe('findAndRankCandidates whatsappOnly filtering', () => {
+    it('defaults to WhatsApp-only candidates when whatsappOnly is omitted', async () => {
+      prisma.operator.findMany.mockResolvedValue([]);
+
+      await service.findAndRankCandidates(6.5, 3.4, [], 0, undefined, []);
+
+      expect(prisma.operator.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+          where: expect.objectContaining({ whatsappEnabled: true }),
+        }),
+      );
+    });
+
+    it('searches only non-WhatsApp operators when whatsappOnly is false', async () => {
+      prisma.operator.findMany.mockResolvedValue([]);
+
+      await service.findAndRankCandidates(
+        6.5,
+        3.4,
+        [],
+        0,
+        undefined,
+        [],
+        false,
+        false,
+      );
+
+      expect(prisma.operator.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+          where: expect.objectContaining({
+            isTest: false,
+            whatsappEnabled: false,
+          }),
+        }),
+      );
+    });
+  });
+
   describe('create() truckClasses server-side enforcement', () => {
     const baseDto = (): CreateOperatorDto => ({
       email: 'op@example.com',
@@ -728,6 +768,58 @@ describe('OperatorService', () => {
         expect(prisma.user.create).toHaveBeenCalledWith(
           expect.objectContaining({
             data: expect.objectContaining({ email: undefined }),
+          }),
+        );
+      });
+
+      it('persists whatsappEnabled: false when explicitly provided at registration', async () => {
+        const dto = { ...baseDto(), whatsappEnabled: false };
+        prisma.user.findUnique.mockResolvedValue(null);
+        prisma.operator.findUnique.mockResolvedValue(null);
+        prisma.user.findFirst.mockResolvedValue(null);
+        otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-fresh' });
+        prisma.$transaction.mockImplementation(
+          (fn: (client: typeof prisma) => unknown) => fn(prisma),
+        );
+        prisma.phoneVerification.updateMany = jest
+          .fn()
+          .mockResolvedValue({ count: 1 });
+        prisma.user.create.mockResolvedValue({ id: 'u-new' });
+        prisma.operator.create.mockResolvedValue({ id: 'op-new' });
+        prisma.operatorMember.create.mockResolvedValue({});
+
+        await service.create(dto);
+
+        expect(prisma.operator.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+            data: expect.objectContaining({ whatsappEnabled: false }),
+          }),
+        );
+      });
+
+      it('defaults to whatsappEnabled: true when omitted', async () => {
+        const dto = baseDto();
+        prisma.user.findUnique.mockResolvedValue(null);
+        prisma.operator.findUnique.mockResolvedValue(null);
+        prisma.user.findFirst.mockResolvedValue(null);
+        otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-fresh' });
+        prisma.$transaction.mockImplementation(
+          (fn: (client: typeof prisma) => unknown) => fn(prisma),
+        );
+        prisma.phoneVerification.updateMany = jest
+          .fn()
+          .mockResolvedValue({ count: 1 });
+        prisma.user.create.mockResolvedValue({ id: 'u-new' });
+        prisma.operator.create.mockResolvedValue({ id: 'op-new' });
+        prisma.operatorMember.create.mockResolvedValue({});
+
+        await service.create(dto);
+
+        expect(prisma.operator.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+            data: expect.objectContaining({ whatsappEnabled: true }),
           }),
         );
       });
@@ -919,6 +1011,28 @@ describe('OperatorService', () => {
       expect(prisma.operator.create).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({ status: 'ACTIVE' }),
+        }),
+      );
+    });
+
+    it('persists whatsappEnabled: false when explicitly provided at field onboarding', async () => {
+      await service.adminCreate({ ...baseDto(), whatsappEnabled: false });
+
+      expect(prisma.operator.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+          data: expect.objectContaining({ whatsappEnabled: false }),
+        }),
+      );
+    });
+
+    it('defaults to whatsappEnabled: true when omitted at field onboarding', async () => {
+      await service.adminCreate(baseDto());
+
+      expect(prisma.operator.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+          data: expect.objectContaining({ whatsappEnabled: true }),
         }),
       );
     });

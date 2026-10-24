@@ -71,6 +71,12 @@ const BLOCKED_FROM_SELF_CANCEL: RescueRequestStatus[] = [
   RescueRequestStatus.IN_DISPUTE,
 ];
 
+// The masked chat relay (CHAT DRIVER / forwarded messages) only works
+// because both sides are reachable over WhatsApp — a non-WhatsApp operator
+// has no channel to relay into, so neither side of the relay may ever be
+// opened or kept open for one.
+const CHAT_UNAVAILABLE_MESSAGE = `Chat isn't available for this operator — please contact LRR support: ${SUPPORT_WHATSAPP_LINK}`;
+
 @Injectable()
 export class WhatsAppCustomerFlowService {
   constructor(
@@ -128,6 +134,13 @@ export class WhatsAppCustomerFlowService {
           where: { id: session.rescueRequestId },
           include: { assignedOperator: true },
         });
+        if (rescueRequest?.assignedOperator?.whatsappEnabled === false) {
+          // The operator went off-platform (or never had WhatsApp) after
+          // this relay was opened — don't silently drop the customer's
+          // message into a channel nobody is reading.
+          await this.sessionStore.update(userId, { relayTarget: null });
+          return this.reply(CHAT_UNAVAILABLE_MESSAGE);
+        }
         if (rescueRequest?.assignedOperator?.phoneNumber) {
           await this.twilioService.sendWhatsAppMessage(
             toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
@@ -152,6 +165,9 @@ export class WhatsAppCustomerFlowService {
       });
       if (!rescueRequest?.assignedOperator) {
         return this.reply(`No operator is assigned to your request yet.`);
+      }
+      if (!rescueRequest.assignedOperator.whatsappEnabled) {
+        return this.reply(CHAT_UNAVAILABLE_MESSAGE);
       }
       const opUser = await this.sharedService.findOrCreateCustomer(
         rescueRequest.assignedOperator.phoneNumber!,
@@ -322,7 +338,10 @@ export class WhatsAppCustomerFlowService {
           // so auto-cancel it and let the new SOS proceed normally.
           await this.prisma.rescueRequest.update({
             where: { id: openRequest.id },
-            data: { status: RescueRequestStatus.CANCELLED },
+            data: {
+              status: RescueRequestStatus.CANCELLED,
+              needsManualAssignment: false,
+            },
           });
         } else if (openRequest) {
           return this.reply(
@@ -382,7 +401,10 @@ export class WhatsAppCustomerFlowService {
 
         await this.prisma.rescueRequest.update({
           where: { id: requestIdToCancel },
-          data: { status: RescueRequestStatus.CANCELLED },
+          data: {
+            status: RescueRequestStatus.CANCELLED,
+            needsManualAssignment: false,
+          },
         });
         // Close out any other operators' still-PENDING offers on this job —
         // same reasoning as RescueRequestAdminService.cancel(): without
@@ -409,7 +431,8 @@ export class WhatsAppCustomerFlowService {
         // release them and let them know
         if (
           existing?.status === RescueRequestStatus.WAITING_FOR_DEPOSIT &&
-          existing.assignedOperator
+          existing.assignedOperator &&
+          existing.assignedOperator.whatsappEnabled
         ) {
           await this.twilioService.sendWhatsAppMessage(
             toWhatsAppAddress(existing.assignedOperator.phoneNumber!),
@@ -774,10 +797,12 @@ export class WhatsAppCustomerFlowService {
       rescueRequest.assignedOperator.phoneNumber,
     );
     await this.sessionStore.update(opUser.id, { relayTarget: null });
-    await this.twilioService.sendWhatsAppMessage(
-      toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
-      `Chat ended.`,
-    );
+    if (rescueRequest.assignedOperator.whatsappEnabled) {
+      await this.twilioService.sendWhatsAppMessage(
+        toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
+        `Chat ended.`,
+      );
+    }
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -1186,7 +1211,7 @@ export class WhatsAppCustomerFlowService {
     // Notify the operators who weren't picked.
     await Promise.all(
       quotedOffers
-        .filter((o) => o.id !== selectedOffer.id)
+        .filter((o) => o.id !== selectedOffer.id && o.operator.whatsappEnabled)
         .map((o) =>
           this.twilioService.sendWhatsAppMessage(
             toWhatsAppAddress(o.operator.phoneNumber!),
