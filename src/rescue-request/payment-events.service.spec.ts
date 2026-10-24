@@ -182,6 +182,92 @@ describe('PaymentEventsService', () => {
       );
     });
 
+    it('sends the arrived template with single-line variables even when the location has an address and a line break', async () => {
+      // WhatsApp rejects newlines/tabs/4+ spaces in template parameters
+      // (Twilio 21656) — the real formatLocationSection output is
+      // "<address>\n📍 <link>".
+      process.env.TWILIO_ARRIVED_PROMPT_TEMPLATE_SID = 'HXarrived123';
+      sharedService.formatLocationSection.mockResolvedValue(
+        '12 Allen Ave, Ikeja\n📍 https://maps.google.com/?q=6.5,3.4',
+      );
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        status: 'WAITING_FOR_DEPOSIT',
+        customer: { phoneNumber: null },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+      });
+
+      await service.confirmDeposit(paymentFor('req-1'));
+
+      const variables = twilioService.sendWhatsAppTemplateMessage.mock
+        .calls[0][2] as Record<string, string>;
+      expect(Object.keys(variables)).toEqual(['1', '2', '3', '4']);
+      for (const value of Object.values(variables)) {
+        expect(value).not.toMatch(/[\r\n\t]| {4}/);
+        expect(value.trim()).not.toBe('');
+      }
+      expect(variables['4']).toBe(
+        '12 Allen Ave, Ikeja · 📍 https://maps.google.com/?q=6.5,3.4',
+      );
+    });
+
+    describe('when the arrived template send fails', () => {
+      const requestWithOperator = {
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        status: 'WAITING_FOR_DEPOSIT',
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+      };
+
+      beforeEach(() => {
+        process.env.TWILIO_ARRIVED_PROMPT_TEMPLATE_SID = 'HXarrived123';
+        prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue(
+          requestWithOperator,
+        );
+        twilioService.sendWhatsAppTemplateMessage.mockRejectedValue(
+          new Error('The Content Variables parameter is invalid.'),
+        );
+        jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      });
+      afterEach(() => jest.restoreAllMocks());
+
+      it('falls back to the freeform "send ARRIVED" text so the operator still hears about the job', async () => {
+        await expect(
+          service.confirmDeposit(paymentFor('req-1')),
+        ).resolves.toBeUndefined();
+
+        expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+          expect.stringContaining('2342'),
+          expect.stringContaining('send *ARRIVED*'),
+        );
+      });
+
+      it('does not fail the payment webhook, and reports to Sentry, when the fallback fails too', async () => {
+        twilioService.sendWhatsAppMessage.mockImplementation((to: string) =>
+          to.includes('2342')
+            ? Promise.reject(new Error('session window closed'))
+            : Promise.resolve(undefined),
+        );
+
+        await expect(
+          service.confirmDeposit(paymentFor('req-1')),
+        ).resolves.toBeUndefined();
+
+        expect(Sentry.captureException).toHaveBeenCalledWith(
+          expect.any(Error),
+          expect.objectContaining({
+            extra: expect.objectContaining({
+              stage: 'activate-assigned-job-operator-message',
+            }),
+          }),
+        );
+      });
+    });
+
     it('assigns the operator and confirms for a WAITING_FOR_DEPOSIT request', async () => {
       prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
         id: 'req-1',
@@ -342,6 +428,30 @@ describe('PaymentEventsService', () => {
   });
 
   describe('activateAssignedJob', () => {
+    it('still surfaces a failed operator message to its own caller (the 0%-deposit paths), unlike the payment webhook', async () => {
+      // Only confirmDeposit opts in to swallowing — see its
+      // swallowOperatorNotifyErrors flag — because a 500 there makes Paystack
+      // redeliver into a non-idempotent confirmDeposit. The 0%-deposit
+      // callers have no such retry and must still find out.
+      delete process.env.TWILIO_ARRIVED_PROMPT_TEMPLATE_SID;
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: { businessName: 'Swift', phoneNumber: '+2342' },
+      });
+      twilioService.sendWhatsAppMessage.mockRejectedValue(
+        new Error('session window closed'),
+      );
+
+      await expect(service.activateAssignedJob('req-1')).rejects.toThrow(
+        'session window closed',
+      );
+    });
+
     it('flips a SELECTED_PENDING_PAYMENT offer to ACCEPTED', async () => {
       prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
         id: 'req-1',

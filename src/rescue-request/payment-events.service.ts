@@ -19,6 +19,7 @@ import {
   RescueRequestStatus,
 } from '@prisma/client';
 import { toWhatsAppAddress } from '../common/phone.util';
+import { sanitizeTemplateVariable } from '../common/template-variable.util';
 import { formatVehicleType } from './domain/vehicle-truck-mapping';
 import { formatJobRef } from './domain/rescue-request-formatting';
 import { hasSucceededPayment } from './domain/derive-payment-state';
@@ -184,7 +185,9 @@ export class PaymentEventsService {
       }
     }
 
-    await this.activateAssignedJob(rescueRequest.id);
+    await this.activateAssignedJob(rescueRequest.id, {
+      swallowOperatorNotifyErrors: true,
+    });
   }
 
   /**
@@ -206,8 +209,17 @@ export class PaymentEventsService {
    * customer message references the payment; the 0%-deposit callers have
    * no payment to reference, and have already set status inside their own
    * transaction) and stay with each caller.
+   *
+   * `swallowOperatorNotifyErrors` is for confirmDeposit only: it runs
+   * inside the Paystack webhook, where a thrown error becomes a 500 and
+   * Paystack redelivers into a confirmDeposit that is not safe to run
+   * twice. The 0%-deposit callers leave it off, so a failed operator
+   * message still surfaces to them as before.
    */
-  async activateAssignedJob(rescueRequestId: string): Promise<void> {
+  async activateAssignedJob(
+    rescueRequestId: string,
+    options: { swallowOperatorNotifyErrors?: boolean } = {},
+  ): Promise<void> {
     const rescueRequest = await this.prisma.rescueRequest.findUniqueOrThrow({
       where: { id: rescueRequestId },
       include: { customer: true, assignedOperator: true },
@@ -269,22 +281,60 @@ export class PaymentEventsService {
     // 2026-10-22): TWILIO_CONTENT_TEMPLATES.arrived_prompt in
     // src/integrations/twilio/twilio-content-templates.ts.
     const arrivedTemplateSid = process.env.TWILIO_ARRIVED_PROMPT_TEMPLATE_SID;
-    if (arrivedTemplateSid) {
-      await this.twilioService.sendWhatsAppTemplateMessage(
-        operatorPhone,
-        arrivedTemplateSid,
-        {
-          '1': formatJobRef(rescueRequest.id),
-          '2': customerPhone,
-          '3': vehicleLine,
-          '4': locationSection,
+    const freeformJobLive = `🚗 *Job is live!* — ${formatJobRef(rescueRequest.id)}\n\nCustomer: ${customerPhone}\nVehicle: ${vehicleLine}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`;
+    // The operator hearing about the job is what matters here, and by this
+    // point the deposit is already confirmed and the job already activated
+    // — so a failed send must not 500 the payment webhook (Paystack would
+    // redeliver into a confirmDeposit that is not safe to run twice). Try
+    // the template, fall back to the freeform text, and if that fails too,
+    // report it rather than rethrow.
+    try {
+      if (arrivedTemplateSid) {
+        try {
+          await this.twilioService.sendWhatsAppTemplateMessage(
+            operatorPhone,
+            arrivedTemplateSid,
+            {
+              // WhatsApp rejects newlines in template parameters (Twilio
+              // 21656) and locationSection is "<address>\n📍 <link>", so
+              // collapse each value; the freeform text keeps its line breaks.
+              '1':
+                sanitizeTemplateVariable(formatJobRef(rescueRequest.id)) || '—',
+              '2': sanitizeTemplateVariable(customerPhone) || '—',
+              '3': sanitizeTemplateVariable(vehicleLine) || '—',
+              '4': sanitizeTemplateVariable(locationSection) || '—',
+            },
+          );
+        } catch (error) {
+          // TwilioService already reported this to Sentry with the Twilio
+          // error code and SID; just note that we're falling back.
+          console.error(
+            `activateAssignedJob ${rescueRequest.id}: arrived template send failed, falling back to freeform text:`,
+            error,
+          );
+          await this.twilioService.sendWhatsAppMessage(
+            operatorPhone,
+            freeformJobLive,
+          );
+        }
+      } else {
+        await this.twilioService.sendWhatsAppMessage(
+          operatorPhone,
+          freeformJobLive,
+        );
+      }
+    } catch (error) {
+      if (!options.swallowOperatorNotifyErrors) throw error;
+      console.error(
+        `activateAssignedJob ${rescueRequest.id}: failed to notify the operator the job is live:`,
+        error,
+      );
+      Sentry.captureException(error, {
+        extra: {
+          rescueRequestId: rescueRequest.id,
+          stage: 'activate-assigned-job-operator-message',
         },
-      );
-    } else {
-      await this.twilioService.sendWhatsAppMessage(
-        operatorPhone,
-        `🚗 *Job is live!* — ${formatJobRef(rescueRequest.id)}\n\nCustomer: ${customerPhone}\nVehicle: ${vehicleLine}\nLocation: ${locationSection}\n\nHead over now and send *ARRIVED* when you reach them.`,
-      );
+      });
     }
   }
 

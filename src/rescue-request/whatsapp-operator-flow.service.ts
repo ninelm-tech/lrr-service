@@ -399,33 +399,31 @@ export class WhatsAppOperatorFlowService {
       // src/integrations/twilio/twilio-content-templates.ts.
       const arrivedReminderSid =
         process.env.TWILIO_ARRIVED_REMINDER_TEMPLATE_SID;
+      const arrivedReminderText = `📍 ${formatJobRef(session.rescueRequestId!)} — Send *ARRIVED* when you reach the customer location so we can notify them.`;
       if (arrivedReminderSid) {
-        await this.twilioService.sendWhatsAppTemplateMessage(
+        return this.replyWithTemplateOrText(
           phoneNumber,
           arrivedReminderSid,
           { '1': formatJobRef(session.rescueRequestId!) },
+          arrivedReminderText,
         );
-        return this.xmlOk();
       }
-      return this.reply(
-        `📍 ${formatJobRef(session.rescueRequestId!)} — Send *ARRIVED* when you reach the customer location so we can notify them.`,
-      );
+      return this.reply(arrivedReminderText);
     }
     if (session.state === WhatsAppFlowState.OPERATOR_AT_LOCATION) {
       // Full definition: TWILIO_CONTENT_TEMPLATES.done_reminder in
       // src/integrations/twilio/twilio-content-templates.ts.
       const doneReminderSid = process.env.TWILIO_DONE_REMINDER_TEMPLATE_SID;
+      const doneReminderText = `✅ ${formatJobRef(session.rescueRequestId!)} — Send *DONE* when the job is complete. The customer will confirm and you'll both be notified.`;
       if (doneReminderSid) {
-        await this.twilioService.sendWhatsAppTemplateMessage(
+        return this.replyWithTemplateOrText(
           phoneNumber,
           doneReminderSid,
           { '1': formatJobRef(session.rescueRequestId!) },
+          doneReminderText,
         );
-        return this.xmlOk();
       }
-      return this.reply(
-        `✅ ${formatJobRef(session.rescueRequestId!)} — Send *DONE* when the job is complete. The customer will confirm and you'll both be notified.`,
-      );
+      return this.reply(doneReminderText);
     }
 
     // Nothing matched — the operator's message went entirely unhandled and
@@ -626,17 +624,16 @@ export class WhatsAppOperatorFlowService {
     // Full definition: TWILIO_CONTENT_TEMPLATES.done_prompt in
     // src/integrations/twilio/twilio-content-templates.ts.
     const donePromptSid = process.env.TWILIO_DONE_PROMPT_TEMPLATE_SID;
+    const donePromptText = `✅ ${formatJobRef(rescueRequestId)} — Arrival confirmed! The customer has been notified.\n\nSend *DONE* when the job is complete.`;
     if (donePromptSid) {
-      await this.twilioService.sendWhatsAppTemplateMessage(
+      return this.replyWithTemplateOrText(
         operatorPhone,
         donePromptSid,
         { '1': formatJobRef(rescueRequestId) },
+        donePromptText,
       );
-      return this.xmlOk();
     }
-    return this.reply(
-      `✅ ${formatJobRef(rescueRequestId)} — Arrival confirmed! The customer has been notified.\n\nSend *DONE* when the job is complete.`,
-    );
+    return this.reply(donePromptText);
   }
 
   private async handleOperatorJobDone(
@@ -753,5 +750,35 @@ export class WhatsAppOperatorFlowService {
 
   private xmlOk(): string {
     return `<?xml version="1.0" encoding="UTF-8"?>\n<Response></Response>`;
+  }
+
+  /**
+   * Sends a quick-reply Content Template (the only way to get a tap button
+   * — TwiML has no contentSid) and acks the webhook empty. These prompts
+   * are all in-session replies, so plain text always works: if Twilio
+   * rejects the template, reply with `freeformText` over TwiML instead of
+   * leaving the operator with nothing. TwilioService has already reported
+   * the failure to Sentry with the Twilio code and SID.
+   */
+  private async replyWithTemplateOrText(
+    to: string,
+    contentSid: string,
+    variables: Record<string, string>,
+    freeformText: string,
+  ): Promise<string> {
+    try {
+      await this.twilioService.sendWhatsAppTemplateMessage(
+        to,
+        contentSid,
+        variables,
+      );
+      return this.xmlOk();
+    } catch (error) {
+      console.error(
+        'whatsapp operator flow: template send failed, replying with freeform text instead:',
+        { contentSid, error },
+      );
+      return this.reply(freeformText);
+    }
   }
 }
