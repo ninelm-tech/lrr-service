@@ -32,13 +32,17 @@ describe('DepositExpiryCheck (integration)', () => {
     check = new DepositExpiryCheck(prisma, twilio as never);
   });
 
-  async function awaitingDeposit(expiresAt: Date) {
+  async function awaitingDeposit(
+    expiresAt: Date,
+    overrides: Record<string, unknown> = {},
+  ) {
     const customer = await createCustomer(prisma);
     const operator = await createOperator(prisma);
     const request = await createRequest(prisma, customer.id, {
       status: 'WAITING_FOR_DEPOSIT',
       depositWindowExpiresAt: expiresAt,
       assignedOperatorId: operator.id,
+      ...overrides,
     });
     const offer = await createOffer(prisma, request.id, operator.id, {
       status: 'SELECTED_PENDING_PAYMENT',
@@ -67,6 +71,43 @@ describe('DepositExpiryCheck (integration)', () => {
       where: { id: offer.id },
     });
     expect(after?.status).toBe('TIMED_OUT');
+  });
+
+  it('clears a stale needsManualAssignment flag when it cancels the request', async () => {
+    const { request } = await awaitingDeposit(past(), {
+      needsManualAssignment: true,
+    });
+
+    await check.run(new Date());
+
+    const after = await prisma.rescueRequest.findUnique({
+      where: { id: request.id },
+    });
+    expect(after?.status).toBe('CANCELLED');
+    expect(after?.needsManualAssignment).toBe(false);
+  });
+
+  it('does not notify a non-WhatsApp operator that the window expired', async () => {
+    const customer = await createCustomer(prisma);
+    const operator = await createOperator(prisma, undefined, {
+      whatsappEnabled: false,
+    });
+    const request = await createRequest(prisma, customer.id, {
+      status: 'WAITING_FOR_DEPOSIT',
+      depositWindowExpiresAt: past(),
+      assignedOperatorId: operator.id,
+    });
+    await createOffer(prisma, request.id, operator.id, {
+      status: 'SELECTED_PENDING_PAYMENT',
+      dispatchRound: 0,
+    });
+
+    await check.run(new Date());
+
+    expect(twilio.sendWhatsAppMessage).not.toHaveBeenCalledWith(
+      expect.stringContaining(operator.phoneNumber!),
+      expect.anything(),
+    );
   });
 
   it('does nothing before the window passes', async () => {

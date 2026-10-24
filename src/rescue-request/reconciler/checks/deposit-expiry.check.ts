@@ -64,7 +64,10 @@ export class DepositExpiryCheck implements ReconcilerCheck {
           status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
           depositWindowExpiresAt: { lt: now },
         },
-        data: { status: RescueRequestStatus.CANCELLED },
+        data: {
+          status: RescueRequestStatus.CANCELLED,
+          needsManualAssignment: false,
+        },
       });
       if (count === 0) return null;
 
@@ -112,7 +115,10 @@ export class DepositExpiryCheck implements ReconcilerCheck {
           `We didn't receive payment confirmation within 30 minutes, so your request was cancelled. If your payment completes after this, we'll refund it.`,
         );
       }
-      if (claimed.assignedOperator?.phoneNumber) {
+      if (
+        claimed.assignedOperator?.phoneNumber &&
+        claimed.assignedOperator.whatsappEnabled
+      ) {
         await this.twilioService.sendWhatsAppMessage(
           toWhatsAppAddress(claimed.assignedOperator.phoneNumber),
           `⏰ ${jobRef} is no longer available — the customer didn't pay in time.`,

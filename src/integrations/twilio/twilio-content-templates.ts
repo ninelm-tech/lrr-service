@@ -108,6 +108,19 @@ export const TWILIO_CONTENT_TEMPLATES: Record<
     source: 'reconstructed',
   },
 
+  // Not yet submitted for Meta approval as of this plan's implementation —
+  // sends fall back to freeform until TWILIO_MANUAL_FALLBACK_ALERT_TEMPLATE_SID
+  // is set in each environment. See dispatch.service.ts's
+  // alertStaffManualFallback for the call site.
+  manual_fallback_alert: {
+    envVar: 'TWILIO_MANUAL_FALLBACK_ALERT_TEMPLATE_SID',
+    category: 'UTILITY',
+    contentType: 'text',
+    variables: ['bareJobRef', 'round'],
+    body: '📞 Job #{{1}} needs a manual call — no WhatsApp-capable operator left after round {{2}}. Check the Requests tab for candidates.',
+    source: 'designed',
+  },
+
   payout_sent: {
     envVar: 'TWILIO_PAYOUT_SENT_TEMPLATE_SID',
     category: 'UTILITY',

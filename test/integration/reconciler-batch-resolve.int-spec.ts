@@ -13,6 +13,8 @@ describe('BatchResolveCheck (integration)', () => {
   let prisma: PrismaService;
   let dispatch: {
     prepareNextRound: jest.Mock;
+    resolveExhaustion: jest.Mock;
+    alertStaffManualFallback: jest.Mock;
     deliverOffers: jest.Mock;
     deliverQuoteShortlist: jest.Mock;
     notifyNoOperatorAvailable: jest.Mock;
@@ -43,6 +45,26 @@ describe('BatchResolveCheck (integration)', () => {
         exhausted: false,
         round: 1,
       }),
+      // Default mirrors the pre-Task-4 inline-cancel behavior: echo back
+      // whatever reason/round prepareNextRound's own exhausted result
+      // carried, as a plain cancellation — every pre-existing exhausted
+      // test in this file only ever sets up prepareNextRound, not this
+      // mock, and must keep seeing a 'cancelled' outcome by default.
+      resolveExhaustion: jest
+        .fn()
+        .mockImplementation(
+          (
+            _tx: unknown,
+            _rescueRequest: unknown,
+            exhausted: { reason: string; round: number },
+          ) =>
+            Promise.resolve({
+              outcome: 'cancelled',
+              reason: exhausted.reason,
+              round: exhausted.round,
+            }),
+        ),
+      alertStaffManualFallback: jest.fn().mockResolvedValue(undefined),
       deliverOffers: jest.fn().mockResolvedValue(undefined),
       deliverQuoteShortlist: jest.fn().mockResolvedValue(undefined),
       notifyNoOperatorAvailable: jest.fn().mockResolvedValue(undefined),
@@ -206,7 +228,14 @@ describe('BatchResolveCheck (integration)', () => {
     expect(after.dispatchRound).toBe(0);
   });
 
-  it('cancels in the same transaction when no operator remains, rather than advancing into silence', async () => {
+  it('routes an exhausted round to resolveExhaustion in the same transaction, rather than advancing into silence', async () => {
+    // Multi-llm review (Task 4): the actual CANCELLED write now lives
+    // inside resolveExhaustion (DispatchService, Task 3) — covered by
+    // that method's own unit tests, including against real Postgres
+    // where relevant. This check's own job is routing to it correctly
+    // and handling its outcome, which is what this test now proves;
+    // resolveExhaustion is mocked here the same way prepareNextRound
+    // already is, so it performs no real write to assert against.
     const { request } = await scenario({
       requestRound: 0,
       batchRound: 0,
@@ -217,14 +246,18 @@ describe('BatchResolveCheck (integration)', () => {
       exhausted: true,
       reason: 'rounds-exhausted',
       round: 4,
+      extraRadiusKm: 6,
+      isTestRequest: false,
     });
 
     await check.run(new Date());
 
-    const after = await prisma.rescueRequest.findUniqueOrThrow({
-      where: { id: request.id },
-    });
-    expect(after.status).toBe('CANCELLED');
+    expect(dispatch.resolveExhaustion).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: request.id }),
+      { reason: 'rounds-exhausted', round: 4, extraRadiusKm: 6 },
+      false,
+    );
     expect(dispatch.notifyNoOperatorAvailable).toHaveBeenCalledWith(
       request.id,
       expect.any(String),
@@ -232,6 +265,45 @@ describe('BatchResolveCheck (integration)', () => {
       4,
     );
     expect(dispatch.deliverOffers).not.toHaveBeenCalled();
+  });
+
+  it('flags manual-fallback instead of cancelling when resolveExhaustion finds a non-WhatsApp candidate', async () => {
+    const { request } = await scenario({
+      requestRound: 0,
+      batchRound: 0,
+      deadline: null,
+    });
+    dispatch.prepareNextRound.mockResolvedValue({
+      offers: [],
+      exhausted: true,
+      reason: 'rounds-exhausted',
+      round: 3,
+      extraRadiusKm: 4,
+      isTestRequest: false,
+    });
+    dispatch.resolveExhaustion.mockResolvedValue({
+      outcome: 'manual-fallback',
+      candidateId: 'op-backup',
+    });
+
+    const acted = await check.run(new Date());
+
+    expect(acted).toBe(1);
+    const after = await prisma.rescueRequest.findUniqueOrThrow({
+      where: { id: request.id },
+    });
+    expect(after.status).not.toBe('CANCELLED');
+    expect(dispatch.resolveExhaustion).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: request.id }),
+      { reason: 'rounds-exhausted', round: 3, extraRadiusKm: 4 },
+      false,
+    );
+    expect(dispatch.alertStaffManualFallback).toHaveBeenCalledWith(
+      request.id,
+      3,
+    );
+    expect(dispatch.notifyNoOperatorAvailable).not.toHaveBeenCalled();
   });
 
   it('opens the selection window in the same transaction when quotes exist', async () => {

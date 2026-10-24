@@ -1,5 +1,6 @@
 import {
   IsArray,
+  IsBoolean,
   IsEmail,
   IsEnum,
   IsNotEmpty,
@@ -74,4 +75,8 @@ export class AdminCreateOperatorDto {
   @IsNumber()
   @IsOptional()
   depositPercentOverride?: number | null;
+
+  @IsBoolean()
+  @IsOptional()
+  whatsappEnabled?: boolean;
 }

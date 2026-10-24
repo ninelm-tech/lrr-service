@@ -85,6 +85,7 @@ describe('PayoutService', () => {
     it('blocks with NO_BANK_DETAILS when the operator has no recipient code, and tells the operator', async () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         paystackRecipientCode: null,
         businessName: 'Swift Towing',
         phoneNumber: '+2349012345678',
@@ -109,9 +110,29 @@ describe('PayoutService', () => {
       expect(paystack.checkBalance).not.toHaveBeenCalled();
     });
 
+    it('skips the operator WhatsApp notification (bank details needed) when the operator has no WhatsApp on file', async () => {
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1',
+        whatsappEnabled: false,
+        paystackRecipientCode: null,
+        businessName: 'Swift Towing',
+        phoneNumber: '+2349012345678',
+      });
+
+      await service.createAndProcessPayout('req-1', 'op-1', 250000);
+
+      expect(paymentLedger.recordBlocked).toHaveBeenCalledWith(
+        'pay-1',
+        'NO_BANK_DETAILS',
+      );
+      expect(twilio.sendWhatsAppMessage).not.toHaveBeenCalled();
+      expect(twilio.sendWhatsAppTemplateMessage).not.toHaveBeenCalled();
+    });
+
     it('does not re-notify when the payout was already blocked for the same reason', async () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         paystackRecipientCode: null,
         businessName: 'Swift Towing',
         phoneNumber: '+2349012345678',
@@ -139,6 +160,7 @@ describe('PayoutService', () => {
       process.env.FRONTEND_URL = 'https://portal.example.com';
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         paystackRecipientCode: null,
         phoneNumber: '+2349012345678',
       });
@@ -160,6 +182,7 @@ describe('PayoutService', () => {
     it('a failed notification never breaks the payout flow', async () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         paystackRecipientCode: null,
         phoneNumber: '+2349012345678',
       });
@@ -175,6 +198,7 @@ describe('PayoutService', () => {
     it('blocks with INSUFFICIENT_BALANCE when the platform balance cannot cover the amount, without notifying', async () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         paystackRecipientCode: 'RCP_existing',
         businessName: 'Swift Towing',
       });
@@ -195,6 +219,7 @@ describe('PayoutService', () => {
     it('initiates a transfer with the ledger row id as the reference', async () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         paystackRecipientCode: 'RCP_existing',
         businessName: 'Swift Towing',
       });
@@ -227,6 +252,7 @@ describe('PayoutService', () => {
       // would make a fresh reference legal — the actual double-pay.
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         paystackRecipientCode: 'RCP_existing',
         businessName: 'Swift Towing',
       });
@@ -245,6 +271,7 @@ describe('PayoutService', () => {
     it('treats a duplicate reference as evidence the original landed, not a rejection', async () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         paystackRecipientCode: 'RCP_existing',
         businessName: 'Swift Towing',
       });
@@ -263,6 +290,7 @@ describe('PayoutService', () => {
     it('blocks the same payment on a transfer validation rejection', async () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         paystackRecipientCode: 'RCP_existing',
         businessName: 'Swift Towing',
       });
@@ -285,6 +313,7 @@ describe('PayoutService', () => {
     it('blocks on otp rather than leaving the transfer stranded SUBMITTED', async () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         paystackRecipientCode: 'RCP_existing',
         businessName: 'Swift Towing',
       });
@@ -305,6 +334,7 @@ describe('PayoutService', () => {
     it('claims abandoned as FAILED — the live bug', async () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         paystackRecipientCode: 'RCP_existing',
         businessName: 'Swift Towing',
       });
@@ -326,6 +356,7 @@ describe('PayoutService', () => {
       // SUCCEEDED comes only from a webhook or verification.
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         paystackRecipientCode: 'RCP_existing',
         businessName: 'Swift Towing',
       });
@@ -403,6 +434,7 @@ describe('PayoutService', () => {
       prisma.payment.findFirst.mockResolvedValueOnce(null);
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         paystackRecipientCode: 'RCP_x',
       });
       paystack.checkBalance.mockResolvedValue(1_000_000);
@@ -446,6 +478,7 @@ describe('PayoutService', () => {
       );
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         paystackRecipientCode: 'RCP_x',
       });
       paystack.checkBalance.mockResolvedValue(1_000_000);
@@ -485,6 +518,7 @@ describe('PayoutService', () => {
         .mockResolvedValueOnce(payoutPayment('SUBMITTED', { id: 'pay-2' })); // reload
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         paystackRecipientCode: 'RCP_x',
       });
       paystack.checkBalance.mockResolvedValue(1_000_000);
@@ -552,6 +586,7 @@ describe('PayoutService', () => {
     it('tells the operator they have been paid', async () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         phoneNumber: '+2349012345678',
       });
 
@@ -567,6 +602,7 @@ describe('PayoutService', () => {
       process.env.TWILIO_PAYOUT_SENT_TEMPLATE_SID = 'HXpaid123';
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         phoneNumber: '+2349012345678',
       });
 
@@ -595,6 +631,7 @@ describe('PayoutService', () => {
     it('a failed notification does not throw', async () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
+        whatsappEnabled: true,
         phoneNumber: '+2349012345678',
       });
       twilio.sendWhatsAppMessage.mockRejectedValue(new Error('63016'));
@@ -602,6 +639,19 @@ describe('PayoutService', () => {
       await expect(
         service.notifyPayoutOutcome(succeededPayment()),
       ).resolves.not.toThrow();
+    });
+
+    it('skips the operator WhatsApp notification (paid) when the operator has no WhatsApp on file', async () => {
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1',
+        whatsappEnabled: false,
+        phoneNumber: '+2349012345678',
+      });
+
+      await service.notifyPayoutOutcome(succeededPayment());
+
+      expect(twilio.sendWhatsAppMessage).not.toHaveBeenCalled();
+      expect(twilio.sendWhatsAppTemplateMessage).not.toHaveBeenCalled();
     });
   });
 });

@@ -303,6 +303,7 @@ export class OperatorService {
           longitude: data.longitude,
           serviceRadius: data.serviceRadius ?? 10,
           status: OperatorStatus.PENDING,
+          whatsappEnabled: data.whatsappEnabled ?? true,
         },
       });
 
@@ -444,6 +445,7 @@ export class OperatorService {
           serviceRadius: data.serviceRadius ?? 10,
           status: OperatorStatus.ACTIVE,
           depositPercentOverride: data.depositPercentOverride ?? null,
+          whatsappEnabled: data.whatsappEnabled ?? true,
         },
       });
 
@@ -505,12 +507,14 @@ export class OperatorService {
     type?: OperatorType,
     truckClasses?: TruckClass[],
     isTest: boolean = false,
+    whatsappOnly: boolean = true,
   ): Promise<ScoredOperator[]> {
     const operators = await this.prisma.operator.findMany({
       where: {
         status: OperatorStatus.ACTIVE,
         isAvailable: true,
         isTest,
+        whatsappEnabled: whatsappOnly,
         ...(excludeIds.length > 0 && { id: { notIn: excludeIds } }),
         ...(type && { type }),
         ...(truckClasses &&

@@ -101,7 +101,13 @@ export class BatchResolveCheck implements ReconcilerCheck {
 
       const request = await tx.rescueRequest.findUniqueOrThrow({
         where: { id: batch.rescueRequestId },
-        select: { customerId: true },
+        select: {
+          customerId: true,
+          latitude: true,
+          longitude: true,
+          vehicleType: true,
+          offeredOperatorIds: true,
+        },
       });
 
       const quoted = await tx.dispatchOffer.count({
@@ -157,26 +163,35 @@ export class BatchResolveCheck implements ReconcilerCheck {
       // offers — nothing to expire, so batch resolve never sees it again and
       // the motorist waits forever. The cancel must commit with the advance.
       if (next.exhausted) {
-        await tx.rescueRequest.update({
-          where: { id: batch.rescueRequestId },
-          data: {
-            status: RescueRequestStatus.CANCELLED,
-            dispatchRound: next.round,
+        const resolution = await this.dispatchService.resolveExhaustion(
+          tx,
+          {
+            id: batch.rescueRequestId,
+            latitude: request.latitude,
+            longitude: request.longitude,
+            vehicleType: request.vehicleType,
+            offeredOperatorIds: request.offeredOperatorIds,
+            customerId: request.customerId,
           },
-        });
-        await tx.dispatchOffer.updateMany({
-          where: { rescueRequestId: batch.rescueRequestId, status: 'PENDING' },
-          data: { status: 'TIMED_OUT', respondedAt: now },
-        });
-        await tx.whatsAppSession.updateMany({
-          where: { userId: request.customerId },
-          data: { state: 'IDLE', rescueRequestId: null },
-        });
+          {
+            reason: next.reason,
+            round: next.round,
+            extraRadiusKm: next.extraRadiusKm,
+          },
+          next.isTestRequest,
+        );
+        if (resolution.outcome === 'manual-fallback') {
+          return {
+            outcome: 'manual-fallback' as const,
+            customerId: request.customerId,
+            round: next.round,
+          };
+        }
         return {
           outcome: 'exhausted' as const,
           customerId: request.customerId,
-          reason: next.reason,
-          round: next.round,
+          reason: resolution.reason,
+          round: resolution.round,
         };
       }
 
@@ -204,6 +219,12 @@ export class BatchResolveCheck implements ReconcilerCheck {
           batch.rescueRequestId,
           outcome.customerId,
           outcome.reason,
+          outcome.round,
+        );
+        break;
+      case 'manual-fallback':
+        await this.dispatchService.alertStaffManualFallback(
+          batch.rescueRequestId,
           outcome.round,
         );
         break;

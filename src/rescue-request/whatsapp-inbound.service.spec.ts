@@ -49,6 +49,7 @@ describe('WhatsAppInboundService', () => {
       id: 'op-1',
       businessName: 'Swift Towing',
       phoneNumber,
+      whatsappEnabled: true,
     });
 
     const inboundBody = {
@@ -66,11 +67,35 @@ describe('WhatsAppInboundService', () => {
       'hi',
       'hi',
       { state: 'IDLE' },
-      { id: 'op-1', businessName: 'Swift Towing', phoneNumber },
+      {
+        id: 'op-1',
+        businessName: 'Swift Towing',
+        phoneNumber,
+        whatsappEnabled: true,
+      },
       inboundBody,
     );
     expect(customerFlowService.handleCustomerMessage).not.toHaveBeenCalled();
     expect(result).toBe('operator-reply');
+  });
+
+  it('blocks a non-WhatsApp operator at the router — neither flow is touched', async () => {
+    prisma.operator.findUnique.mockResolvedValue({
+      id: 'op-1',
+      businessName: 'Swift Towing',
+      phoneNumber,
+      whatsappEnabled: false,
+    });
+
+    const result = await service.handleIncomingWhatsAppMessage({
+      From: `whatsapp:${phoneNumber}`,
+      Body: 'hi',
+    });
+
+    expect(operatorFlowService.handleOperatorMessage).not.toHaveBeenCalled();
+    expect(customerFlowService.handleCustomerMessage).not.toHaveBeenCalled();
+    expect(result).toContain('<Response>');
+    expect(result).toContain('contact LRR staff');
   });
 
   it('routes to WhatsAppCustomerFlowService when the sender is not a known operator', async () => {

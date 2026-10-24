@@ -1,5 +1,6 @@
 import {
   IsArray,
+  IsBoolean,
   IsEmail,
   IsEnum,
   IsNotEmpty,
@@ -71,4 +72,8 @@ export class CreateOperatorDto {
   @IsString()
   @IsNotEmpty()
   phoneVerificationToken: string;
+
+  @IsBoolean()
+  @IsOptional()
+  whatsappEnabled?: boolean;
 }

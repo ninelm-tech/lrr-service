@@ -49,7 +49,10 @@ export class QuoteSelectionTimeoutCheck implements ReconcilerCheck {
           status: RescueRequestStatus.DISPATCHING,
           quoteSelectionExpiresAt: { lt: now },
         },
-        data: { status: RescueRequestStatus.CANCELLED },
+        data: {
+          status: RescueRequestStatus.CANCELLED,
+          needsManualAssignment: false,
+        },
       });
       if (count === 0) return null;
 

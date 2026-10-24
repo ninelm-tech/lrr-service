@@ -96,7 +96,7 @@ describe('RescueRequestSharedService', () => {
       id: 'req-1',
       customerId: 'cust-user-1',
       customer: { phoneNumber: '+2341' },
-      assignedOperator: { phoneNumber: '+2342' },
+      assignedOperator: { phoneNumber: '+2342', whatsappEnabled: true },
     };
 
     beforeEach(async () => {
@@ -158,6 +158,28 @@ describe('RescueRequestSharedService', () => {
       await expect(
         service.endRelayForEndedRequest('req-1'),
       ).resolves.toBeUndefined();
+    });
+
+    it('still clears the relay but does not message a non-WhatsApp operator — only the customer', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        ...requestWithOperator,
+        assignedOperator: { phoneNumber: '+2342', whatsappEnabled: false },
+      });
+
+      await service.endRelayForEndedRequest('req-1');
+
+      expect(sessionStore.clearRelayTargets).toHaveBeenCalledWith([
+        'cust-user-1',
+        'op-user-1',
+      ]);
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        '+2341',
+        expect.stringContaining('Chat ended'),
+      );
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
+        '+2342',
+        expect.anything(),
+      );
     });
   });
 });

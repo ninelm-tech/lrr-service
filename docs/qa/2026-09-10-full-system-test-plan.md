@@ -598,6 +598,118 @@ simply isn't there.
 
 ---
 
+## 19. Non-WhatsApp Operator Manual Dispatch — new this pass
+
+Covers the operator-side "WhatsApp-enabled" toggle and the staff-driven
+fallback path it unlocks: a non-WhatsApp operator is never offered a job
+automatically, and when every WhatsApp-capable candidate is exhausted,
+staff call around and assign one manually instead of the job failing
+outright. Completion evidence (photo/video) is a permanent exemption for
+this path, not a temporary gap — verified by phone instead, by design.
+Seeding a request directly with `needsManualAssignment: true` (rather than
+driving a real round-by-round exhaustion) is acceptable where noted — the
+exhaustion mechanics themselves are covered elsewhere in this plan.
+
+### Registration
+
+- [ ] **19.1 — Register with WhatsApp unchecked**
+  On `/register`, fill the operator form for a brand-new operator and
+  uncheck **"This business has WhatsApp on this phone number"** before
+  submitting (checked by default).
+  **Expected:** Registration succeeds the same as any other signup. In the
+  admin Operators tab, the new operator's detail view shows no WhatsApp
+  indicator (or an explicit "No WhatsApp" marker, whichever this build
+  surfaces) — confirm via the database if the admin UI doesn't yet show it
+  directly.
+
+### Automatic dispatch exemption
+
+- [ ] **19.2 — Never offered automatically**
+  Approve the 19.1 operator to `ACTIVE` and place them well within range of
+  a fresh SOS request of a vehicle type they're eligible for. Let automatic
+  dispatch run its normal rounds.
+  **Expected:** This operator never receives a dispatch offer — no WhatsApp
+  message, no appearance in their pending-offers list — for as long as any
+  WhatsApp-enabled candidate remains available. Confirm by checking the
+  Dispatch Board's offer list for the request; this operator's business
+  name should never appear there while the job is still searching
+  WhatsApp-capable candidates.
+
+### Manual assignment flow
+
+- [ ] **19.3 — Badge and candidate card appear on exhaustion**
+  Either drive a request to genuine round exhaustion with only the 19.1
+  operator left as a candidate, or seed a request directly with
+  `needsManualAssignment: true` and this operator as a nearby, eligible
+  candidate.
+  **Expected:** The **Requests** tab shows a **"Needs manual call"** badge
+  on that row, and opening its detail view shows a candidate card for the
+  operator with business name, phone number, distance, and acceptance
+  rate. The same badge appears on the matching row of the **Dispatch
+  Board**.
+
+- [ ] **19.4 — Call before confirm, no WhatsApp leak**
+  From the candidate card in 19.3, click **Call operator**, then click
+  **Confirm assignment**, enter an agreed price, and click **Assign**.
+  **Expected:** The assignment succeeds (status moves on exactly as a
+  normal manual assignment would) and the **"Needs manual call"** badge
+  disappears. At no point in this flow — the call, the confirm, or the
+  assign — does the operator receive a WhatsApp message; check Twilio logs
+  or local console output for a send attempt addressed to this operator's
+  number. There should be none.
+
+### Masked chat unavailable
+
+- [ ] **19.5 — CHAT DRIVER reports unavailable**
+  With the 19.1 operator assigned to an active job, have the customer send
+  **CHAT DRIVER** over WhatsApp.
+  **Expected:** The customer gets a clear "chat isn't available for this
+  operator" reply (not a silent failure, not a normal relay-connected
+  message) and no relay session opens on either side — a follow-up message
+  from the customer is not forwarded anywhere.
+
+- [ ] **19.6 — Deposit-paid badge appears**
+  Once the 19.1 operator's assignment reaches `OPERATOR_ASSIGNED` (deposit
+  cleared, or a 0%-deposit assignment), check the Requests tab row again.
+  **Expected:** A second badge — **"Call operator — deposit paid, dispatch
+  now"** — appears alongside (or in place of) the manual-call badge, as a
+  visual cue that the operator still needs a phone call to actually start
+  the job, since they can't be reached over WhatsApp for it.
+
+### Manual arrived / done
+
+- [ ] **19.7 — Mark arrived / Mark done send the normal customer prompts**
+  With the 19.1 operator's job assigned and in progress, use the detail
+  view's **Mark arrived** button, then — once it shows **ARRIVED** — the
+  **Mark done** button.
+  **Expected:** The customer receives the identical WhatsApp messages a
+  WhatsApp-operated job's own ARRIVED/DONE flow would send them (arrival
+  notice, then the CONFIRM/DISPUTE completion prompt) — the manual path is
+  invisible to the customer. The operator receives neither message, since
+  they have no WhatsApp channel for either.
+
+### Cancellation
+
+- [ ] **19.8 — Badge disappears on cancellation**
+  From the state reached in 19.3 (flagged, not yet assigned), cancel the
+  request from the admin Requests tab.
+  **Expected:** The request moves to `CANCELLED` and the **"Needs manual
+  call"** badge disappears — the flag doesn't linger on a dead request.
+
+### Completion
+
+- [ ] **19.9 — Completes through the normal CONFIRM/balance flow, no photo required**
+  Continue the 19.7 job through to completion: the customer replies
+  **CONFIRM** to the DONE prompt and pays the balance (or the deposit
+  already covered it in full).
+  **Expected:** The job reaches `COMPLETED` through the exact same
+  CONFIRM/balance-payment mechanics a WhatsApp-operated job uses — no
+  photo or video evidence is requested or required anywhere in this flow
+  for the non-WhatsApp operator's side. This exemption is permanent policy
+  for this operator type, not a bug to report.
+
+---
+
 ## Known Gaps — Not Testable Yet (features not built)
 
 These will fail if tested, because they don't exist. Don't file these as bugs — they're tracked separately as open product decisions:
