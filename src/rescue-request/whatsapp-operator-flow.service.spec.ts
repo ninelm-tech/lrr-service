@@ -554,6 +554,7 @@ describe('WhatsAppOperatorFlowService', () => {
     const originalDonePromptSid = process.env.TWILIO_DONE_PROMPT_TEMPLATE_SID;
 
     afterEach(() => {
+      jest.restoreAllMocks();
       const restore = (key: string, original: string | undefined) => {
         if (original === undefined) delete process.env[key];
         else process.env[key] = original;
@@ -644,6 +645,26 @@ describe('WhatsAppOperatorFlowService', () => {
         );
         expect(twiml).not.toContain('<Message>');
       });
+
+      it('falls back to the freeform "Send ARRIVED" reply when Twilio rejects the template', async () => {
+        process.env.TWILIO_ARRIVED_REMINDER_TEMPLATE_SID = 'HXarrivedreminder';
+        twilioService.sendWhatsAppTemplateMessage.mockRejectedValue(
+          new Error('The Content Variables parameter is invalid.'),
+        );
+        jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        const twiml = await service.handleOperatorMessage(
+          operatorPhone,
+          'op-user-1',
+          'huh',
+          'huh',
+          session,
+          operator,
+          {},
+        );
+
+        expect(twiml).toContain('Send *ARRIVED*');
+      });
     });
 
     describe('AT_LOCATION reminder (unrecognized message on site)', () => {
@@ -688,6 +709,26 @@ describe('WhatsAppOperatorFlowService', () => {
           expect.any(Object),
         );
         expect(twiml).not.toContain('<Message>');
+      });
+
+      it('falls back to the freeform "Send DONE" reply when Twilio rejects the template', async () => {
+        process.env.TWILIO_DONE_REMINDER_TEMPLATE_SID = 'HXdonereminder';
+        twilioService.sendWhatsAppTemplateMessage.mockRejectedValue(
+          new Error('The Content Variables parameter is invalid.'),
+        );
+        jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        const twiml = await service.handleOperatorMessage(
+          operatorPhone,
+          'op-user-1',
+          'huh',
+          'huh',
+          session,
+          operator,
+          {},
+        );
+
+        expect(twiml).toContain('Send *DONE*');
       });
     });
 
@@ -742,6 +783,33 @@ describe('WhatsAppOperatorFlowService', () => {
         );
         expect(twiml).not.toContain('<Message>');
         // The customer-facing "arrived" notification is unaffected either way.
+        expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+          customerPhone,
+          expect.stringContaining('arrived'),
+        );
+      });
+
+      it('falls back to the freeform "Send DONE" reply when Twilio rejects the template, and the arrival still goes through', async () => {
+        process.env.TWILIO_DONE_PROMPT_TEMPLATE_SID = 'HXdoneprompt';
+        twilioService.sendWhatsAppTemplateMessage.mockRejectedValue(
+          new Error('The Content Variables parameter is invalid.'),
+        );
+        jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        const twiml = await service.handleOperatorMessage(
+          operatorPhone,
+          'op-user-1',
+          'arrived',
+          'ARRIVED',
+          session,
+          operator,
+          {},
+        );
+
+        expect(twiml).toContain('Send *DONE*');
+        expect(prisma.rescueRequest.update).toHaveBeenCalledWith(
+          expect.objectContaining({ data: { status: 'ARRIVED' } }),
+        );
         expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
           customerPhone,
           expect.stringContaining('arrived'),

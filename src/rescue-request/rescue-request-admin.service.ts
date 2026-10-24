@@ -980,20 +980,20 @@ export class RescueRequestAdminService {
 
     if (role === 'SUPER_ADMIN' || role === 'ADMIN') {
       const config = await this.platformConfigService.getConfig();
-      const offers: DispatchOfferAdminDto[] = raw.dispatchOffers.map(
-        (o: any) => ({
-          operatorId: o.operatorId,
-          businessName: o.operator.businessName,
-          status: o.status,
-          quotedPrice: o.quotedPrice ?? undefined,
-          motoristFacingTotal: o.quotedPrice
-            ? o.quotedPrice +
-              Math.round((o.quotedPrice * config.serviceFeePercent) / 100)
-            : undefined,
-          offeredAt: o.offeredAt,
-          respondedAt: o.respondedAt ?? undefined,
-        }),
-      );
+      const offers: DispatchOfferAdminDto[] = raw.dispatchOffers.map((o) => ({
+        operatorId: o.operatorId,
+        businessName: o.operator.businessName,
+        status: o.status,
+        quotedPrice: o.quotedPrice ?? undefined,
+        motoristFacingTotal: o.quotedPrice
+          ? o.quotedPrice +
+            Math.round((o.quotedPrice * config.serviceFeePercent) / 100)
+          : undefined,
+        offeredAt: o.offeredAt,
+        respondedAt: o.respondedAt ?? undefined,
+        deliveryStatus: o.deliveryStatus ?? undefined,
+        deliveryErrorCode: o.deliveryErrorCode ?? undefined,
+      }));
       return { data: this.mapToDetailDto(raw, true, offers) };
     }
 

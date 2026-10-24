@@ -106,6 +106,8 @@ describe('RescueRequestAdminService', () => {
           quotedPrice: 2500000,
           offeredAt: new Date('2026-08-10T00:00:00Z'),
           respondedAt: new Date('2026-08-10T00:05:00Z'),
+          deliveryStatus: null,
+          deliveryErrorCode: null,
           operator: { id: 'op-1', businessName: 'Swift Towing' },
         },
       ],
@@ -133,6 +135,52 @@ describe('RescueRequestAdminService', () => {
           motoristFacingTotal: 2750000,
         }),
       ]);
+    });
+
+    it('includes deliveryStatus/deliveryErrorCode for ADMIN when a confirmed delivery failure is recorded', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        ...baseRaw,
+        dispatchOffers: [
+          {
+            ...baseRaw.dispatchOffers[0],
+            status: 'TIMED_OUT',
+            deliveryStatus: 'undelivered',
+            deliveryErrorCode: 63024,
+          },
+        ],
+      });
+      platformConfigService.getConfig.mockResolvedValue({
+        serviceFeePercent: 10,
+        depositPercent: 10,
+      });
+
+      const result = await detailService.detailForUser(
+        { role: 'ADMIN', userId: 'admin-1' },
+        'req-1',
+      );
+
+      expect(result.data.offers).toEqual([
+        expect.objectContaining({
+          deliveryStatus: 'undelivered',
+          deliveryErrorCode: 63024,
+        }),
+      ]);
+    });
+
+    it('omits deliveryStatus/deliveryErrorCode when neither is recorded', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue(baseRaw);
+      platformConfigService.getConfig.mockResolvedValue({
+        serviceFeePercent: 10,
+        depositPercent: 10,
+      });
+
+      const result = await detailService.detailForUser(
+        { role: 'ADMIN', userId: 'admin-1' },
+        'req-1',
+      );
+
+      expect(result.data.offers![0].deliveryStatus).toBeUndefined();
+      expect(result.data.offers![0].deliveryErrorCode).toBeUndefined();
     });
 
     it('includes ratings with their flagged/resolved state for ADMIN', async () => {

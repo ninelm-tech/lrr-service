@@ -56,3 +56,6 @@ pids
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
 /generated/prisma
+
+# Superpowers scratch (plan ledgers, briefs, review packages)
+.superpowers/

@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import * as Sentry from '@sentry/node';
 import { DispatchService } from './dispatch.service';
 import { RescueRequestModule } from './rescue-request.module';
 import { PrismaService } from '../prisma/prisma.service';
@@ -9,6 +10,14 @@ import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { ConfigModule } from '@nestjs/config';
 import { OperatorMembershipService } from '../operator/operator-membership.service';
+
+jest.mock('@sentry/node', () => ({
+  captureException: jest.fn(),
+  captureMessage: jest.fn(),
+  withScope: (fn: (scope: unknown) => void) =>
+    fn({ setLevel: jest.fn(), setContext: jest.fn() }),
+  logger: { info: jest.fn() },
+}));
 
 /**
  * Batch timers are keyed `requestId:batchId`, so a test can't clear one by
@@ -785,7 +794,11 @@ describe('DispatchService', () => {
         update: jest.Mock;
       };
       operator: { findUnique: jest.Mock };
-      dispatchOffer: { create: jest.Mock; updateMany: jest.Mock };
+      dispatchOffer: {
+        create: jest.Mock;
+        update: jest.Mock;
+        updateMany: jest.Mock;
+      };
       requestMedia: { findMany: jest.Mock };
       $transaction: jest.Mock;
     };
@@ -796,11 +809,14 @@ describe('DispatchService', () => {
     };
     let sharedService: { formatLocationSection: jest.Mock };
     const originalTemplateSid = process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
+    const originalApiBaseUrl = process.env.API_BASE_URL;
 
     afterEach(() => {
       if (originalTemplateSid === undefined)
         delete process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
       else process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID = originalTemplateSid;
+      if (originalApiBaseUrl === undefined) delete process.env.API_BASE_URL;
+      else process.env.API_BASE_URL = originalApiBaseUrl;
     });
 
     beforeEach(async () => {
@@ -812,7 +828,11 @@ describe('DispatchService', () => {
           update: jest.fn(),
         },
         operator: { findUnique: jest.fn() },
-        dispatchOffer: { create: jest.fn(), updateMany: jest.fn() },
+        dispatchOffer: {
+          create: jest.fn(),
+          update: jest.fn(),
+          updateMany: jest.fn(),
+        },
         requestMedia: { findMany: jest.fn().mockResolvedValue([]) },
         // The offer and the offeredOperatorIds append now commit together, so
         // the callback runs against this same mock as its transaction client.
@@ -823,8 +843,12 @@ describe('DispatchService', () => {
         update: jest.fn(),
       };
       twilioService = {
-        sendWhatsAppMessage: jest.fn(),
-        sendWhatsAppTemplateMessage: jest.fn(),
+        sendWhatsAppMessage: jest
+          .fn()
+          .mockResolvedValue({ sid: 'SM_manual_default' }),
+        sendWhatsAppTemplateMessage: jest
+          .fn()
+          .mockResolvedValue({ sid: 'SM_manual_default' }),
       };
       sharedService = {
         formatLocationSection: jest
@@ -1076,6 +1100,113 @@ describe('DispatchService', () => {
       expect(prisma.$transaction).toHaveBeenCalledTimes(1);
     });
 
+    it("persists the Twilio SID onto the manually-created offer's own row", async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
+      });
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1',
+        status: 'ACTIVE',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2349012345678',
+      });
+      prisma.dispatchOffer.updateMany.mockResolvedValue({ count: 0 });
+      prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-manual-1' });
+      twilioService.sendWhatsAppMessage.mockResolvedValue({
+        sid: 'SM-manual-1',
+      });
+
+      await manualService.manualOfferToOperator('req-1', 'op-1');
+
+      expect(prisma.dispatchOffer.update).toHaveBeenCalledWith({
+        where: { id: 'offer-manual-1' },
+        data: { twilioMessageSid: 'SM-manual-1' },
+      });
+    });
+
+    it('does not throw when persisting the Twilio SID fails — the message already sent, the admin must still see success', async () => {
+      // Multi-llm review flagged the nesting here: the SID-persist
+      // try/catch sits INSIDE the send's try/catch, whose own catch
+      // re-throws. Today the inner catch doesn't re-throw, so this
+      // already passes — but the structure makes that one accidental
+      // line away from turning a persist-only failure into a reported
+      // send failure. Locking in the correct behavior with a test, not
+      // just a comment, and restructuring so it can't regress by nesting.
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
+      });
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1',
+        status: 'ACTIVE',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2349012345678',
+      });
+      prisma.dispatchOffer.updateMany.mockResolvedValue({ count: 0 });
+      prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-manual-1' });
+      twilioService.sendWhatsAppMessage.mockResolvedValue({
+        sid: 'SM-manual-1',
+      });
+      prisma.dispatchOffer.update.mockRejectedValue(new Error('db down'));
+
+      await expect(
+        manualService.manualOfferToOperator('req-1', 'op-1'),
+      ).resolves.toBeUndefined();
+
+      expect(Sentry.captureException).toHaveBeenCalledWith(
+        expect.any(Error),
+        expect.objectContaining({
+          extra: expect.objectContaining({ offerId: 'offer-manual-1' }),
+        }),
+      );
+    });
+
+    it('includes the offerId query param on the statusCallback URL for a manual offer', async () => {
+      process.env.API_BASE_URL = 'https://api.example.com';
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
+      });
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1',
+        status: 'ACTIVE',
+        businessName: 'Swift Towing',
+        phoneNumber: '+2349012345678',
+      });
+      prisma.dispatchOffer.updateMany.mockResolvedValue({ count: 0 });
+      prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-manual-1' });
+
+      await manualService.manualOfferToOperator('req-1', 'op-1');
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
+        {
+          statusCallback:
+            'https://api.example.com/api/v1/webhooks/twilio-status?offerId=offer-manual-1',
+        },
+      );
+      // Restored by this block's afterEach, not inline here — an assertion
+      // throwing above would otherwise leave API_BASE_URL set for later
+      // tests.
+    });
+
     it('includes the issue type in the freeform message when the request has one', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
         id: 'req-1',
@@ -1172,9 +1303,14 @@ describe('DispatchService', () => {
         expect(prisma.requestMedia.findMany).toHaveBeenCalledWith({
           where: { rescueRequestId: 'req-1' },
         });
+        // 3rd arg (statusCallback) is incidental here — this test sets
+        // API_BASE_URL only to exercise media-link URL building, not to
+        // test statusCallback construction (see the dedicated offerId
+        // test above for that) — so it's deliberately not asserted on.
         expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
           expect.any(String),
           expect.stringContaining('media-1'),
+          expect.any(Object),
         );
 
         // No timer is armed at all: the offer's own expiresAt is what
@@ -1268,7 +1404,9 @@ describe('DispatchService', () => {
       operator: { count: jest.Mock };
       dispatchOffer: {
         createMany: jest.Mock;
+        findMany: jest.Mock;
         count: jest.Mock;
+        update: jest.Mock;
         updateMany: jest.Mock;
       };
       requestMedia: { findMany: jest.Mock };
@@ -1284,6 +1422,7 @@ describe('DispatchService', () => {
     };
     let sharedService: { formatLocationSection: jest.Mock };
     const originalTemplateSid = process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
+    const originalApiBaseUrl = process.env.API_BASE_URL;
 
     const candidateA = {
       id: 'op-a',
@@ -1302,6 +1441,8 @@ describe('DispatchService', () => {
       if (originalTemplateSid === undefined)
         delete process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID;
       else process.env.TWILIO_DISPATCH_OFFER_TEMPLATE_SID = originalTemplateSid;
+      if (originalApiBaseUrl === undefined) delete process.env.API_BASE_URL;
+      else process.env.API_BASE_URL = originalApiBaseUrl;
     });
 
     beforeEach(async () => {
@@ -1334,8 +1475,35 @@ describe('DispatchService', () => {
         },
         operator: { count: jest.fn() },
         dispatchOffer: {
-          createMany: jest.fn(),
+          createMany: jest.fn<unknown, [{ data: { operatorId: string }[] }]>(),
+          // Returns one row per distinct operatorId createMany was last
+          // called with, so writeRound's offerId lookup always resolves —
+          // the synthetic id just needs to be stable per operator, not
+          // globally unique, for these tests.
+          findMany: jest.fn().mockImplementation(() => {
+            // createMany is declared as a bare jest.Mock in this block's
+            // own `let prisma: {...}` type above (matching every other
+            // mock in this file), so .mock.calls is untyped — the cast
+            // is this file's established way of narrowing a Jest mock
+            // call's recorded arguments back to a known shape (see the
+            // identical pattern on prisma.rescueRequest.update.mock.calls
+            // elsewhere in this file).
+            const calls = prisma.dispatchOffer.createMany.mock.calls as [
+              { data: { operatorId: string }[] },
+            ][];
+            const lastCall = calls.at(-1)?.[0];
+            const operatorIds: string[] = (lastCall?.data ?? []).map(
+              (d) => d.operatorId,
+            );
+            return Promise.resolve(
+              operatorIds.map((operatorId) => ({
+                id: `offer-${operatorId}`,
+                operatorId,
+              })),
+            );
+          }),
           count: jest.fn().mockResolvedValue(0),
+          update: jest.fn(),
           updateMany: jest.fn(),
         },
         requestMedia: { findMany: jest.fn().mockResolvedValue([]) },
@@ -1361,8 +1529,10 @@ describe('DispatchService', () => {
         }),
       };
       twilioService = {
-        sendWhatsAppMessage: jest.fn(),
-        sendWhatsAppTemplateMessage: jest.fn(),
+        sendWhatsAppMessage: jest.fn().mockResolvedValue({ sid: 'SM_default' }),
+        sendWhatsAppTemplateMessage: jest
+          .fn()
+          .mockResolvedValue({ sid: 'SM_default' }),
       };
       sharedService = {
         formatLocationSection: jest
@@ -1605,7 +1775,7 @@ describe('DispatchService', () => {
       twilioService.sendWhatsAppMessage.mockImplementation((to: string) => {
         if (to.includes('+2349011111111'))
           return Promise.reject(new Error('63016: outside messaging window'));
-        return Promise.resolve();
+        return Promise.resolve({ sid: 'SM_ok' });
       });
 
       await expect(
@@ -1654,6 +1824,124 @@ describe('DispatchService', () => {
       expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
         expect.any(String),
         expect.stringContaining('automatically cancelled'),
+      );
+    });
+
+    it("persists the Twilio SID onto each offer's own row once its send resolves", async () => {
+      twilioService.sendWhatsAppMessage.mockImplementation((to: string) =>
+        Promise.resolve({
+          sid: to.includes('+2349011111111') ? 'SM-op-a' : 'SM-op-b',
+        }),
+      );
+
+      await batchService.startDispatch('req-1', 'cust-1');
+
+      expect(prisma.dispatchOffer.update).toHaveBeenCalledWith({
+        where: { id: 'offer-op-a' },
+        data: { twilioMessageSid: 'SM-op-a' },
+      });
+      expect(prisma.dispatchOffer.update).toHaveBeenCalledWith({
+        where: { id: 'offer-op-b' },
+        data: { twilioMessageSid: 'SM-op-b' },
+      });
+    });
+
+    it('persisting the SID for one offer failing does not block persisting it for the others', async () => {
+      prisma.dispatchOffer.update.mockImplementation(
+        (args: { where: { id: string } }) => {
+          if (args.where.id === 'offer-op-a')
+            return Promise.reject(new Error('db down'));
+          return Promise.resolve();
+        },
+      );
+
+      await expect(
+        batchService.startDispatch('req-1', 'cust-1'),
+      ).resolves.toBeUndefined();
+
+      expect(prisma.dispatchOffer.update).toHaveBeenCalledWith({
+        where: { id: 'offer-op-b' },
+        data: { twilioMessageSid: 'SM_default' },
+      });
+    });
+
+    it('throws a clear error instead of silently mis-attributing an offerId when fewer offers come back from the DB than the batch sent in', async () => {
+      // Multi-llm review flagged the non-null assertion on
+      // offerIdByOperatorId.get(op.id) as relying entirely on an
+      // unenforced invariant (every batch entry produces exactly one
+      // created row). This proves the mismatch fails loudly — at the
+      // point it's discovered, with both counts in the message — rather
+      // than one operator silently getting `offerId: undefined` (or,
+      // post-`!`, a misleading "Cannot read properties of undefined").
+      prisma.dispatchOffer.findMany.mockResolvedValue([
+        { id: 'offer-op-a', operatorId: 'op-a' },
+        // op-b's row is missing — simulates a duplicate operatorId in the
+        // batch, or any other createMany/findMany divergence.
+      ]);
+
+      await expect(
+        batchService.startDispatch('req-1', 'cust-1'),
+      ).rejects.toThrow(/expected 2 created offers, found 1/);
+    });
+
+    it("includes a statusCallback URL built from API_BASE_URL, the /api/v1 global prefix, and this offer's own id", async () => {
+      // /api/v1 matters: main.ts calls app.setGlobalPrefix('api/v1'), so
+      // every route — including this webhook — is actually served under
+      // it. A URL missing this prefix 404s in production; this test is
+      // what catches that regression before it ships again.
+      process.env.API_BASE_URL = 'https://api.example.com';
+
+      await batchService.startDispatch('req-1', 'cust-1');
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2349011111111'),
+        expect.any(String),
+        {
+          statusCallback:
+            'https://api.example.com/api/v1/webhooks/twilio-status?offerId=offer-op-a',
+        },
+      );
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2349022222222'),
+        expect.any(String),
+        {
+          statusCallback:
+            'https://api.example.com/api/v1/webhooks/twilio-status?offerId=offer-op-b',
+        },
+      );
+    });
+
+    it('strips a trailing slash from API_BASE_URL so the callback URL never contains a double slash — must stay byte-identical to what webhooks.controller.ts reconstructs for signature verification', async () => {
+      process.env.API_BASE_URL = 'https://api.example.com/';
+
+      await batchService.startDispatch('req-1', 'cust-1');
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2349011111111'),
+        expect.any(String),
+        {
+          statusCallback:
+            'https://api.example.com/api/v1/webhooks/twilio-status?offerId=offer-op-a',
+        },
+      );
+    });
+
+    it('sends successfully with no statusCallback argument at all when API_BASE_URL is unset', async () => {
+      // Deliberately a 2-arg call, not a 3-arg call with an explicit
+      // `undefined` third argument — see this task's Step 5 design note on
+      // why the third argument is conditionally omitted rather than always
+      // passed. A 3-arg assertion here would also silently diverge from
+      // every pre-existing 2-arg assertion elsewhere in this file for the
+      // exact same mock, which multi-llm review caught as a real breakage.
+      delete process.env.API_BASE_URL;
+
+      await expect(
+        batchService.startDispatch('req-1', 'cust-1'),
+      ).resolves.toBeUndefined();
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
       );
     });
   });
@@ -1865,6 +2153,364 @@ describe('DispatchService', () => {
       expect(prisma.dispatchOffer.update).toHaveBeenCalledWith({
         where: { id: 'offer-1' },
         data: { depositPercentSnapshot: 30 },
+      });
+    });
+  });
+
+  describe('handleDeliveryStatusUpdate', () => {
+    let service: DispatchService;
+    let prisma: {
+      dispatchOffer: { findUnique: jest.Mock; updateMany: jest.Mock };
+    };
+    let sentryCapture: jest.Mock;
+
+    beforeEach(async () => {
+      prisma = {
+        dispatchOffer: {
+          findUnique: jest.fn().mockResolvedValue({
+            id: 'offer-1',
+            rescueRequestId: 'req-1',
+            operatorId: 'op-1',
+          }),
+          // count: 1 is the default "the write took" case most tests want.
+          // A dedicated test below overrides this to count: 0 to exercise
+          // the "guard rejected it" / stale-callback path.
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        },
+      };
+      sentryCapture = Sentry.captureMessage as jest.Mock;
+      sentryCapture.mockClear();
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          DispatchService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+          { provide: OperatorMembershipService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<DispatchService>(DispatchService);
+    });
+
+    it("persists the SID, status, and error code via one atomic conditional update, tagged by the offer's own id", async () => {
+      await service.handleDeliveryStatusUpdate(
+        'offer-1',
+        'SM123',
+        'undelivered',
+        63024,
+      );
+
+      expect(prisma.dispatchOffer.findUnique).toHaveBeenCalledWith({
+        where: { id: 'offer-1' },
+        select: { id: true, rescueRequestId: true, operatorId: true },
+      });
+      expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+          where: expect.objectContaining({ id: 'offer-1' }),
+          data: {
+            twilioMessageSid: 'SM123',
+            deliveryStatus: 'undelivered',
+            deliveryErrorCode: 63024,
+          },
+        }),
+      );
+    });
+
+    it('persists a status with no error code (e.g. delivered) as deliveryErrorCode: null', async () => {
+      await service.handleDeliveryStatusUpdate(
+        'offer-1',
+        'SM123',
+        'delivered',
+        undefined,
+      );
+
+      expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: {
+            twilioMessageSid: 'SM123',
+            deliveryStatus: 'delivered',
+            deliveryErrorCode: null,
+          },
+        }),
+      );
+    });
+
+    it('no-ops when no offer matches the offerId, rather than throwing', async () => {
+      prisma.dispatchOffer.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.handleDeliveryStatusUpdate(
+          'offer-unknown',
+          'SM-unknown',
+          'undelivered',
+          63024,
+        ),
+      ).resolves.toBeUndefined();
+
+      expect(prisma.dispatchOffer.updateMany).not.toHaveBeenCalled();
+    });
+
+    describe('alerting — gated on whether the atomic update actually wrote anything', () => {
+      it('fires a Sentry alert for an undelivered status when the update reports count: 1 (the write took)', async () => {
+        await service.handleDeliveryStatusUpdate(
+          'offer-1',
+          'SM123',
+          'undelivered',
+          63024,
+        );
+
+        expect(sentryCapture).toHaveBeenCalledWith(
+          expect.stringContaining('undelivered'),
+          expect.objectContaining({
+            level: 'error',
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+            extra: expect.objectContaining({
+              rescueRequestId: 'req-1',
+              operatorId: 'op-1',
+              messageSid: 'SM123',
+              errorCode: 63024,
+            }),
+          }),
+        );
+      });
+
+      it('fires a Sentry alert for a failed status', async () => {
+        await service.handleDeliveryStatusUpdate(
+          'offer-1',
+          'SM123',
+          'failed',
+          30008,
+        );
+
+        expect(sentryCapture).toHaveBeenCalled();
+      });
+
+      it('does not alert on a non-failure status (sent/delivered/read)', async () => {
+        await service.handleDeliveryStatusUpdate(
+          'offer-1',
+          'SM123',
+          'delivered',
+          undefined,
+        );
+        await service.handleDeliveryStatusUpdate(
+          'offer-1',
+          'SM123',
+          'read',
+          undefined,
+        );
+        await service.handleDeliveryStatusUpdate(
+          'offer-1',
+          'SM123',
+          'sent',
+          undefined,
+        );
+
+        expect(sentryCapture).not.toHaveBeenCalled();
+      });
+
+      it('does not alert when the atomic update reports count: 0 — the guard rejected a stale/out-of-order callback, nothing was actually written', async () => {
+        // This is the case the old read-then-write design couldn't express
+        // atomically: the real DB's WHERE clause is what decides whether
+        // this write "counts," not a value this process read earlier.
+        prisma.dispatchOffer.updateMany.mockResolvedValue({ count: 0 });
+
+        await service.handleDeliveryStatusUpdate(
+          'offer-1',
+          'SM123',
+          'undelivered',
+          63024,
+        );
+
+        expect(sentryCapture).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('out-of-order guard construction', () => {
+      // These test the WHERE clause DispatchService builds, not Prisma's
+      // own filtering (that's covered by the real-Postgres integration
+      // test at test/integration/dispatch-delivery-status.int-spec.ts —
+      // multi-llm review caught that this comment previously pointed at
+      // Task 3's dispatch-round-state update, which only ever checked
+      // twilioMessageSid persistence and never exercised this guard at
+      // all). Assertions are content-based
+      // (arrayContaining), not exact-order, since the guard's job is "which
+      // statuses are/aren't in the allowed set," not array ordering.
+      type DeliveryStatusGuardCall = {
+        where: {
+          id: string;
+          OR: Array<{
+            deliveryStatus?: null | { in?: string[]; notIn?: string[] };
+          }>;
+        };
+      };
+
+      it('allows overwriting only a not-more-advanced existing status for a recognized incoming status', async () => {
+        await service.handleDeliveryStatusUpdate(
+          'offer-1',
+          'SM123',
+          'sent',
+          undefined,
+        );
+
+        const calls = prisma.dispatchOffer.updateMany.mock.calls as [
+          DeliveryStatusGuardCall,
+        ][];
+        const call = calls[0][0];
+        expect(call.where.id).toBe('offer-1');
+        const allowedExisting = call.where.OR.find(
+          (clause: { deliveryStatus?: { in?: string[] } }) =>
+            clause.deliveryStatus?.in,
+        )?.deliveryStatus?.in;
+        // 'sent' only ranks above queued/accepted/sending.
+        expect(allowedExisting).toEqual(
+          expect.arrayContaining(['queued', 'accepted', 'sending', 'sent']),
+        );
+        expect(allowedExisting).not.toEqual(
+          expect.arrayContaining([
+            'delivered',
+            'read',
+            'undelivered',
+            'failed',
+          ]),
+        );
+      });
+
+      it('always allows a null existing deliveryStatus to be overwritten (the first-ever callback for an offer)', async () => {
+        await service.handleDeliveryStatusUpdate(
+          'offer-1',
+          'SM123',
+          'sent',
+          undefined,
+        );
+
+        const calls = prisma.dispatchOffer.updateMany.mock.calls as [
+          DeliveryStatusGuardCall,
+        ][];
+        const call = calls[0][0];
+        expect(call.where.OR).toEqual(
+          expect.arrayContaining([{ deliveryStatus: null }]),
+        );
+      });
+
+      it('always allows overwriting an existing status this process does not recognize, for a recognized incoming status', async () => {
+        // An unrecognized already-recorded status can't be ranked against
+        // anything — rather than permanently block every future write to
+        // this offer, the guard explicitly carves this out.
+        await service.handleDeliveryStatusUpdate(
+          'offer-1',
+          'SM123',
+          'delivered',
+          undefined,
+        );
+
+        const calls = prisma.dispatchOffer.updateMany.mock.calls as [
+          DeliveryStatusGuardCall,
+        ][];
+        const call = calls[0][0];
+        const notInClause = call.where.OR.find(
+          (clause: { deliveryStatus?: { notIn?: string[] } }) =>
+            clause.deliveryStatus?.notIn,
+        );
+        expect(notInClause?.deliveryStatus?.notIn).toEqual(
+          expect.arrayContaining([
+            'queued',
+            'sent',
+            'delivered',
+            'read',
+            'undelivered',
+            'failed',
+          ]),
+        );
+      });
+
+      it('does NOT allow one terminal status to overwrite a different terminal status already recorded — read/undelivered/failed share a rank but are not interchangeable', async () => {
+        // Multi-llm review caught that sharing a rank (all three are
+        // equally "final") had been implemented as "equally overwritable,"
+        // not "equally un-overwritable" — a late/duplicate 'failed'
+        // callback could silently erase a confirmed 'read', which
+        // contradicts this file's own design comment: "nothing legitimately
+        // follows" a terminal state.
+        await service.handleDeliveryStatusUpdate(
+          'offer-1',
+          'SM123',
+          'failed',
+          30008,
+        );
+
+        const calls = prisma.dispatchOffer.updateMany.mock.calls as [
+          DeliveryStatusGuardCall,
+        ][];
+        const call = calls[0][0];
+        const allowedExisting = call.where.OR.find(
+          (clause: { deliveryStatus?: { in?: string[] } }) =>
+            clause.deliveryStatus?.in,
+        )?.deliveryStatus?.in;
+        expect(allowedExisting).not.toEqual(
+          expect.arrayContaining(['read', 'undelivered', 'failed']),
+        );
+        // Still ranks above every non-terminal status.
+        expect(allowedExisting).toEqual(
+          expect.arrayContaining([
+            'queued',
+            'accepted',
+            'sending',
+            'sent',
+            'delivered',
+          ]),
+        );
+      });
+
+      it('does not re-alert (or re-write) when Twilio redelivers the same terminal callback — at-least-once delivery is not a new event', async () => {
+        prisma.dispatchOffer.findUnique.mockResolvedValue({
+          id: 'offer-1',
+          rescueRequestId: 'req-1',
+          operatorId: 'op-1',
+        });
+        // Simulate the already-terminal row the atomic guard would reject
+        // against: updateMany's WHERE now excludes 'failed' from the
+        // overwritable set (per the fix above), so a real Postgres would
+        // return count: 0 for this redelivery — assert the same outcome
+        // the mock is told to report.
+        prisma.dispatchOffer.updateMany.mockResolvedValue({ count: 0 });
+
+        await service.handleDeliveryStatusUpdate(
+          'offer-1',
+          'SM123-retry',
+          'failed',
+          30008,
+        );
+
+        expect(sentryCapture).not.toHaveBeenCalled();
+      });
+
+      it('applies no ranking constraint at all when the incoming status itself is unrecognized — never silently dropped', async () => {
+        // Contrast with the old (pre-fix) design, which defaulted an
+        // unrecognized status to rank 0 — the lowest possible — meaning it
+        // would almost always lose to anything already recorded. Multi-llm
+        // review caught that this contradicted the plan's own promise that
+        // deliveryStatus is a raw string specifically so a future Twilio
+        // status needs no code change to keep recording correctly.
+        await service.handleDeliveryStatusUpdate(
+          'offer-1',
+          'SM123',
+          'some-future-status',
+          undefined,
+        );
+
+        expect(prisma.dispatchOffer.updateMany).toHaveBeenCalledWith({
+          where: { id: 'offer-1' },
+          data: {
+            twilioMessageSid: 'SM123',
+            deliveryStatus: 'some-future-status',
+            deliveryErrorCode: null,
+          },
+        });
       });
     });
   });

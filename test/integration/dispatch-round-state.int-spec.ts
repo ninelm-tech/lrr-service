@@ -35,8 +35,10 @@ describe('dispatch round state (integration)', () => {
    */
   function buildDispatchService(operatorIds: string[]): DispatchService {
     const twilio = {
-      sendWhatsAppMessage: jest.fn().mockResolvedValue(undefined),
-      sendWhatsAppTemplateMessage: jest.fn().mockResolvedValue(undefined),
+      sendWhatsAppMessage: jest.fn().mockResolvedValue({ sid: 'SM_test' }),
+      sendWhatsAppTemplateMessage: jest
+        .fn()
+        .mockResolvedValue({ sid: 'SM_test' }),
     };
     const operatorService = {
       // Returns whatever has not already been excluded, so the exclusion list
@@ -111,6 +113,11 @@ describe('dispatch round state (integration)', () => {
     });
     expect(offers).toHaveLength(1);
     expect(offers[0].dispatchRound).toBe(after.dispatchRound);
+    // Proof the offerId writeRound hands back actually exists in Postgres:
+    // deliverOffers only reaches this update if it does — a mocked
+    // findMany in the unit tests can't catch writeRound's lookup being
+    // wrong the way a real database can.
+    expect(offers[0].twilioMessageSid).toBe('SM_test');
   });
 
   it('keeps two requests from the same customer on independent exclusion lists', async () => {

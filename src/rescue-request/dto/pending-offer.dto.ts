@@ -6,6 +6,9 @@
  * — offers are exactly-once, messages are best-effort.
  */
 export interface PendingOffer {
+  /** The DispatchOffer row's own id — needed to persist the Twilio SID
+   * back onto it once the send resolves (see DispatchService.deliverOffers). */
+  offerId: string;
   operatorId: string;
   operatorPhone: string;
   jobRef: string;
