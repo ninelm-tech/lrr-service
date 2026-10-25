@@ -1096,10 +1096,14 @@ describe('OperatorService', () => {
       expect(prisma.$transaction).not.toHaveBeenCalled();
     });
 
-    it('accepts and persists depositPercentOverride: 0 — not skipped as falsy', async () => {
-      // Platform floor dropped to 0 for this test specifically: it exists to
-      // prove a real 0 isn't skipped by falsy coercion, which only happens
-      // to be a valid value when the floor itself is 0.
+    it('still rejects depositPercentOverride: 0 even when the live platform config value is stale and reads 0 (hotfix, 2026-10-25)', async () => {
+      // Superseded test, 2026-10-25: this used to assert the OPPOSITE — that
+      // 0 is accepted and persisted (not skipped by falsy coercion) when the
+      // live config floor happens to read 0. A 0% deposit must never be
+      // possible at all now, so that premise is gone; this proves the real
+      // replacement guarantee — the floor is never trusted from the live
+      // config value alone, so even a stale/wrong config row can't let a 0
+      // override through.
       platformConfigService.getConfig.mockResolvedValue({
         serviceFeePercent: 10,
         depositPercent: 0,
@@ -1110,20 +1114,33 @@ describe('OperatorService', () => {
         newRequestAlertPhoneNumbers: [],
         testCustomerPhoneNumbers: [],
       });
-      // Captured via a typed mockImplementation callback, not `mock.calls[0][0]`
-      // indexing — the latter reads back through this file's bare `jest.Mock`
-      // typing as `any`, which trips no-unsafe-assignment/member-access.
-      let capturedData: { depositPercentOverride?: number | null } | undefined;
-      prisma.operator.create.mockImplementation(
-        (args: { data: { depositPercentOverride?: number | null } }) => {
-          capturedData = args.data;
-          return Promise.resolve({ id: 'op-new', status: 'ACTIVE' });
-        },
-      );
 
-      await service.adminCreate({ ...baseDto(), depositPercentOverride: 0 });
+      await expect(
+        service.adminCreate({ ...baseDto(), depositPercentOverride: 0 }),
+      ).rejects.toThrow('depositPercentOverride must be between 10 and 50');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
 
-      expect(capturedData?.depositPercentOverride).toBe(0);
+    it('still rejects a too-low value when the live platform config value is non-finite (hotfix, 2026-10-25)', async () => {
+      // Math.max(10, NaN) is NaN, and any comparison against NaN is false —
+      // without guarding liveDefault itself, a corrupt config read would
+      // silently defeat this floor entirely, the same NaN-contagion pattern
+      // already fixed for computeDepositAmount.
+      platformConfigService.getConfig.mockResolvedValue({
+        serviceFeePercent: 10,
+        depositPercent: NaN,
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        quoteCollectionMinutes: 5,
+        disputeAlertPhoneNumbers: [],
+        newRequestAlertPhoneNumbers: [],
+        testCustomerPhoneNumbers: [],
+      });
+
+      await expect(
+        service.adminCreate({ ...baseDto(), depositPercentOverride: 5 }),
+      ).rejects.toThrow('depositPercentOverride must be between 10 and 50');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
     });
 
     it('accepts depositPercentOverride at exactly the platform floor (10, from the mocked default)', async () => {
@@ -1203,10 +1220,14 @@ describe('OperatorService', () => {
       expect(result).toEqual({ id: 'op-1', depositPercentOverride: 25 });
     });
 
-    it('persists exactly 0 — not skipped as falsy — when the platform floor is 0', async () => {
-      // Floor dropped to 0 for this test specifically: it exists to prove a
-      // real 0 isn't skipped by falsy coercion, which only happens to be a
-      // valid value when the floor itself is 0.
+    it('still rejects 0 even when the live platform config value is stale and reads 0 (hotfix, 2026-10-25)', async () => {
+      // Superseded test, 2026-10-25: this used to assert the OPPOSITE — that
+      // a 0 override succeeds when the live config floor happens to read 0,
+      // proving falsy-0 wasn't skipped. A 0% deposit must never be possible
+      // at all now, so that premise is gone; this proves the real
+      // replacement guarantee — the floor is never trusted from the live
+      // config value alone, so even a stale/wrong config row can't let a 0
+      // override through.
       platformConfigService.getConfig.mockResolvedValue({
         serviceFeePercent: 10,
         depositPercent: 0,
@@ -1220,17 +1241,36 @@ describe('OperatorService', () => {
       prisma.operator.findUnique.mockResolvedValue({
         depositPercentOverride: 25,
       });
-      prisma.operator.update.mockResolvedValue({
-        id: 'op-1',
-        depositPercentOverride: 0,
+
+      await expect(service.setDepositPercent('op-1', 0, actor)).rejects.toThrow(
+        'depositPercentOverride must be between 10 and 50',
+      );
+      expect(prisma.operator.update).not.toHaveBeenCalled();
+    });
+
+    it('still rejects a too-low value when the live platform config value is non-finite (hotfix, 2026-10-25)', async () => {
+      // Math.max(10, NaN) is NaN, and any comparison against NaN is false —
+      // without guarding liveDefault itself, a corrupt config read would
+      // silently defeat this floor entirely, the same NaN-contagion pattern
+      // already fixed for computeDepositAmount.
+      platformConfigService.getConfig.mockResolvedValue({
+        serviceFeePercent: 10,
+        depositPercent: NaN,
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        quoteCollectionMinutes: 5,
+        disputeAlertPhoneNumbers: [],
+        newRequestAlertPhoneNumbers: [],
+        testCustomerPhoneNumbers: [],
+      });
+      prisma.operator.findUnique.mockResolvedValue({
+        depositPercentOverride: 25,
       });
 
-      await service.setDepositPercent('op-1', 0, actor);
-
-      expect(prisma.operator.update).toHaveBeenCalledWith({
-        where: { id: 'op-1' },
-        data: { depositPercentOverride: 0 },
-      });
+      await expect(service.setDepositPercent('op-1', 5, actor)).rejects.toThrow(
+        'depositPercentOverride must be between 10 and 50',
+      );
+      expect(prisma.operator.update).not.toHaveBeenCalled();
     });
 
     it('clears the override back to the platform default when given null', async () => {

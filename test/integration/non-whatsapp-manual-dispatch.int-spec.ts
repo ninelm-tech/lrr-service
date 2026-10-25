@@ -27,14 +27,11 @@ import {
  * below is checked against that constraint, not just the happy-path status
  * transitions.
  *
- * depositPercent is deliberately 0 for this scenario: deposit-payment
- * mechanics (the Paystack round trip, the WAITING_FOR_DEPOSIT window) are
- * already covered by payment-deposit-flow.int-spec.ts. Using 0% here routes
- * assignOperator straight through its own real 0%-deposit branch (the same
- * one a WhatsApp job's 0%-deposit path uses), which still exercises
- * activateAssignedJob's whatsappEnabled guard (Task 6) for real — closer to
- * the real codepath than hand-writing a status column, and no less faithful
- * to what this task is actually about.
+ * depositPercent is the platform-wide floor (10%, as of the 2026-10-24
+ * hotfix that made 0% deposits impossible) — a real deposit payment is
+ * simulated inline (confirmDeposit, same as the BALANCE payment later in
+ * this same test) rather than skipped, since 0% is no longer a real
+ * codepath to exercise.
  */
 describe('Non-WhatsApp operator manual dispatch (integration)', () => {
   let prisma: PrismaService;
@@ -43,6 +40,7 @@ describe('Non-WhatsApp operator manual dispatch (integration)', () => {
   let operatorFlowService: WhatsAppOperatorFlowService;
   let customerFlowService: WhatsAppCustomerFlowService;
   let paymentEventsService: PaymentEventsService;
+  let paymentLedger: PaymentLedgerService;
   let sessionStore: WhatsAppSessionStore;
   let twilio: {
     sendWhatsAppMessage: jest.Mock;
@@ -83,7 +81,7 @@ describe('Non-WhatsApp operator manual dispatch (integration)', () => {
     const platformConfig = {
       getConfig: jest.fn().mockResolvedValue({
         serviceFeePercent: 10,
-        depositPercent: 0,
+        depositPercent: 10,
         testCustomerPhoneNumbers: [],
       }),
     };
@@ -97,7 +95,7 @@ describe('Non-WhatsApp operator manual dispatch (integration)', () => {
       twilio as never,
       sessionStore,
     );
-    const paymentLedger = new PaymentLedgerService(prisma);
+    paymentLedger = new PaymentLedgerService(prisma);
     const operatorService = new OperatorService(
       prisma,
       {} as never, // PaystackService — not exercised by findAndRankCandidates
@@ -224,8 +222,9 @@ describe('Non-WhatsApp operator manual dispatch (integration)', () => {
     expect(current.status).toBe('DISPATCHING');
 
     // 3. assignOperator succeeds for a non-WhatsApp operator specifically
-    // because needsManualAssignment is set; the flag clears; with
-    // depositPercent 0 this lands straight on OPERATOR_ASSIGNED.
+    // because needsManualAssignment is set; the flag clears; a real deposit
+    // is now required (0% is no longer possible as of the 2026-10-24
+    // hotfix), so this lands on WAITING_FOR_DEPOSIT first.
     await adminService.assignOperator(request.id, {
       operatorId: operator.id,
       priceKobo: 500_000,
@@ -234,8 +233,32 @@ describe('Non-WhatsApp operator manual dispatch (integration)', () => {
       where: { id: request.id },
     });
     expect(current.needsManualAssignment).toBe(false);
-    expect(current.status).toBe('OPERATOR_ASSIGNED');
+    expect(current.status).toBe('WAITING_FOR_DEPOSIT');
     expect(current.assignedOperatorId).toBe(operator.id);
+
+    // 3b. Simulate the deposit actually being paid — the real ledger claim
+    // sequence a webhook drives (claimForSubmission, then claimTerminal to
+    // SUCCEEDED; see payment-webhooks.int-spec.ts for the same pattern)
+    // before calling confirmDeposit, not just confirmDeposit alone —
+    // confirmDeposit itself never touches Payment.status, it only reacts to
+    // an already-settled row, exactly as PaymentService.settle() hands it
+    // one in production.
+    const freshDeposit = await prisma.payment.findFirstOrThrow({
+      where: { rescueRequestId: request.id, type: 'DEPOSIT' },
+    });
+    await paymentLedger.claimForSubmission(freshDeposit.id, new Date());
+    await paymentLedger.claimTerminal(freshDeposit.id, {
+      status: 'SUCCEEDED',
+    });
+    const depositPayment = await prisma.payment.findUniqueOrThrow({
+      where: { id: freshDeposit.id },
+    });
+    expect(depositPayment.status).toBe('SUCCEEDED');
+    await paymentEventsService.confirmDeposit(depositPayment);
+    current = await prisma.rescueRequest.findUniqueOrThrow({
+      where: { id: request.id },
+    });
+    expect(current.status).toBe('OPERATOR_ASSIGNED');
 
     // 4. The "deposit paid, dispatch now" badge's own derived condition —
     // assignedOperator.whatsappEnabled === false && status ===

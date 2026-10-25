@@ -50,6 +50,14 @@ const STATS_LOOKBACK_DAYS = 30;
 // operator can pitch something easier than the platform standard, never
 // below it. This ceiling is a separate, fixed platform rule.
 const MAX_OPERATOR_DEPOSIT_PERCENT = 50;
+// The real floor an operator override may never go below, independent of
+// what PlatformConfigService.getConfig().depositPercent happens to read
+// live — that value is itself validated at write time (never below 10),
+// but trusting it alone here means any future bypass of that write-time
+// check (direct DB write, a migration, anything) would silently lower this
+// floor too. Matches PlatformConfigService's own floor exactly (2026-10-25
+// hotfix) so the two can never drift apart.
+const MIN_PLATFORM_DEPOSIT_PERCENT = 10;
 
 export interface ScoredOperator {
   id: string;
@@ -355,8 +363,18 @@ export class OperatorService {
       data.depositPercentOverride !== undefined &&
       data.depositPercentOverride !== null
     ) {
-      const { depositPercent: minDepositPercent } =
+      const { depositPercent: liveDefaultRaw } =
         await this.platformConfigService.getConfig();
+      // Math.max(10, NaN) is NaN, and every comparison against NaN is
+      // false — a corrupt/non-finite config read must not silently defeat
+      // this floor (same NaN-contagion class as computeDepositAmount's).
+      const liveDefault = Number.isFinite(liveDefaultRaw)
+        ? liveDefaultRaw
+        : MIN_PLATFORM_DEPOSIT_PERCENT;
+      const minDepositPercent = Math.max(
+        MIN_PLATFORM_DEPOSIT_PERCENT,
+        liveDefault,
+      );
       if (
         typeof data.depositPercentOverride !== 'number' ||
         !Number.isFinite(data.depositPercentOverride) ||
@@ -946,8 +964,18 @@ export class OperatorService {
     // coerces to false on both sides and would let it through to Prisma
     // unvalidated.
     if (depositPercentOverride !== null) {
-      const { depositPercent: minDepositPercent } =
+      const { depositPercent: liveDefaultRaw } =
         await this.platformConfigService.getConfig();
+      // Math.max(10, NaN) is NaN, and every comparison against NaN is
+      // false — a corrupt/non-finite config read must not silently defeat
+      // this floor (same NaN-contagion class as computeDepositAmount's).
+      const liveDefault = Number.isFinite(liveDefaultRaw)
+        ? liveDefaultRaw
+        : MIN_PLATFORM_DEPOSIT_PERCENT;
+      const minDepositPercent = Math.max(
+        MIN_PLATFORM_DEPOSIT_PERCENT,
+        liveDefault,
+      );
       if (
         typeof depositPercentOverride !== 'number' ||
         !Number.isFinite(depositPercentOverride) ||

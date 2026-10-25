@@ -198,26 +198,24 @@ export class PaymentEventsService {
    * actively working it: flips a pending offer to ACCEPTED, moves both
    * parties into their on-job session states, and sends the operator
    * their job-is-live details (customer phone, vehicle, location — the
-   * same ARRIVED-button message a paid deposit triggers). Called from
-   * confirmDeposit for the normal paid-deposit path, and directly from the
-   * 0%-deposit branches in handleQuoteSelected and assignOperator, which
-   * skip payment entirely but still need the same activation — this
-   * stands in for "payment confirmed" when there was never a payment to
-   * confirm. Fetches its own data rather than trusting a caller-provided
-   * object, since the three callers have differently-shaped data at their
-   * own call sites (same rationale as finalizeJobSettlement, Task 7).
+   * same ARRIVED-button message a paid deposit triggers). Called only from
+   * confirmDeposit (same file) — the 0%-deposit branches in
+   * handleQuoteSelected and assignOperator that used to call this
+   * directly no longer exist (2026-10-25 hotfix: a 0% deposit, and the
+   * skip-payment path it drove, are no longer possible at all). Still
+   * fetches its own data rather than trusting a caller-provided object
+   * (same rationale as finalizeJobSettlement, Task 7), even with a single
+   * caller today — nothing about that rationale depended on there being
+   * more than one.
    *
    * Deliberately does NOT send anything to the customer or touch
-   * RescueRequest.status — those differ by caller (confirmDeposit's
-   * customer message references the payment; the 0%-deposit callers have
-   * no payment to reference, and have already set status inside their own
-   * transaction) and stay with each caller.
+   * RescueRequest.status — confirmDeposit's own customer message
+   * references the payment and sets status itself before calling this.
    *
-   * `swallowOperatorNotifyErrors` is for confirmDeposit only: it runs
-   * inside the Paystack webhook, where a thrown error becomes a 500 and
-   * Paystack redelivers into a confirmDeposit that is not safe to run
-   * twice. The 0%-deposit callers leave it off, so a failed operator
-   * message still surfaces to them as before.
+   * `swallowOperatorNotifyErrors` exists because this runs inside the
+   * Paystack webhook, where a thrown error becomes a 500 and Paystack
+   * redelivers into a confirmDeposit that is not safe to run twice —
+   * confirmDeposit always passes it; nothing else calls this method today.
    */
   async activateAssignedJob(
     rescueRequestId: string,

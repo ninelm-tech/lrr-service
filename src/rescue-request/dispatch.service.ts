@@ -24,6 +24,7 @@ import {
   formatVehicleType,
 } from './domain/vehicle-truck-mapping';
 import { estimateEtaMinutes, rankQuotes } from './domain/quote-ranking';
+import { computeDepositAmount } from './domain/compute-deposit-amount';
 import {
   formatJobRef,
   formatIssueType,
@@ -1717,7 +1718,16 @@ export class DispatchService {
         Math.round((q.quotedPrice * config.serviceFeePercent) / 100);
       const priceNaira = (displayTotal / 100).toLocaleString();
       const depositPercent = depositPercentByOfferId.get(q.offerId)!;
-      return `${numberEmoji} ₦${priceNaira} · ETA ${q.etaMinutes} min · Deposit ${depositPercent}% · ${q.businessName}`;
+      // Shown as the actual amount, not the raw percentage: a percent alone
+      // can no longer exactly match what's charged now that a 0%-sourced
+      // percentage is floored at Paystack's minimum (computeDepositAmount)
+      // rather than charged as stated — the same "must exactly match"
+      // invariant as displayTotal above, computed the identical way
+      // handleQuoteSelected itself will.
+      const depositNaira = (
+        computeDepositAmount(displayTotal, depositPercent) / 100
+      ).toLocaleString();
+      return `${numberEmoji} ₦${priceNaira} · ETA ${q.etaMinutes} min · Deposit ₦${depositNaira} · ${q.businessName}`;
     });
 
     const customerPhone = rescueRequest.customer.phoneNumber;

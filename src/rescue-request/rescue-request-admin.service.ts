@@ -34,6 +34,7 @@ import {
 import { RequestMediaDto } from '../media/dto/request-media.dto';
 import { DispatchService, RADIUS_EXPANSION_KM } from './dispatch.service';
 import { getEligibleTruckClasses } from './domain/vehicle-truck-mapping';
+import { computeDepositAmount } from './domain/compute-deposit-amount';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { PaymentLedgerService } from '../payment/payment-ledger.service';
 import { PaystackCustomerService } from '../payment/paystack-customer.service';
@@ -184,13 +185,20 @@ export class RescueRequestAdminService {
     const depositPercent = Number(
       operator.depositPercentOverride ?? config.depositPercent,
     );
-    const depositAmount = Math.round((total * depositPercent) / 100);
+    // A 0% deposit must never be possible — not just unconfigurable going
+    // forward (PlatformConfigService's own floor), but unconditionally: a
+    // stale depositPercentOverride/depositPercent row from before that floor
+    // existed, a non-numeric value, or rounding a tiny price down, must
+    // never produce a free (or unpayable) job either — computeDepositAmount
+    // floors at Paystack's own minimum chargeable amount, never at 0 or an
+    // amount Paystack would reject.
+    const depositAmount = computeDepositAmount(total, depositPercent);
     const balanceAmount = total - depositAmount;
 
     const MANUAL_ASSIGN_WINDOW_MS = 30 * 60 * 1000;
     const batchId = crypto.randomUUID();
     const depositWindowExpiresAt = new Date(Date.now() + DEPOSIT_WINDOW_MS);
-    let payment: Payment | null;
+    let payment: Payment;
     try {
       payment = await this.prisma.$transaction(async (tx) => {
         const customerStillActive = await tx.user.updateMany({
@@ -222,17 +230,13 @@ export class RescueRequestAdminService {
           },
           data: {
             assignedOperatorId: dto.operatorId,
-            status:
-              depositAmount === 0
-                ? RescueRequestStatus.OPERATOR_ASSIGNED
-                : RescueRequestStatus.WAITING_FOR_DEPOSIT,
+            status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
             needsManualAssignment: false,
             serviceFeeAmount,
             depositAmount,
             balanceAmount,
-            ...(depositAmount === 0
-              ? {}
-              : { depositWindowExpiresAt, depositRemindersSent: 0 }),
+            depositWindowExpiresAt,
+            depositRemindersSent: 0,
           },
         });
         if (claimed.count === 0) {
@@ -245,8 +249,7 @@ export class RescueRequestAdminService {
           data: {
             rescueRequestId: id,
             operatorId: dto.operatorId,
-            status:
-              depositAmount === 0 ? 'ACCEPTED' : 'SELECTED_PENDING_PAYMENT',
+            status: 'SELECTED_PENDING_PAYMENT',
             quotedPrice: dto.priceKobo,
             respondedAt: new Date(),
             expiresAt: new Date(Date.now() + MANUAL_ASSIGN_WINDOW_MS),
@@ -254,12 +257,6 @@ export class RescueRequestAdminService {
             dispatchRound: request.dispatchRound,
           },
         });
-
-        if (depositAmount === 0) {
-          // No Payment row to create — there's nothing to pay. The offer
-          // above was already created as ACCEPTED.
-          return null;
-        }
 
         return this.paymentLedger.create({
           rescueRequestId: id,
@@ -280,63 +277,6 @@ export class RescueRequestAdminService {
       throw error;
     }
 
-    if (depositAmount === 0) {
-      // Send the customer's own "operator assigned" notification FIRST —
-      // same failure-isolation as PaymentEventsService.confirmDeposit
-      // (Task 4) and handleQuoteSelected's 0%-deposit branch (Task 5): a
-      // failure inside activateAssignedJob (operator lookup, location
-      // formatting, the operator's own Twilio send) must not silently
-      // swallow this notification. The reverse must also hold — caught and
-      // logged rather than left to reject unhandled, so a Twilio failure
-      // sending THIS message can't swallow activateAssignedJob below, which
-      // is what actually matters operationally.
-      const customerPhone = toWhatsAppAddress(request.customer.phoneNumber);
-      try {
-        await this.twilioService.sendWhatsAppMessage(
-          customerPhone,
-          `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nNo deposit required — you'll pay the full ₦${(total / 100).toLocaleString()} once the job is complete.`,
-        );
-      } catch (error) {
-        console.error(
-          `assignOperator ${id}: failed to send the customer's "operator assigned" message:`,
-          error,
-        );
-        Sentry.captureException(error, {
-          extra: {
-            rescueRequestId: id,
-            stage: 'assign-operator-customer-message',
-          },
-        });
-      }
-
-      // The offer was already created as ACCEPTED above, so
-      // activateAssignedJob's own offer-flip is a no-op here — it's still
-      // the thing that moves both sessions into their on-job states and
-      // sends the operator their job-is-live message, same as a paid
-      // deposit would.
-      await this.paymentEventsService.activateAssignedJob(id);
-
-      const updated = await this.prisma.rescueRequest.findUniqueOrThrow({
-        where: { id },
-        include: {
-          customer: true,
-          assignedOperator: true,
-          payments: { select: { id: true, type: true, status: true } },
-        },
-      });
-
-      return { data: this.mapToDetailDto(updated, true) };
-    }
-
-    if (!payment) {
-      // Defensive: depositAmount > 0 on this path, so the transaction above
-      // always returned a real Payment row (see the depositAmount === 0
-      // branch's early return above, which is the only case that returns
-      // null).
-      throw new BadRequestException(
-        'Expected a payment row for a nonzero deposit.',
-      );
-    }
     if (
       !(await this.paymentLedger.claimForSubmission(payment.id, new Date()))
     ) {

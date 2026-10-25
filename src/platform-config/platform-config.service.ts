@@ -57,11 +57,14 @@ export class PlatformConfigService {
     // OperatorService.setDepositPercent/adminCreate), which read this value
     // live. A platform default above 50 would make the floor exceed the
     // operator-override ceiling, making every override attempt impossible.
+    // Floored at 10, not 0 — a 0% deposit must never be configurable,
+    // platform-wide or per-operator; this value is the live floor the
+    // per-operator override itself can't go below either.
     if (
       dto.depositPercent !== undefined &&
-      (dto.depositPercent < 0 || dto.depositPercent > 50)
+      (dto.depositPercent < 10 || dto.depositPercent > 50)
     ) {
-      throw new BadRequestException('depositPercent must be between 0 and 50');
+      throw new BadRequestException('depositPercent must be between 10 and 50');
     }
     if (
       dto.dispatchWindowMinutes !== undefined &&

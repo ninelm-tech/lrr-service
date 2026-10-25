@@ -140,6 +140,56 @@ describe('PaymentEventsService', () => {
       else process.env.TWILIO_ARRIVED_PROMPT_TEMPLATE_SID = originalArrivedSid;
     });
 
+    it("sends the customer's own confirmation before activateAssignedJob runs (hotfix, 2026-10-25) — restored coverage", async () => {
+      // This ordering invariant used to also be covered by the now-deleted
+      // 0%-deposit-branch tests in rescue-request-admin.service.spec.ts and
+      // whatsapp-customer-flow.service.spec.ts — those branches no longer
+      // exist (a 0% deposit is no longer possible at all), so confirmDeposit
+      // is now the ONLY path this ever runs through, and needs its own
+      // direct coverage of the same guarantee.
+      prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        assignedOperatorId: 'op-1',
+        status: 'WAITING_FOR_DEPOSIT',
+        vehicleType: 'SEDAN',
+        customer: { phoneNumber: '+2341' },
+        assignedOperator: {
+          businessName: 'Swift',
+          phoneNumber: '+2342',
+          whatsappEnabled: true,
+        },
+      });
+
+      await service.confirmDeposit(paymentFor('req-1'));
+
+      const customerCallIndex =
+        twilioService.sendWhatsAppMessage.mock.calls.findIndex(
+          (call: unknown[]) => call[0] === '+2341',
+        );
+      expect(customerCallIndex).toBeGreaterThanOrEqual(0);
+      const customerMessageOrder =
+        twilioService.sendWhatsAppMessage.mock.invocationCallOrder[
+          customerCallIndex
+        ];
+      // activateAssignedJob (for a WhatsApp-enabled operator) sends the
+      // ARRIVED prompt to the operator's own number via one of these two
+      // mocks, depending on whether a template SID is configured — no SID
+      // is set in this describe block's beforeEach, so it's the freeform
+      // sendWhatsAppMessage call, addressed to the operator's number.
+      const operatorCallIndex =
+        twilioService.sendWhatsAppMessage.mock.calls.findIndex(
+          (call: unknown[]) =>
+            typeof call[0] === 'string' && call[0].includes('2342'),
+        );
+      expect(operatorCallIndex).toBeGreaterThanOrEqual(0);
+      const operatorMessageOrder =
+        twilioService.sendWhatsAppMessage.mock.invocationCallOrder[
+          operatorCallIndex
+        ];
+      expect(customerMessageOrder).toBeLessThan(operatorMessageOrder);
+    });
+
     it('sends the operator the freeform "send ARRIVED" prompt when no template SID is configured', async () => {
       prisma.rescueRequest.findUniqueOrThrow.mockResolvedValue({
         id: 'req-1',

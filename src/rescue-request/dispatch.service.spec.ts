@@ -2151,7 +2151,7 @@ describe('DispatchService', () => {
 
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
         '+2348000000000',
-        '🚗 *Operator quotes received!*\n⏰ You have 5 minutes to choose before this request is cancelled.\n\n1️⃣ ₦11,000 · ETA 0 min · Deposit 10% · Acme Towing\n\n⚠️ *ACTION NEEDED* — reply with the number of your choice (e.g. "1") to select an operator.',
+        '🚗 *Operator quotes received!*\n⏰ You have 5 minutes to choose before this request is cancelled.\n\n1️⃣ ₦11,000 · ETA 0 min · Deposit ₦1,100 · Acme Towing\n\n⚠️ *ACTION NEEDED* — reply with the number of your choice (e.g. "1") to select an operator.',
       );
     });
 
@@ -2222,7 +2222,7 @@ describe('DispatchService', () => {
       });
     });
 
-    it('includes the deposit percentage in each shortlist line', async () => {
+    it('includes the actual deposit amount (not the raw percentage) in each shortlist line', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
         id: 'req-1',
         status: 'DISPATCHING',
@@ -2251,9 +2251,54 @@ describe('DispatchService', () => {
 
       await service.deliverQuoteShortlist('req-1', 'cust-1');
 
+      // quotedPrice 25,000 + 10% service fee (2,500) = 27,500 total.
+      // 20% of that = 5,500 — above the 5,000 kobo floor, so the ordinary
+      // percentage-based amount wins (not a special case of this fix).
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
         '+2348000000000',
-        expect.stringContaining('Deposit 20%'),
+        expect.stringContaining('Deposit ₦55'),
+      );
+    });
+
+    it('shows the real floored amount for a stale 0% override, never a misleading "Deposit 0%" (hotfix, 2026-10-24)', async () => {
+      // A customer selecting this quote would be charged the floored amount
+      // at checkout (computeDepositAmount) — the shortlist must show that
+      // same amount, not a bare "0%" that implies a free job.
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: '+2348000000000' },
+      });
+      prisma.dispatchOffer.findMany.mockResolvedValue([
+        {
+          id: 'offer-1',
+          operatorId: 'op-1',
+          quotedPrice: 100_000,
+          operator: {
+            id: 'op-1',
+            businessName: 'Swift Towing',
+            latitude: 6.5,
+            longitude: 3.4,
+            depositPercentOverride: 0,
+          },
+        },
+      ]);
+      platformConfigService.getConfig.mockResolvedValue({
+        serviceFeePercent: 10,
+        depositPercent: 10,
+      });
+
+      await service.deliverQuoteShortlist('req-1', 'cust-1');
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        '+2348000000000',
+        expect.stringContaining('Deposit ₦50'),
+      );
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.stringContaining('Deposit 0%'),
       );
     });
 

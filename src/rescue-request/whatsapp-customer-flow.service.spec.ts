@@ -1232,7 +1232,13 @@ describe('WhatsAppCustomerFlowService', () => {
       expect(data.depositAmount).toBe(16_500);
     });
 
-    it('skips the Paystack deposit step and activates the job directly when the snapshot resolves to 0%', async () => {
+    it('a stale 0% snapshot still produces a paid, real deposit — never a free one (hotfix, 2026-10-24)', async () => {
+      // This offer's depositPercentSnapshot is literally 0 — exactly the
+      // case the 2026-10-24 hotfix closed. Whether that 0 was frozen before
+      // PlatformConfigService's own floor existed, or anything else, the
+      // computed deposit must never collapse to a free job — and must be
+      // floored at Paystack's real minimum (5,000 kobo), not a
+      // theoretically-nonzero amount Paystack would actually reject.
       prisma.dispatchOffer.findMany.mockResolvedValue([
         {
           id: 'offer-1',
@@ -1256,92 +1262,29 @@ describe('WhatsAppCustomerFlowService', () => {
       const [{ data }] = prisma.rescueRequest.updateMany.mock.calls[0] as [
         { data: Record<string, unknown> },
       ];
-      expect(data.status).toBe('OPERATOR_ASSIGNED');
-      expect(data.depositAmount).toBe(0);
+      expect(data.status).toBe('WAITING_FOR_DEPOSIT');
+      expect(data.depositAmount).toBe(5000);
       const [{ data: offerData }] = prisma.dispatchOffer.update.mock
         .calls[0] as [{ data: Record<string, unknown> }];
-      expect(offerData.status).toBe('ACCEPTED');
-      expect(paymentEventsService.activateAssignedJob).toHaveBeenCalledWith(
-        'req-1',
+      expect(offerData.status).toBe('SELECTED_PENDING_PAYMENT');
+      expect(paymentLedger.create).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 5000 }),
       );
-      expect(paymentLedger.create).not.toHaveBeenCalled();
-      expect(paystackService.initializePayment).not.toHaveBeenCalled();
-      // The customer's session must NOT be left at OPERATOR_FOUND_WAITING_PAYMENT
-      // — there is no payment link coming, so a later message from the
-      // customer must not be met with "please pay using the link we sent you".
-      expect(sessionStore.update).not.toHaveBeenCalledWith(
-        'user-1',
-        expect.objectContaining({ state: 'OPERATOR_FOUND_WAITING_PAYMENT' }),
-      );
-      // Failure isolation (same as Task 4's confirmDeposit fix): the
-      // customer's own confirmation must be sent BEFORE activateAssignedJob
-      // runs, so a failure inside activation can't silently swallow it.
-      // Index by the customer's own phone number rather than assuming
-      // call [0], in case the "notify losing operators" step above ever
-      // also lands a call on this same mock.
-      const customerMessageCallIndex =
-        twilioService.sendWhatsAppMessage.mock.calls.findIndex(
-          (call: unknown[]) => call[0] === '+2348000000000',
-        );
-      expect(customerMessageCallIndex).toBeGreaterThanOrEqual(0);
-      const customerMessageOrder =
-        twilioService.sendWhatsAppMessage.mock.invocationCallOrder[
-          customerMessageCallIndex
-        ];
-      const activationOrder =
-        paymentEventsService.activateAssignedJob.mock.invocationCallOrder[0];
-      expect(customerMessageOrder).toBeLessThan(activationOrder);
-      // The operator's phone number must be included so the customer can
-      // actually reach them — the same information the paid-deposit path's
-      // equivalent customer message already carries (confirmDeposit).
-      const [, customerMessageBody] = twilioService.sendWhatsAppMessage.mock
-        .calls[customerMessageCallIndex] as [string, string];
-      expect(customerMessageBody).toContain('+2348011111111');
-    });
-
-    it('still activates the job (offer flip, session transitions) even when the customer-message send rejects, in the 0%-deposit branch', async () => {
-      // A Twilio failure sending the customer's own "operator confirmed"
-      // notification must never prevent activateAssignedJob from running —
-      // that's the offer flip and both session transitions, which is what
-      // actually matters operationally. Only the customer not getting one
-      // WhatsApp message is at stake here, and that must be logged, not
-      // allowed to swallow the rest.
-      prisma.dispatchOffer.findMany.mockResolvedValue([
-        {
-          id: 'offer-1',
-          rescueRequestId: 'req-1',
-          operatorId: 'op-1',
-          status: 'QUOTED',
-          quotedPrice: 100_000,
-          depositPercentSnapshot: 0,
-          operator: {
-            id: 'op-1',
-            businessName: 'Swift Towing',
-            phoneNumber: '+2348011111111',
-            latitude: 6.5,
-            longitude: 3.4,
-          },
-        },
-      ]);
-      twilioService.sendWhatsAppMessage.mockImplementation((to: string) => {
-        if (to === '+2348000000000') {
-          return Promise.reject(new Error('Twilio down'));
-        }
-        return Promise.resolve();
-      });
-
-      await service['handleQuoteSelected']('+2348000000000', 'user-1', 1);
-
-      expect(paymentEventsService.activateAssignedJob).toHaveBeenCalledWith(
-        'req-1',
+      expect(paystackService.initializePayment).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 5000 }),
       );
     });
 
-    it('rounds a very small total at a nonzero percentage down to the 0%-deposit branch', async () => {
+    it("floors a rounded-to-zero deposit at Paystack's real minimum (5,000 kobo) rather than taking the 0%-deposit branch", async () => {
       // quotedPrice = 4 kobo. serviceFeeAmount = Math.round(4 * 10 / 100) = 0,
-      // so total = 4. depositPercentSnapshot = 1 (NOT literally 0), but
-      // Math.round(4 * 1 / 100) = Math.round(0.04) = 0 — the branch must key
-      // off the computed depositAmount, not the raw stored percentage.
+      // so total = 4. depositPercentSnapshot = 1 (NOT literally 0).
+      // Math.round(4 * 1 / 100) = Math.round(0.04) = 0, but the percent
+      // itself is nonzero, so the floor applies: this must take the paid
+      // path (WAITING_FOR_DEPOSIT), never the free-job branch — a rounding
+      // artifact must never silently turn a paid job into a free one
+      // (hotfix, 2026-10-24), and the floor itself is Paystack's own
+      // minimum chargeable amount, not an arbitrary 1 kobo a real charge
+      // would be rejected for.
       prisma.dispatchOffer.findMany.mockResolvedValue([
         {
           id: 'offer-1',
@@ -1365,15 +1308,15 @@ describe('WhatsAppCustomerFlowService', () => {
       const [{ data }] = prisma.rescueRequest.updateMany.mock.calls[0] as [
         { data: Record<string, unknown> },
       ];
-      expect(data.status).toBe('OPERATOR_ASSIGNED');
-      expect(data.depositAmount).toBe(0);
+      expect(data.status).toBe('WAITING_FOR_DEPOSIT');
+      expect(data.depositAmount).toBe(5000);
       const [{ data: offerData }] = prisma.dispatchOffer.update.mock
         .calls[0] as [{ data: Record<string, unknown> }];
-      expect(offerData.status).toBe('ACCEPTED');
-      expect(paymentLedger.create).not.toHaveBeenCalled();
-      expect(paymentEventsService.activateAssignedJob).toHaveBeenCalledWith(
-        'req-1',
+      expect(offerData.status).toBe('SELECTED_PENDING_PAYMENT');
+      expect(paymentLedger.create).toHaveBeenCalledWith(
+        expect.objectContaining({ rescueRequestId: 'req-1', amount: 5000 }),
       );
+      expect(paystackService.initializePayment).toHaveBeenCalledTimes(1);
     });
 
     it('does not notify a non-WhatsApp losing bidder when the customer picks someone else', async () => {

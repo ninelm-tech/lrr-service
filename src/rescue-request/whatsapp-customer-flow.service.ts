@@ -21,12 +21,14 @@ import {
   MediaContext,
   UserRole,
   RatingDirection,
+  Payment,
 } from '@prisma/client';
 import {
   mapVehicleTypeReply,
   formatVehicleType,
 } from './domain/vehicle-truck-mapping';
 import { estimateEtaMinutes, rankQuotes } from './domain/quote-ranking';
+import { computeDepositAmount } from './domain/compute-deposit-amount';
 import {
   formatStatus,
   formatJobRef,
@@ -1105,10 +1107,17 @@ export class WhatsAppCustomerFlowService {
     const depositPercent = Number(
       selectedOffer.depositPercentSnapshot ?? config.depositPercent,
     );
-    const depositAmount = Math.round((total * depositPercent) / 100);
+    // A 0% deposit must never be possible — not just unconfigurable going
+    // forward (PlatformConfigService's own floor), but unconditionally: a
+    // stale depositPercentSnapshot frozen before that floor existed, a
+    // non-numeric value, or rounding a tiny price down, must never produce
+    // a free (or unpayable) job either — computeDepositAmount floors at
+    // Paystack's own minimum chargeable amount, never at 0 or an amount
+    // Paystack would reject.
+    const depositAmount = computeDepositAmount(total, depositPercent);
     const balanceAmount = total - depositAmount;
 
-    let payment;
+    let payment: Payment;
     try {
       payment = await this.prisma.$transaction(async (tx) => {
         const customerStillActive = await tx.user.updateMany({
@@ -1135,22 +1144,13 @@ export class WhatsAppCustomerFlowService {
             status: RescueRequestStatus.DISPATCHING,
           },
           data: {
-            status:
-              depositAmount === 0
-                ? RescueRequestStatus.OPERATOR_ASSIGNED
-                : RescueRequestStatus.WAITING_FOR_DEPOSIT,
+            status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
             serviceFeeAmount,
             depositAmount,
             balanceAmount,
             assignedOperatorId: selected.operatorId,
-            ...(depositAmount === 0
-              ? {}
-              : {
-                  depositWindowExpiresAt: new Date(
-                    Date.now() + DEPOSIT_WINDOW_MS,
-                  ),
-                  depositRemindersSent: 0,
-                }),
+            depositWindowExpiresAt: new Date(Date.now() + DEPOSIT_WINDOW_MS),
+            depositRemindersSent: 0,
           },
         });
         if (claimed.count === 0) {
@@ -1160,8 +1160,7 @@ export class WhatsAppCustomerFlowService {
         await tx.dispatchOffer.update({
           where: { id: selectedOffer.id },
           data: {
-            status:
-              depositAmount === 0 ? 'ACCEPTED' : 'SELECTED_PENDING_PAYMENT',
+            status: 'SELECTED_PENDING_PAYMENT',
             respondedAt: new Date(),
           },
         });
@@ -1177,11 +1176,6 @@ export class WhatsAppCustomerFlowService {
           where: { rescueRequestId, status: 'PENDING' },
           data: { status: 'TIMED_OUT', respondedAt: new Date() },
         });
-
-        if (depositAmount === 0) {
-          // No Payment row to create — there's nothing to pay.
-          return null;
-        }
 
         return this.paymentLedger.create({
           rescueRequestId,
@@ -1221,53 +1215,6 @@ export class WhatsAppCustomerFlowService {
     );
 
     const operator = selectedOffer.operator;
-
-    if (depositAmount === 0) {
-      // No deposit to collect — the transaction above already set
-      // OPERATOR_ASSIGNED directly. Run the same activation a paid deposit
-      // would trigger (offer → ACCEPTED, both sessions moved to their
-      // on-job states, operator gets their job-is-live message) instead of
-      // leaving the customer's session at OPERATOR_FOUND_WAITING_PAYMENT —
-      // that state makes later messages get "please pay using the link we
-      // sent you", which would be a lie here.
-      //
-      // Send the customer's own message first — same failure-isolation as
-      // confirmDeposit (Task 4): a failure inside activateAssignedJob must
-      // not silently swallow this notification. The reverse must also
-      // hold — caught and logged rather than rethrown, so a Twilio failure
-      // sending THIS message can't swallow activateAssignedJob below, which
-      // is what actually matters operationally (offer flip, both session
-      // transitions, the operator's job-is-live message).
-      try {
-        await this.twilioService.sendWhatsAppMessage(
-          phoneNumber,
-          `✅ *Operator confirmed!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nNo deposit required — you'll pay the full ₦${(total / 100).toLocaleString()} once the job is complete.`,
-        );
-      } catch (error) {
-        console.error(
-          `handleQuoteSelected ${rescueRequestId}: failed to send the customer's "operator confirmed" message:`,
-          error,
-        );
-        Sentry.captureException(error, {
-          extra: {
-            rescueRequestId,
-            stage: 'quote-selected-customer-message',
-          },
-        });
-      }
-      await this.paymentEventsService.activateAssignedJob(rescueRequestId);
-      return this.xmlOk();
-    }
-
-    if (!payment) {
-      // Defensive: depositAmount > 0 on this path, so the transaction above
-      // always returned a real Payment row (see the depositAmount === 0
-      // branch's early return above, which is the only case that returns
-      // null).
-      throw new BadRequestException(
-        'Expected a payment row for a nonzero deposit.',
-      );
-    }
 
     await this.sessionStore.update(userId, {
       state: WhatsAppFlowState.OPERATOR_FOUND_WAITING_PAYMENT,

@@ -1193,6 +1193,33 @@ describe('RescueRequestAdminService', () => {
       );
     });
 
+    it('floors the deposit at 5,000 kobo without the balance going negative, for a realistically-priced job', async () => {
+      // No real roadside-rescue job prices below ~₦1,000, and the platform
+      // minimum deposit percent is 10% — so a realistic total can never
+      // actually be small enough for the 5,000 kobo floor to exceed it.
+      // This proves the floor behaves correctly at a realistic edge (a
+      // cheap-but-real job, not a degenerate near-zero price that can't
+      // occur with real data and isn't worth guarding against separately).
+      // price 5,450 kobo, 10% fee -> serviceFeeAmount = Math.round(5450 * 10 / 100) = 545,
+      // so total = 5,995. 20% deposit -> Math.round(5995 * 20 / 100) = 1199,
+      // below the 5,000 floor, so the floor wins — but total itself is
+      // comfortably above 5,000, so balanceAmount stays positive (995), not
+      // negative.
+      await assignService.assignOperator('req-1', {
+        operatorId: 'op-1',
+        priceKobo: 5450,
+      });
+
+      const [{ data }] = prisma.rescueRequest.updateMany.mock.calls[0] as [
+        { data: Record<string, unknown> },
+      ];
+      expect(data.depositAmount).toBe(5000);
+      expect(data.balanceAmount).toBe(995);
+      expect(paystackService.initializePayment).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 5000 }),
+      );
+    });
+
     it('splits the price into service fee, deposit, and balance, and creates a payment link', async () => {
       // price 100_000 kobo, 10% fee -> total 110_000, 20% deposit -> 22_000 deposit, 88_000 balance
       const result = await assignService.assignOperator('req-1', {
@@ -1424,7 +1451,13 @@ describe('RescueRequestAdminService', () => {
       );
     });
 
-    it('creates the offer as ACCEPTED (not SELECTED_PENDING_PAYMENT) and activates the job when the override resolves to 0%', async () => {
+    it('a stale 0% override still produces a paid, real deposit — never a free one (hotfix, 2026-10-24)', async () => {
+      // This operator's depositPercentOverride is literally 0 — exactly the
+      // case the 2026-10-24 hotfix closed. Whether that 0 is stale data from
+      // before PlatformConfigService's own floor existed, or anything else,
+      // the computed deposit must never collapse to a free job — and must
+      // be floored at Paystack's real minimum (5,000 kobo), not a
+      // theoretically-nonzero amount Paystack would actually reject.
       prisma.operator.findUnique.mockResolvedValue({
         ...operator,
         depositPercentOverride: 0,
@@ -1438,84 +1471,16 @@ describe('RescueRequestAdminService', () => {
       const [{ data }] = prisma.rescueRequest.updateMany.mock.calls[0] as [
         { data: Record<string, unknown> },
       ];
-      expect(data.status).toBe('OPERATOR_ASSIGNED');
-      expect(data.depositAmount).toBe(0);
-      // No deposit window to track when there's nothing to collect.
-      expect(data).not.toHaveProperty('depositWindowExpiresAt');
-      expect(data).not.toHaveProperty('depositRemindersSent');
+      expect(data.status).toBe('WAITING_FOR_DEPOSIT');
+      expect(data.depositAmount).toBe(5000);
       const [{ data: offerData }] = prisma.dispatchOffer.create.mock
         .calls[0] as [{ data: Record<string, unknown> }];
-      expect(offerData.status).toBe('ACCEPTED');
-      expect(paymentEventsService.activateAssignedJob).toHaveBeenCalledWith(
-        'req-1',
+      expect(offerData.status).toBe('SELECTED_PENDING_PAYMENT');
+      expect(paymentLedger.create).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 5000 }),
       );
-      expect(paymentLedger.create).not.toHaveBeenCalled();
-      expect(paystackService.initializePayment).not.toHaveBeenCalled();
-    });
-
-    it('sends the customer their "operator assigned" message before activating the job, in the 0%-deposit branch', async () => {
-      prisma.operator.findUnique.mockResolvedValue({
-        ...operator,
-        depositPercentOverride: 0,
-      });
-
-      await assignService.assignOperator('req-1', {
-        operatorId: 'op-1',
-        priceKobo: 100_000,
-      });
-
-      // Failure isolation (same as Task 4's confirmDeposit fix and Task 5's
-      // 0%-deposit branch in handleQuoteSelected): the customer's own
-      // "operator assigned" notification must be sent BEFORE
-      // activateAssignedJob runs, so a failure inside activation (operator
-      // lookup, location formatting, the operator's own Twilio send) can't
-      // silently swallow it. Indexed by the customer's own WhatsApp address
-      // rather than assumed to be call [0], in case another message ever
-      // lands on this same mock first.
-      const customerMessageCallIndex =
-        twilioService.sendWhatsAppMessage.mock.calls.findIndex(
-          (call: unknown[]) => call[0] === 'whatsapp:+2348022222222',
-        );
-      expect(customerMessageCallIndex).toBeGreaterThanOrEqual(0);
-      const customerMessageOrder =
-        twilioService.sendWhatsAppMessage.mock.invocationCallOrder[
-          customerMessageCallIndex
-        ];
-      const activationOrder =
-        paymentEventsService.activateAssignedJob.mock.invocationCallOrder[0];
-      expect(customerMessageOrder).toBeLessThan(activationOrder);
-      // The operator's phone number must be included so the customer can
-      // actually reach them — the same information the paid-deposit path's
-      // equivalent customer message already carries (confirmDeposit).
-      const [, customerMessageBody] = twilioService.sendWhatsAppMessage.mock
-        .calls[customerMessageCallIndex] as [string, string];
-      expect(customerMessageBody).toContain(operator.phoneNumber);
-    });
-
-    it('still activates the job (offer flip, session transitions) even when the customer-message send rejects, in the 0%-deposit branch', async () => {
-      // A Twilio failure sending the customer's own "operator assigned"
-      // notification must never prevent activateAssignedJob from running —
-      // that's the actual operationally-important work. Only the customer
-      // not getting one WhatsApp message is at stake, and that must be
-      // logged, not allowed to swallow the rest.
-      prisma.operator.findUnique.mockResolvedValue({
-        ...operator,
-        depositPercentOverride: 0,
-      });
-      twilioService.sendWhatsAppMessage.mockImplementation((to: string) => {
-        if (to === 'whatsapp:+2348022222222') {
-          return Promise.reject(new Error('Twilio down'));
-        }
-        return Promise.resolve();
-      });
-
-      await assignService.assignOperator('req-1', {
-        operatorId: 'op-1',
-        priceKobo: 100_000,
-      });
-
-      expect(paymentEventsService.activateAssignedJob).toHaveBeenCalledWith(
-        'req-1',
+      expect(paystackService.initializePayment).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 5000 }),
       );
     });
 
