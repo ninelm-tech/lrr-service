@@ -31,6 +31,12 @@ export class WebhooksController {
   @Header('Content-Type', 'text/xml')
   async handleTwilioWebhook(@Body() body: Record<string, any>) {
     console.log('🔔 Twilio webhook received');
+    // Twilio doesn't document the payload shape for a REQUEST_CONTACT_INFO
+    // button tap (From/WaId/ChannelMetadata — unconfirmed which fields
+    // actually appear). Logging the full raw body, same as the Paystack
+    // handler below, so the Task 11 spike can read the real shape straight
+    // from staging logs once a test tap happens, instead of guessing.
+    console.log('Body:', JSON.stringify(body, null, 2));
     return this.whatsAppInboundService.handleIncomingWhatsAppMessage(body);
   }
 

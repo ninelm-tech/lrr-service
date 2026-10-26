@@ -253,11 +253,36 @@ export const TWILIO_CONTENT_TEMPLATES: Record<
   },
 
   // A native WhatsApp consent prompt, not a labeled button — sent to a
-  // BSUID-only customer at checkout (and at confirmation for a 0%-deposit
-  // job) when their phoneNumber is still null, so WhatsApp can share their
-  // real number directly. See the WhatsApp username/BSUID identity design
-  // doc. source is 'designed': this body text was handed off to create in
-  // the Twilio console, not read back from a live template yet.
+  // BSUID-only customer at checkout when their phoneNumber is still null,
+  // so WhatsApp can share their real number directly. See the WhatsApp
+  // username/BSUID identity design doc.
+  //
+  // UNLIKE arrived_prompt/done_prompt above: this does NOT get the
+  // in-session free pass. Per Twilio's own call-to-action docs
+  // (twilio.com/docs/content/twilio-call-to-action), only QUICK_REPLY,
+  // URL, VOICE_CALL_REQUEST and VOICE_CALL are usable unapproved inside
+  // an active session — REQUEST_CONTACT_INFO is not on that list, so it
+  // needs real Meta template approval before it can send at all,
+  // regardless of session window. Same submit-and-wait path
+  // new_request_staff_alert went through below.
+  //
+  // The Twilio Console's "Call to action" builder does NOT expose
+  // REQUEST_CONTACT_INFO as a Type of action — its dropdown only offers
+  // Phone number, Visit website, Voice call, Voice call request, Coupon
+  // code (confirmed 2026-10-25 against the live LRR Stage console).
+  // Created instead via a direct Content API call
+  // (POST https://content.twilio.com/v1/Content, types['twilio/call-to-action'].actions
+  // = [{ type: 'REQUEST_CONTACT_INFO' }]), then submitted for approval via
+  // POST .../Content/{sid}/ApprovalRequests/whatsapp — both run against the
+  // LRR Stage subaccount 2026-10-25/26. SID: HX842ee8d92168c7ccb366c9a5fd9dd7ff
+  // (set TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID to this once wiring up
+  // the env, Stage only — LRR Prod has nothing yet). Approval status
+  // "received" as of creation; not yet confirmed approved — check
+  // GET .../Content/{sid}/ApprovalRequests before relying on it sending.
+  //
+  // source is 'confirmed', not 'designed': the body below is exactly what
+  // was sent to and echoed back by the Content API create call, not a
+  // guess or a console screenshot transcription.
   request_contact_info: {
     envVar: 'TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID',
     category: 'UTILITY',
@@ -265,7 +290,7 @@ export const TWILIO_CONTENT_TEMPLATES: Record<
     action: 'REQUEST_CONTACT_INFO',
     variables: [],
     body: "We're on WhatsApp with you, but your account has a username set, so WhatsApp isn't sharing your phone number with us automatically — that's a WhatsApp privacy setting, not something we're choosing. Tap below to share it, so you can find this request if you sign up on the LRR portal later.",
-    source: 'designed',
+    source: 'confirmed',
   },
 
   low_rating_staff_alert: {
