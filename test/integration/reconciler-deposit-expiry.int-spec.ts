@@ -141,6 +141,28 @@ describe('DepositExpiryCheck (integration)', () => {
     expect(twilio.sendWhatsAppMessage).toHaveBeenCalledTimes(2);
   });
 
+  it('notifies a BSUID-only customer via their BSUID instead of silently skipping them (Task 14, hotfix 2026-10-25)', async () => {
+    const customer = await createCustomer(prisma, undefined, {
+      phoneNumber: null,
+      whatsappExternalUserId: 'CA.masked',
+    });
+    const request = await createRequest(prisma, customer.id, {
+      status: 'WAITING_FOR_DEPOSIT',
+      depositWindowExpiresAt: past(),
+    });
+
+    await check.run(new Date());
+
+    const after = await prisma.rescueRequest.findUnique({
+      where: { id: request.id },
+    });
+    expect(after?.status).toBe('CANCELLED');
+    expect(twilio.sendWhatsAppMessage).toHaveBeenCalledWith(
+      'whatsapp:CA.masked',
+      expect.stringContaining("didn't receive payment confirmation"),
+    );
+  });
+
   /*
    * The two cases below guard behaviour the timer this check replaces
    * performed and which is easy to lose in the move: without them the

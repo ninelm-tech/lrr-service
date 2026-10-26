@@ -21,6 +21,7 @@ import { AdminRescueRequestQueryDto } from './dto/admin-rescue-request.dto';
 import { AssignOperatorDto } from './dto/assign-operator.dto';
 import { ResolveDisputeDto } from './dto/resolve-dispute.dto';
 import { ResolveCancellationSettlementDto } from './dto/resolve-cancellation-settlement.dto';
+import { ManualOverrideDto } from './dto/manual-override.dto';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -192,10 +193,14 @@ export class RescueRequestController {
   }
 
   /**
-   * Staff stand-in for an operator sending ARRIVED over WhatsApp — only
-   * usable when the assigned operator has no WhatsApp on file. A
-   * WhatsApp-enabled operator's job is never manually advanced, so staff
-   * and the operator's own replies can never race over the same status.
+   * Staff stand-in for an operator sending ARRIVED over WhatsApp. Usable
+   * without a reason when the assigned operator has no WhatsApp on file —
+   * the original, already-legitimate path, where staff and the operator's
+   * own replies can never race over the same status. For a WhatsApp-enabled
+   * operator (their account may have gone BSUID-masked mid-job — see the
+   * WhatsApp username/BSUID identity design doc), the override still
+   * requires a non-empty `reason`, since here a real WhatsApp conversation
+   * could in principle still be live.
    *
    * The pre-check below (`findRawForManualAction`) is what produces a
    * precise error message; it is NOT the concurrency guard. The guard is
@@ -210,13 +215,14 @@ export class RescueRequestController {
   async manualArrived(
     @Req() req: AuthenticatedRequest,
     @Param('id') id: string,
+    @Body() body: ManualOverrideDto,
   ) {
     const request =
       await this.rescueRequestAdminService.findRawForManualAction(id);
     if (!request) throw new NotFoundException('Rescue request not found');
-    if (request.assignedOperator?.whatsappEnabled !== false) {
+    if (request.assignedOperator?.whatsappEnabled && !body.reason) {
       throw new BadRequestException(
-        'This operator has WhatsApp on file — arrival is tracked automatically for this job.',
+        'This operator has WhatsApp on file — a reason is required to override arrival tracking manually.',
       );
     }
     if (request.status !== RescueRequestStatus.OPERATOR_ASSIGNED) {
@@ -225,8 +231,10 @@ export class RescueRequestController {
       );
     }
 
-    const { claimed } =
-      await this.rescueRequestAdminService.claimManualArrived(id);
+    const { claimed } = await this.rescueRequestAdminService.claimManualArrived(
+      id,
+      { reason: body.reason },
+    );
     if (!claimed) {
       throw new BadRequestException(
         'This request is no longer eligible for a manual arrival — it may already have been marked, or its status changed.',
@@ -236,11 +244,14 @@ export class RescueRequestController {
     await this.operatorFlowService.notifyCustomerOperatorArrived(id);
     await this.auditLogService.record({
       category: 'manual_operator_arrived',
-      message: `Marked operator arrived for request ${id} (no WhatsApp on file)`,
+      message: `Marked operator arrived for request ${id}${
+        body.reason ? ` (override: ${body.reason})` : ' (no WhatsApp on file)'
+      }`,
       details: {
         targetType: 'RescueRequest',
         targetId: id,
         operatorId: request.assignedOperatorId,
+        reason: body.reason,
       },
       actorId: req.user.userId,
     });
@@ -249,9 +260,10 @@ export class RescueRequestController {
 
   /**
    * Staff stand-in for an operator sending DONE over WhatsApp — same
-   * whatsappEnabled guard as manual-arrived. Deliberately does NOT require
-   * completion media (product decision, see the design spec) — the WhatsApp
-   * path's own DONE handler is completely untouched and still requires it.
+   * whatsappEnabled-vs-reason guard as manual-arrived. Deliberately does
+   * NOT require completion media (product decision, see the design spec)
+   * — the WhatsApp path's own DONE handler is completely untouched and
+   * still requires it.
    *
    * Unlike manual-arrived, the atomic claim itself lives inside
    * `startManualCompletionConfirmation` (Task 9) — that method is
@@ -263,13 +275,17 @@ export class RescueRequestController {
   @Patch(':id/manual-done')
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
-  async manualDone(@Req() req: AuthenticatedRequest, @Param('id') id: string) {
+  async manualDone(
+    @Req() req: AuthenticatedRequest,
+    @Param('id') id: string,
+    @Body() body: ManualOverrideDto,
+  ) {
     const request =
       await this.rescueRequestAdminService.findRawForManualAction(id);
     if (!request) throw new NotFoundException('Rescue request not found');
-    if (request.assignedOperator?.whatsappEnabled !== false) {
+    if (request.assignedOperator?.whatsappEnabled && !body.reason) {
       throw new BadRequestException(
-        'This operator has WhatsApp on file — completion is tracked automatically for this job.',
+        'This operator has WhatsApp on file — a reason is required to override completion tracking manually.',
       );
     }
     if (request.status !== RescueRequestStatus.ARRIVED) {
@@ -279,7 +295,9 @@ export class RescueRequestController {
     }
 
     const { claimed } =
-      await this.operatorFlowService.startManualCompletionConfirmation(id);
+      await this.operatorFlowService.startManualCompletionConfirmation(id, {
+        reason: body.reason,
+      });
     if (!claimed) {
       throw new BadRequestException(
         'This request is no longer eligible for manual completion — it may already have been marked, or its status changed.',
@@ -288,11 +306,14 @@ export class RescueRequestController {
 
     await this.auditLogService.record({
       category: 'manual_operator_done',
-      message: `Marked operator done for request ${id} (no WhatsApp on file)`,
+      message: `Marked operator done for request ${id}${
+        body.reason ? ` (override: ${body.reason})` : ' (no WhatsApp on file)'
+      }`,
       details: {
         targetType: 'RescueRequest',
         targetId: id,
         operatorId: request.assignedOperatorId,
+        reason: body.reason,
       },
       actorId: req.user.userId,
     });

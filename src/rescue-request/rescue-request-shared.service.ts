@@ -3,7 +3,9 @@ import { PrismaService } from '../prisma/prisma.service';
 import { GeocodingService } from '../integrations/geocoding/geocoding.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
-import { Prisma, UserRole } from '@prisma/client';
+import { Prisma, User, UserRole } from '@prisma/client';
+import { ParsedWhatsAppSender } from '../common/whatsapp-sender-identity.util';
+import { toWhatsAppDestination } from '../common/phone.util';
 
 /**
  * Small shared helpers with no WhatsApp-flow state of their own, used by
@@ -34,6 +36,133 @@ export class RescueRequestSharedService {
       update: {},
       create: { phoneNumber, role: UserRole.CUSTOMER },
     });
+  }
+
+  /**
+   * Resolves the sender of an inbound WhatsApp message to a User, passively
+   * linking BSUID<->phone whenever both are visible on the same message —
+   * this is what lets a returning sender (by either identifier) resolve
+   * back to the same account instead of a duplicate. See the WhatsApp
+   * username/BSUID identity design doc for the full rationale.
+   */
+  async findOrCreateBySender(parsed: ParsedWhatsAppSender): Promise<User> {
+    if (parsed.phoneNumber) {
+      const byPhone = await this.prisma.user.findUnique({
+        where: { phoneNumber: parsed.phoneNumber },
+      });
+      if (byPhone) {
+        if (
+          parsed.externalUserId &&
+          byPhone.whatsappExternalUserId !== parsed.externalUserId
+        ) {
+          return this.prisma.$transaction(async (tx) => {
+            // The same WhatsApp account may already be known under a
+            // DIFFERENT row — e.g. a BSUID-only row created while this
+            // account was masked, before it ever showed this phone number.
+            // Clear the BSUID off that other row first, in the same
+            // transaction, so the unique constraint doesn't reject moving
+            // it onto byPhone below. Mirrors the identical collision
+            // handling the REQUEST_CONTACT_INFO flow uses for the same
+            // "same person, reuniting two rows" case.
+            await tx.user.updateMany({
+              where: {
+                whatsappExternalUserId: parsed.externalUserId,
+                id: { not: byPhone.id },
+              },
+              data: { whatsappExternalUserId: null },
+            });
+            return tx.user.update({
+              where: { id: byPhone.id },
+              data: { whatsappExternalUserId: parsed.externalUserId },
+            });
+          });
+        }
+        return byPhone;
+      }
+
+      if (parsed.externalUserId) {
+        const byExternalUserId = await this.prisma.user.findUnique({
+          where: { whatsappExternalUserId: parsed.externalUserId },
+        });
+        if (byExternalUserId) {
+          return this.prisma.user.update({
+            where: { id: byExternalUserId.id },
+            data: { phoneNumber: parsed.phoneNumber },
+          });
+        }
+      }
+
+      try {
+        return await this.prisma.user.create({
+          data: {
+            phoneNumber: parsed.phoneNumber,
+            whatsappExternalUserId: parsed.externalUserId,
+            role: UserRole.CUSTOMER,
+          },
+        });
+      } catch (error) {
+        // Twilio redelivers on a slow/timeout response, so the same
+        // brand-new sender's message can arrive twice concurrently — both
+        // calls see "not found" above, then race to create. The loser
+        // doesn't get an error surfaced to the customer; it re-fetches the
+        // row the winner just committed.
+        if (this.isUniqueConstraint(error, 'phoneNumber')) {
+          const winner = await this.prisma.user.findUnique({
+            where: { phoneNumber: parsed.phoneNumber },
+          });
+          if (winner) return winner;
+        }
+        if (
+          parsed.externalUserId &&
+          this.isUniqueConstraint(error, 'whatsappExternalUserId')
+        ) {
+          const winner = await this.prisma.user.findUnique({
+            where: { whatsappExternalUserId: parsed.externalUserId },
+          });
+          if (winner) return winner;
+        }
+        throw error;
+      }
+    }
+
+    if (parsed.externalUserId) {
+      const byExternalUserId = await this.prisma.user.findUnique({
+        where: { whatsappExternalUserId: parsed.externalUserId },
+      });
+      if (byExternalUserId) return byExternalUserId;
+    }
+
+    try {
+      return await this.prisma.user.create({
+        data: {
+          phoneNumber: null,
+          whatsappExternalUserId: parsed.externalUserId,
+          role: UserRole.CUSTOMER,
+        },
+      });
+    } catch (error) {
+      // Same concurrent-redelivery race as above, for a BSUID-only sender.
+      if (this.isUniqueConstraint(error, 'whatsappExternalUserId')) {
+        const winner = await this.prisma.user.findUnique({
+          where: { whatsappExternalUserId: parsed.externalUserId! },
+        });
+        if (winner) return winner;
+      }
+      throw error;
+    }
+  }
+
+  private isUniqueConstraint(error: unknown, field: string): boolean {
+    if (
+      !(error instanceof Prisma.PrismaClientKnownRequestError) ||
+      error.code !== 'P2002'
+    ) {
+      return false;
+    }
+    const target = error.meta?.target;
+    if (Array.isArray(target)) return target.includes(field);
+    if (typeof target === 'string') return target.includes(field);
+    return false;
   }
 
   /**
@@ -75,8 +204,8 @@ export class RescueRequestSharedService {
 
       const phones: string[] = [];
       const userIds: string[] = [request.customerId];
-      if (request.customer?.phoneNumber)
-        phones.push(request.customer.phoneNumber);
+      if (request.customer)
+        phones.push(toWhatsAppDestination(request.customer));
 
       if (request.assignedOperator?.phoneNumber) {
         const operatorUser = await this.findOrCreateCustomer(

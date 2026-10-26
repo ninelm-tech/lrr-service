@@ -53,3 +53,21 @@ export function normalizePhone(raw: string): string {
 export function toWhatsAppAddress(phone: string): string {
   return `whatsapp:${phone}`;
 }
+
+/**
+ * Resolves a WhatsApp destination from a DB-held phone-or-BSUID pair,
+ * preferring the real phone number. A destination with neither set is a
+ * data-integrity bug, not something to paper over — let it throw.
+ */
+export function toWhatsAppDestination(target: {
+  phoneNumber: string | null;
+  whatsappExternalUserId: string | null;
+}): string {
+  const address = target.phoneNumber ?? target.whatsappExternalUserId;
+  if (!address) {
+    throw new Error(
+      'toWhatsAppDestination: target has neither a phoneNumber nor a whatsappExternalUserId',
+    );
+  }
+  return toWhatsAppAddress(address);
+}

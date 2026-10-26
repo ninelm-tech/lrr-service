@@ -453,6 +453,38 @@ describe('WhatsAppOperatorFlowService', () => {
       );
     });
 
+    it('relays to the BSUID when the customer has no visible phone number (Task 14, hotfix 2026-10-25)', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        customer: { phoneNumber: null, whatsappExternalUserId: 'CA.masked' },
+      });
+      const session = {
+        state: WhatsAppFlowState.OPERATOR_AT_LOCATION,
+        rescueRequestId: 'req-1',
+        relayTarget: 'CUSTOMER',
+      } as unknown as WhatsAppSession;
+
+      await service.handleOperatorMessage(
+        operatorPhone,
+        'op-user-1',
+        'on my way',
+        'On my way, 5 minutes.',
+        session,
+        {
+          id: 'op-1',
+          businessName: 'Swift Towing',
+          phoneNumber: operatorPhone,
+        },
+        {},
+      );
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        'whatsapp:CA.masked',
+        'Driver: On my way, 5 minutes.',
+      );
+    });
+
     it('END CHAT clears relayTarget on both sides and notifies both', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
         id: 'req-1',
@@ -495,6 +527,41 @@ describe('WhatsAppOperatorFlowService', () => {
       );
     });
 
+    it('still clears the customer session and notifies via BSUID when they have no visible phone number (Task 14, hotfix 2026-10-25)', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        customer: { phoneNumber: null, whatsappExternalUserId: 'CA.masked' },
+      });
+      const session = {
+        state: WhatsAppFlowState.OPERATOR_AT_LOCATION,
+        rescueRequestId: 'req-1',
+        relayTarget: 'CUSTOMER',
+      } as unknown as WhatsAppSession;
+
+      await service.handleOperatorMessage(
+        operatorPhone,
+        'op-user-1',
+        'end chat',
+        'end chat',
+        session,
+        {
+          id: 'op-1',
+          businessName: 'Swift Towing',
+          phoneNumber: operatorPhone,
+        },
+        {},
+      );
+
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
+        relayTarget: null,
+      });
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        'whatsapp:CA.masked',
+        'Chat ended.',
+      );
+    });
+
     it('does not treat a numeric quote-shaped reply as a command while relaying', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
         id: 'req-1',
@@ -532,6 +599,7 @@ describe('WhatsAppOperatorFlowService', () => {
     let service: WhatsAppOperatorFlowService;
     let prisma: {
       rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
+      user: { findUnique: jest.Mock };
     };
     let sessionStore: { update: jest.Mock };
     let twilioService: {
@@ -577,6 +645,9 @@ describe('WhatsAppOperatorFlowService', () => {
           findUnique: jest.fn(),
           update: jest.fn().mockResolvedValue({}),
         },
+        user: {
+          findUnique: jest.fn().mockResolvedValue(null),
+        },
       };
       sessionStore = { update: jest.fn() };
       twilioService = {
@@ -606,7 +677,7 @@ describe('WhatsAppOperatorFlowService', () => {
       const session = {
         state: WhatsAppFlowState.OPERATOR_ON_JOB,
         rescueRequestId: 'req-1',
-      } as any;
+      } as unknown as WhatsAppSession;
 
       it('replies with the freeform "Send ARRIVED" text when no template SID is configured', async () => {
         const twiml = await service.handleOperatorMessage(
@@ -639,11 +710,34 @@ describe('WhatsAppOperatorFlowService', () => {
         );
 
         expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
-          operatorPhone,
+          `whatsapp:${operatorPhone}`,
           'HXarrivedreminder',
           expect.any(Object),
         );
         expect(twiml).not.toContain('<Message>');
+      });
+
+      it('addresses the ARRIVED reminder to the BSUID when the operator currently has no visible phone number', async () => {
+        process.env.TWILIO_ARRIVED_REMINDER_TEMPLATE_SID = 'HXarrivedreminder';
+        prisma.user.findUnique.mockResolvedValue({
+          whatsappExternalUserId: 'CA.masked',
+        });
+
+        await service.handleOperatorMessage(
+          operatorPhone,
+          'op-user-1',
+          'huh',
+          'huh',
+          session,
+          operator,
+          {},
+        );
+
+        expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+          'whatsapp:CA.masked',
+          'HXarrivedreminder',
+          expect.any(Object),
+        );
       });
 
       it('falls back to the freeform "Send ARRIVED" reply when Twilio rejects the template', async () => {
@@ -671,7 +765,7 @@ describe('WhatsAppOperatorFlowService', () => {
       const session = {
         state: WhatsAppFlowState.OPERATOR_AT_LOCATION,
         rescueRequestId: 'req-1',
-      } as any;
+      } as unknown as WhatsAppSession;
 
       it('replies with the freeform "Send DONE" text when no template SID is configured', async () => {
         const twiml = await service.handleOperatorMessage(
@@ -704,11 +798,34 @@ describe('WhatsAppOperatorFlowService', () => {
         );
 
         expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
-          operatorPhone,
+          `whatsapp:${operatorPhone}`,
           'HXdonereminder',
           expect.any(Object),
         );
         expect(twiml).not.toContain('<Message>');
+      });
+
+      it('addresses the DONE reminder to the BSUID when the operator currently has no visible phone number', async () => {
+        process.env.TWILIO_DONE_REMINDER_TEMPLATE_SID = 'HXdonereminder';
+        prisma.user.findUnique.mockResolvedValue({
+          whatsappExternalUserId: 'CA.masked',
+        });
+
+        await service.handleOperatorMessage(
+          operatorPhone,
+          'op-user-1',
+          'huh',
+          'huh',
+          session,
+          operator,
+          {},
+        );
+
+        expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+          'whatsapp:CA.masked',
+          'HXdonereminder',
+          expect.any(Object),
+        );
       });
 
       it('falls back to the freeform "Send DONE" reply when Twilio rejects the template', async () => {
@@ -736,7 +853,7 @@ describe('WhatsAppOperatorFlowService', () => {
       const session = {
         state: WhatsAppFlowState.OPERATOR_ON_JOB,
         rescueRequestId: 'req-1',
-      } as any;
+      } as unknown as WhatsAppSession;
 
       beforeEach(() => {
         prisma.rescueRequest.findUnique.mockResolvedValue({
@@ -777,7 +894,7 @@ describe('WhatsAppOperatorFlowService', () => {
         );
 
         expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
-          operatorPhone,
+          `whatsapp:${operatorPhone}`,
           'HXdoneprompt',
           expect.any(Object),
         );
@@ -786,6 +903,29 @@ describe('WhatsAppOperatorFlowService', () => {
         expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
           customerPhone,
           expect.stringContaining('arrived'),
+        );
+      });
+
+      it('sends the DONE prompt to the BSUID when the operator currently has no visible phone number (multi-llm review finding, hotfix 2026-10-25)', async () => {
+        process.env.TWILIO_DONE_PROMPT_TEMPLATE_SID = 'HXdoneprompt';
+        prisma.user.findUnique.mockResolvedValue({
+          whatsappExternalUserId: 'CA.masked',
+        });
+
+        await service.handleOperatorMessage(
+          operatorPhone,
+          'op-user-1',
+          'arrived',
+          'ARRIVED',
+          session,
+          operator,
+          {},
+        );
+
+        expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+          'whatsapp:CA.masked',
+          'HXdoneprompt',
+          expect.any(Object),
         );
       });
 
@@ -917,7 +1057,11 @@ describe('WhatsAppOperatorFlowService', () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
         customerId: 'cust-1',
         customer: { phoneNumber: '+2348000000000' },
-        assignedOperator: { businessName: 'Swift Towing' },
+        assignedOperatorId: 'op-1',
+        assignedOperator: {
+          businessName: 'Swift Towing',
+          whatsappEnabled: false,
+        },
       });
 
       const result = await service.startManualCompletionConfirmation('req-1');
@@ -944,6 +1088,61 @@ describe('WhatsAppOperatorFlowService', () => {
         '+2348000000000',
         expect.stringContaining('CONFIRM'),
       );
+      // Non-WhatsApp operator — no session reset performed, only the
+      // customer-session move above.
+      expect(prisma.whatsAppSession.updateMany).toHaveBeenCalledTimes(1);
+    });
+
+    it("re-verifies whatsappEnabled: false atomically in the claim itself when no reason is given, closing the race where the operator reconnects between the controller's pre-check and this claim (multi-llm review finding, hotfix 2026-10-25)", async () => {
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 });
+
+      const result = await service.startManualCompletionConfirmation('req-1');
+
+      expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'req-1',
+          status: 'ARRIVED',
+          confirmationDueAt: null,
+          assignedOperator: { whatsappEnabled: false },
+        },
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- an expect.any(Date) value loses its generic inference when assigned to an object literal property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+        data: { confirmationDueAt: expect.any(Date) },
+      });
+      expect(result).toEqual({ claimed: false });
+    });
+
+    it('resets the operator session to IDLE when overriding a WhatsApp-enabled operator with a reason', async () => {
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 1 });
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        customerId: 'cust-1',
+        customer: { phoneNumber: '+2348000000000' },
+        assignedOperatorId: 'op-1',
+        assignedOperator: {
+          businessName: 'Swift Towing',
+          whatsappEnabled: true,
+          phoneNumber: '+2348011112222',
+        },
+      });
+
+      const result = await service.startManualCompletionConfirmation('req-1', {
+        reason: 'WhatsApp unreachable, operator called support',
+      });
+
+      expect(result).toEqual({ claimed: true });
+      expect(prisma.whatsAppSession.updateMany).toHaveBeenCalledWith({
+        where: { userId: 'cust-1' },
+        data: {
+          state: 'AWAITING_COMPLETION_CONFIRM',
+          rescueRequestId: 'req-1',
+        },
+      });
+      expect(prisma.whatsAppSession.updateMany).toHaveBeenCalledWith({
+        where: {
+          rescueRequestId: 'req-1',
+          user: { phoneNumber: '+2348011112222' },
+        },
+        data: { state: 'IDLE', rescueRequestId: null },
+      });
     });
 
     it('claims nothing and sends no notification when the status already moved on', async () => {

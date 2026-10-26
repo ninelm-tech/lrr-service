@@ -1,5 +1,5 @@
 import { BadRequestException } from '@nestjs/common';
-import { normalizePhone } from './phone.util';
+import { normalizePhone, toWhatsAppDestination } from './phone.util';
 
 describe('normalizePhone', () => {
   it('normalizes a local-format number', () => {
@@ -31,5 +31,34 @@ describe('normalizePhone', () => {
 
   it('throws BadRequestException for an empty string', () => {
     expect(() => normalizePhone('')).toThrow(BadRequestException);
+  });
+});
+
+describe('toWhatsAppDestination', () => {
+  it('prefers the phone number when present', () => {
+    expect(
+      toWhatsAppDestination({
+        phoneNumber: '+2348012345678',
+        whatsappExternalUserId: 'CA.123',
+      }),
+    ).toBe('whatsapp:+2348012345678');
+  });
+
+  it('falls back to the BSUID when there is no phone number', () => {
+    expect(
+      toWhatsAppDestination({
+        phoneNumber: null,
+        whatsappExternalUserId: 'CA.123',
+      }),
+    ).toBe('whatsapp:CA.123');
+  });
+
+  it('throws when neither a phone number nor a BSUID is present, rather than producing "whatsapp:null" (multi-llm review finding, hotfix 2026-10-25)', () => {
+    expect(() =>
+      toWhatsAppDestination({
+        phoneNumber: null,
+        whatsappExternalUserId: null,
+      }),
+    ).toThrow();
   });
 });

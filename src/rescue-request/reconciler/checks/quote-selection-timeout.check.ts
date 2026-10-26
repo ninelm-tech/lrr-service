@@ -3,7 +3,10 @@ import * as Sentry from '@sentry/node';
 import { RescueRequestStatus } from '@prisma/client';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { TwilioService } from '../../../integrations/twilio/twilio.service';
-import { toWhatsAppAddress } from '../../../common/phone.util';
+import {
+  toWhatsAppAddress,
+  toWhatsAppDestination,
+} from '../../../common/phone.util';
 import { formatJobRef } from '../../domain/rescue-request-formatting';
 import { ReconcilerCheck } from '../reconciler-check.interface';
 
@@ -69,7 +72,9 @@ export class QuoteSelectionTimeoutCheck implements ReconcilerCheck {
         where: { id: rescueRequestId },
         select: {
           customerId: true,
-          customer: { select: { phoneNumber: true } },
+          customer: {
+            select: { phoneNumber: true, whatsappExternalUserId: true },
+          },
         },
       });
 
@@ -84,16 +89,16 @@ export class QuoteSelectionTimeoutCheck implements ReconcilerCheck {
 
       return {
         operatorPhones: quoting.map((o) => o.operator.phoneNumber),
-        customerPhone: request.customer?.phoneNumber ?? null,
+        customer: request.customer,
       };
     });
 
     if (!claimed) return false;
 
     try {
-      if (claimed.customerPhone) {
+      if (claimed.customer) {
         await this.twilioService.sendWhatsAppMessage(
-          claimed.customerPhone,
+          toWhatsAppDestination(claimed.customer),
           `⏰ You didn't choose a quote in time. Your request has been cancelled — send SOS to start again.`,
         );
       }

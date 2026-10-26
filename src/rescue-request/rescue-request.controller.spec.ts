@@ -58,14 +58,14 @@ describe('RescueRequestController — manual dispatch actions', () => {
   });
 
   describe('manualArrived', () => {
-    it("rejects a WhatsApp-enabled operator's request, without attempting a claim", async () => {
+    it('manualArrived rejects a WhatsApp-enabled operator override with no reason given', async () => {
       rescueRequestAdminService.findRawForManualAction.mockResolvedValue({
         status: 'OPERATOR_ASSIGNED',
         assignedOperator: { whatsappEnabled: true },
       });
 
-      await expect(controller.manualArrived(req, 'req-1')).rejects.toThrow(
-        'tracked automatically',
+      await expect(controller.manualArrived(req, 'req-1', {})).rejects.toThrow(
+        'reason',
       );
       expect(
         rescueRequestAdminService.claimManualArrived,
@@ -75,13 +75,45 @@ describe('RescueRequestController — manual dispatch actions', () => {
       ).not.toHaveBeenCalled();
     });
 
+    it('manualArrived accepts a WhatsApp-enabled operator override when a reason is given, and resets their WhatsApp session', async () => {
+      rescueRequestAdminService.findRawForManualAction.mockResolvedValue({
+        status: 'OPERATOR_ASSIGNED',
+        assignedOperatorId: 'op-1',
+        assignedOperator: { whatsappEnabled: true },
+      });
+      rescueRequestAdminService.claimManualArrived.mockResolvedValue({
+        claimed: true,
+      });
+
+      await controller.manualArrived(req, 'req-1', {
+        reason: 'WhatsApp unreachable, operator called support',
+      });
+
+      // The session reset itself lives inside claimManualArrived (Task 9) —
+      // the controller's job is only to require and forward the reason.
+      expect(rescueRequestAdminService.claimManualArrived).toHaveBeenCalledWith(
+        'req-1',
+        { reason: 'WhatsApp unreachable, operator called support' },
+      );
+      expect(auditLogService.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          category: 'manual_operator_arrived',
+          actorId: 'admin-1',
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+          details: expect.objectContaining({
+            reason: 'WhatsApp unreachable, operator called support',
+          }),
+        }),
+      );
+    });
+
     it('rejects a request not in OPERATOR_ASSIGNED, without attempting a claim', async () => {
       rescueRequestAdminService.findRawForManualAction.mockResolvedValue({
         status: 'WAITING_FOR_DEPOSIT',
         assignedOperator: { whatsappEnabled: false },
       });
 
-      await expect(controller.manualArrived(req, 'req-1')).rejects.toThrow(
+      await expect(controller.manualArrived(req, 'req-1', {})).rejects.toThrow(
         'WAITING_FOR_DEPOSIT',
       );
       expect(
@@ -89,7 +121,7 @@ describe('RescueRequestController — manual dispatch actions', () => {
       ).not.toHaveBeenCalled();
     });
 
-    it('claims, notifies, and audit-logs for an eligible request', async () => {
+    it('claims, notifies, and audit-logs for an eligible request — no reason required for a non-WhatsApp operator', async () => {
       rescueRequestAdminService.findRawForManualAction.mockResolvedValue({
         status: 'OPERATOR_ASSIGNED',
         assignedOperatorId: 'op-1',
@@ -99,10 +131,11 @@ describe('RescueRequestController — manual dispatch actions', () => {
         claimed: true,
       });
 
-      await controller.manualArrived(req, 'req-1');
+      await controller.manualArrived(req, 'req-1', {});
 
       expect(rescueRequestAdminService.claimManualArrived).toHaveBeenCalledWith(
         'req-1',
+        { reason: undefined },
       );
       expect(
         operatorFlowService.notifyCustomerOperatorArrived,
@@ -125,7 +158,7 @@ describe('RescueRequestController — manual dispatch actions', () => {
         claimed: false,
       });
 
-      await expect(controller.manualArrived(req, 'req-1')).rejects.toThrow(
+      await expect(controller.manualArrived(req, 'req-1', {})).rejects.toThrow(
         /no longer eligible|already/i,
       );
       expect(
@@ -136,13 +169,58 @@ describe('RescueRequestController — manual dispatch actions', () => {
   });
 
   describe('manualDone', () => {
+    it('rejects a WhatsApp-enabled operator override with no reason given', async () => {
+      rescueRequestAdminService.findRawForManualAction.mockResolvedValue({
+        status: 'ARRIVED',
+        assignedOperator: { whatsappEnabled: true },
+      });
+
+      await expect(controller.manualDone(req, 'req-1', {})).rejects.toThrow(
+        'reason',
+      );
+      expect(
+        operatorFlowService.startManualCompletionConfirmation,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('accepts a WhatsApp-enabled operator override when a reason is given', async () => {
+      rescueRequestAdminService.findRawForManualAction.mockResolvedValue({
+        status: 'ARRIVED',
+        assignedOperatorId: 'op-1',
+        assignedOperator: { whatsappEnabled: true },
+      });
+      operatorFlowService.startManualCompletionConfirmation.mockResolvedValue({
+        claimed: true,
+      });
+
+      await controller.manualDone(req, 'req-1', {
+        reason: 'WhatsApp unreachable, operator called support',
+      });
+
+      expect(
+        operatorFlowService.startManualCompletionConfirmation,
+      ).toHaveBeenCalledWith('req-1', {
+        reason: 'WhatsApp unreachable, operator called support',
+      });
+      expect(auditLogService.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          category: 'manual_operator_done',
+          actorId: 'admin-1',
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+          details: expect.objectContaining({
+            reason: 'WhatsApp unreachable, operator called support',
+          }),
+        }),
+      );
+    });
+
     it('rejects a request not in ARRIVED, without attempting confirmation', async () => {
       rescueRequestAdminService.findRawForManualAction.mockResolvedValue({
         status: 'OPERATOR_ASSIGNED',
         assignedOperator: { whatsappEnabled: false },
       });
 
-      await expect(controller.manualDone(req, 'req-1')).rejects.toThrow(
+      await expect(controller.manualDone(req, 'req-1', {})).rejects.toThrow(
         'OPERATOR_ASSIGNED',
       );
       expect(
@@ -150,7 +228,7 @@ describe('RescueRequestController — manual dispatch actions', () => {
       ).not.toHaveBeenCalled();
     });
 
-    it('starts completion confirmation and audit-logs when the atomic claim succeeds', async () => {
+    it('starts completion confirmation and audit-logs when the atomic claim succeeds — no reason required for a non-WhatsApp operator', async () => {
       rescueRequestAdminService.findRawForManualAction.mockResolvedValue({
         status: 'ARRIVED',
         assignedOperatorId: 'op-1',
@@ -160,11 +238,11 @@ describe('RescueRequestController — manual dispatch actions', () => {
         claimed: true,
       });
 
-      await controller.manualDone(req, 'req-1');
+      await controller.manualDone(req, 'req-1', {});
 
       expect(
         operatorFlowService.startManualCompletionConfirmation,
-      ).toHaveBeenCalledWith('req-1');
+      ).toHaveBeenCalledWith('req-1', { reason: undefined });
       expect(auditLogService.record).toHaveBeenCalledWith(
         expect.objectContaining({
           category: 'manual_operator_done',
@@ -183,7 +261,7 @@ describe('RescueRequestController — manual dispatch actions', () => {
         claimed: false,
       });
 
-      await expect(controller.manualDone(req, 'req-1')).rejects.toThrow(
+      await expect(controller.manualDone(req, 'req-1', {})).rejects.toThrow(
         /no longer eligible|already/i,
       );
       expect(auditLogService.record).not.toHaveBeenCalled();

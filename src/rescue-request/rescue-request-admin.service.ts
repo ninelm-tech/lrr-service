@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import * as crypto from 'crypto';
 import * as Sentry from '@sentry/node';
+import { logger } from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
@@ -20,8 +21,9 @@ import {
   Prisma,
   RescueRequestStatus,
 } from '@prisma/client';
-import { toWhatsAppAddress } from '../common/phone.util';
+import { toWhatsAppAddress, toWhatsAppDestination } from '../common/phone.util';
 import { claimOnce } from '../common/claim-once.util';
+import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { DEPOSIT_WINDOW_MS } from './deposit.constants';
 import {
   RescueRequestListResponseDto,
@@ -779,12 +781,10 @@ export class RescueRequestAdminService {
     // own CANCEL command already does this; the admin action was missing it.
     await this.sessionStore.clear(updated.customerId);
 
-    if (updated.customer.phoneNumber) {
-      await this.twilioService.sendWhatsAppMessage(
-        updated.customer.phoneNumber,
-        `❌ Your rescue request has been cancelled${dto.reason ? `: ${dto.reason}` : '.'}\n\nSend SOS or HELP if you need assistance again.`,
-      );
-    }
+    await this.twilioService.sendWhatsAppMessage(
+      toWhatsAppDestination(updated.customer),
+      `❌ Your rescue request has been cancelled${dto.reason ? `: ${dto.reason}` : '.'}\n\nSend SOS or HELP if you need assistance again.`,
+    );
     return { data: this.mapToDetailDto(updated, true) };
   }
 
@@ -928,20 +928,77 @@ export class RescueRequestAdminService {
   /**
    * Atomically claims the ARRIVED transition for a manually-operated job.
    * `count: 0` means the pre-check (`findRawForManualAction`, read moments
-   * earlier by the controller) is now stale — status or the operator's
-   * whatsappEnabled flag changed in between — and the caller must not
-   * proceed to notify the customer or write an audit entry.
+   * earlier by the controller) is now stale — status changed in between —
+   * and the caller must not proceed to notify the customer or write an
+   * audit entry.
+   *
+   * No longer gated on `assignedOperator.whatsappEnabled: false` — the
+   * controller now also permits a reasoned override for a WhatsApp-enabled
+   * operator (its own `reason` requirement is enforced there, not here).
+   * `reason` is accepted here purely so this method's own call shape
+   * matches that override path; the controller's existing audit-log call
+   * is what actually records it. When the override applies, this also
+   * resets whichever session row is currently tracking this job for the
+   * assigned operator, to the same state a real, unmasked ARRIVED would
+   * have left it in — otherwise a later WhatsApp reconnect would act on
+   * stale pre-override session state.
    */
-  async claimManualArrived(id: string): Promise<{ claimed: boolean }> {
+  async claimManualArrived(
+    id: string,
+    options?: { reason?: string },
+  ): Promise<{ claimed: boolean }> {
+    const hasReason = !!options?.reason;
     const claimed = await this.prisma.rescueRequest.updateMany({
       where: {
         id,
         status: RescueRequestStatus.OPERATOR_ASSIGNED,
-        assignedOperator: { whatsappEnabled: false },
+        // Without a reason, re-verify whatsappEnabled: false atomically,
+        // here — not from the controller's pre-check, which can be stale
+        // by the time this claim runs. Closes the race where the operator
+        // reconnects WhatsApp between that pre-check and this claim: a
+        // reasonless override must still fail if that happened.
+        ...(!hasReason && { assignedOperator: { whatsappEnabled: false } }),
       },
       data: { status: RescueRequestStatus.ARRIVED },
     });
-    return { claimed: claimed.count === 1 };
+    if (claimed.count !== 1) return { claimed: false };
+
+    const request = await this.prisma.rescueRequest.findUnique({
+      where: { id },
+      select: {
+        assignedOperatorId: true,
+        assignedOperator: {
+          select: { whatsappEnabled: true, phoneNumber: true },
+        },
+      },
+    });
+    if (
+      request?.assignedOperator?.whatsappEnabled &&
+      request.assignedOperator.phoneNumber
+    ) {
+      logger.info(
+        'manual override: resetting WhatsApp-enabled operator session (ARRIVED)',
+        {
+          rescueRequestId: id,
+          operatorId: request.assignedOperatorId,
+          reason: options?.reason,
+        },
+      );
+      // Matched by the operator's own on-file phoneNumber, not by any
+      // OperatorMember/staff-login relationship — that system tracks admin
+      // portal access, a separate identity axis from which User row the
+      // operator's WhatsApp dispatch conversation actually lives on (see
+      // the WhatsApp username/BSUID identity design doc).
+      await this.prisma.whatsAppSession.updateMany({
+        where: {
+          rescueRequestId: id,
+          user: { phoneNumber: request.assignedOperator.phoneNumber },
+        },
+        data: { state: WhatsAppFlowState.OPERATOR_AT_LOCATION },
+      });
+    }
+
+    return { claimed: true };
   }
 
   async manualCandidatesFor(id: string) {

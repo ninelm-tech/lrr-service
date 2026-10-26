@@ -6,7 +6,7 @@ import {
 import * as crypto from 'crypto';
 import * as Sentry from '@sentry/node';
 import { logger } from '@sentry/node';
-import { toWhatsAppAddress } from '../common/phone.util';
+import { toWhatsAppAddress, toWhatsAppDestination } from '../common/phone.util';
 import { sanitizeTemplateVariable } from '../common/template-variable.util';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
@@ -1170,11 +1170,11 @@ export class DispatchService {
 
     const customerRecord = await this.prisma.user.findUnique({
       where: { id: customerId },
-      select: { phoneNumber: true },
+      select: { phoneNumber: true, whatsappExternalUserId: true },
     });
-    if (customerRecord?.phoneNumber) {
+    if (customerRecord) {
       await this.twilioService.sendWhatsAppMessage(
-        customerRecord.phoneNumber,
+        toWhatsAppDestination(customerRecord),
         reason === 'no-coverage'
           ? `😔 Sorry, there are no tow operators available in your area at the moment.\n\nYour request has been cancelled.\n\nPlease try again later or call your breakdown provider.`
           : `😔 We're sorry — no tow operator was available near you after an extended search.\n\nYour request has been automatically cancelled.\n\nPlease try again shortly or call your breakdown cover provider.`,
@@ -1730,14 +1730,11 @@ export class DispatchService {
       return `${numberEmoji} ₦${priceNaira} · ETA ${q.etaMinutes} min · Deposit ₦${depositNaira} · ${q.businessName}`;
     });
 
-    const customerPhone = rescueRequest.customer.phoneNumber;
-    if (customerPhone) {
-      const quoteSelectionMinutes = QUOTE_SELECTION_WINDOW_MS / 60_000;
-      await this.twilioService.sendWhatsAppMessage(
-        customerPhone,
-        `🚗 *Operator quotes received!*\n⏰ You have ${quoteSelectionMinutes} minutes to choose before this request is cancelled.\n\n${lines.join('\n')}\n\n⚠️ *ACTION NEEDED* — reply with the number of your choice (e.g. "1") to select an operator.`,
-      );
-    }
+    const quoteSelectionMinutes = QUOTE_SELECTION_WINDOW_MS / 60_000;
+    await this.twilioService.sendWhatsAppMessage(
+      toWhatsAppDestination(rescueRequest.customer),
+      `🚗 *Operator quotes received!*\n⏰ You have ${quoteSelectionMinutes} minutes to choose before this request is cancelled.\n\n${lines.join('\n')}\n\n⚠️ *ACTION NEEDED* — reply with the number of your choice (e.g. "1") to select an operator.`,
+    );
 
     await this.sessionStore.update(customerId, {
       state: WhatsAppFlowState.WAITING_FOR_QUOTE_SELECTION,

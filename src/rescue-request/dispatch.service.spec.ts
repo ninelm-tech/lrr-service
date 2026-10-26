@@ -2150,8 +2150,25 @@ describe('DispatchService', () => {
       await service.deliverQuoteShortlist('req-1', 'cust-1');
 
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
-        '+2348000000000',
+        'whatsapp:+2348000000000',
         '🚗 *Operator quotes received!*\n⏰ You have 5 minutes to choose before this request is cancelled.\n\n1️⃣ ₦11,000 · ETA 0 min · Deposit ₦1,100 · Acme Towing\n\n⚠️ *ACTION NEEDED* — reply with the number of your choice (e.g. "1") to select an operator.',
+      );
+    });
+
+    it('delivers the shortlist to the BSUID when the customer has no visible phone number — otherwise they never see their quotes at all (Task 14, hotfix 2026-10-25)', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: null, whatsappExternalUserId: 'CA.masked' },
+      });
+
+      await service.deliverQuoteShortlist('req-1', 'cust-1');
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        'whatsapp:CA.masked',
+        expect.stringContaining('Operator quotes received'),
       );
     });
 
@@ -2255,7 +2272,7 @@ describe('DispatchService', () => {
       // 20% of that = 5,500 — above the 5,000 kobo floor, so the ordinary
       // percentage-based amount wins (not a special case of this fix).
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
-        '+2348000000000',
+        'whatsapp:+2348000000000',
         expect.stringContaining('Deposit ₦55'),
       );
     });
@@ -2293,7 +2310,7 @@ describe('DispatchService', () => {
       await service.deliverQuoteShortlist('req-1', 'cust-1');
 
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
-        '+2348000000000',
+        'whatsapp:+2348000000000',
         expect.stringContaining('Deposit ₦50'),
       );
       expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
@@ -3005,6 +3022,78 @@ describe('DispatchService', () => {
         expect.any(Object),
       );
       expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('notifyNoOperatorAvailable', () => {
+    let service: DispatchService;
+    let prisma: {
+      rescueRequest: { findUnique: jest.Mock };
+      user: { findUnique: jest.Mock };
+    };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: {
+          findUnique: jest
+            .fn()
+            .mockResolvedValue({ latitude: 6.5, longitude: 3.4 }),
+        },
+        user: {
+          findUnique: jest
+            .fn()
+            .mockResolvedValue({ phoneNumber: '+2348012345678' }),
+        },
+      };
+      twilioService = { sendWhatsAppMessage: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          DispatchService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: OperatorService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+          { provide: OperatorMembershipService, useValue: {} },
+        ],
+      }).compile();
+      service = module.get<DispatchService>(DispatchService);
+    });
+
+    it('notifies the customer via their real phone number', async () => {
+      await service.notifyNoOperatorAvailable(
+        'req-1',
+        'cust-1',
+        'no-coverage',
+        2,
+      );
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        'whatsapp:+2348012345678',
+        expect.stringContaining('no tow operators available'),
+      );
+    });
+
+    it('notifies a BSUID-only customer via their BSUID instead of silently skipping them (Task 14, hotfix 2026-10-25)', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        phoneNumber: null,
+        whatsappExternalUserId: 'CA.masked',
+      });
+
+      await service.notifyNoOperatorAvailable(
+        'req-1',
+        'cust-1',
+        'rounds-exhausted',
+        5,
+      );
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        'whatsapp:CA.masked',
+        expect.stringContaining('no tow operator was available'),
+      );
     });
   });
 });

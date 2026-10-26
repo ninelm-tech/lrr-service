@@ -102,6 +102,25 @@ describe('DepositReminderCheck (integration)', () => {
     expect(twilio.sendWhatsAppMessage).not.toHaveBeenCalled();
   });
 
+  it('nudges a BSUID-only customer via their BSUID instead of staying silent forever (Task 14, hotfix 2026-10-25)', async () => {
+    const customer = await createCustomer(prisma, undefined, {
+      phoneNumber: null,
+      whatsappExternalUserId: 'CA.masked',
+    });
+    await createRequest(prisma, customer.id, {
+      status: 'WAITING_FOR_DEPOSIT',
+      depositWindowExpiresAt: new Date(Date.now() + 24 * MINUTE),
+      depositPaymentUrl: PAY_URL,
+    });
+
+    await check.run(new Date());
+
+    expect(twilio.sendWhatsAppMessage).toHaveBeenCalledWith(
+      'whatsapp:CA.masked',
+      expect.stringContaining('still waiting for payment'),
+    );
+  });
+
   it('sends once when two ticks run concurrently', async () => {
     await withWindow(24);
     await Promise.all([check.run(new Date()), check.run(new Date())]);

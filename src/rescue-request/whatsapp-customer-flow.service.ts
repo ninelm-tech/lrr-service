@@ -538,16 +538,20 @@ export class WhatsAppCustomerFlowService {
       }
 
       const rescueRequest = await this.prisma.$transaction(async (tx) => {
-        const customer = await this.sharedService.findOrCreateCustomer(
-          phoneNumber,
-          tx,
-        );
-
+        // The router already resolved (or created) this exact User before
+        // ever calling into this method — re-resolving by `phoneNumber`
+        // here was a latent bug: for a BSUID-only sender, `phoneNumber` is
+        // actually the BSUID string, and findOrCreateCustomer's upsert
+        // keys on the phoneNumber column, so it would create a SECOND,
+        // unrelated User row (with the raw BSUID written into
+        // phoneNumber — the exact thing this plan exists to prevent) and
+        // orphan the request from the session actually driving it.
+        //
         // Lock-as-mutex against a concurrent account deletion: contends for
         // the same User row deleteUser's own updateMany writes to, so
         // whichever transaction commits first wins.
         const stillActive = await tx.user.updateMany({
-          where: { id: customer.id, deletedAt: null },
+          where: { id: userId, deletedAt: null },
           data: { updatedAt: new Date() },
         });
         if (stillActive.count === 0) {
@@ -556,7 +560,7 @@ export class WhatsAppCustomerFlowService {
 
         return tx.rescueRequest.create({
           data: {
-            customerId: customer.id,
+            customerId: userId,
             status: RescueRequestStatus.WAITING_FOR_MEDIA,
             latitude: session.latitude,
             longitude: session.longitude,

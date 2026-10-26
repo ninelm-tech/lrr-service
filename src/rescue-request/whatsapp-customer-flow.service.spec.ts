@@ -937,7 +937,7 @@ describe('WhatsAppCustomerFlowService', () => {
 
       expect(prisma.rescueRequest.create).toHaveBeenCalledWith({
         data: {
-          customerId: 'cust-1',
+          customerId: userId,
           status: 'WAITING_FOR_MEDIA',
           latitude: 6.5,
           longitude: 3.4,
@@ -951,6 +951,38 @@ describe('WhatsAppCustomerFlowService', () => {
         state: WhatsAppFlowState.WAITING_FOR_MEDIA,
       });
       expect(result).toContain('photo or video');
+    });
+
+    it('creates the request for the already-resolved userId, never re-resolving by the raw sender value — a BSUID-only sender must not fragment into a second user (multi-llm review finding, hotfix 2026-10-25)', async () => {
+      // For a BSUID-only sender, `phoneNumber` here is actually the BSUID
+      // string (per the router's parsed.phoneNumber ?? parsed.externalUserId
+      // fallback) — if the implementation still called
+      // findOrCreateCustomer(phoneNumber) to resolve the customer, it would
+      // create a second, unrelated User row with that raw string written
+      // into the phoneNumber column instead of using the session's own
+      // already-resolved userId.
+      sharedService.findOrCreateCustomer.mockResolvedValue({
+        id: 'wrong-fragmented-user',
+      });
+
+      await issueService.handleCustomerMessage(
+        'CA.masked',
+        userId,
+        '3',
+        '3',
+        undefined,
+        undefined,
+        undefined,
+        baseSession,
+        {},
+      );
+
+      expect(sharedService.findOrCreateCustomer).not.toHaveBeenCalled();
+      expect(prisma.rescueRequest.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ customerId: userId }),
+        }),
+      );
     });
 
     it('also accepts the word reply, not just the number', async () => {

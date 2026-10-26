@@ -2369,7 +2369,30 @@ describe('RescueRequestAdminService', () => {
 
       expect(sessionStore.clear).toHaveBeenCalledWith('cust-1');
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
-        '+2348012345678',
+        'whatsapp:+2348012345678',
+        expect.stringContaining('cancelled'),
+      );
+    });
+
+    it('notifies a BSUID-only customer via their BSUID instead of silently skipping them (Task 14, hotfix 2026-10-25)', async () => {
+      prisma.rescueRequest.update.mockResolvedValue({
+        id: 'req-1',
+        customerId: 'cust-1',
+        status: 'CANCELLED',
+        customer: {
+          id: 'cust-1',
+          phoneNumber: null,
+          whatsappExternalUserId: 'CA.masked',
+        },
+        media: [],
+        dispatchOffers: [],
+        payments: [],
+      });
+
+      await service.cancel('req-1', {});
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        'whatsapp:CA.masked',
         expect.stringContaining('cancelled'),
       );
     });
@@ -2612,6 +2635,127 @@ describe('RescueRequestAdminService', () => {
       await expect(
         service.updateStatus('req-1', { status: 'CANCELLED' }),
       ).resolves.toBeDefined();
+    });
+  });
+
+  describe('claimManualArrived', () => {
+    let service: RescueRequestAdminService;
+    let prisma: {
+      rescueRequest: { updateMany: jest.Mock; findUnique: jest.Mock };
+      whatsAppSession: { updateMany: jest.Mock };
+    };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: {
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+          findUnique: jest.fn().mockResolvedValue({
+            assignedOperatorId: 'op-1',
+            assignedOperator: { whatsappEnabled: false },
+          }),
+        },
+        whatsAppSession: { updateMany: jest.fn() },
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          { provide: PayoutService, useValue: {} },
+          RescueRequestAdminService,
+          { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          { provide: PaystackService, useValue: {} },
+          { provide: TwilioService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: OperatorMembershipService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<RescueRequestAdminService>(
+        RescueRequestAdminService,
+      );
+    });
+
+    it('claims the ARRIVED transition for a non-WhatsApp operator, unchanged from before — no session reset', async () => {
+      const result = await service.claimManualArrived('req-1');
+
+      expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'req-1',
+          status: 'OPERATOR_ASSIGNED',
+          assignedOperator: { whatsappEnabled: false },
+        },
+        data: { status: 'ARRIVED' },
+      });
+      expect(result.claimed).toBe(true);
+      expect(prisma.whatsAppSession.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("does not fall back to re-reading whatsappEnabled from a stale pre-check — without a reason, the atomic claim itself re-verifies whatsappEnabled: false, closing the race where the operator reconnects between the controller's pre-check and this claim (multi-llm review finding, hotfix 2026-10-25)", async () => {
+      // The operator reconnected (whatsappEnabled flipped true) between the
+      // controller's pre-check and this claim — with no reason supplied,
+      // the claim's own where-clause no longer matches, so the DB (not
+      // this mock) is what actually rejects it; here we only prove the
+      // where-clause the controller's no-reason path sends is the one that
+      // would reject that race in a real database.
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 });
+
+      const result = await service.claimManualArrived('req-1');
+
+      expect(prisma.rescueRequest.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'req-1',
+          status: 'OPERATOR_ASSIGNED',
+          assignedOperator: { whatsappEnabled: false },
+        },
+        data: { status: 'ARRIVED' },
+      });
+      expect(result.claimed).toBe(false);
+    });
+
+    it('claims a manual arrived transition for a WhatsApp-enabled operator when a reason is given, and resets their session', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        assignedOperatorId: 'op-1',
+        assignedOperator: {
+          whatsappEnabled: true,
+          phoneNumber: '+2348011112222',
+        },
+      });
+
+      const { claimed } = await service.claimManualArrived('req-1', {
+        reason: 'WhatsApp unreachable, operator called support',
+      });
+
+      expect(claimed).toBe(true);
+      expect(prisma.whatsAppSession.updateMany).toHaveBeenCalledWith({
+        where: {
+          rescueRequestId: 'req-1',
+          user: { phoneNumber: '+2348011112222' },
+        },
+        data: { state: 'OPERATOR_AT_LOCATION' },
+      });
+    });
+
+    it('returns claimed: false and never touches the session when the status no longer matches', async () => {
+      prisma.rescueRequest.updateMany.mockResolvedValue({ count: 0 });
+
+      const result = await service.claimManualArrived('req-1', {
+        reason: 'does not matter',
+      });
+
+      expect(result.claimed).toBe(false);
+      expect(prisma.whatsAppSession.updateMany).not.toHaveBeenCalled();
     });
   });
 });

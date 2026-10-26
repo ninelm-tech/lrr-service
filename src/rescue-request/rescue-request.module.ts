@@ -8,6 +8,7 @@ import { ReconcilerService } from './reconciler/reconciler.service';
 import { RECONCILER_CHECKS } from './reconciler/reconciler-check.interface';
 import { OfferSweepCheck } from './reconciler/checks/offer-sweep.check';
 import { DepositExpiryCheck } from './reconciler/checks/deposit-expiry.check';
+import { StuckOperatorJobCheck } from './reconciler/checks/stuck-operator-job.check';
 import { DepositReminderCheck } from './reconciler/checks/deposit-reminder.check';
 import { BiddingCloseCheck } from './reconciler/checks/bidding-close.check';
 import { BatchResolveCheck } from './reconciler/checks/batch-resolve.check';
@@ -65,6 +66,7 @@ import { AuditLogModule } from '../audit-log/audit-log.module';
     DispatchService,
     OfferSweepCheck,
     DepositExpiryCheck,
+    StuckOperatorJobCheck,
     DepositReminderCheck,
     BiddingCloseCheck,
     BatchResolveCheck,
@@ -80,6 +82,7 @@ import { AuditLogModule } from '../audit-log/audit-log.module';
       useFactory: (
         offerSweep: OfferSweepCheck,
         depositExpiry: DepositExpiryCheck,
+        stuckOperatorJob: StuckOperatorJobCheck,
         depositReminder: DepositReminderCheck,
         biddingClose: BiddingCloseCheck,
         batchResolve: BatchResolveCheck,
@@ -89,6 +92,7 @@ import { AuditLogModule } from '../audit-log/audit-log.module';
       ) => [
         offerSweep,
         depositExpiry,
+        stuckOperatorJob,
         depositReminder,
         biddingClose,
         batchResolve,
@@ -99,6 +103,7 @@ import { AuditLogModule } from '../audit-log/audit-log.module';
       inject: [
         OfferSweepCheck,
         DepositExpiryCheck,
+        StuckOperatorJobCheck,
         DepositReminderCheck,
         BiddingCloseCheck,
         BatchResolveCheck,
