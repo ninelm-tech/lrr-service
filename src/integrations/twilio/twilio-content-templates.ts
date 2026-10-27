@@ -257,14 +257,12 @@ export const TWILIO_CONTENT_TEMPLATES: Record<
   // so WhatsApp can share their real number directly. See the WhatsApp
   // username/BSUID identity design doc.
   //
-  // UNLIKE arrived_prompt/done_prompt above: this does NOT get the
-  // in-session free pass. Per Twilio's own call-to-action docs
-  // (twilio.com/docs/content/twilio-call-to-action), only QUICK_REPLY,
-  // URL, VOICE_CALL_REQUEST and VOICE_CALL are usable unapproved inside
-  // an active session — REQUEST_CONTACT_INFO is not on that list, so it
-  // needs real Meta template approval before it can send at all,
-  // regardless of session window. Same submit-and-wait path
-  // new_request_staff_alert went through below.
+  // UNLIKE what the Twilio call-to-action docs would suggest
+  // (twilio.com/docs/content/twilio-call-to-action, which lists only
+  // QUICK_REPLY, URL, VOICE_CALL_REQUEST and VOICE_CALL as usable
+  // unapproved inside an active session): confirmed empirically
+  // 2026-10-26 that REQUEST_CONTACT_INFO sends and renders without
+  // approval inside an active session, on the LRR Stage subaccount.
   //
   // The Twilio Console's "Call to action" builder does NOT expose
   // REQUEST_CONTACT_INFO as a Type of action — its dropdown only offers
