@@ -670,6 +670,194 @@ describe('WhatsAppCustomerFlowService', () => {
     });
   });
 
+  describe('WAITING_FOR_MEDIA — contact info gate', () => {
+    let service: WhatsAppCustomerFlowService;
+    let prisma: {
+      requestMedia: { count: jest.Mock };
+      user: { findUnique: jest.Mock };
+      rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
+    };
+    let sessionStore: { update: jest.Mock };
+    let twilioService: {
+      sendWhatsAppMessage: jest.Mock;
+      sendWhatsAppTemplateMessage: jest.Mock;
+    };
+    let platformConfigService: { getConfig: jest.Mock };
+    let dispatchService: { startDispatch: jest.Mock };
+    const phoneNumber = 'whatsapp:CA.test';
+    const userId = 'user-1';
+    const session = {
+      state: WhatsAppFlowState.WAITING_FOR_MEDIA,
+      rescueRequestId: 'req-1',
+    } as WhatsAppSession;
+    const originalTemplateSid =
+      process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID;
+
+    beforeEach(async () => {
+      delete process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID;
+      prisma = {
+        requestMedia: { count: jest.fn().mockResolvedValue(1) },
+        user: {
+          findUnique: jest
+            .fn()
+            .mockResolvedValue({ id: userId, name: null, phoneNumber: null }),
+        },
+        rescueRequest: {
+          findUnique: jest.fn().mockResolvedValue({
+            id: 'req-1',
+            vehicleType: 'SEDAN',
+            destination: 'Lekki Phase 1',
+            issueType: 'BREAKDOWN',
+          }),
+          update: jest.fn().mockResolvedValue({}),
+        },
+      };
+      sessionStore = { update: jest.fn() };
+      twilioService = {
+        sendWhatsAppMessage: jest.fn(),
+        sendWhatsAppTemplateMessage: jest.fn(),
+      };
+      platformConfigService = {
+        getConfig: jest
+          .fn()
+          .mockResolvedValue({ newRequestAlertPhoneNumbers: [] }),
+      };
+      dispatchService = { startDispatch: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppCustomerFlowService,
+          { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PaystackService, useValue: {} },
+          { provide: PlatformConfigService, useValue: platformConfigService },
+          { provide: OperatorService, useValue: {} },
+          { provide: DispatchService, useValue: dispatchService },
+          { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppCustomerFlowService>(
+        WhatsAppCustomerFlowService,
+      );
+    });
+
+    afterEach(() => {
+      if (originalTemplateSid === undefined)
+        delete process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID;
+      else
+        process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID =
+          originalTemplateSid;
+    });
+
+    async function continueToDispatch() {
+      return service.handleCustomerMessage(
+        phoneNumber,
+        userId,
+        '2',
+        '2',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {},
+      );
+    }
+
+    it('asks for contact info instead of dispatching when the customer has no phone number', async () => {
+      process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID = 'HXtest';
+
+      const result = await continueToDispatch();
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        'HXtest',
+        {},
+      );
+      expect(sessionStore.update).toHaveBeenCalledWith(userId, {
+        state: WhatsAppFlowState.WAITING_FOR_CONTACT_INFO,
+      });
+      expect(result).toContain('contact');
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+      expect(dispatchService.startDispatch).not.toHaveBeenCalled();
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+
+    it('still dispatches normally when the customer already has a phone number', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: userId,
+        name: null,
+        phoneNumber: '+2348012345678',
+      });
+
+      await continueToDispatch();
+
+      expect(twilioService.sendWhatsAppTemplateMessage).not.toHaveBeenCalled();
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { status: 'DISPATCHING' },
+      });
+      expect(sessionStore.update).toHaveBeenCalledWith(userId, {
+        state: WhatsAppFlowState.REQUEST_CONFIRMED,
+      });
+      expect(sessionStore.update).not.toHaveBeenCalledWith(
+        userId,
+        expect.objectContaining({
+          state: WhatsAppFlowState.WAITING_FOR_CONTACT_INFO,
+        }),
+      );
+      expect(dispatchService.startDispatch).toHaveBeenCalledWith(
+        'req-1',
+        userId,
+      );
+    });
+
+    it('still moves to WAITING_FOR_CONTACT_INFO, with a plain-text fallback reply, when the template send rejects', async () => {
+      process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID = 'HXtest';
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+      twilioService.sendWhatsAppTemplateMessage.mockRejectedValue(
+        new Error('boom'),
+      );
+
+      const result = await continueToDispatch();
+
+      expect(sessionStore.update).toHaveBeenCalledWith(userId, {
+        state: WhatsAppFlowState.WAITING_FOR_CONTACT_INFO,
+      });
+      expect(result).toContain('contact');
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+      expect(dispatchService.startDispatch).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+
+    it('still moves to WAITING_FOR_CONTACT_INFO when the template SID env var is not configured', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+      const result = await continueToDispatch();
+
+      expect(twilioService.sendWhatsAppTemplateMessage).not.toHaveBeenCalled();
+      expect(sessionStore.update).toHaveBeenCalledWith(userId, {
+        state: WhatsAppFlowState.WAITING_FOR_CONTACT_INFO,
+      });
+      expect(result).toContain('contact');
+      warnSpy.mockRestore();
+    });
+  });
+
   describe('WAITING_FOR_DESTINATION', () => {
     let destService: WhatsAppCustomerFlowService;
     let prisma: {

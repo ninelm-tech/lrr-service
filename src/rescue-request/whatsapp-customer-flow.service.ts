@@ -604,6 +604,31 @@ export class WhatsAppCustomerFlowService {
             `Please send at least one photo or video before continuing — a voice note alone isn't enough for the operator to assess the vehicle.`,
           );
         }
+
+        // A BSUID-only (masked) customer — one who set a WhatsApp username —
+        // has no real phone number on file; Twilio never reveals one once a
+        // username is set, so an assigned operator would have nothing to
+        // call/text. Gate dispatch here and ask for their contact card
+        // instead; Task 3 (WAITING_FOR_CONTACT_INFO's own handler) owns
+        // validating the reply, re-prompting, and either backfilling this
+        // User or merging onto a pre-existing one.
+        const customer = await this.prisma.user.findUnique({
+          where: { id: userId },
+        });
+        if (customer?.phoneNumber === null) {
+          await this.sendContactInfoRequest(phoneNumber);
+          await this.sessionStore.update(userId, {
+            state: WhatsAppFlowState.WAITING_FOR_CONTACT_INFO,
+          });
+          // Sent regardless of whether sendContactInfoRequest's own template
+          // send succeeded — a customer who ends up with both isn't harmed
+          // by the duplicate, and this plain-text reply is the only one
+          // guaranteed to go through without needing an approved template.
+          return this.reply(
+            `📵 We don't have a phone number we can reach you on. Please share your contact card — tap 📎 (attachment) → Contact — so we can connect you with an operator.`,
+          );
+        }
+
         return this.handleMediaFinished(
           phoneNumber,
           userId,
@@ -808,6 +833,38 @@ export class WhatsAppCustomerFlowService {
         toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
         `Chat ended.`,
       );
+    }
+  }
+
+  /**
+   * Sends the `request_contact_info` Content Template asking a BSUID-only
+   * customer to share their WhatsApp contact card. Used for both the
+   * initial ask (here) and every re-prompt (Task 3's
+   * WAITING_FOR_CONTACT_INFO handler). Never throws — a missing template
+   * SID or a rejected Twilio send must never block the caller's own state
+   * transition or leave an unhandled rejection; the caller always falls
+   * back to a plain-text reply regardless of what this returns.
+   */
+  private async sendContactInfoRequest(phoneNumber: string): Promise<boolean> {
+    const templateSid = process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID;
+    if (!templateSid) {
+      console.warn(
+        'TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID is not set — contact info request template not sent, falling back to plain-text reply only',
+      );
+      return false;
+    }
+
+    try {
+      await this.twilioService.sendWhatsAppTemplateMessage(
+        phoneNumber,
+        templateSid,
+        {},
+      );
+      return true;
+    } catch (error) {
+      console.error('Failed to send contact info request template:', error);
+      Sentry.captureException(error, { extra: { phoneNumber } });
+      return false;
     }
   }
 
