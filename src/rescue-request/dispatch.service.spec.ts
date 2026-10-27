@@ -843,9 +843,11 @@ describe('DispatchService', () => {
         create: jest.Mock;
         update: jest.Mock;
         updateMany: jest.Mock;
+        findFirst: jest.Mock;
       };
       requestMedia: { findMany: jest.Mock };
       $transaction: jest.Mock;
+      $queryRaw: jest.Mock;
     };
     let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
     let twilioService: {
@@ -877,11 +879,13 @@ describe('DispatchService', () => {
           create: jest.fn(),
           update: jest.fn(),
           updateMany: jest.fn(),
+          findFirst: jest.fn().mockResolvedValue(null),
         },
         requestMedia: { findMany: jest.fn().mockResolvedValue([]) },
         // The offer and the offeredOperatorIds append now commit together, so
         // the callback runs against this same mock as its transaction client.
         $transaction: jest.fn((fn: (tx: unknown) => unknown) => fn(prisma)),
+        $queryRaw: jest.fn().mockResolvedValue([]),
       };
       sessionStore = {
         getOrCreate: jest.fn().mockResolvedValue({}),
@@ -1005,6 +1009,99 @@ describe('DispatchService', () => {
         manualService.manualOfferToOperator('req-1', 'op-1'),
       ).rejects.toThrow('Bidding has closed');
       expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();
+    });
+
+    describe('when the operator is already engaged on this job', () => {
+      beforeEach(() => {
+        prisma.rescueRequest.findUnique.mockResolvedValue({
+          id: 'req-1',
+          status: 'DISPATCHING',
+          customerId: 'cust-1',
+          vehicleType: 'SEDAN',
+          destination: 'Lekki',
+          latitude: 6.5,
+          longitude: 3.4,
+          quoteCollectionDeadline: new Date(Date.now() + 10 * 60 * 1000),
+          biddingClosedAt: null,
+        });
+        prisma.operator.findUnique.mockResolvedValue({
+          id: 'op-1',
+          status: 'ACTIVE',
+          whatsappEnabled: true,
+          businessName: 'Swift Towing',
+          phoneNumber: '+2349012345678',
+        });
+        prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
+      });
+
+      it('refuses a second offer while the first is still pending, saying how long it has left', async () => {
+        prisma.dispatchOffer.findFirst.mockResolvedValue({
+          status: 'PENDING',
+          expiresAt: new Date(Date.now() + 150 * 1000),
+        });
+
+        await expect(
+          manualService.manualOfferToOperator('req-1', 'op-1'),
+        ).rejects.toThrow(
+          'This operator already has a live offer for this job (expires in 3 min).',
+        );
+        expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();
+        expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+        expect(
+          twilioService.sendWhatsAppTemplateMessage,
+        ).not.toHaveBeenCalled();
+      });
+
+      it('refuses to re-offer an operator who has already quoted', async () => {
+        prisma.dispatchOffer.findFirst.mockResolvedValue({
+          status: 'QUOTED',
+          expiresAt: new Date(Date.now() - 1000),
+        });
+
+        await expect(
+          manualService.manualOfferToOperator('req-1', 'op-1'),
+        ).rejects.toThrow('This operator has already quoted on this job.');
+        expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();
+      });
+
+      it('only counts unexpired PENDING or any QUOTED offer for this operator on this request as live', async () => {
+        await manualService.manualOfferToOperator('req-1', 'op-1');
+
+        const anyDate: unknown = expect.any(Date);
+        expect(prisma.dispatchOffer.findFirst).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: {
+              rescueRequestId: 'req-1',
+              operatorId: 'op-1',
+              OR: [
+                { status: 'PENDING', expiresAt: { gt: anyDate } },
+                { status: 'QUOTED' },
+              ],
+            },
+          }),
+        );
+        // No live offer found (timed out / declined / expired) — a new offer
+        // is created as before.
+        expect(prisma.dispatchOffer.create).toHaveBeenCalled();
+      });
+
+      it('locks the request row before checking, so two near-simultaneous clicks cannot both pass', async () => {
+        await manualService.manualOfferToOperator('req-1', 'op-1');
+
+        const lockOrder = prisma.$queryRaw.mock.invocationCallOrder[0];
+        const checkOrder =
+          prisma.dispatchOffer.findFirst.mock.invocationCallOrder[0];
+        const createOrder =
+          prisma.dispatchOffer.create.mock.invocationCallOrder[0];
+        expect(lockOrder).toBeLessThan(checkOrder);
+        expect(checkOrder).toBeLessThan(createOrder);
+        const [strings] = prisma.$queryRaw.mock.calls[0] as [
+          TemplateStringsArray,
+        ];
+        const sql = strings.join('?');
+        expect(sql).toContain('FROM "RescueRequest"');
+        expect(sql).toContain('FOR UPDATE');
+      });
     });
 
     it('clamps a phase-2 offer to the deadline and tells the operator the TRUE remaining time', async () => {

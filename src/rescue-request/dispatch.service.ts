@@ -1525,6 +1525,37 @@ export class DispatchService {
     // who has been asked, and the next automatic round re-offers the same
     // job to an operator the admin already contacted.
     const createdOffer = await this.prisma.$transaction(async (tx) => {
+      // Locks the request row first so two near-simultaneous clicks can't
+      // both pass the live-offer check below and each send an offer.
+      await tx.$queryRaw`SELECT 1 FROM "RescueRequest" WHERE id = ${rescueRequestId} FOR UPDATE`;
+
+      // Re-offering an operator who's already engaged on this job sends them
+      // a second WhatsApp offer for the same job and leaves two open offers.
+      const live = await tx.dispatchOffer.findFirst({
+        where: {
+          rescueRequestId,
+          operatorId,
+          OR: [
+            { status: 'PENDING', expiresAt: { gt: new Date() } },
+            { status: 'QUOTED' },
+          ],
+        },
+        select: { status: true, expiresAt: true },
+      });
+      if (live?.status === 'QUOTED') {
+        throw new BadRequestException(
+          'This operator has already quoted on this job.',
+        );
+      }
+      if (live) {
+        const minutesLeft = Math.ceil(
+          (live.expiresAt.getTime() - Date.now()) / 60_000,
+        );
+        throw new BadRequestException(
+          `This operator already has a live offer for this job (expires in ${minutesLeft} min).`,
+        );
+      }
+
       const { dispatchRound } = await tx.rescueRequest.findUniqueOrThrow({
         where: { id: rescueRequestId },
         select: { dispatchRound: true },
