@@ -272,7 +272,7 @@ export const TWILIO_CONTENT_TEMPLATES: Record<
   // (POST https://content.twilio.com/v1/Content, types['twilio/call-to-action'].actions
   // = [{ type: 'REQUEST_CONTACT_INFO' }]), then submitted for approval via
   // POST .../Content/{sid}/ApprovalRequests/whatsapp — both run against the
-  // LRR Stage subaccount 2026-10-25/26. SID: HX842ee8d92168c7ccb366c9a5fd9dd7ff
+  // LRR Stage subaccount 2026-10-25/26. SID: set via TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID
   // (set TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID to this once wiring up
   // the env, Stage only — LRR Prod has nothing yet). Approval status
   // "received" as of creation; approval is not required to send inside an

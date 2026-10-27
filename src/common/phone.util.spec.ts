@@ -22,11 +22,11 @@ describe('normalizePhone', () => {
     // A plain Error here is what made this surface as a bare 500 instead of
     // a clean 400 — NestJS's default filter only maps HttpException
     // subclasses to the right status code.
-    expect(() => normalizePhone('19054628168')).toThrow(BadRequestException);
+    expect(() => normalizePhone('15550100002')).toThrow(BadRequestException);
   });
 
   it('includes the original input in the error message', () => {
-    expect(() => normalizePhone('19054628168')).toThrow(/19054628168/);
+    expect(() => normalizePhone('15550100002')).toThrow(/15550100002/);
   });
 
   it('throws BadRequestException for an empty string', () => {

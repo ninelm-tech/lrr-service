@@ -150,26 +150,26 @@ describe('RescueRequestSharedService', () => {
       prisma.user.create.mockResolvedValue({
         id: 'user-2',
         phoneNumber: null,
-        whatsappExternalUserId: 'CA.2512472632651794',
+        whatsappExternalUserId: 'CA.1234567890123456',
       });
 
       const result = await service.findOrCreateBySender({
         phoneNumber: null,
-        externalUserId: 'CA.2512472632651794',
+        externalUserId: 'CA.1234567890123456',
       });
 
       expect(prisma.user.findUnique).toHaveBeenCalledWith({
-        where: { whatsappExternalUserId: 'CA.2512472632651794' },
+        where: { whatsappExternalUserId: 'CA.1234567890123456' },
       });
       expect(prisma.user.create).toHaveBeenCalledWith({
         data: {
           phoneNumber: null,
-          whatsappExternalUserId: 'CA.2512472632651794',
+          whatsappExternalUserId: 'CA.1234567890123456',
           role: 'CUSTOMER',
         },
       });
       expect(result.phoneNumber).toBeNull();
-      expect(result.whatsappExternalUserId).toBe('CA.2512472632651794');
+      expect(result.whatsappExternalUserId).toBe('CA.1234567890123456');
     });
 
     it('recovers by re-fetching when a concurrent delivery of the same new-sender message already created the row (multi-llm review finding, hotfix 2026-10-25)', async () => {
@@ -253,13 +253,13 @@ describe('RescueRequestSharedService', () => {
       const existing = {
         id: 'user-4',
         phoneNumber: null,
-        whatsappExternalUserId: 'CA.2512472632651794',
+        whatsappExternalUserId: 'CA.1234567890123456',
       };
       prisma.user.findUnique.mockResolvedValue(existing);
 
       const result = await service.findOrCreateBySender({
         phoneNumber: null,
-        externalUserId: 'CA.2512472632651794',
+        externalUserId: 'CA.1234567890123456',
       });
 
       expect(prisma.user.create).not.toHaveBeenCalled();
