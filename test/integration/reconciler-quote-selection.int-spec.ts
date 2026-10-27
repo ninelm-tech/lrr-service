@@ -84,6 +84,29 @@ describe('QuoteSelectionTimeoutCheck (integration)', () => {
     expect(session?.rescueRequestId).toBeNull();
   });
 
+  it('clears a stale needsManualAssignment flag when it times out the request', async () => {
+    const customer = await createCustomer(prisma);
+    const operator = await createOperator(prisma);
+    const request = await createRequest(prisma, customer.id, {
+      status: 'DISPATCHING',
+      quoteSelectionExpiresAt: new Date(Date.now() - 60_000),
+      needsManualAssignment: true,
+    });
+    await createOffer(prisma, request.id, operator.id, {
+      status: 'QUOTED',
+      quotedPrice: 2_000_000,
+      dispatchRound: 0,
+    });
+
+    await check.run(new Date());
+
+    const after = await prisma.rescueRequest.findUnique({
+      where: { id: request.id },
+    });
+    expect(after?.status).toBe('CANCELLED');
+    expect(after?.needsManualAssignment).toBe(false);
+  });
+
   it('does nothing before the deadline', async () => {
     const { request } = await awaitingSelection(60_000);
     await check.run(new Date());
@@ -108,5 +131,29 @@ describe('QuoteSelectionTimeoutCheck (integration)', () => {
 
     // One motorist message plus one operator message, for one cancellation.
     expect(twilio.sendWhatsAppMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('notifies a BSUID-only customer via their BSUID instead of silently skipping them (Task 14, hotfix 2026-10-25)', async () => {
+    const customer = await createCustomer(prisma, undefined, {
+      phoneNumber: null,
+      whatsappExternalUserId: 'CA.masked',
+    });
+    const operator = await createOperator(prisma);
+    const request = await createRequest(prisma, customer.id, {
+      status: 'DISPATCHING',
+      quoteSelectionExpiresAt: new Date(Date.now() - 60_000),
+    });
+    await createOffer(prisma, request.id, operator.id, {
+      status: 'QUOTED',
+      quotedPrice: 2_000_000,
+      dispatchRound: 0,
+    });
+
+    await check.run(new Date());
+
+    expect(twilio.sendWhatsAppMessage).toHaveBeenCalledWith(
+      'whatsapp:CA.masked',
+      expect.stringContaining("didn't choose a quote in time"),
+    );
   });
 });

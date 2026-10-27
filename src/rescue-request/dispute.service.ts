@@ -152,7 +152,10 @@ export class DisputeService {
     // The operator is the one physically holding the vehicle — they're the
     // one who needs to hear "don't release it," not the customer. Best-effort:
     // a failed operator notification shouldn't block the dispute itself.
-    if (rescueRequest.assignedOperator?.phoneNumber) {
+    if (
+      rescueRequest.assignedOperator?.phoneNumber &&
+      rescueRequest.assignedOperator.whatsappEnabled
+    ) {
       try {
         const opUser = await this.sharedService.findOrCreateCustomer(
           rescueRequest.assignedOperator.phoneNumber,
@@ -321,7 +324,10 @@ export class DisputeService {
     const operatorMessage = `The dispute on ${jobRef} has been resolved. A payment link for ₦${(settledBalance / 100).toLocaleString()} has been sent to the customer.`;
 
     try {
-      if (rescueRequest.assignedOperator?.phoneNumber) {
+      if (
+        rescueRequest.assignedOperator?.phoneNumber &&
+        rescueRequest.assignedOperator.whatsappEnabled
+      ) {
         await this.twilioService.sendWhatsAppMessage(
           toWhatsAppAddress(rescueRequest.assignedOperator.phoneNumber),
           operatorMessage,

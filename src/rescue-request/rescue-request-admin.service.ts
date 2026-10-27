@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import * as crypto from 'crypto';
 import * as Sentry from '@sentry/node';
+import { logger } from '@sentry/node';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaystackService } from '../integrations/paystack/paystack.service';
 import { TwilioService } from '../integrations/twilio/twilio.service';
@@ -20,8 +21,9 @@ import {
   Prisma,
   RescueRequestStatus,
 } from '@prisma/client';
-import { toWhatsAppAddress } from '../common/phone.util';
+import { toWhatsAppAddress, toWhatsAppDestination } from '../common/phone.util';
 import { claimOnce } from '../common/claim-once.util';
+import { WhatsAppFlowState } from './state/whatsapp-session.types';
 import { DEPOSIT_WINDOW_MS } from './deposit.constants';
 import {
   RescueRequestListResponseDto,
@@ -32,11 +34,14 @@ import {
   PaginationMetaDto,
 } from './dto/rescue-request-response.dto';
 import { RequestMediaDto } from '../media/dto/request-media.dto';
-import { DispatchService } from './dispatch.service';
+import { DispatchService, RADIUS_EXPANSION_KM } from './dispatch.service';
+import { getEligibleTruckClasses } from './domain/vehicle-truck-mapping';
+import { computeDepositAmount } from './domain/compute-deposit-amount';
 import { RescueRequestSharedService } from './rescue-request-shared.service';
 import { PaymentLedgerService } from '../payment/payment-ledger.service';
 import { PaystackCustomerService } from '../payment/paystack-customer.service';
 import { OperatorMembershipService } from '../operator/operator-membership.service';
+import { OperatorService } from '../operator/operator.service';
 import { mapRefundStatus } from '../payment/domain/paystack-status';
 import {
   deriveRefundStatus,
@@ -68,6 +73,7 @@ export class RescueRequestAdminService {
     private readonly paystackCustomerService: PaystackCustomerService,
     private readonly operatorMembershipService: OperatorMembershipService,
     private readonly payoutService: PayoutService,
+    private readonly operatorService: OperatorService,
   ) {}
 
   async adminList(query: any) {
@@ -164,6 +170,11 @@ export class RescueRequestAdminService {
         'Customer has no phone number on file — cannot send a payment link',
       );
     }
+    if (!operator.whatsappEnabled && !request.needsManualAssignment) {
+      throw new BadRequestException(
+        'This operator has no WhatsApp on file — it can only be assigned to a request flagged for manual assignment.',
+      );
+    }
 
     const config = await this.platformConfigService.getConfig();
     const serviceFeeAmount = Math.round(
@@ -176,13 +187,20 @@ export class RescueRequestAdminService {
     const depositPercent = Number(
       operator.depositPercentOverride ?? config.depositPercent,
     );
-    const depositAmount = Math.round((total * depositPercent) / 100);
+    // A 0% deposit must never be possible — not just unconfigurable going
+    // forward (PlatformConfigService's own floor), but unconditionally: a
+    // stale depositPercentOverride/depositPercent row from before that floor
+    // existed, a non-numeric value, or rounding a tiny price down, must
+    // never produce a free (or unpayable) job either — computeDepositAmount
+    // floors at Paystack's own minimum chargeable amount, never at 0 or an
+    // amount Paystack would reject.
+    const depositAmount = computeDepositAmount(total, depositPercent);
     const balanceAmount = total - depositAmount;
 
     const MANUAL_ASSIGN_WINDOW_MS = 30 * 60 * 1000;
     const batchId = crypto.randomUUID();
     const depositWindowExpiresAt = new Date(Date.now() + DEPOSIT_WINDOW_MS);
-    let payment: Payment | null;
+    let payment: Payment;
     try {
       payment = await this.prisma.$transaction(async (tx) => {
         const customerStillActive = await tx.user.updateMany({
@@ -210,19 +228,17 @@ export class RescueRequestAdminService {
             id,
             status: request.status,
             assignedOperatorId: request.assignedOperatorId,
+            ...(!operator.whatsappEnabled && { needsManualAssignment: true }),
           },
           data: {
             assignedOperatorId: dto.operatorId,
-            status:
-              depositAmount === 0
-                ? RescueRequestStatus.OPERATOR_ASSIGNED
-                : RescueRequestStatus.WAITING_FOR_DEPOSIT,
+            status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
+            needsManualAssignment: false,
             serviceFeeAmount,
             depositAmount,
             balanceAmount,
-            ...(depositAmount === 0
-              ? {}
-              : { depositWindowExpiresAt, depositRemindersSent: 0 }),
+            depositWindowExpiresAt,
+            depositRemindersSent: 0,
           },
         });
         if (claimed.count === 0) {
@@ -235,8 +251,7 @@ export class RescueRequestAdminService {
           data: {
             rescueRequestId: id,
             operatorId: dto.operatorId,
-            status:
-              depositAmount === 0 ? 'ACCEPTED' : 'SELECTED_PENDING_PAYMENT',
+            status: 'SELECTED_PENDING_PAYMENT',
             quotedPrice: dto.priceKobo,
             respondedAt: new Date(),
             expiresAt: new Date(Date.now() + MANUAL_ASSIGN_WINDOW_MS),
@@ -244,12 +259,6 @@ export class RescueRequestAdminService {
             dispatchRound: request.dispatchRound,
           },
         });
-
-        if (depositAmount === 0) {
-          // No Payment row to create — there's nothing to pay. The offer
-          // above was already created as ACCEPTED.
-          return null;
-        }
 
         return this.paymentLedger.create({
           rescueRequestId: id,
@@ -270,63 +279,6 @@ export class RescueRequestAdminService {
       throw error;
     }
 
-    if (depositAmount === 0) {
-      // Send the customer's own "operator assigned" notification FIRST —
-      // same failure-isolation as PaymentEventsService.confirmDeposit
-      // (Task 4) and handleQuoteSelected's 0%-deposit branch (Task 5): a
-      // failure inside activateAssignedJob (operator lookup, location
-      // formatting, the operator's own Twilio send) must not silently
-      // swallow this notification. The reverse must also hold — caught and
-      // logged rather than left to reject unhandled, so a Twilio failure
-      // sending THIS message can't swallow activateAssignedJob below, which
-      // is what actually matters operationally.
-      const customerPhone = toWhatsAppAddress(request.customer.phoneNumber);
-      try {
-        await this.twilioService.sendWhatsAppMessage(
-          customerPhone,
-          `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\nPhone: ${operator.phoneNumber}\n\nNo deposit required — you'll pay the full ₦${(total / 100).toLocaleString()} once the job is complete.`,
-        );
-      } catch (error) {
-        console.error(
-          `assignOperator ${id}: failed to send the customer's "operator assigned" message:`,
-          error,
-        );
-        Sentry.captureException(error, {
-          extra: {
-            rescueRequestId: id,
-            stage: 'assign-operator-customer-message',
-          },
-        });
-      }
-
-      // The offer was already created as ACCEPTED above, so
-      // activateAssignedJob's own offer-flip is a no-op here — it's still
-      // the thing that moves both sessions into their on-job states and
-      // sends the operator their job-is-live message, same as a paid
-      // deposit would.
-      await this.paymentEventsService.activateAssignedJob(id);
-
-      const updated = await this.prisma.rescueRequest.findUniqueOrThrow({
-        where: { id },
-        include: {
-          customer: true,
-          assignedOperator: true,
-          payments: { select: { id: true, type: true, status: true } },
-        },
-      });
-
-      return { data: this.mapToDetailDto(updated, true) };
-    }
-
-    if (!payment) {
-      // Defensive: depositAmount > 0 on this path, so the transaction above
-      // always returned a real Payment row (see the depositAmount === 0
-      // branch's early return above, which is the only case that returns
-      // null).
-      throw new BadRequestException(
-        'Expected a payment row for a nonzero deposit.',
-      );
-    }
     if (
       !(await this.paymentLedger.claimForSubmission(payment.id, new Date()))
     ) {
@@ -396,10 +348,12 @@ export class RescueRequestAdminService {
       customerPhone,
       `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *30 minutes*:\n\n👉 ${checkoutUrl}\n\nReply CANCEL to cancel (no charge).`,
     );
-    void this.twilioService.sendWhatsAppMessage(
-      operatorPhone,
-      `🚗 You've been assigned a job (₦${(dto.priceKobo / 100).toLocaleString()}). Waiting for the customer to confirm payment.`,
-    );
+    if (operator.whatsappEnabled) {
+      void this.twilioService.sendWhatsAppMessage(
+        operatorPhone,
+        `🚗 You've been assigned a job (₦${(dto.priceKobo / 100).toLocaleString()}). Waiting for the customer to confirm payment.`,
+      );
+    }
 
     return { data: this.mapToDetailDto(updated, true) };
   }
@@ -727,9 +681,28 @@ export class RescueRequestAdminService {
     if (!Object.values(RescueRequestStatus).includes(status)) {
       throw new BadRequestException(`Invalid status: ${dto.status}`);
     }
+    if (
+      status === RescueRequestStatus.ARRIVED ||
+      status === RescueRequestStatus.COMPLETED
+    ) {
+      const current = await this.prisma.rescueRequest.findUnique({
+        where: { id },
+        select: { assignedOperator: { select: { whatsappEnabled: true } } },
+      });
+      if (current?.assignedOperator?.whatsappEnabled === false) {
+        throw new BadRequestException(
+          'Use manual-arrived/manual-done for a non-WhatsApp operator, not the generic status endpoint.',
+        );
+      }
+    }
     const updated = await this.prisma.rescueRequest.update({
       where: { id },
-      data: { status },
+      data: {
+        status,
+        ...(status === RescueRequestStatus.CANCELLED && {
+          needsManualAssignment: false,
+        }),
+      },
       include: {
         customer: true,
         payments: { select: { id: true, type: true, status: true } },
@@ -766,7 +739,10 @@ export class RescueRequestAdminService {
   async cancel(id: string, dto: { reason?: string }) {
     const updated = await this.prisma.rescueRequest.update({
       where: { id },
-      data: { status: RescueRequestStatus.CANCELLED },
+      data: {
+        status: RescueRequestStatus.CANCELLED,
+        needsManualAssignment: false,
+      },
       include: {
         customer: true,
         payments: { select: { id: true, type: true, status: true } },
@@ -805,12 +781,10 @@ export class RescueRequestAdminService {
     // own CANCEL command already does this; the admin action was missing it.
     await this.sessionStore.clear(updated.customerId);
 
-    if (updated.customer.phoneNumber) {
-      await this.twilioService.sendWhatsAppMessage(
-        updated.customer.phoneNumber,
-        `❌ Your rescue request has been cancelled${dto.reason ? `: ${dto.reason}` : '.'}\n\nSend SOS or HELP if you need assistance again.`,
-      );
-    }
+    await this.twilioService.sendWhatsAppMessage(
+      toWhatsAppDestination(updated.customer),
+      `❌ Your rescue request has been cancelled${dto.reason ? `: ${dto.reason}` : '.'}\n\nSend SOS or HELP if you need assistance again.`,
+    );
     return { data: this.mapToDetailDto(updated, true) };
   }
 
@@ -843,6 +817,7 @@ export class RescueRequestAdminService {
             businessName: true,
             phoneNumber: true,
             email: true,
+            whatsappEnabled: true,
           },
         },
         payments: { select: { id: true, type: true, status: true } },
@@ -939,6 +914,161 @@ export class RescueRequestAdminService {
     throw new UnauthorizedException('Access denied');
   }
 
+  async findRawForManualAction(id: string) {
+    return this.prisma.rescueRequest.findUnique({
+      where: { id },
+      select: {
+        status: true,
+        assignedOperatorId: true,
+        assignedOperator: { select: { whatsappEnabled: true } },
+      },
+    });
+  }
+
+  /**
+   * Atomically claims the ARRIVED transition for a manually-operated job.
+   * `count: 0` means the pre-check (`findRawForManualAction`, read moments
+   * earlier by the controller) is now stale — status changed in between —
+   * and the caller must not proceed to notify the customer or write an
+   * audit entry.
+   *
+   * No longer gated on `assignedOperator.whatsappEnabled: false` — the
+   * controller now also permits a reasoned override for a WhatsApp-enabled
+   * operator (its own `reason` requirement is enforced there, not here).
+   * `reason` is accepted here purely so this method's own call shape
+   * matches that override path; the controller's existing audit-log call
+   * is what actually records it. When the override applies, this also
+   * resets whichever session row is currently tracking this job for the
+   * assigned operator, to the same state a real, unmasked ARRIVED would
+   * have left it in — otherwise a later WhatsApp reconnect would act on
+   * stale pre-override session state.
+   */
+  async claimManualArrived(
+    id: string,
+    options?: { reason?: string },
+  ): Promise<{ claimed: boolean }> {
+    const hasReason = !!options?.reason;
+    const claimed = await this.prisma.rescueRequest.updateMany({
+      where: {
+        id,
+        status: RescueRequestStatus.OPERATOR_ASSIGNED,
+        // Without a reason, re-verify whatsappEnabled: false atomically,
+        // here — not from the controller's pre-check, which can be stale
+        // by the time this claim runs. Closes the race where the operator
+        // reconnects WhatsApp between that pre-check and this claim: a
+        // reasonless override must still fail if that happened.
+        ...(!hasReason && { assignedOperator: { whatsappEnabled: false } }),
+      },
+      data: { status: RescueRequestStatus.ARRIVED },
+    });
+    if (claimed.count !== 1) return { claimed: false };
+
+    const request = await this.prisma.rescueRequest.findUnique({
+      where: { id },
+      select: {
+        assignedOperatorId: true,
+        assignedOperator: {
+          select: { whatsappEnabled: true, phoneNumber: true },
+        },
+      },
+    });
+    if (
+      request?.assignedOperator?.whatsappEnabled &&
+      request.assignedOperator.phoneNumber
+    ) {
+      logger.info(
+        'manual override: resetting WhatsApp-enabled operator session (ARRIVED)',
+        {
+          rescueRequestId: id,
+          operatorId: request.assignedOperatorId,
+          reason: options?.reason,
+        },
+      );
+      // Matched by the operator's own on-file phoneNumber, not by any
+      // OperatorMember/staff-login relationship — that system tracks admin
+      // portal access, a separate identity axis from which User row the
+      // operator's WhatsApp dispatch conversation actually lives on (see
+      // the WhatsApp username/BSUID identity design doc).
+      await this.prisma.whatsAppSession.updateMany({
+        where: {
+          rescueRequestId: id,
+          user: { phoneNumber: request.assignedOperator.phoneNumber },
+        },
+        data: { state: WhatsAppFlowState.OPERATOR_AT_LOCATION },
+      });
+    }
+
+    return { claimed: true };
+  }
+
+  async manualCandidatesFor(id: string) {
+    const request = await this.prisma.rescueRequest.findUnique({
+      where: { id },
+      select: {
+        status: true,
+        needsManualAssignment: true,
+        latitude: true,
+        longitude: true,
+        vehicleType: true,
+        offeredOperatorIds: true,
+        dispatchRound: true,
+        customer: { select: { phoneNumber: true } },
+      },
+    });
+    if (!request) throw new NotFoundException('Rescue request not found');
+    if (
+      request.status !== RescueRequestStatus.DISPATCHING ||
+      !request.needsManualAssignment
+    ) {
+      throw new BadRequestException(
+        'This request does not currently need manual assignment.',
+      );
+    }
+    const eligibleTruckClasses = request.vehicleType
+      ? getEligibleTruckClasses(request.vehicleType)
+      : undefined;
+    // Same computation as DispatchService.prepareNextRound's own
+    // isTestRequest — see that method's comment for why it's re-checked
+    // live from PlatformConfig rather than snapshotted.
+    const config = await this.platformConfigService.getConfig();
+    const isTestRequest = config.testCustomerPhoneNumbers.includes(
+      request.customer.phoneNumber ?? '',
+    );
+    // Matches resolveExhaustion's own radius exactly — dispatchRound is
+    // persisted AFTER attemptRound's increment but BEFORE extraRadiusKm's
+    // own increment for that same round (see prepareNextRound), so the
+    // last radius actually searched is two steps back, not one.
+    //
+    // This formula is only exact for a 'rounds-exhausted' exhaustion —
+    // prepareNextRound's OTHER exhaustion reason, 'no-coverage', returns
+    // `round` one step lower (attemptRound is never incremented on that
+    // path), which this formula would under-count by one
+    // RADIUS_EXPANSION_KM step. That's not a live bug today: 'no-coverage'
+    // means zero ACTIVE operators of any kind exist within prepareNextRound's
+    // own ~150km coverage box, which makes resolveExhaustion's own
+    // whatsappOnly:false backup search (confined to that same box) provably
+    // also find zero candidates — so a 'no-coverage' exhaustion can never
+    // actually set needsManualAssignment: true, and this method can never be
+    // reached for one. If the coverage check (nearbyOperatorCount, above in
+    // prepareNextRound) is ever narrowed to WhatsApp-only operators, that
+    // invariant breaks and this formula would need its own `reason` input
+    // rather than reconstructing purely from dispatchRound — flagged here so
+    // the next person touching that check sees it coming.
+    const extraRadiusKm =
+      Math.max(0, request.dispatchRound - 2) * RADIUS_EXPANSION_KM;
+    const candidates = await this.operatorService.findAndRankCandidates(
+      Number(request.latitude),
+      Number(request.longitude),
+      request.offeredOperatorIds,
+      extraRadiusKm,
+      undefined,
+      eligibleTruckClasses,
+      isTestRequest,
+      false, // whatsappOnly
+    );
+    return { data: candidates };
+  }
+
   async detailForUser(
     user: any,
     id: string,
@@ -957,6 +1087,7 @@ export class RescueRequestAdminService {
             businessName: true,
             phoneNumber: true,
             email: true,
+            whatsappEnabled: true,
           },
         },
         media: {
@@ -1037,7 +1168,9 @@ export class RescueRequestAdminService {
           customer: {
             select: { id: true, phoneNumber: true, deletedAt: true },
           },
-          assignedOperator: { select: { id: true, businessName: true } },
+          assignedOperator: {
+            select: { id: true, businessName: true, whatsappEnabled: true },
+          },
           payments: {
             select: { id: true, type: true, status: true, createdAt: true },
           },
@@ -1077,8 +1210,10 @@ export class RescueRequestAdminService {
         ? {
             id: item.assignedOperator.id,
             businessName: item.assignedOperator.businessName,
+            whatsappEnabled: item.assignedOperator.whatsappEnabled,
           }
         : undefined,
+      needsManualAssignment: item.needsManualAssignment,
       disputed: item.disputed,
       disputeRaisedAt: item.disputeRaisedAt ?? undefined,
       disputeResolvedAt: item.disputeResolvedAt ?? undefined,
@@ -1148,6 +1283,8 @@ export class RescueRequestAdminService {
     return {
       id: raw.id,
       status: raw.status,
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access -- raw is typed `any` throughout this method, same as every other raw.* access here
+      needsManualAssignment: raw.needsManualAssignment,
       issueType: raw.issueType ?? undefined,
       vehicleType: raw.vehicleType ?? undefined,
       destination: raw.destination ?? undefined,
@@ -1182,6 +1319,8 @@ export class RescueRequestAdminService {
             businessName: raw.assignedOperator.businessName,
             phoneNumber: raw.assignedOperator.phoneNumber,
             email: raw.assignedOperator.email,
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access -- raw is typed `any` throughout this method, same as every other raw.assignedOperator.* access above
+            whatsappEnabled: raw.assignedOperator.whatsappEnabled,
           }
         : undefined,
       disputed: raw.disputed,

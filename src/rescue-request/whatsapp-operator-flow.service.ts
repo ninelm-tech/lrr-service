@@ -19,7 +19,7 @@ import { PaymentEventsService } from './payment-events.service';
 import { WhatsAppCustomerFlowService } from './whatsapp-customer-flow.service';
 import { WhatsAppSessionStore } from './state/whatsapp-session.store';
 import { WhatsAppFlowState } from './state/whatsapp-session.types';
-import { toWhatsAppAddress } from '../common/phone.util';
+import { toWhatsAppAddress, toWhatsAppDestination } from '../common/phone.util';
 import { PlatformConfigService } from '../platform-config/platform-config.service';
 
 const MAX_MEDIA_ITEMS = 5;
@@ -65,9 +65,9 @@ export class WhatsAppOperatorFlowService {
           where: { id: session.rescueRequestId },
           include: { customer: true },
         });
-        if (rescueRequest?.customer?.phoneNumber) {
+        if (rescueRequest?.customer) {
           await this.twilioService.sendWhatsAppMessage(
-            toWhatsAppAddress(rescueRequest.customer.phoneNumber),
+            toWhatsAppDestination(rescueRequest.customer),
             `Driver: ${rawMessage}`,
           );
         }
@@ -402,7 +402,7 @@ export class WhatsAppOperatorFlowService {
       const arrivedReminderText = `📍 ${formatJobRef(session.rescueRequestId!)} — Send *ARRIVED* when you reach the customer location so we can notify them.`;
       if (arrivedReminderSid) {
         return this.replyWithTemplateOrText(
-          phoneNumber,
+          await this.resolveOperatorReminderDestination(userId, operator),
           arrivedReminderSid,
           { '1': formatJobRef(session.rescueRequestId!) },
           arrivedReminderText,
@@ -417,7 +417,7 @@ export class WhatsAppOperatorFlowService {
       const doneReminderText = `✅ ${formatJobRef(session.rescueRequestId!)} — Send *DONE* when the job is complete. The customer will confirm and you'll both be notified.`;
       if (doneReminderSid) {
         return this.replyWithTemplateOrText(
-          phoneNumber,
+          await this.resolveOperatorReminderDestination(userId, operator),
           doneReminderSid,
           { '1': formatJobRef(session.rescueRequestId!) },
           doneReminderText,
@@ -575,6 +575,143 @@ export class WhatsAppOperatorFlowService {
     );
   }
 
+  /**
+   * The customer-facing NOTIFICATION half of ARRIVED — deliberately does
+   * NOT write the ARRIVED status itself. Shared between the WhatsApp
+   * handler (which does its own unconditional status write, already gated
+   * by its own session-state check, immediately before calling this) and
+   * the manual-arrived controller action (Task 10, which does an atomic
+   * CONDITIONAL claim of that same status write before calling this) —
+   * those two callers need different concurrency guarantees for the write
+   * itself, so the write can't live in this shared method without collapsing
+   * that difference. Keeping this method to "read the current state, tell
+   * the customer" only is what lets both callers share it safely.
+   */
+  async notifyCustomerOperatorArrived(rescueRequestId: string): Promise<void> {
+    const rescueRequest = await this.prisma.rescueRequest.findUnique({
+      where: { id: rescueRequestId },
+      include: { customer: true, assignedOperator: true },
+    });
+    if (!rescueRequest) return;
+    const customerPhone = rescueRequest.customer.phoneNumber;
+    if (customerPhone) {
+      await this.twilioService.sendWhatsAppMessage(
+        customerPhone,
+        `🚗 Your tow operator has arrived!\n\nBusiness: *${rescueRequest.assignedOperator?.businessName}*\n\nThey're at your location. Please show them your vehicle.`,
+      );
+    }
+  }
+
+  /**
+   * The DONE-equivalent for a manual job — deliberately NOT gated on
+   * completion media: a non-WhatsApp job is exempt from the mandatory
+   * evidence rule by explicit product decision, verified by phone instead.
+   * `handleOperatorJobDone` (the WhatsApp path) is completely untouched by
+   * this method and still requires media first, exactly as today.
+   *
+   * Unlike `notifyCustomerOperatorArrived`, this one is NOT shared with any
+   * WhatsApp-path method (the WhatsApp DONE flow has no manual-only
+   * equivalent to share with), so it owns its own atomic conditional claim
+   * end to end — the claim (`status: ARRIVED` AND `confirmationDueAt: null`
+   * → sets `confirmationDueAt`) is the first statement inside its own
+   * transaction, closing the claim race a status-only condition would leave
+   * open (a second call re-claiming the same row and re-sending CONFIRM
+   * indefinitely), self-contained, with no separate claim helper needed
+   * elsewhere.
+   *
+   * No longer gated on `assignedOperator.whatsappEnabled: false` — the
+   * controller now also permits a reasoned override for a WhatsApp-enabled
+   * operator. `reason` is accepted purely so this method's call shape
+   * matches that override path; the controller's own audit-log call is
+   * what records it. When the override applies, this also resets whichever
+   * session row is currently tracking this job for the assigned operator
+   * to IDLE — the same state a real, unmasked DONE leaves the operator's
+   * own session in (see the WhatsApp-path handler, same file) — so a later
+   * reconnect doesn't act on stale pre-override state.
+   */
+  async startManualCompletionConfirmation(
+    rescueRequestId: string,
+    options?: { reason?: string },
+  ): Promise<{ claimed: boolean }> {
+    const hasReason = !!options?.reason;
+    const result = await this.prisma.$transaction(async (tx) => {
+      const claimed = await tx.rescueRequest.updateMany({
+        where: {
+          id: rescueRequestId,
+          status: RescueRequestStatus.ARRIVED,
+          confirmationDueAt: null,
+          // Without a reason, re-verify whatsappEnabled: false atomically
+          // — see the identical note in
+          // RescueRequestAdminService.claimManualArrived.
+          ...(!hasReason && { assignedOperator: { whatsappEnabled: false } }),
+        },
+        data: {
+          confirmationDueAt: new Date(Date.now() + STALLED_CONFIRMATION_MS),
+        },
+      });
+      if (claimed.count === 0) return null;
+
+      const rescueRequest = await tx.rescueRequest.findUnique({
+        where: { id: rescueRequestId },
+        select: {
+          customerId: true,
+          customer: { select: { phoneNumber: true } },
+          assignedOperatorId: true,
+          assignedOperator: {
+            select: {
+              businessName: true,
+              whatsappEnabled: true,
+              phoneNumber: true,
+            },
+          },
+        },
+      });
+      if (rescueRequest?.customerId) {
+        await tx.whatsAppSession.updateMany({
+          where: { userId: rescueRequest.customerId },
+          data: {
+            state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
+            rescueRequestId,
+          },
+        });
+      }
+      if (
+        rescueRequest?.assignedOperator?.whatsappEnabled &&
+        rescueRequest.assignedOperator.phoneNumber
+      ) {
+        logger.info(
+          'manual override: resetting WhatsApp-enabled operator session (DONE)',
+          {
+            rescueRequestId,
+            operatorId: rescueRequest.assignedOperatorId,
+            reason: options?.reason,
+          },
+        );
+        // Matched by the operator's own on-file phoneNumber — see the
+        // identical note in RescueRequestAdminService.claimManualArrived.
+        await tx.whatsAppSession.updateMany({
+          where: {
+            rescueRequestId,
+            user: { phoneNumber: rescueRequest.assignedOperator.phoneNumber },
+          },
+          data: { state: WhatsAppFlowState.IDLE, rescueRequestId: null },
+        });
+      }
+      return rescueRequest;
+    });
+
+    if (!result) return { claimed: false };
+
+    const customerPhone = result.customer?.phoneNumber;
+    if (customerPhone) {
+      await this.twilioService.sendWhatsAppMessage(
+        customerPhone,
+        `🔧 ${result.assignedOperator?.businessName} says the job is done!\n\nReply *CONFIRM* to release your vehicle and receive the balance payment link.\n\nIf there's a problem, reply *DISPUTE* and our team will investigate.`,
+      );
+    }
+    return { claimed: true };
+  }
+
   private async handleOperatorArrived(
     operatorPhone: string,
     operatorUserId: string,
@@ -601,7 +738,11 @@ export class WhatsAppOperatorFlowService {
       );
     }
 
-    // Update request status to ARRIVED
+    // Update request status to ARRIVED — unconditional here, exactly as
+    // before this task: this path's own session-state check above
+    // (OPERATOR_ON_JOB) is what already guards this write; it does not need
+    // the manual path's atomic conditional claim, which exists specifically
+    // because the manual path has no session state to check instead.
     await this.prisma.rescueRequest.update({
       where: { id: rescueRequestId },
       data: { status: RescueRequestStatus.ARRIVED },
@@ -612,14 +753,7 @@ export class WhatsAppOperatorFlowService {
       state: WhatsAppFlowState.OPERATOR_AT_LOCATION,
     });
 
-    // Notify customer
-    const customerPhone = rescueRequest.customer.phoneNumber;
-    if (customerPhone) {
-      await this.twilioService.sendWhatsAppMessage(
-        customerPhone,
-        `🚗 Your tow operator has arrived!\n\nBusiness: *${operator.businessName}*\n\nThey're at your location. Please show them your vehicle.`,
-      );
-    }
+    await this.notifyCustomerOperatorArrived(rescueRequestId);
 
     // Full definition: TWILIO_CONTENT_TEMPLATES.done_prompt in
     // src/integrations/twilio/twilio-content-templates.ts.
@@ -627,7 +761,9 @@ export class WhatsAppOperatorFlowService {
     const donePromptText = `✅ ${formatJobRef(rescueRequestId)} — Arrival confirmed! The customer has been notified.\n\nSend *DONE* when the job is complete.`;
     if (donePromptSid) {
       return this.replyWithTemplateOrText(
-        operatorPhone,
+        await this.resolveOperatorReminderDestination(operatorUserId, {
+          phoneNumber: operatorPhone,
+        }),
         donePromptSid,
         { '1': formatJobRef(rescueRequestId) },
         donePromptText,
@@ -733,19 +869,48 @@ export class WhatsAppOperatorFlowService {
       where: { id: rescueRequestId },
       include: { customer: true },
     });
-    if (!rescueRequest?.customer?.phoneNumber) return;
+    if (!rescueRequest?.customer) return;
 
     await this.sessionStore.update(rescueRequest.customerId, {
       relayTarget: null,
     });
     await this.twilioService.sendWhatsAppMessage(
-      toWhatsAppAddress(rescueRequest.customer.phoneNumber),
+      toWhatsAppDestination(rescueRequest.customer),
       `Chat ended.`,
     );
   }
 
   private reply(message: string): string {
     return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n<Message>${message}</Message>\n</Response>`;
+  }
+
+  /**
+   * The ARRIVED/DONE reminders are sent via an async REST call, not a TwiML
+   * reply, so they must target a reachable address explicitly rather than
+   * relying on Twilio to route a reply back to whoever sent the inbound
+   * webhook. Once this operator has ever been captured masked (a BSUID on
+   * their linked User), prefer that over their on-file `operator.phoneNumber`
+   * — Meta's own changelog documents outbound sends to a username-set
+   * account needing the BSUID form, not the old phone number. Falls back to
+   * the phone number when no BSUID has been captured, unchanged from before.
+   */
+  private async resolveOperatorReminderDestination(
+    userId: string,
+    operator: { phoneNumber: string },
+  ): Promise<string> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { whatsappExternalUserId: true },
+    });
+    return user?.whatsappExternalUserId
+      ? toWhatsAppDestination({
+          phoneNumber: null,
+          whatsappExternalUserId: user.whatsappExternalUserId,
+        })
+      : toWhatsAppDestination({
+          phoneNumber: operator.phoneNumber,
+          whatsappExternalUserId: null,
+        });
   }
 
   private xmlOk(): string {

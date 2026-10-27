@@ -24,6 +24,7 @@ export class CustomerDetailDto {
 export class OperatorSummaryDto {
   id: string;
   businessName: string;
+  whatsappEnabled: boolean;
 }
 
 export class OperatorDetailDto {
@@ -31,6 +32,7 @@ export class OperatorDetailDto {
   businessName: string;
   phoneNumber: string;
   email?: string;
+  whatsappEnabled: boolean;
 }
 
 export class RescueRequestListItemDto {
@@ -51,6 +53,7 @@ export class RescueRequestListItemDto {
   depositRefundStatus: 'NONE' | 'ELIGIBLE' | 'PENDING' | 'COMPLETED' | 'FAILED';
   customer: CustomerSummaryDto;
   assignedOperator?: OperatorSummaryDto;
+  needsManualAssignment: boolean;
   disputed: boolean;
   disputeRaisedAt?: Date;
   disputeResolvedAt?: Date;
@@ -81,6 +84,7 @@ export class DispatchBoardRowDto {
   createdAt: Date;
   /** Set once the first quote arrives; null while still SEARCHING (phase 1). */
   quoteCollectionDeadline?: Date;
+  needsManualAssignment: boolean;
   offers: DispatchOfferAdminDto[];
 }
 
@@ -97,6 +101,7 @@ export class RatingSummaryDto {
 export class RescueRequestDetailDto {
   id: string;
   status: RescueRequestStatus;
+  needsManualAssignment: boolean;
   issueType?: IssueType;
   vehicleType?: VehicleType;
   destination?: string;

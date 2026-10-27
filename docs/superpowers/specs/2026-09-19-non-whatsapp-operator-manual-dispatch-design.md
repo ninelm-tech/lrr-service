@@ -200,16 +200,29 @@ still alive, just waiting on a phone call, not something to apologize for).
 staff get alerted here the way `alertAdminNoOperator` "already does" — that
 method is in fact just a `console.warn` stub today ("Hook to admin
 notification service when available", `dispatch.service.ts:1415-1425`), not
-a real alert of any kind. There is no existing push-alert mechanism for this
-case to reuse. Given Section 5 already makes the Requests/Dispatch Board
-badge the primary way staff notices a manual-assignment job, this design
-does not add a new alert channel for it — logs a warning + a
-`Sentry.captureMessage` at `info` level (same shape as
-`notifyNoOperatorAvailable`'s existing Sentry call for the cancelled case,
-so this failure mode is at least visible in Sentry if the badge goes
-unnoticed), and relies on the badge for staff to actually act. If that
-turns out to be insufficient in practice, a real staff-alert channel is a
-separate, later feature — not assumed here.
+a real alert of any kind.
+
+**Correction, multi-llm review (2026-10-23): the "no existing push-alert
+mechanism" premise below is now stale.** It was true when this section was
+written (2026-09-19). Since then, `PlatformConfig.disputeAlertPhoneNumbers`
+shipped as a real, configurable staff-alert channel — a list of WhatsApp
+numbers that already fan out for disputes, low ratings, and stalled
+confirmations (see `StalledConfirmationCheck`, the closest existing
+precedent: same "staff needs to act on a stuck request" shape this
+section describes). The plan now sends a staff alert to that same list
+when a request is flagged for manual assignment, matching
+`StalledConfirmationCheck`'s own freeform-send pattern (plain
+`sendWhatsAppMessage`, no Content Template — consistent with that
+existing precedent, not a new convention). Given Section 5's badge and
+this new alert, this design does not add a time-based auto-escalation or
+auto-cancellation for a flagged-but-unresolved request — the alert +
+badge are the two notification channels; what happens if staff still
+doesn't act is left as a deliberate open question, not solved here (a
+real escalation policy — cancel after N hours? keep paging staff? — is a
+product decision, not a gap this correction tries to resolve on its
+own). If the alert + badge turn out to be insufficient in practice, a
+time-based auto-escalation is a separate, later feature — not assumed
+here.
 
 **Ordering note:** if a request is flagged `needsManualAssignment: true` and
 staff hasn't acted yet, and a WhatsApp-enabled operator becomes newly

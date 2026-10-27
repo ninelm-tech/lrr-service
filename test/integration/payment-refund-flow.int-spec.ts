@@ -56,6 +56,7 @@ describe('Refund submission protocol (integration)', () => {
       } as never,
       {} as never,
       {} as never,
+      {} as never,
     );
   });
 

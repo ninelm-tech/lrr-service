@@ -13,7 +13,10 @@ describe('OperatorMembershipService', () => {
 
   beforeEach(async () => {
     prisma = {
-      operatorMember: { findMany: jest.fn(), findFirst: jest.fn() },
+      operatorMember: {
+        findMany: jest.fn(),
+        findFirst: jest.fn(),
+      },
       user: { updateMany: jest.fn() },
       operator: { updateMany: jest.fn() },
     };

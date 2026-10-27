@@ -469,10 +469,11 @@ export class PayoutService {
   // A failed send leaves the Payment row's status untouched and correct.
 
   private async notifyOperatorPaid(
-    operator: { phoneNumber: string },
+    operator: { phoneNumber: string; whatsappEnabled: boolean },
     amount: number,
     rescueRequestId: string,
   ): Promise<void> {
+    if (!operator.whatsappEnabled) return;
     const jobRef = formatJobRef(rescueRequestId).replace('Job #', '');
     // Pin the locale — an unpinned toLocaleString formats per the container's
     // default, so the same payout could render differently across environments.
@@ -503,10 +504,11 @@ export class PayoutService {
   }
 
   private async notifyOperatorBankDetailsNeeded(
-    operator: { phoneNumber: string },
+    operator: { phoneNumber: string; whatsappEnabled: boolean },
     amount: number,
     rescueRequestId: string,
   ): Promise<void> {
+    if (!operator.whatsappEnabled) return;
     const jobRef = formatJobRef(rescueRequestId).replace('Job #', '');
     // Pin the locale — an unpinned toLocaleString formats per the container's
     // default, so the same payout could render differently across environments.

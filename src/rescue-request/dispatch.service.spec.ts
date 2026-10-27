@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { Prisma } from '@prisma/client';
 import * as Sentry from '@sentry/node';
 import { DispatchService } from './dispatch.service';
 import { RescueRequestModule } from './rescue-request.module';
@@ -122,6 +123,26 @@ describe('DispatchService', () => {
           ],
         },
       ]);
+    });
+
+    it('surfaces needsManualAssignment so the Dispatch Board can badge a job stuck waiting on staff', async () => {
+      prisma.rescueRequest.findMany.mockResolvedValue([
+        {
+          id: 'req-1',
+          status: 'DISPATCHING',
+          vehicleType: null,
+          destination: null,
+          createdAt: new Date(),
+          customerId: 'cust-1',
+          dispatchRound: 3,
+          dispatchOffers: [],
+          needsManualAssignment: true,
+        },
+      ]);
+
+      const result = await boardService.getDispatchBoard();
+
+      expect(result[0].needsManualAssignment).toBe(true);
     });
 
     it('surfaces quoteCollectionDeadline so the admin UI can gate Expand near bidding close', async () => {
@@ -489,7 +510,13 @@ describe('DispatchService', () => {
       jest.useFakeTimers();
       try {
         prisma.dispatchOffer.findMany.mockResolvedValue([
-          { operatorId: 'op-2', operator: { phoneNumber: '+2349022222222' } },
+          {
+            operatorId: 'op-2',
+            operator: {
+              phoneNumber: '+2349022222222',
+              whatsappEnabled: true,
+            },
+          },
         ]);
 
         process.env.TWILIO_QUOTE_COUNTDOWN_TEMPLATE_SID = 'HXcountdown1';
@@ -529,6 +556,24 @@ describe('DispatchService', () => {
       } finally {
         jest.useRealTimers();
       }
+    });
+
+    it('does not warn a non-WhatsApp operator whose offer is still pending', async () => {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- prisma is typed `any` in this describe block's shared mock setup, same as every other prisma.* call above in this file; not a new unsafety, one more occurrence of the existing one.
+      prisma.dispatchOffer.findMany.mockResolvedValue([
+        {
+          operatorId: 'op-2',
+          operator: {
+            phoneNumber: '+2349022222222',
+            whatsappEnabled: false,
+          },
+        },
+      ]);
+
+      await service.processQuoteOrDecline(offer, 2_500_000);
+
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+      expect(twilioService.sendWhatsAppTemplateMessage).not.toHaveBeenCalled();
     });
 
     it('a decline in phase 2 is claimed atomically and does not touch the deadline', async () => {
@@ -798,9 +843,11 @@ describe('DispatchService', () => {
         create: jest.Mock;
         update: jest.Mock;
         updateMany: jest.Mock;
+        findFirst: jest.Mock;
       };
       requestMedia: { findMany: jest.Mock };
       $transaction: jest.Mock;
+      $queryRaw: jest.Mock;
     };
     let sessionStore: { getOrCreate: jest.Mock; update: jest.Mock };
     let twilioService: {
@@ -832,11 +879,13 @@ describe('DispatchService', () => {
           create: jest.fn(),
           update: jest.fn(),
           updateMany: jest.fn(),
+          findFirst: jest.fn().mockResolvedValue(null),
         },
         requestMedia: { findMany: jest.fn().mockResolvedValue([]) },
         // The offer and the offeredOperatorIds append now commit together, so
         // the callback runs against this same mock as its transaction client.
         $transaction: jest.fn((fn: (tx: unknown) => unknown) => fn(prisma)),
+        $queryRaw: jest.fn().mockResolvedValue([]),
       };
       sessionStore = {
         getOrCreate: jest.fn().mockResolvedValue({}),
@@ -950,6 +999,7 @@ describe('DispatchService', () => {
         return {
           id: 'op-1',
           status: 'ACTIVE',
+          whatsappEnabled: true,
           businessName: 'Swift Towing',
           phoneNumber: '+2349012345678',
         };
@@ -959,6 +1009,99 @@ describe('DispatchService', () => {
         manualService.manualOfferToOperator('req-1', 'op-1'),
       ).rejects.toThrow('Bidding has closed');
       expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();
+    });
+
+    describe('when the operator is already engaged on this job', () => {
+      beforeEach(() => {
+        prisma.rescueRequest.findUnique.mockResolvedValue({
+          id: 'req-1',
+          status: 'DISPATCHING',
+          customerId: 'cust-1',
+          vehicleType: 'SEDAN',
+          destination: 'Lekki',
+          latitude: 6.5,
+          longitude: 3.4,
+          quoteCollectionDeadline: new Date(Date.now() + 10 * 60 * 1000),
+          biddingClosedAt: null,
+        });
+        prisma.operator.findUnique.mockResolvedValue({
+          id: 'op-1',
+          status: 'ACTIVE',
+          whatsappEnabled: true,
+          businessName: 'Swift Towing',
+          phoneNumber: '+2349012345678',
+        });
+        prisma.dispatchOffer.create.mockResolvedValue({ id: 'offer-1' });
+      });
+
+      it('refuses a second offer while the first is still pending, saying how long it has left', async () => {
+        prisma.dispatchOffer.findFirst.mockResolvedValue({
+          status: 'PENDING',
+          expiresAt: new Date(Date.now() + 150 * 1000),
+        });
+
+        await expect(
+          manualService.manualOfferToOperator('req-1', 'op-1'),
+        ).rejects.toThrow(
+          'This operator already has a live offer for this job (expires in 3 min).',
+        );
+        expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();
+        expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+        expect(
+          twilioService.sendWhatsAppTemplateMessage,
+        ).not.toHaveBeenCalled();
+      });
+
+      it('refuses to re-offer an operator who has already quoted', async () => {
+        prisma.dispatchOffer.findFirst.mockResolvedValue({
+          status: 'QUOTED',
+          expiresAt: new Date(Date.now() - 1000),
+        });
+
+        await expect(
+          manualService.manualOfferToOperator('req-1', 'op-1'),
+        ).rejects.toThrow('This operator has already quoted on this job.');
+        expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();
+      });
+
+      it('only counts unexpired PENDING or any QUOTED offer for this operator on this request as live', async () => {
+        await manualService.manualOfferToOperator('req-1', 'op-1');
+
+        const anyDate: unknown = expect.any(Date);
+        expect(prisma.dispatchOffer.findFirst).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: {
+              rescueRequestId: 'req-1',
+              operatorId: 'op-1',
+              OR: [
+                { status: 'PENDING', expiresAt: { gt: anyDate } },
+                { status: 'QUOTED' },
+              ],
+            },
+          }),
+        );
+        // No live offer found (timed out / declined / expired) — a new offer
+        // is created as before.
+        expect(prisma.dispatchOffer.create).toHaveBeenCalled();
+      });
+
+      it('locks the request row before checking, so two near-simultaneous clicks cannot both pass', async () => {
+        await manualService.manualOfferToOperator('req-1', 'op-1');
+
+        const lockOrder = prisma.$queryRaw.mock.invocationCallOrder[0];
+        const checkOrder =
+          prisma.dispatchOffer.findFirst.mock.invocationCallOrder[0];
+        const createOrder =
+          prisma.dispatchOffer.create.mock.invocationCallOrder[0];
+        expect(lockOrder).toBeLessThan(checkOrder);
+        expect(checkOrder).toBeLessThan(createOrder);
+        const [strings] = prisma.$queryRaw.mock.calls[0] as [
+          TemplateStringsArray,
+        ];
+        const sql = strings.join('?');
+        expect(sql).toContain('FROM "RescueRequest"');
+        expect(sql).toContain('FOR UPDATE');
+      });
     });
 
     it('clamps a phase-2 offer to the deadline and tells the operator the TRUE remaining time', async () => {
@@ -978,6 +1121,7 @@ describe('DispatchService', () => {
         prisma.operator.findUnique.mockResolvedValue({
           id: 'op-1',
           status: 'ACTIVE',
+          whatsappEnabled: true,
           businessName: 'Swift Towing',
           phoneNumber: '+2349012345678',
         });
@@ -1020,6 +1164,7 @@ describe('DispatchService', () => {
         prisma.operator.findUnique.mockResolvedValue({
           id: 'op-1',
           status: 'ACTIVE',
+          whatsappEnabled: true,
           businessName: 'Swift Towing',
           phoneNumber: '+2349012345678',
         });
@@ -1057,6 +1202,32 @@ describe('DispatchService', () => {
       ).rejects.toThrow('not an active operator');
     });
 
+    it('rejects offering a job to a non-WhatsApp operator — use assignOperator instead', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        customerId: 'cust-1',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
+      });
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1',
+        status: 'ACTIVE',
+        whatsappEnabled: false,
+        phoneNumber: '+2348011111111',
+      });
+
+      await expect(
+        manualService.manualOfferToOperator('req-1', 'op-1'),
+      ).rejects.toThrow(
+        'This operator has no WhatsApp on file — use "Assign this operator" instead of offering.',
+      );
+      expect(prisma.dispatchOffer.create).not.toHaveBeenCalled();
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+
     it('creates a single-operator round: offer created and recorded in one transaction, WhatsApp sent', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
         id: 'req-1',
@@ -1070,6 +1241,7 @@ describe('DispatchService', () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
         status: 'ACTIVE',
+        whatsappEnabled: true,
         businessName: 'Swift Towing',
         phoneNumber: '+2349012345678',
       });
@@ -1113,6 +1285,7 @@ describe('DispatchService', () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
         status: 'ACTIVE',
+        whatsappEnabled: true,
         businessName: 'Swift Towing',
         phoneNumber: '+2349012345678',
       });
@@ -1150,6 +1323,7 @@ describe('DispatchService', () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
         status: 'ACTIVE',
+        whatsappEnabled: true,
         businessName: 'Swift Towing',
         phoneNumber: '+2349012345678',
       });
@@ -1186,6 +1360,7 @@ describe('DispatchService', () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
         status: 'ACTIVE',
+        whatsappEnabled: true,
         businessName: 'Swift Towing',
         phoneNumber: '+2349012345678',
       });
@@ -1221,6 +1396,7 @@ describe('DispatchService', () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
         status: 'ACTIVE',
+        whatsappEnabled: true,
         businessName: 'Swift Towing',
         phoneNumber: '+2349012345678',
       });
@@ -1252,6 +1428,7 @@ describe('DispatchService', () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
         status: 'ACTIVE',
+        whatsappEnabled: true,
         businessName: 'Swift Towing',
         phoneNumber: '+2349012345678',
       });
@@ -1284,6 +1461,7 @@ describe('DispatchService', () => {
         prisma.operator.findUnique.mockResolvedValue({
           id: 'op-1',
           status: 'ACTIVE',
+          whatsappEnabled: true,
           businessName: 'Swift Towing',
           phoneNumber: '+2349012345678',
         });
@@ -1337,6 +1515,7 @@ describe('DispatchService', () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
         status: 'ACTIVE',
+        whatsappEnabled: true,
         businessName: 'Swift Towing',
         phoneNumber: '+2349012345678',
       });
@@ -1377,6 +1556,7 @@ describe('DispatchService', () => {
       prisma.operator.findUnique.mockResolvedValue({
         id: 'op-1',
         status: 'ACTIVE',
+        whatsappEnabled: true,
         businessName: 'Swift Towing',
         phoneNumber: '+2349012345678',
       });
@@ -1618,6 +1798,59 @@ describe('DispatchService', () => {
         0,
         undefined,
         ['LIGHT_DUTY', 'TEN_TYRE'],
+        false,
+      );
+    });
+
+    it('clears a stale needsManualAssignment flag the moment automatic dispatch finds candidates again', async () => {
+      await batchService.startDispatch('req-1', 'cust-1');
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { needsManualAssignment: false },
+      });
+    });
+
+    it("threads prepareNextRound's extraRadiusKm and isTestRequest into resolveExhaustion's own fallback search when automatic dispatch is fully exhausted", async () => {
+      // No candidates at any radius, and no coverage at all — resolveExhaustion's
+      // own fallback search (which this test observes) must still receive the
+      // same extraRadiusKm (0, since this exhausts on round 1 before any
+      // expansion) and the same isTestRequest this round already computed.
+      operatorService.findAndRankCandidates.mockResolvedValue([]);
+      prisma.operator.count.mockResolvedValue(0);
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        vehicleType: 'SEDAN',
+        destination: 'Lekki',
+        latitude: 6.5,
+        longitude: 3.4,
+        dispatchRound: 0,
+        offeredOperatorIds: [],
+        quoteCollectionDeadline: null,
+        biddingClosedAt: null,
+        customer: { phoneNumber: '+2348012345678' },
+      });
+      platformConfigService.getConfig.mockResolvedValue({
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        testCustomerPhoneNumbers: ['+2348012345678'],
+      });
+
+      await batchService.startDispatch('req-1', 'cust-1');
+
+      // Call 1: prepareNextRound's own primary search (asserted elsewhere).
+      // Call 2: resolveExhaustion's fallback search — same extraRadiusKm (0)
+      // and isTestRequest (true) prepareNextRound itself computed.
+      expect(operatorService.findAndRankCandidates).toHaveBeenNthCalledWith(
+        2,
+        6.5,
+        3.4,
+        [],
+        0,
+        undefined,
+        ['LIGHT_DUTY', 'TEN_TYRE'],
+        true,
         false,
       );
     });
@@ -2014,8 +2247,25 @@ describe('DispatchService', () => {
       await service.deliverQuoteShortlist('req-1', 'cust-1');
 
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
-        '+2348000000000',
-        '🚗 *Operator quotes received!*\n⏰ You have 5 minutes to choose before this request is cancelled.\n\n1️⃣ ₦11,000 · ETA 0 min · Deposit 10% · Acme Towing\n\n⚠️ *ACTION NEEDED* — reply with the number of your choice (e.g. "1") to select an operator.',
+        'whatsapp:+2348000000000',
+        '🚗 *Operator quotes received!*\n⏰ You have 5 minutes to choose before this request is cancelled.\n\n1️⃣ ₦11,000 · ETA 0 min · Deposit ₦1,100 · Acme Towing\n\n⚠️ *ACTION NEEDED* — reply with the number of your choice (e.g. "1") to select an operator.',
+      );
+    });
+
+    it('delivers the shortlist to the BSUID when the customer has no visible phone number — otherwise they never see their quotes at all (Task 14, hotfix 2026-10-25)', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: null, whatsappExternalUserId: 'CA.masked' },
+      });
+
+      await service.deliverQuoteShortlist('req-1', 'cust-1');
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        'whatsapp:CA.masked',
+        expect.stringContaining('Operator quotes received'),
       );
     });
 
@@ -2086,7 +2336,7 @@ describe('DispatchService', () => {
       });
     });
 
-    it('includes the deposit percentage in each shortlist line', async () => {
+    it('includes the actual deposit amount (not the raw percentage) in each shortlist line', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
         id: 'req-1',
         status: 'DISPATCHING',
@@ -2115,9 +2365,54 @@ describe('DispatchService', () => {
 
       await service.deliverQuoteShortlist('req-1', 'cust-1');
 
+      // quotedPrice 25,000 + 10% service fee (2,500) = 27,500 total.
+      // 20% of that = 5,500 — above the 5,000 kobo floor, so the ordinary
+      // percentage-based amount wins (not a special case of this fix).
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
-        '+2348000000000',
-        expect.stringContaining('Deposit 20%'),
+        'whatsapp:+2348000000000',
+        expect.stringContaining('Deposit ₦55'),
+      );
+    });
+
+    it('shows the real floored amount for a stale 0% override, never a misleading "Deposit 0%" (hotfix, 2026-10-24)', async () => {
+      // A customer selecting this quote would be charged the floored amount
+      // at checkout (computeDepositAmount) — the shortlist must show that
+      // same amount, not a bare "0%" that implies a free job.
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'DISPATCHING',
+        latitude: 6.5,
+        longitude: 3.4,
+        customer: { phoneNumber: '+2348000000000' },
+      });
+      prisma.dispatchOffer.findMany.mockResolvedValue([
+        {
+          id: 'offer-1',
+          operatorId: 'op-1',
+          quotedPrice: 100_000,
+          operator: {
+            id: 'op-1',
+            businessName: 'Swift Towing',
+            latitude: 6.5,
+            longitude: 3.4,
+            depositPercentOverride: 0,
+          },
+        },
+      ]);
+      platformConfigService.getConfig.mockResolvedValue({
+        serviceFeePercent: 10,
+        depositPercent: 10,
+      });
+
+      await service.deliverQuoteShortlist('req-1', 'cust-1');
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        'whatsapp:+2348000000000',
+        expect.stringContaining('Deposit ₦50'),
+      );
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.stringContaining('Deposit 0%'),
       );
     });
 
@@ -2576,6 +2871,325 @@ describe('DispatchService', () => {
             }),
           }),
         }),
+      );
+    });
+  });
+
+  describe('resolveExhaustion', () => {
+    let service: DispatchService;
+    let operatorService: { findAndRankCandidates: jest.Mock };
+
+    const baseRescueRequest = {
+      id: 'req-1',
+      latitude: 6.5,
+      longitude: 3.4,
+      vehicleType: null,
+      offeredOperatorIds: ['op-already-offered'],
+      customerId: 'cust-1',
+    };
+
+    beforeEach(async () => {
+      operatorService = { findAndRankCandidates: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          DispatchService,
+          { provide: PrismaService, useValue: {} },
+          { provide: TwilioService, useValue: {} },
+          { provide: OperatorService, useValue: operatorService },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+          { provide: OperatorMembershipService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<DispatchService>(DispatchService);
+    });
+
+    it('flags manual-fallback and does not cancel when a non-WhatsApp candidate exists', async () => {
+      operatorService.findAndRankCandidates.mockResolvedValue([
+        { id: 'op-backup' },
+      ]);
+      const tx = {
+        rescueRequest: { update: jest.fn() },
+        dispatchOffer: { updateMany: jest.fn() },
+        whatsAppSession: { updateMany: jest.fn() },
+      } as unknown as Prisma.TransactionClient;
+
+      const result = await service.resolveExhaustion(
+        tx,
+        baseRescueRequest,
+        { reason: 'rounds-exhausted', round: 5, extraRadiusKm: 8 },
+        false,
+      );
+
+      expect(operatorService.findAndRankCandidates).toHaveBeenCalledWith(
+        6.5,
+        3.4,
+        ['op-already-offered'],
+        8,
+        undefined,
+        undefined,
+        false,
+        false,
+      );
+      expect(result).toEqual({
+        outcome: 'manual-fallback',
+        candidateId: 'op-backup',
+      });
+      // tx is typed as Prisma.TransactionClient so the mocked methods below
+      // are genuine (unbound) method references, not `any` — same looseness
+      // as every other bare mock-method assertion in this file, now visible
+      // because this one case has a real interface behind it.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(tx.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { needsManualAssignment: true, dispatchRound: 5 },
+      });
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(tx.dispatchOffer.updateMany).not.toHaveBeenCalled();
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(tx.whatsAppSession.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('cancels exactly as before when no candidate exists at all, for either reason', async () => {
+      operatorService.findAndRankCandidates.mockResolvedValue([]);
+      const tx = {
+        rescueRequest: { update: jest.fn() },
+        dispatchOffer: { updateMany: jest.fn() },
+        whatsAppSession: { updateMany: jest.fn() },
+      } as unknown as Prisma.TransactionClient;
+
+      const result = await service.resolveExhaustion(
+        tx,
+        baseRescueRequest,
+        { reason: 'no-coverage', round: 2, extraRadiusKm: 2 },
+        false,
+      );
+
+      expect(result).toEqual({
+        outcome: 'cancelled',
+        reason: 'no-coverage',
+        round: 2,
+      });
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- see note above
+      expect(tx.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: {
+          status: 'CANCELLED',
+          needsManualAssignment: false,
+          dispatchRound: 2,
+        },
+      });
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- see note above
+      expect(tx.dispatchOffer.updateMany).toHaveBeenCalledWith({
+        where: { rescueRequestId: 'req-1', status: 'PENDING' },
+        data: { status: 'TIMED_OUT', respondedAt: expect.any(Date) },
+      });
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- see note above
+      expect(tx.whatsAppSession.updateMany).toHaveBeenCalledWith({
+        where: { userId: 'cust-1' },
+        data: { state: 'IDLE', rescueRequestId: null },
+      });
+    });
+
+    it('passes isTestRequest through to findAndRankCandidates unchanged — the test/real operator partition must hold for the fallback search too', async () => {
+      operatorService.findAndRankCandidates.mockResolvedValue([
+        { id: 'op-backup' },
+      ]);
+      const tx = {
+        rescueRequest: { update: jest.fn() },
+        dispatchOffer: { updateMany: jest.fn() },
+        whatsAppSession: { updateMany: jest.fn() },
+      } as unknown as Prisma.TransactionClient;
+
+      await service.resolveExhaustion(
+        tx,
+        baseRescueRequest,
+        { reason: 'rounds-exhausted', round: 5, extraRadiusKm: 8 },
+        true,
+      );
+
+      expect(operatorService.findAndRankCandidates).toHaveBeenCalledWith(
+        6.5,
+        3.4,
+        ['op-already-offered'],
+        8,
+        undefined,
+        undefined,
+        true,
+        false,
+      );
+    });
+  });
+
+  describe('alertStaffManualFallback', () => {
+    let service: DispatchService;
+    let platformConfigService: { getConfig: jest.Mock };
+    let twilioService: {
+      sendWhatsAppMessage: jest.Mock;
+      sendWhatsAppTemplateMessage: jest.Mock;
+    };
+    const originalTemplateSid =
+      process.env.TWILIO_MANUAL_FALLBACK_ALERT_TEMPLATE_SID;
+
+    afterEach(() => {
+      if (originalTemplateSid === undefined)
+        delete process.env.TWILIO_MANUAL_FALLBACK_ALERT_TEMPLATE_SID;
+      else
+        process.env.TWILIO_MANUAL_FALLBACK_ALERT_TEMPLATE_SID =
+          originalTemplateSid;
+    });
+
+    beforeEach(async () => {
+      delete process.env.TWILIO_MANUAL_FALLBACK_ALERT_TEMPLATE_SID;
+      platformConfigService = {
+        getConfig: jest.fn().mockResolvedValue({
+          disputeAlertPhoneNumbers: ['+2348011111111', '+2348022222222'],
+        }),
+      };
+      twilioService = {
+        sendWhatsAppMessage: jest.fn().mockResolvedValue({ sid: 'SM_test' }),
+        sendWhatsAppTemplateMessage: jest
+          .fn()
+          .mockResolvedValue({ sid: 'SM_test' }),
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          DispatchService,
+          { provide: PrismaService, useValue: {} },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: OperatorService, useValue: {} },
+          { provide: PlatformConfigService, useValue: platformConfigService },
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+          { provide: OperatorMembershipService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<DispatchService>(DispatchService);
+      (Sentry.captureException as jest.Mock).mockClear();
+    });
+
+    it('fans out to every configured staff number, with per-number failure isolation', async () => {
+      twilioService.sendWhatsAppMessage.mockRejectedValueOnce(
+        new Error('Twilio down'),
+      );
+
+      await service.alertStaffManualFallback('req-1', 3);
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledTimes(2);
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348011111111'),
+        expect.stringContaining('needs a manual call'),
+      );
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348022222222'),
+        expect.anything(),
+      );
+      expect(Sentry.captureException).toHaveBeenCalledTimes(1);
+    });
+
+    it('sends nothing and throws nothing when no staff numbers are configured', async () => {
+      platformConfigService.getConfig.mockResolvedValue({
+        disputeAlertPhoneNumbers: [],
+      });
+
+      await expect(
+        service.alertStaffManualFallback('req-1', 3),
+      ).resolves.toBeUndefined();
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+
+    it('sends via the Content Template when configured, instead of freeform', async () => {
+      process.env.TWILIO_MANUAL_FALLBACK_ALERT_TEMPLATE_SID = 'HXmanualalert';
+
+      await service.alertStaffManualFallback('req-1', 3);
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348011111111'),
+        'HXmanualalert',
+        expect.any(Object),
+      );
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2348022222222'),
+        'HXmanualalert',
+        expect.any(Object),
+      );
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('notifyNoOperatorAvailable', () => {
+    let service: DispatchService;
+    let prisma: {
+      rescueRequest: { findUnique: jest.Mock };
+      user: { findUnique: jest.Mock };
+    };
+    let twilioService: { sendWhatsAppMessage: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: {
+          findUnique: jest
+            .fn()
+            .mockResolvedValue({ latitude: 6.5, longitude: 3.4 }),
+        },
+        user: {
+          findUnique: jest
+            .fn()
+            .mockResolvedValue({ phoneNumber: '+2348012345678' }),
+        },
+      };
+      twilioService = { sendWhatsAppMessage: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          DispatchService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: OperatorService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: {} },
+          { provide: RescueRequestSharedService, useValue: {} },
+          { provide: OperatorMembershipService, useValue: {} },
+        ],
+      }).compile();
+      service = module.get<DispatchService>(DispatchService);
+    });
+
+    it('notifies the customer via their real phone number', async () => {
+      await service.notifyNoOperatorAvailable(
+        'req-1',
+        'cust-1',
+        'no-coverage',
+        2,
+      );
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        'whatsapp:+2348012345678',
+        expect.stringContaining('no tow operators available'),
+      );
+    });
+
+    it('notifies a BSUID-only customer via their BSUID instead of silently skipping them (Task 14, hotfix 2026-10-25)', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        phoneNumber: null,
+        whatsappExternalUserId: 'CA.masked',
+      });
+
+      await service.notifyNoOperatorAvailable(
+        'req-1',
+        'cust-1',
+        'rounds-exhausted',
+        5,
+      );
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        'whatsapp:CA.masked',
+        expect.stringContaining('no tow operator was available'),
       );
     });
   });

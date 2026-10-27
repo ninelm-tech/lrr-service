@@ -670,6 +670,682 @@ describe('WhatsAppCustomerFlowService', () => {
     });
   });
 
+  describe('WAITING_FOR_MEDIA — contact info gate', () => {
+    let service: WhatsAppCustomerFlowService;
+    let prisma: {
+      requestMedia: { count: jest.Mock };
+      user: { findUnique: jest.Mock };
+      rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
+    };
+    let sessionStore: { update: jest.Mock };
+    let twilioService: {
+      sendWhatsAppMessage: jest.Mock;
+      sendWhatsAppTemplateMessage: jest.Mock;
+    };
+    let platformConfigService: { getConfig: jest.Mock };
+    let dispatchService: { startDispatch: jest.Mock };
+    const phoneNumber = 'whatsapp:CA.test';
+    const userId = 'user-1';
+    const session = {
+      state: WhatsAppFlowState.WAITING_FOR_MEDIA,
+      rescueRequestId: 'req-1',
+    } as WhatsAppSession;
+    const originalTemplateSid =
+      process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID;
+
+    beforeEach(async () => {
+      delete process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID;
+      prisma = {
+        requestMedia: { count: jest.fn().mockResolvedValue(1) },
+        user: {
+          findUnique: jest
+            .fn()
+            .mockResolvedValue({ id: userId, name: null, phoneNumber: null }),
+        },
+        rescueRequest: {
+          findUnique: jest.fn().mockResolvedValue({
+            id: 'req-1',
+            vehicleType: 'SEDAN',
+            destination: 'Lekki Phase 1',
+            issueType: 'BREAKDOWN',
+          }),
+          update: jest.fn().mockResolvedValue({}),
+        },
+      };
+      sessionStore = { update: jest.fn() };
+      twilioService = {
+        sendWhatsAppMessage: jest.fn(),
+        sendWhatsAppTemplateMessage: jest.fn(),
+      };
+      platformConfigService = {
+        getConfig: jest
+          .fn()
+          .mockResolvedValue({ newRequestAlertPhoneNumbers: [] }),
+      };
+      dispatchService = { startDispatch: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppCustomerFlowService,
+          { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PaystackService, useValue: {} },
+          { provide: PlatformConfigService, useValue: platformConfigService },
+          { provide: OperatorService, useValue: {} },
+          { provide: DispatchService, useValue: dispatchService },
+          { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppCustomerFlowService>(
+        WhatsAppCustomerFlowService,
+      );
+    });
+
+    afterEach(() => {
+      if (originalTemplateSid === undefined)
+        delete process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID;
+      else
+        process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID =
+          originalTemplateSid;
+    });
+
+    async function continueToDispatch() {
+      return service.handleCustomerMessage(
+        phoneNumber,
+        userId,
+        '2',
+        '2',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {},
+      );
+    }
+
+    it('asks for contact info instead of dispatching when the customer has no phone number', async () => {
+      process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID = 'HXtest';
+
+      const result = await continueToDispatch();
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        'HXtest',
+        {},
+      );
+      expect(sessionStore.update).toHaveBeenCalledWith(userId, {
+        state: WhatsAppFlowState.WAITING_FOR_CONTACT_INFO,
+      });
+      expect(result).toContain('contact');
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+      expect(dispatchService.startDispatch).not.toHaveBeenCalled();
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+
+    it('still dispatches normally when the customer already has a phone number', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: userId,
+        name: null,
+        phoneNumber: '+2348012345678',
+      });
+
+      await continueToDispatch();
+
+      expect(twilioService.sendWhatsAppTemplateMessage).not.toHaveBeenCalled();
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: { status: 'DISPATCHING' },
+      });
+      expect(sessionStore.update).toHaveBeenCalledWith(userId, {
+        state: WhatsAppFlowState.REQUEST_CONFIRMED,
+      });
+      expect(sessionStore.update).not.toHaveBeenCalledWith(
+        userId,
+        expect.objectContaining({
+          state: WhatsAppFlowState.WAITING_FOR_CONTACT_INFO,
+        }),
+      );
+      expect(dispatchService.startDispatch).toHaveBeenCalledWith(
+        'req-1',
+        userId,
+      );
+    });
+
+    it('still moves to WAITING_FOR_CONTACT_INFO, with a plain-text fallback reply, when the template send rejects', async () => {
+      process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID = 'HXtest';
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+      twilioService.sendWhatsAppTemplateMessage.mockRejectedValue(
+        new Error('boom'),
+      );
+
+      const result = await continueToDispatch();
+
+      expect(sessionStore.update).toHaveBeenCalledWith(userId, {
+        state: WhatsAppFlowState.WAITING_FOR_CONTACT_INFO,
+      });
+      expect(result).toContain('contact');
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+      expect(dispatchService.startDispatch).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+
+    it('still moves to WAITING_FOR_CONTACT_INFO when the template SID env var is not configured', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+      const result = await continueToDispatch();
+
+      expect(twilioService.sendWhatsAppTemplateMessage).not.toHaveBeenCalled();
+      expect(sessionStore.update).toHaveBeenCalledWith(userId, {
+        state: WhatsAppFlowState.WAITING_FOR_CONTACT_INFO,
+      });
+      expect(result).toContain('contact');
+      warnSpy.mockRestore();
+    });
+  });
+
+  describe('WAITING_FOR_CONTACT_INFO — validate, claim, backfill or merge', () => {
+    let service: WhatsAppCustomerFlowService;
+    let prisma: {
+      operator: { findUnique: jest.Mock };
+      whatsAppSession: {
+        updateMany: jest.Mock;
+        deleteMany: jest.Mock;
+        update: jest.Mock;
+      };
+      user: {
+        findUnique: jest.Mock;
+        update: jest.Mock;
+        updateMany: jest.Mock;
+      };
+      rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
+      $transaction: jest.Mock;
+    };
+    let sessionStore: { update: jest.Mock };
+    let twilioService: {
+      downloadMedia: jest.Mock;
+      sendWhatsAppMessage: jest.Mock;
+      sendWhatsAppTemplateMessage: jest.Mock;
+    };
+    let platformConfigService: { getConfig: jest.Mock };
+    let dispatchService: { startDispatch: jest.Mock };
+
+    const phoneNumber = 'whatsapp:CA.masked';
+    const userId = 'user-masked';
+    const existingUserId = 'user-existing';
+    const rescueRequestId = 'req-1';
+    const vcardPhone = '+15550100001';
+    const mediaUrl = 'https://api.twilio.com/media/vcard-123';
+    const session = {
+      state: WhatsAppFlowState.WAITING_FOR_CONTACT_INFO,
+      rescueRequestId,
+    } as WhatsAppSession;
+    const originalTemplateSid =
+      process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID;
+
+    const CONTACT_REQUEST_METADATA = JSON.stringify({
+      data: { context: { Origin: 'contact_request' } },
+    });
+
+    function vCardBuffer(telLine?: string): Buffer {
+      const lines = ['BEGIN:VCARD', 'VERSION:3.0', 'FN:Test Contact'];
+      if (telLine) lines.push(telLine);
+      lines.push('END:VCARD');
+      return Buffer.from(lines.join('\n'), 'utf-8');
+    }
+
+    function contactsBody(): Record<string, any> {
+      return {
+        MessageType: 'contacts',
+        MediaUrl0: mediaUrl,
+        MediaContentType0: 'text/vcard',
+        ChannelMetadata: CONTACT_REQUEST_METADATA,
+      };
+    }
+
+    beforeEach(async () => {
+      process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID = 'HXtest';
+      prisma = {
+        operator: { findUnique: jest.fn().mockResolvedValue(null) },
+        whatsAppSession: {
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+          deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+          update: jest.fn().mockResolvedValue({}),
+        },
+        user: {
+          findUnique: jest.fn().mockResolvedValue(null),
+          update: jest.fn().mockResolvedValue({}),
+          updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+        },
+        rescueRequest: {
+          findUnique: jest.fn().mockResolvedValue({
+            id: rescueRequestId,
+            vehicleType: 'SEDAN',
+            destination: 'Lekki Phase 1',
+            issueType: 'BREAKDOWN',
+          }),
+          update: jest.fn().mockResolvedValue({}),
+        },
+        $transaction: jest.fn((cb: (tx: unknown) => unknown) => cb(prisma)),
+      };
+      sessionStore = { update: jest.fn() };
+      twilioService = {
+        downloadMedia: jest
+          .fn()
+          .mockResolvedValue(vCardBuffer(`TEL;TYPE=CELL:${vcardPhone}`)),
+        sendWhatsAppMessage: jest.fn(),
+        sendWhatsAppTemplateMessage: jest.fn(),
+      };
+      platformConfigService = {
+        getConfig: jest
+          .fn()
+          .mockResolvedValue({ newRequestAlertPhoneNumbers: [] }),
+      };
+      dispatchService = { startDispatch: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppCustomerFlowService,
+          { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PaystackService, useValue: {} },
+          { provide: PlatformConfigService, useValue: platformConfigService },
+          { provide: OperatorService, useValue: {} },
+          { provide: DispatchService, useValue: dispatchService },
+          { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppCustomerFlowService>(
+        WhatsAppCustomerFlowService,
+      );
+    });
+
+    afterEach(() => {
+      if (originalTemplateSid === undefined)
+        delete process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID;
+      else
+        process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID =
+          originalTemplateSid;
+    });
+
+    async function sendContactReply(body: Record<string, any>) {
+      return service.handleCustomerMessage(
+        phoneNumber,
+        userId,
+        '',
+        '',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        body,
+      );
+    }
+
+    it('re-prompts on an off-script reply', async () => {
+      const result = await sendContactReply({});
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        'HXtest',
+        {},
+      );
+      expect(twilioService.downloadMedia).not.toHaveBeenCalled();
+      expect(result).toContain('contact');
+      expect(sessionStore.update).not.toHaveBeenCalled();
+      expect(prisma.whatsAppSession.updateMany).not.toHaveBeenCalled();
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('re-prompts when the shared vCard has no phone number', async () => {
+      twilioService.downloadMedia.mockResolvedValue(vCardBuffer());
+
+      const result = await sendContactReply(contactsBody());
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        'HXtest',
+        {},
+      );
+      expect(result).toContain('contact');
+      expect(sessionStore.update).not.toHaveBeenCalled();
+      expect(prisma.whatsAppSession.updateMany).not.toHaveBeenCalled();
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('tolerates a transient vCard fetch failure', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+      twilioService.downloadMedia.mockRejectedValue(
+        new TwilioMediaDownloadError(mediaUrl, 404, 'Not Found'),
+      );
+
+      const result = await sendContactReply(contactsBody());
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        'HXtest',
+        {},
+      );
+      expect(result).toContain('contact');
+      expect(sessionStore.update).not.toHaveBeenCalled();
+      expect(prisma.whatsAppSession.updateMany).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+
+    it('rejects and re-prompts when the shared number belongs to a registered operator', async () => {
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1',
+        phoneNumber: vcardPhone,
+      });
+
+      const result = await sendContactReply(contactsBody());
+
+      expect(prisma.operator.findUnique).toHaveBeenCalledWith({
+        where: { phoneNumber: vcardPhone },
+      });
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        'HXtest',
+        {},
+      );
+      expect(result).toContain('contact');
+      expect(prisma.whatsAppSession.updateMany).not.toHaveBeenCalled();
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('backfills the phone number and dispatches when there is no collision', async () => {
+      prisma.user.findUnique
+        .mockResolvedValueOnce(null) // existingUser lookup by phoneNumber — no collision
+        .mockResolvedValueOnce({
+          id: userId,
+          name: null,
+          phoneNumber: vcardPhone,
+        }); // handleMediaFinished's own lookup
+
+      const result = await sendContactReply(contactsBody());
+
+      expect(prisma.whatsAppSession.updateMany).toHaveBeenCalledWith({
+        where: { userId, state: WhatsAppFlowState.WAITING_FOR_CONTACT_INFO },
+        data: { state: WhatsAppFlowState.REQUEST_CONFIRMED },
+      });
+      expect(prisma.user.update).toHaveBeenCalledWith({
+        where: { id: userId },
+        data: { phoneNumber: vcardPhone },
+      });
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: rescueRequestId },
+        data: { status: 'DISPATCHING' },
+      });
+      // The reply goes to the session's own inbound address, never the
+      // vCard's number.
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        expect.stringContaining('Searching'),
+      );
+      expect(sessionStore.update).toHaveBeenCalledWith(userId, {
+        state: WhatsAppFlowState.REQUEST_CONFIRMED,
+      });
+      expect(dispatchService.startDispatch).toHaveBeenCalledWith(
+        rescueRequestId,
+        userId,
+      );
+      expect(result).toContain('<Response');
+    });
+
+    it('merges onto a pre-existing account with no prior BSUID when the shared number collides', async () => {
+      const existingUser = {
+        id: existingUserId,
+        phoneNumber: vcardPhone,
+        whatsappExternalUserId: null,
+      };
+      const maskedUser = {
+        id: userId,
+        phoneNumber: null,
+        whatsappExternalUserId: 'CA.masked',
+      };
+      prisma.user.findUnique
+        .mockResolvedValueOnce(existingUser) // existingUser lookup — collision!
+        .mockResolvedValueOnce(maskedUser) // mergeIntoExistingAccount: read masked's own BSUID
+        .mockResolvedValueOnce({
+          id: existingUserId,
+          name: null,
+          phoneNumber: vcardPhone,
+        }); // handleMediaFinished's own lookup, now keyed to the survivor
+
+      await sendContactReply(contactsBody());
+
+      expect(prisma.user.updateMany).toHaveBeenCalledWith({
+        where: {
+          whatsappExternalUserId: 'CA.masked',
+          id: { not: existingUserId },
+        },
+        data: { whatsappExternalUserId: null },
+      });
+      expect(prisma.user.update).toHaveBeenCalledWith({
+        where: { id: existingUserId },
+        data: { whatsappExternalUserId: 'CA.masked', phoneNumber: vcardPhone },
+      });
+      expect(prisma.whatsAppSession.deleteMany).toHaveBeenCalledWith({
+        where: { userId: existingUserId },
+      });
+      expect(prisma.whatsAppSession.update).toHaveBeenCalledWith({
+        where: { userId },
+        data: { userId: existingUserId },
+      });
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: rescueRequestId },
+        data: { customerId: existingUserId },
+      });
+      expect(prisma.user.update).toHaveBeenCalledWith({
+        where: { id: userId },
+        data: { deletedAt: expect.any(Date) },
+      });
+
+      // handleMediaFinished ran keyed to the survivor, not the orphan.
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: rescueRequestId },
+        data: { status: 'DISPATCHING' },
+      });
+      expect(dispatchService.startDispatch).toHaveBeenCalledWith(
+        rescueRequestId,
+        existingUserId,
+      );
+      expect(sessionStore.update).toHaveBeenCalledWith(existingUserId, {
+        state: WhatsAppFlowState.REQUEST_CONFIRMED,
+      });
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        expect.stringContaining('Searching'),
+      );
+    });
+
+    it('merges the same way when the pre-existing account already has a different BSUID', async () => {
+      const existingUser = {
+        id: existingUserId,
+        phoneNumber: vcardPhone,
+        whatsappExternalUserId: 'CA.some-other-stale-id',
+      };
+      const maskedUser = {
+        id: userId,
+        phoneNumber: null,
+        whatsappExternalUserId: 'CA.masked',
+      };
+      prisma.user.findUnique
+        .mockResolvedValueOnce(existingUser)
+        .mockResolvedValueOnce(maskedUser)
+        .mockResolvedValueOnce({
+          id: existingUserId,
+          name: null,
+          phoneNumber: vcardPhone,
+        });
+
+      await expect(sendContactReply(contactsBody())).resolves.toBeDefined();
+
+      // Overwritten with the masked user's BSUID, not left at (or merged
+      // with) the stale prior value — same unconditional-overwrite
+      // behavior findOrCreateBySender already has for the fresh-message case.
+      expect(prisma.user.update).toHaveBeenCalledWith({
+        where: { id: existingUserId },
+        data: { whatsappExternalUserId: 'CA.masked', phoneNumber: vcardPhone },
+      });
+    });
+
+    it("discards the existing account's own stale session in favor of the live masked one", async () => {
+      const existingUser = {
+        id: existingUserId,
+        phoneNumber: vcardPhone,
+        whatsappExternalUserId: null,
+      };
+      const maskedUser = {
+        id: userId,
+        phoneNumber: null,
+        whatsappExternalUserId: 'CA.masked',
+      };
+      prisma.user.findUnique
+        .mockResolvedValueOnce(existingUser)
+        .mockResolvedValueOnce(maskedUser)
+        .mockResolvedValueOnce({
+          id: existingUserId,
+          name: null,
+          phoneNumber: vcardPhone,
+        });
+
+      await sendContactReply(contactsBody());
+
+      expect(prisma.whatsAppSession.deleteMany).toHaveBeenCalledWith({
+        where: { userId: existingUserId },
+      });
+      expect(prisma.whatsAppSession.update).toHaveBeenCalledWith({
+        where: { userId },
+        data: { userId: existingUserId },
+      });
+      // The existing account's own stale session row must be gone BEFORE
+      // the live one is re-pointed onto that same userId, or the re-point
+      // would collide with the unique constraint instead of leaving
+      // exactly one surviving row.
+      const deleteOrder =
+        prisma.whatsAppSession.deleteMany.mock.invocationCallOrder[0];
+      const updateOrder =
+        prisma.whatsAppSession.update.mock.invocationCallOrder[0];
+      expect(deleteOrder).toBeLessThan(updateOrder);
+    });
+
+    it('a second, concurrent delivery of the same contacts webhook finds the gate already claimed and does nothing', async () => {
+      // Both "deliveries" read the session before either had committed —
+      // same state, same vCard. The DB-level claim (whatsAppSession.updateMany)
+      // is what actually serializes them: only the first UPDATE's WHERE
+      // clause still matches state === WAITING_FOR_CONTACT_INFO, so it wins
+      // (count: 1); the second finds the row already moved on (count: 0).
+      prisma.whatsAppSession.updateMany
+        .mockResolvedValueOnce({ count: 1 })
+        .mockResolvedValueOnce({ count: 0 });
+      prisma.user.findUnique
+        .mockResolvedValueOnce(null) // first call's existingUser lookup
+        .mockResolvedValueOnce({
+          id: userId,
+          name: null,
+          phoneNumber: vcardPhone,
+        }); // first call's handleMediaFinished lookup
+
+      await sendContactReply(contactsBody());
+      const secondResult = await sendContactReply(contactsBody());
+
+      expect(prisma.whatsAppSession.updateMany).toHaveBeenCalledTimes(2);
+      // Neither the backfill nor handleMediaFinished's effects ran twice.
+      expect(prisma.user.update).toHaveBeenCalledTimes(1);
+      expect(dispatchService.startDispatch).toHaveBeenCalledTimes(1);
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledTimes(1);
+      expect(secondResult).toBe(
+        '<?xml version="1.0" encoding="UTF-8"?>\n<Response></Response>',
+      );
+    });
+
+    it('rolls the claim back and re-prompts when the backfill write fails, leaving the customer in WAITING_FOR_CONTACT_INFO with no dispatch', async () => {
+      // Simulates a real transaction: the claim's state change is only kept
+      // if the whole callback resolves; a throw restores the prior state.
+      let sessionState: WhatsAppFlowState =
+        WhatsAppFlowState.WAITING_FOR_CONTACT_INFO;
+      prisma.whatsAppSession.updateMany.mockImplementation(async () => {
+        if (sessionState !== WhatsAppFlowState.WAITING_FOR_CONTACT_INFO) {
+          return { count: 0 };
+        }
+        sessionState = WhatsAppFlowState.REQUEST_CONFIRMED;
+        return { count: 1 };
+      });
+      prisma.$transaction.mockImplementation(
+        async (cb: (tx: unknown) => unknown) => {
+          const before = sessionState;
+          try {
+            return await cb(prisma);
+          } catch (error) {
+            sessionState = before;
+            throw error;
+          }
+        },
+      );
+      prisma.user.findUnique.mockResolvedValue(null);
+      prisma.user.update.mockRejectedValue(new Error('db blip'));
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+
+      const result = await sendContactReply(contactsBody());
+
+      expect(sessionState).toBe(WhatsAppFlowState.WAITING_FOR_CONTACT_INFO);
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        'HXtest',
+        {},
+      );
+      expect(result).toContain('Share contact');
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+      expect(dispatchService.startDispatch).not.toHaveBeenCalled();
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+
+    it('tells the customer to use the Share contact button, not the attachment menu, when a manually attached contact arrives', async () => {
+      const result = await sendContactReply({
+        MessageType: 'contacts',
+        MediaUrl0: mediaUrl,
+        MediaContentType0: 'text/vcard',
+        ChannelMetadata: '{}',
+      });
+
+      expect(result).toContain('Share contact');
+      expect(result).toContain('not the attachment');
+      expect(twilioService.downloadMedia).not.toHaveBeenCalled();
+      expect(prisma.whatsAppSession.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
   describe('WAITING_FOR_DESTINATION', () => {
     let destService: WhatsAppCustomerFlowService;
     let prisma: {
@@ -937,7 +1613,7 @@ describe('WhatsAppCustomerFlowService', () => {
 
       expect(prisma.rescueRequest.create).toHaveBeenCalledWith({
         data: {
-          customerId: 'cust-1',
+          customerId: userId,
           status: 'WAITING_FOR_MEDIA',
           latitude: 6.5,
           longitude: 3.4,
@@ -951,6 +1627,38 @@ describe('WhatsAppCustomerFlowService', () => {
         state: WhatsAppFlowState.WAITING_FOR_MEDIA,
       });
       expect(result).toContain('photo or video');
+    });
+
+    it('creates the request for the already-resolved userId, never re-resolving by the raw sender value — a BSUID-only sender must not fragment into a second user (multi-llm review finding, hotfix 2026-10-25)', async () => {
+      // For a BSUID-only sender, `phoneNumber` here is actually the BSUID
+      // string (per the router's parsed.phoneNumber ?? parsed.externalUserId
+      // fallback) — if the implementation still called
+      // findOrCreateCustomer(phoneNumber) to resolve the customer, it would
+      // create a second, unrelated User row with that raw string written
+      // into the phoneNumber column instead of using the session's own
+      // already-resolved userId.
+      sharedService.findOrCreateCustomer.mockResolvedValue({
+        id: 'wrong-fragmented-user',
+      });
+
+      await issueService.handleCustomerMessage(
+        'CA.masked',
+        userId,
+        '3',
+        '3',
+        undefined,
+        undefined,
+        undefined,
+        baseSession,
+        {},
+      );
+
+      expect(sharedService.findOrCreateCustomer).not.toHaveBeenCalled();
+      expect(prisma.rescueRequest.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ customerId: userId }),
+        }),
+      );
     });
 
     it('also accepts the word reply, not just the number', async () => {
@@ -1232,7 +1940,13 @@ describe('WhatsAppCustomerFlowService', () => {
       expect(data.depositAmount).toBe(16_500);
     });
 
-    it('skips the Paystack deposit step and activates the job directly when the snapshot resolves to 0%', async () => {
+    it('a stale 0% snapshot still produces a paid, real deposit — never a free one (hotfix, 2026-10-24)', async () => {
+      // This offer's depositPercentSnapshot is literally 0 — exactly the
+      // case the 2026-10-24 hotfix closed. Whether that 0 was frozen before
+      // PlatformConfigService's own floor existed, or anything else, the
+      // computed deposit must never collapse to a free job — and must be
+      // floored at Paystack's real minimum (5,000 kobo), not a
+      // theoretically-nonzero amount Paystack would actually reject.
       prisma.dispatchOffer.findMany.mockResolvedValue([
         {
           id: 'offer-1',
@@ -1256,92 +1970,29 @@ describe('WhatsAppCustomerFlowService', () => {
       const [{ data }] = prisma.rescueRequest.updateMany.mock.calls[0] as [
         { data: Record<string, unknown> },
       ];
-      expect(data.status).toBe('OPERATOR_ASSIGNED');
-      expect(data.depositAmount).toBe(0);
+      expect(data.status).toBe('WAITING_FOR_DEPOSIT');
+      expect(data.depositAmount).toBe(5000);
       const [{ data: offerData }] = prisma.dispatchOffer.update.mock
         .calls[0] as [{ data: Record<string, unknown> }];
-      expect(offerData.status).toBe('ACCEPTED');
-      expect(paymentEventsService.activateAssignedJob).toHaveBeenCalledWith(
-        'req-1',
+      expect(offerData.status).toBe('SELECTED_PENDING_PAYMENT');
+      expect(paymentLedger.create).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 5000 }),
       );
-      expect(paymentLedger.create).not.toHaveBeenCalled();
-      expect(paystackService.initializePayment).not.toHaveBeenCalled();
-      // The customer's session must NOT be left at OPERATOR_FOUND_WAITING_PAYMENT
-      // — there is no payment link coming, so a later message from the
-      // customer must not be met with "please pay using the link we sent you".
-      expect(sessionStore.update).not.toHaveBeenCalledWith(
-        'user-1',
-        expect.objectContaining({ state: 'OPERATOR_FOUND_WAITING_PAYMENT' }),
-      );
-      // Failure isolation (same as Task 4's confirmDeposit fix): the
-      // customer's own confirmation must be sent BEFORE activateAssignedJob
-      // runs, so a failure inside activation can't silently swallow it.
-      // Index by the customer's own phone number rather than assuming
-      // call [0], in case the "notify losing operators" step above ever
-      // also lands a call on this same mock.
-      const customerMessageCallIndex =
-        twilioService.sendWhatsAppMessage.mock.calls.findIndex(
-          (call: unknown[]) => call[0] === '+2348000000000',
-        );
-      expect(customerMessageCallIndex).toBeGreaterThanOrEqual(0);
-      const customerMessageOrder =
-        twilioService.sendWhatsAppMessage.mock.invocationCallOrder[
-          customerMessageCallIndex
-        ];
-      const activationOrder =
-        paymentEventsService.activateAssignedJob.mock.invocationCallOrder[0];
-      expect(customerMessageOrder).toBeLessThan(activationOrder);
-      // The operator's phone number must be included so the customer can
-      // actually reach them — the same information the paid-deposit path's
-      // equivalent customer message already carries (confirmDeposit).
-      const [, customerMessageBody] = twilioService.sendWhatsAppMessage.mock
-        .calls[customerMessageCallIndex] as [string, string];
-      expect(customerMessageBody).toContain('+2348011111111');
-    });
-
-    it('still activates the job (offer flip, session transitions) even when the customer-message send rejects, in the 0%-deposit branch', async () => {
-      // A Twilio failure sending the customer's own "operator confirmed"
-      // notification must never prevent activateAssignedJob from running —
-      // that's the offer flip and both session transitions, which is what
-      // actually matters operationally. Only the customer not getting one
-      // WhatsApp message is at stake here, and that must be logged, not
-      // allowed to swallow the rest.
-      prisma.dispatchOffer.findMany.mockResolvedValue([
-        {
-          id: 'offer-1',
-          rescueRequestId: 'req-1',
-          operatorId: 'op-1',
-          status: 'QUOTED',
-          quotedPrice: 100_000,
-          depositPercentSnapshot: 0,
-          operator: {
-            id: 'op-1',
-            businessName: 'Swift Towing',
-            phoneNumber: '+2348011111111',
-            latitude: 6.5,
-            longitude: 3.4,
-          },
-        },
-      ]);
-      twilioService.sendWhatsAppMessage.mockImplementation((to: string) => {
-        if (to === '+2348000000000') {
-          return Promise.reject(new Error('Twilio down'));
-        }
-        return Promise.resolve();
-      });
-
-      await service['handleQuoteSelected']('+2348000000000', 'user-1', 1);
-
-      expect(paymentEventsService.activateAssignedJob).toHaveBeenCalledWith(
-        'req-1',
+      expect(paystackService.initializePayment).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 5000 }),
       );
     });
 
-    it('rounds a very small total at a nonzero percentage down to the 0%-deposit branch', async () => {
+    it("floors a rounded-to-zero deposit at Paystack's real minimum (5,000 kobo) rather than taking the 0%-deposit branch", async () => {
       // quotedPrice = 4 kobo. serviceFeeAmount = Math.round(4 * 10 / 100) = 0,
-      // so total = 4. depositPercentSnapshot = 1 (NOT literally 0), but
-      // Math.round(4 * 1 / 100) = Math.round(0.04) = 0 — the branch must key
-      // off the computed depositAmount, not the raw stored percentage.
+      // so total = 4. depositPercentSnapshot = 1 (NOT literally 0).
+      // Math.round(4 * 1 / 100) = Math.round(0.04) = 0, but the percent
+      // itself is nonzero, so the floor applies: this must take the paid
+      // path (WAITING_FOR_DEPOSIT), never the free-job branch — a rounding
+      // artifact must never silently turn a paid job into a free one
+      // (hotfix, 2026-10-24), and the floor itself is Paystack's own
+      // minimum chargeable amount, not an arbitrary 1 kobo a real charge
+      // would be rejected for.
       prisma.dispatchOffer.findMany.mockResolvedValue([
         {
           id: 'offer-1',
@@ -1365,14 +2016,59 @@ describe('WhatsAppCustomerFlowService', () => {
       const [{ data }] = prisma.rescueRequest.updateMany.mock.calls[0] as [
         { data: Record<string, unknown> },
       ];
-      expect(data.status).toBe('OPERATOR_ASSIGNED');
-      expect(data.depositAmount).toBe(0);
+      expect(data.status).toBe('WAITING_FOR_DEPOSIT');
+      expect(data.depositAmount).toBe(5000);
       const [{ data: offerData }] = prisma.dispatchOffer.update.mock
         .calls[0] as [{ data: Record<string, unknown> }];
-      expect(offerData.status).toBe('ACCEPTED');
-      expect(paymentLedger.create).not.toHaveBeenCalled();
-      expect(paymentEventsService.activateAssignedJob).toHaveBeenCalledWith(
-        'req-1',
+      expect(offerData.status).toBe('SELECTED_PENDING_PAYMENT');
+      expect(paymentLedger.create).toHaveBeenCalledWith(
+        expect.objectContaining({ rescueRequestId: 'req-1', amount: 5000 }),
+      );
+      expect(paystackService.initializePayment).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not notify a non-WhatsApp losing bidder when the customer picks someone else', async () => {
+      prisma.dispatchOffer.findMany.mockResolvedValue([
+        {
+          id: 'offer-1',
+          rescueRequestId: 'req-1',
+          operatorId: 'op-1',
+          status: 'QUOTED',
+          quotedPrice: 100_000,
+          operator: {
+            id: 'op-1',
+            businessName: 'Swift Towing',
+            phoneNumber: '+2348011111111',
+            latitude: 6.5,
+            longitude: 3.4,
+            whatsappEnabled: true,
+          },
+        },
+        {
+          id: 'offer-2',
+          rescueRequestId: 'req-1',
+          operatorId: 'op-2',
+          status: 'QUOTED',
+          quotedPrice: 200_000,
+          operator: {
+            id: 'op-2',
+            businessName: 'Off-Grid Towing',
+            phoneNumber: '+2348022223333',
+            latitude: 6.5,
+            longitude: 3.4,
+            whatsappEnabled: false,
+          },
+        },
+      ]);
+
+      // op-1 is strictly cheaper (and distance/ETA is pinned equal by the
+      // calculateDistance mock in this block's beforeEach), so it ranks
+      // first — choice 1 selects op-1, leaving op-2 as the losing bidder.
+      await service['handleQuoteSelected']('+2348000000000', 'user-1', 1);
+
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
+        expect.stringContaining('+2348022223333'),
+        expect.anything(),
       );
     });
   });
@@ -1509,6 +2205,7 @@ describe('WhatsAppCustomerFlowService', () => {
         assignedOperator: {
           businessName: 'Swift Towing',
           phoneNumber: operatorPhone,
+          whatsappEnabled: true,
         },
       });
       const session = {
@@ -1568,12 +2265,47 @@ describe('WhatsAppCustomerFlowService', () => {
       expect(sessionStore.update).not.toHaveBeenCalled();
     });
 
+    it('CHAT DRIVER replies with the unavailable message and opens no relay session when the assigned operator has no WhatsApp on file', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        assignedOperator: {
+          businessName: 'Swift Towing',
+          phoneNumber: operatorPhone,
+          whatsappEnabled: false,
+        },
+      });
+      const session: WhatsAppSession = {
+        userId: 'cust-1',
+        state: WhatsAppFlowState.IDLE,
+        rescueRequestId: 'req-1',
+        updatedAt: new Date(),
+      };
+
+      const result = await service.handleCustomerMessage(
+        customerPhone,
+        'cust-1',
+        'chat driver',
+        'chat driver',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {},
+      );
+
+      expect(result).toContain("isn't available");
+      expect(sharedService.findOrCreateCustomer).not.toHaveBeenCalled();
+      expect(sessionStore.update).not.toHaveBeenCalled();
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+
     it('relays a plain message to the operator while relayTarget is set', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
         id: 'req-1',
         assignedOperator: {
           businessName: 'Swift Towing',
           phoneNumber: operatorPhone,
+          whatsappEnabled: true,
         },
       });
       const session = {
@@ -1600,12 +2332,49 @@ describe('WhatsAppCustomerFlowService', () => {
       );
     });
 
+    it('clears a stale relay and replies with the unavailable message instead of forwarding, when the assigned operator has no WhatsApp on file', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        assignedOperator: {
+          businessName: 'Swift Towing',
+          phoneNumber: operatorPhone,
+          whatsappEnabled: false,
+        },
+      });
+      const session: WhatsAppSession = {
+        userId: 'cust-1',
+        state: WhatsAppFlowState.IDLE,
+        rescueRequestId: 'req-1',
+        relayTarget: 'OPERATOR',
+        updatedAt: new Date(),
+      };
+
+      const result = await service.handleCustomerMessage(
+        customerPhone,
+        'cust-1',
+        'where are you',
+        'Where are you?',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {},
+      );
+
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
+        relayTarget: null,
+      });
+      expect(result).toContain("isn't available");
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
+
     it('END CHAT clears relayTarget on both sides and notifies both', async () => {
       prisma.rescueRequest.findUnique.mockResolvedValue({
         id: 'req-1',
         assignedOperator: {
           businessName: 'Swift Towing',
           phoneNumber: operatorPhone,
+          whatsappEnabled: true,
         },
       });
       const session = {
@@ -1639,6 +2408,51 @@ describe('WhatsAppCustomerFlowService', () => {
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
         expect.stringContaining(operatorPhone),
         'Chat ended.',
+      );
+    });
+
+    it('END CHAT clears the operator relay session but skips the WhatsApp notification when the operator has no WhatsApp on file', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        assignedOperator: {
+          businessName: 'Swift Towing',
+          phoneNumber: operatorPhone,
+          whatsappEnabled: false,
+        },
+      });
+      const session: WhatsAppSession = {
+        userId: 'cust-1',
+        state: WhatsAppFlowState.IDLE,
+        rescueRequestId: 'req-1',
+        relayTarget: 'OPERATOR',
+        updatedAt: new Date(),
+      };
+
+      await service.handleCustomerMessage(
+        customerPhone,
+        'cust-1',
+        'end chat',
+        'end chat',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {},
+      );
+
+      expect(sessionStore.update).toHaveBeenCalledWith('cust-1', {
+        relayTarget: null,
+      });
+      expect(sessionStore.update).toHaveBeenCalledWith('op-user-1', {
+        relayTarget: null,
+      });
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining(customerPhone),
+        'Chat ended.',
+      );
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
+        expect.stringContaining(operatorPhone),
+        expect.anything(),
       );
     });
   });
@@ -2101,11 +2915,76 @@ describe('WhatsAppCustomerFlowService', () => {
 
         expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
           where: { id: 'req-1' },
-          data: { status: 'CANCELLED' },
+          data: { status: 'CANCELLED', needsManualAssignment: false },
         });
         expect(result).toContain('You were not charged');
       },
     );
+
+    it('notifies the assigned operator that the job is released when cancelling while WAITING_FOR_DEPOSIT', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'WAITING_FOR_DEPOSIT',
+        assignedOperator: {
+          phoneNumber: '+2349011111111',
+          whatsappEnabled: true,
+        },
+      });
+      const session: WhatsAppSession = {
+        userId: 'cust-1',
+        state: WhatsAppFlowState.IDLE,
+        rescueRequestId: 'req-1',
+        updatedAt: new Date(),
+      };
+
+      await service.handleCustomerMessage(
+        '+2348012345678',
+        'cust-1',
+        'cancel',
+        'cancel',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {},
+      );
+
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        expect.stringContaining('+2349011111111'),
+        expect.stringContaining('no longer available'),
+      );
+    });
+
+    it('does not notify a non-WhatsApp operator that the job is released when cancelling while WAITING_FOR_DEPOSIT', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: 'req-1',
+        status: 'WAITING_FOR_DEPOSIT',
+        assignedOperator: {
+          phoneNumber: '+2349011111111',
+          whatsappEnabled: false,
+        },
+      });
+      const session: WhatsAppSession = {
+        userId: 'cust-1',
+        state: WhatsAppFlowState.IDLE,
+        rescueRequestId: 'req-1',
+        updatedAt: new Date(),
+      };
+
+      await service.handleCustomerMessage(
+        '+2348012345678',
+        'cust-1',
+        'cancel',
+        'cancel',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {},
+      );
+
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+    });
   });
 
   describe('captureMediaAttachment', () => {
@@ -2349,6 +3228,87 @@ describe('WhatsAppCustomerFlowService', () => {
         state: WhatsAppFlowState.AWAITING_COMPLETION_CONFIRM,
       });
       expect(s3Service.uploadMedia).toHaveBeenCalled();
+    });
+  });
+
+  describe('SOS — stale request replacement', () => {
+    let service: WhatsAppCustomerFlowService;
+    let prisma: {
+      rescueRequest: { findFirst: jest.Mock; update: jest.Mock };
+    };
+    let sessionStore: { update: jest.Mock };
+
+    beforeEach(async () => {
+      prisma = {
+        rescueRequest: {
+          findFirst: jest.fn(),
+          update: jest.fn(),
+        },
+      };
+      sessionStore = { update: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppCustomerFlowService,
+          { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          {
+            provide: TwilioService,
+            useValue: { sendWhatsAppMessage: jest.fn() },
+          },
+          { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PaystackService, useValue: {} },
+          { provide: PlatformConfigService, useValue: {} },
+          { provide: OperatorService, useValue: {} },
+          { provide: DispatchService, useValue: {} },
+          { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppCustomerFlowService>(
+        WhatsAppCustomerFlowService,
+      );
+    });
+
+    it('auto-cancels a stale WAITING_FOR_MEDIA request and clears its needsManualAssignment flag before starting a new SOS', async () => {
+      prisma.rescueRequest.findFirst.mockResolvedValue({
+        id: 'req-stale',
+        status: 'WAITING_FOR_MEDIA',
+      });
+      const session: WhatsAppSession = {
+        userId: 'cust-1',
+        state: WhatsAppFlowState.IDLE,
+        updatedAt: new Date(),
+      };
+
+      await service.handleCustomerMessage(
+        '+2348012345678',
+        'cust-1',
+        'sos',
+        'SOS',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        {},
+      );
+
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-stale' },
+        data: { status: 'CANCELLED', needsManualAssignment: false },
+      });
     });
   });
 });

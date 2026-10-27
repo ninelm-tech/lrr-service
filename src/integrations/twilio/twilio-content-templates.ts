@@ -48,12 +48,19 @@ export type TwilioContentTemplateDefinition = {
   envVar: string;
   /** Twilio/Meta category — every template in this app is UTILITY (operational, not promotional). */
   category: 'UTILITY';
-  contentType: 'text' | 'quick-reply';
+  contentType: 'text' | 'quick-reply' | 'twilio/call-to-action';
   /** Each numbered variable, in the exact order the template declares them (index 0 = {{1}}). */
   variables: string[];
   /** The approved body, with {{N}} placeholders — see the file header for what `source` means here. */
   body: string;
   buttons?: { title: string }[];
+  /**
+   * Set only for `contentType: 'twilio/call-to-action'` entries whose
+   * action has no title/label in the usual `buttons` sense —
+   * REQUEST_CONTACT_INFO is a native WhatsApp consent prompt, not a
+   * labeled button like ARRIVED/DONE above.
+   */
+  action?: 'REQUEST_CONTACT_INFO';
   source: 'confirmed' | 'reconstructed' | 'designed';
 };
 
@@ -106,6 +113,19 @@ export const TWILIO_CONTENT_TEMPLATES: Record<
     variables: ['bareJobRef', 'dashboardLink'],
     body: '🚨 New dispute raised — Job #{{1}}\n\nLog in to view: {{2}}',
     source: 'reconstructed',
+  },
+
+  // Not yet submitted for Meta approval as of this plan's implementation —
+  // sends fall back to freeform until TWILIO_MANUAL_FALLBACK_ALERT_TEMPLATE_SID
+  // is set in each environment. See dispatch.service.ts's
+  // alertStaffManualFallback for the call site.
+  manual_fallback_alert: {
+    envVar: 'TWILIO_MANUAL_FALLBACK_ALERT_TEMPLATE_SID',
+    category: 'UTILITY',
+    contentType: 'text',
+    variables: ['bareJobRef', 'round'],
+    body: '📞 Job #{{1}} needs a manual call — no WhatsApp-capable operator left after round {{2}}. Check the Requests tab for candidates.',
+    source: 'designed',
   },
 
   payout_sent: {
@@ -230,6 +250,45 @@ export const TWILIO_CONTENT_TEMPLATES: Record<
     // once someone has.
     body: '🆕 A new rescue request just came in — Job {{1}}. Vehicle type: {{2}}. Issue reported: {{3}}. Heading to: {{4}}. Customer contact: {{5}}. Please review and assign as needed.',
     source: 'designed',
+  },
+
+  // A native WhatsApp consent prompt, not a labeled button — sent to a
+  // BSUID-only customer, right after the photo step and before dispatch, when their phoneNumber is still null,
+  // so WhatsApp can share their real number directly. See the WhatsApp
+  // username/BSUID identity design doc.
+  //
+  // UNLIKE what the Twilio call-to-action docs would suggest
+  // (twilio.com/docs/content/twilio-call-to-action, which lists only
+  // QUICK_REPLY, URL, VOICE_CALL_REQUEST and VOICE_CALL as usable
+  // unapproved inside an active session): confirmed empirically
+  // 2026-10-26 that REQUEST_CONTACT_INFO sends and renders without
+  // approval inside an active session, on the LRR Stage subaccount.
+  //
+  // The Twilio Console's "Call to action" builder does NOT expose
+  // REQUEST_CONTACT_INFO as a Type of action — its dropdown only offers
+  // Phone number, Visit website, Voice call, Voice call request, Coupon
+  // code (confirmed 2026-10-25 against the live LRR Stage console).
+  // Created instead via a direct Content API call
+  // (POST https://content.twilio.com/v1/Content, types['twilio/call-to-action'].actions
+  // = [{ type: 'REQUEST_CONTACT_INFO' }]), then submitted for approval via
+  // POST .../Content/{sid}/ApprovalRequests/whatsapp — both run against the
+  // LRR Stage subaccount 2026-10-25/26. SID: set via TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID
+  // (set TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID to this once wiring up
+  // the env, Stage only — LRR Prod has nothing yet). Approval status
+  // "received" as of creation; approval is not required to send inside an
+  // active session (see above).
+  //
+  // source is 'confirmed', not 'designed': the body below is exactly what
+  // was sent to and echoed back by the Content API create call, not a
+  // guess or a console screenshot transcription.
+  request_contact_info: {
+    envVar: 'TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID',
+    category: 'UTILITY',
+    contentType: 'twilio/call-to-action',
+    action: 'REQUEST_CONTACT_INFO',
+    variables: [],
+    body: "We're on WhatsApp with you, but your account has a username set, so WhatsApp isn't sharing your phone number with us automatically — that's a WhatsApp privacy setting, not something we're choosing. Tap below to share it, so you can find this request if you sign up on the LRR portal later.",
+    source: 'confirmed',
   },
 
   low_rating_staff_alert: {

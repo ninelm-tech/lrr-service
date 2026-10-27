@@ -566,6 +566,46 @@ describe('OperatorService', () => {
     });
   });
 
+  describe('findAndRankCandidates whatsappOnly filtering', () => {
+    it('defaults to WhatsApp-only candidates when whatsappOnly is omitted', async () => {
+      prisma.operator.findMany.mockResolvedValue([]);
+
+      await service.findAndRankCandidates(6.5, 3.4, [], 0, undefined, []);
+
+      expect(prisma.operator.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+          where: expect.objectContaining({ whatsappEnabled: true }),
+        }),
+      );
+    });
+
+    it('searches only non-WhatsApp operators when whatsappOnly is false', async () => {
+      prisma.operator.findMany.mockResolvedValue([]);
+
+      await service.findAndRankCandidates(
+        6.5,
+        3.4,
+        [],
+        0,
+        undefined,
+        [],
+        false,
+        false,
+      );
+
+      expect(prisma.operator.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+          where: expect.objectContaining({
+            isTest: false,
+            whatsappEnabled: false,
+          }),
+        }),
+      );
+    });
+  });
+
   describe('create() truckClasses server-side enforcement', () => {
     const baseDto = (): CreateOperatorDto => ({
       email: 'op@example.com',
@@ -728,6 +768,58 @@ describe('OperatorService', () => {
         expect(prisma.user.create).toHaveBeenCalledWith(
           expect.objectContaining({
             data: expect.objectContaining({ email: undefined }),
+          }),
+        );
+      });
+
+      it('persists whatsappEnabled: false when explicitly provided at registration', async () => {
+        const dto = { ...baseDto(), whatsappEnabled: false };
+        prisma.user.findUnique.mockResolvedValue(null);
+        prisma.operator.findUnique.mockResolvedValue(null);
+        prisma.user.findFirst.mockResolvedValue(null);
+        otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-fresh' });
+        prisma.$transaction.mockImplementation(
+          (fn: (client: typeof prisma) => unknown) => fn(prisma),
+        );
+        prisma.phoneVerification.updateMany = jest
+          .fn()
+          .mockResolvedValue({ count: 1 });
+        prisma.user.create.mockResolvedValue({ id: 'u-new' });
+        prisma.operator.create.mockResolvedValue({ id: 'op-new' });
+        prisma.operatorMember.create.mockResolvedValue({});
+
+        await service.create(dto);
+
+        expect(prisma.operator.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+            data: expect.objectContaining({ whatsappEnabled: false }),
+          }),
+        );
+      });
+
+      it('defaults to whatsappEnabled: true when omitted', async () => {
+        const dto = baseDto();
+        prisma.user.findUnique.mockResolvedValue(null);
+        prisma.operator.findUnique.mockResolvedValue(null);
+        prisma.user.findFirst.mockResolvedValue(null);
+        otpService.findValidTokenRow.mockResolvedValue({ id: 'pv-fresh' });
+        prisma.$transaction.mockImplementation(
+          (fn: (client: typeof prisma) => unknown) => fn(prisma),
+        );
+        prisma.phoneVerification.updateMany = jest
+          .fn()
+          .mockResolvedValue({ count: 1 });
+        prisma.user.create.mockResolvedValue({ id: 'u-new' });
+        prisma.operator.create.mockResolvedValue({ id: 'op-new' });
+        prisma.operatorMember.create.mockResolvedValue({});
+
+        await service.create(dto);
+
+        expect(prisma.operator.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+            data: expect.objectContaining({ whatsappEnabled: true }),
           }),
         );
       });
@@ -923,6 +1015,28 @@ describe('OperatorService', () => {
       );
     });
 
+    it('persists whatsappEnabled: false when explicitly provided at field onboarding', async () => {
+      await service.adminCreate({ ...baseDto(), whatsappEnabled: false });
+
+      expect(prisma.operator.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+          data: expect.objectContaining({ whatsappEnabled: false }),
+        }),
+      );
+    });
+
+    it('defaults to whatsappEnabled: true when omitted at field onboarding', async () => {
+      await service.adminCreate(baseDto());
+
+      expect(prisma.operator.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- a nested expect.objectContaining(...) value loses its generic inference when assigned to an outer objectContaining's property; same @types/jest looseness as the expect.not case elsewhere in this codebase
+          data: expect.objectContaining({ whatsappEnabled: true }),
+        }),
+      );
+    });
+
     it('creates the user with passwordHash: null when no password is given', async () => {
       await service.adminCreate(baseDto());
 
@@ -982,10 +1096,14 @@ describe('OperatorService', () => {
       expect(prisma.$transaction).not.toHaveBeenCalled();
     });
 
-    it('accepts and persists depositPercentOverride: 0 — not skipped as falsy', async () => {
-      // Platform floor dropped to 0 for this test specifically: it exists to
-      // prove a real 0 isn't skipped by falsy coercion, which only happens
-      // to be a valid value when the floor itself is 0.
+    it('still rejects depositPercentOverride: 0 even when the live platform config value is stale and reads 0 (hotfix, 2026-10-25)', async () => {
+      // Superseded test, 2026-10-25: this used to assert the OPPOSITE — that
+      // 0 is accepted and persisted (not skipped by falsy coercion) when the
+      // live config floor happens to read 0. A 0% deposit must never be
+      // possible at all now, so that premise is gone; this proves the real
+      // replacement guarantee — the floor is never trusted from the live
+      // config value alone, so even a stale/wrong config row can't let a 0
+      // override through.
       platformConfigService.getConfig.mockResolvedValue({
         serviceFeePercent: 10,
         depositPercent: 0,
@@ -996,20 +1114,33 @@ describe('OperatorService', () => {
         newRequestAlertPhoneNumbers: [],
         testCustomerPhoneNumbers: [],
       });
-      // Captured via a typed mockImplementation callback, not `mock.calls[0][0]`
-      // indexing — the latter reads back through this file's bare `jest.Mock`
-      // typing as `any`, which trips no-unsafe-assignment/member-access.
-      let capturedData: { depositPercentOverride?: number | null } | undefined;
-      prisma.operator.create.mockImplementation(
-        (args: { data: { depositPercentOverride?: number | null } }) => {
-          capturedData = args.data;
-          return Promise.resolve({ id: 'op-new', status: 'ACTIVE' });
-        },
-      );
 
-      await service.adminCreate({ ...baseDto(), depositPercentOverride: 0 });
+      await expect(
+        service.adminCreate({ ...baseDto(), depositPercentOverride: 0 }),
+      ).rejects.toThrow('depositPercentOverride must be between 10 and 50');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
 
-      expect(capturedData?.depositPercentOverride).toBe(0);
+    it('still rejects a too-low value when the live platform config value is non-finite (hotfix, 2026-10-25)', async () => {
+      // Math.max(10, NaN) is NaN, and any comparison against NaN is false —
+      // without guarding liveDefault itself, a corrupt config read would
+      // silently defeat this floor entirely, the same NaN-contagion pattern
+      // already fixed for computeDepositAmount.
+      platformConfigService.getConfig.mockResolvedValue({
+        serviceFeePercent: 10,
+        depositPercent: NaN,
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        quoteCollectionMinutes: 5,
+        disputeAlertPhoneNumbers: [],
+        newRequestAlertPhoneNumbers: [],
+        testCustomerPhoneNumbers: [],
+      });
+
+      await expect(
+        service.adminCreate({ ...baseDto(), depositPercentOverride: 5 }),
+      ).rejects.toThrow('depositPercentOverride must be between 10 and 50');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
     });
 
     it('accepts depositPercentOverride at exactly the platform floor (10, from the mocked default)', async () => {
@@ -1089,10 +1220,14 @@ describe('OperatorService', () => {
       expect(result).toEqual({ id: 'op-1', depositPercentOverride: 25 });
     });
 
-    it('persists exactly 0 — not skipped as falsy — when the platform floor is 0', async () => {
-      // Floor dropped to 0 for this test specifically: it exists to prove a
-      // real 0 isn't skipped by falsy coercion, which only happens to be a
-      // valid value when the floor itself is 0.
+    it('still rejects 0 even when the live platform config value is stale and reads 0 (hotfix, 2026-10-25)', async () => {
+      // Superseded test, 2026-10-25: this used to assert the OPPOSITE — that
+      // a 0 override succeeds when the live config floor happens to read 0,
+      // proving falsy-0 wasn't skipped. A 0% deposit must never be possible
+      // at all now, so that premise is gone; this proves the real
+      // replacement guarantee — the floor is never trusted from the live
+      // config value alone, so even a stale/wrong config row can't let a 0
+      // override through.
       platformConfigService.getConfig.mockResolvedValue({
         serviceFeePercent: 10,
         depositPercent: 0,
@@ -1106,17 +1241,36 @@ describe('OperatorService', () => {
       prisma.operator.findUnique.mockResolvedValue({
         depositPercentOverride: 25,
       });
-      prisma.operator.update.mockResolvedValue({
-        id: 'op-1',
-        depositPercentOverride: 0,
+
+      await expect(service.setDepositPercent('op-1', 0, actor)).rejects.toThrow(
+        'depositPercentOverride must be between 10 and 50',
+      );
+      expect(prisma.operator.update).not.toHaveBeenCalled();
+    });
+
+    it('still rejects a too-low value when the live platform config value is non-finite (hotfix, 2026-10-25)', async () => {
+      // Math.max(10, NaN) is NaN, and any comparison against NaN is false —
+      // without guarding liveDefault itself, a corrupt config read would
+      // silently defeat this floor entirely, the same NaN-contagion pattern
+      // already fixed for computeDepositAmount.
+      platformConfigService.getConfig.mockResolvedValue({
+        serviceFeePercent: 10,
+        depositPercent: NaN,
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        quoteCollectionMinutes: 5,
+        disputeAlertPhoneNumbers: [],
+        newRequestAlertPhoneNumbers: [],
+        testCustomerPhoneNumbers: [],
+      });
+      prisma.operator.findUnique.mockResolvedValue({
+        depositPercentOverride: 25,
       });
 
-      await service.setDepositPercent('op-1', 0, actor);
-
-      expect(prisma.operator.update).toHaveBeenCalledWith({
-        where: { id: 'op-1' },
-        data: { depositPercentOverride: 0 },
-      });
+      await expect(service.setDepositPercent('op-1', 5, actor)).rejects.toThrow(
+        'depositPercentOverride must be between 10 and 50',
+      );
+      expect(prisma.operator.update).not.toHaveBeenCalled();
     });
 
     it('clears the override back to the platform default when given null', async () => {

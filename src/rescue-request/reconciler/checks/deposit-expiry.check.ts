@@ -3,7 +3,10 @@ import * as Sentry from '@sentry/node';
 import { DispatchOfferStatus, RescueRequestStatus } from '@prisma/client';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { TwilioService } from '../../../integrations/twilio/twilio.service';
-import { toWhatsAppAddress } from '../../../common/phone.util';
+import {
+  toWhatsAppAddress,
+  toWhatsAppDestination,
+} from '../../../common/phone.util';
 import { formatJobRef } from '../../domain/rescue-request-formatting';
 import { ReconcilerCheck } from '../reconciler-check.interface';
 
@@ -64,7 +67,10 @@ export class DepositExpiryCheck implements ReconcilerCheck {
           status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
           depositWindowExpiresAt: { lt: now },
         },
-        data: { status: RescueRequestStatus.CANCELLED },
+        data: {
+          status: RescueRequestStatus.CANCELLED,
+          needsManualAssignment: false,
+        },
       });
       if (count === 0) return null;
 
@@ -106,13 +112,16 @@ export class DepositExpiryCheck implements ReconcilerCheck {
     // the job is over, and a duplicate costs a billable WhatsApp send.
     const jobRef = formatJobRef(rescueRequestId);
     try {
-      if (claimed.customer?.phoneNumber) {
+      if (claimed.customer) {
         await this.twilioService.sendWhatsAppMessage(
-          claimed.customer.phoneNumber,
+          toWhatsAppDestination(claimed.customer),
           `We didn't receive payment confirmation within 30 minutes, so your request was cancelled. If your payment completes after this, we'll refund it.`,
         );
       }
-      if (claimed.assignedOperator?.phoneNumber) {
+      if (
+        claimed.assignedOperator?.phoneNumber &&
+        claimed.assignedOperator.whatsappEnabled
+      ) {
         await this.twilioService.sendWhatsAppMessage(
           toWhatsAppAddress(claimed.assignedOperator.phoneNumber),
           `⏰ ${jobRef} is no longer available — the customer didn't pay in time.`,

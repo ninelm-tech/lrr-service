@@ -58,6 +58,7 @@ describe('Deposit submission protocol (integration)', () => {
       } as never,
       {} as never,
       {} as never,
+      {} as never,
     );
   });
 

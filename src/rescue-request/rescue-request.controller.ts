@@ -1,7 +1,9 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
+  NotFoundException,
   Param,
   Patch,
   Post,
@@ -9,15 +11,17 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
-import { UserRole } from '@prisma/client';
+import { RescueRequestStatus, UserRole } from '@prisma/client';
 import { DisputeService } from './dispute.service';
 import { RescueRequestAdminService } from './rescue-request-admin.service';
 import { DispatchService } from './dispatch.service';
+import { WhatsAppOperatorFlowService } from './whatsapp-operator-flow.service';
 import type { Request } from 'express';
 import { AdminRescueRequestQueryDto } from './dto/admin-rescue-request.dto';
 import { AssignOperatorDto } from './dto/assign-operator.dto';
 import { ResolveDisputeDto } from './dto/resolve-dispute.dto';
 import { ResolveCancellationSettlementDto } from './dto/resolve-cancellation-settlement.dto';
+import { ManualOverrideDto } from './dto/manual-override.dto';
 import { AuthGuard } from '../auth/auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -32,6 +36,7 @@ export class RescueRequestController {
     private readonly rescueRequestAdminService: RescueRequestAdminService,
     private readonly dispatchService: DispatchService,
     private readonly auditLogService: AuditLogService,
+    private readonly operatorFlowService: WhatsAppOperatorFlowService,
   ) {}
 
   @Get()
@@ -115,10 +120,25 @@ export class RescueRequestController {
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
   async assignOperator(
+    @Req() req: AuthenticatedRequest,
     @Param('id') id: string,
     @Body() dto: AssignOperatorDto,
   ) {
-    return this.rescueRequestAdminService.assignOperator(id, dto);
+    const result = await this.rescueRequestAdminService.assignOperator(id, dto);
+    if (result.data.assignedOperator?.whatsappEnabled === false) {
+      await this.auditLogService.record({
+        category: 'manual_assignment_confirmed',
+        message: `Manually assigned ${result.data.assignedOperator.businessName} to request ${id}`,
+        details: {
+          targetType: 'RescueRequest',
+          targetId: id,
+          operatorId: result.data.assignedOperator.id,
+          businessName: result.data.assignedOperator.businessName,
+        },
+        actorId: req.user.userId,
+      });
+    }
+    return result;
   }
 
   /**
@@ -170,6 +190,147 @@ export class RescueRequestController {
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
   async cancel(@Param('id') id: string, @Body() body: { reason?: string }) {
     return this.rescueRequestAdminService.cancel(id, { reason: body.reason });
+  }
+
+  /**
+   * Staff stand-in for an operator sending ARRIVED over WhatsApp. Usable
+   * without a reason when the assigned operator has no WhatsApp on file —
+   * the original, already-legitimate path, where staff and the operator's
+   * own replies can never race over the same status. For a WhatsApp-enabled
+   * operator (their account may have gone BSUID-masked mid-job — see the
+   * WhatsApp username/BSUID identity design doc), the override still
+   * requires a non-empty `reason`, since here a real WhatsApp conversation
+   * could in principle still be live.
+   *
+   * The pre-check below (`findRawForManualAction`) is what produces a
+   * precise error message; it is NOT the concurrency guard. The guard is
+   * `claimManualArrived`'s own atomic conditional update — if two staff
+   * members click this at once, or the request moved on between the
+   * pre-check and the claim, only one claim can ever succeed, and only the
+   * winner notifies the customer or writes an audit entry.
+   */
+  @Patch(':id/manual-arrived')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async manualArrived(
+    @Req() req: AuthenticatedRequest,
+    @Param('id') id: string,
+    @Body() body: ManualOverrideDto,
+  ) {
+    const request =
+      await this.rescueRequestAdminService.findRawForManualAction(id);
+    if (!request) throw new NotFoundException('Rescue request not found');
+    if (request.assignedOperator?.whatsappEnabled && !body.reason) {
+      throw new BadRequestException(
+        'This operator has WhatsApp on file — a reason is required to override arrival tracking manually.',
+      );
+    }
+    if (request.status !== RescueRequestStatus.OPERATOR_ASSIGNED) {
+      throw new BadRequestException(
+        `Cannot mark arrived — request is ${request.status}, expected OPERATOR_ASSIGNED.`,
+      );
+    }
+
+    const { claimed } = await this.rescueRequestAdminService.claimManualArrived(
+      id,
+      { reason: body.reason },
+    );
+    if (!claimed) {
+      throw new BadRequestException(
+        'This request is no longer eligible for a manual arrival — it may already have been marked, or its status changed.',
+      );
+    }
+
+    await this.operatorFlowService.notifyCustomerOperatorArrived(id);
+    await this.auditLogService.record({
+      category: 'manual_operator_arrived',
+      message: `Marked operator arrived for request ${id}${
+        body.reason ? ` (override: ${body.reason})` : ' (no WhatsApp on file)'
+      }`,
+      details: {
+        targetType: 'RescueRequest',
+        targetId: id,
+        operatorId: request.assignedOperatorId,
+        reason: body.reason,
+      },
+      actorId: req.user.userId,
+    });
+    return { message: 'Marked arrived' };
+  }
+
+  /**
+   * Staff stand-in for an operator sending DONE over WhatsApp — same
+   * whatsappEnabled-vs-reason guard as manual-arrived. Deliberately does
+   * NOT require completion media (product decision, see the design spec)
+   * — the WhatsApp path's own DONE handler is completely untouched and
+   * still requires it.
+   *
+   * Unlike manual-arrived, the atomic claim itself lives inside
+   * `startManualCompletionConfirmation` (Task 9) — that method is
+   * self-contained since it isn't shared with any WhatsApp-path method, so
+   * there's no separate `claimManualDone` helper here; this endpoint's own
+   * two checks below are still pre-check-only, for the same precise-error
+   * reason as manual-arrived.
+   */
+  @Patch(':id/manual-done')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async manualDone(
+    @Req() req: AuthenticatedRequest,
+    @Param('id') id: string,
+    @Body() body: ManualOverrideDto,
+  ) {
+    const request =
+      await this.rescueRequestAdminService.findRawForManualAction(id);
+    if (!request) throw new NotFoundException('Rescue request not found');
+    if (request.assignedOperator?.whatsappEnabled && !body.reason) {
+      throw new BadRequestException(
+        'This operator has WhatsApp on file — a reason is required to override completion tracking manually.',
+      );
+    }
+    if (request.status !== RescueRequestStatus.ARRIVED) {
+      throw new BadRequestException(
+        `Cannot mark done — request is ${request.status}, expected ARRIVED.`,
+      );
+    }
+
+    const { claimed } =
+      await this.operatorFlowService.startManualCompletionConfirmation(id, {
+        reason: body.reason,
+      });
+    if (!claimed) {
+      throw new BadRequestException(
+        'This request is no longer eligible for manual completion — it may already have been marked, or its status changed.',
+      );
+    }
+
+    await this.auditLogService.record({
+      category: 'manual_operator_done',
+      message: `Marked operator done for request ${id}${
+        body.reason ? ` (override: ${body.reason})` : ' (no WhatsApp on file)'
+      }`,
+      details: {
+        targetType: 'RescueRequest',
+        targetId: id,
+        operatorId: request.assignedOperatorId,
+        reason: body.reason,
+      },
+      actorId: req.user.userId,
+    });
+    return { message: 'Marked done — awaiting customer confirmation' };
+  }
+
+  /**
+   * Live-ranked candidates for a request flagged needsManualAssignment —
+   * the same whatsappOnly: false search resolveExhaustion's own fallback
+   * used, re-run fresh rather than persisted, so staff always see current
+   * operator availability.
+   */
+  @Get(':id/manual-candidates')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async manualCandidates(@Param('id') id: string) {
+    return this.rescueRequestAdminService.manualCandidatesFor(id);
   }
 
   /** Mark a disputed request resolved. Idempotent — safe to call more than once. */

@@ -16,14 +16,14 @@ import {
 /**
  * The per-operator deposit percentage, end to end against a real database.
  *
- * The unit specs already cover the branch logic in isolation (Task 3's
- * snapshot write, Task 5's snapshot read and 0%/rounding branches, Task 4's
- * activation extraction). What only a real database can show is that those
- * pieces compose correctly across two separate calls into the real service
- * methods: the snapshot taken at shortlist-delivery time really does survive
- * a later, real write to the operator's live override, and the full
- * 0%-deposit path really does leave the database in the state the other
- * callers of PaymentEventsService.activateAssignedJob depend on.
+ * The unit specs already cover the branch logic in isolation. What only a
+ * real database can show is that those pieces compose correctly across two
+ * separate calls into the real service methods: the snapshot taken at
+ * shortlist-delivery time really does survive a later, real write to the
+ * operator's live override, and a stale/bypassed 0% value really does still
+ * produce a real, payable deposit (never a free job — 2026-10-25 hotfix)
+ * whose settlement correctly unblocks the request all the way to
+ * OPERATOR_ASSIGNED.
  *
  * Both tests drive the same two real entry points dispatch actually uses:
  * DispatchService.deliverQuoteShortlist (Task 3) and
@@ -44,6 +44,8 @@ describe('Per-operator deposit percentage (integration)', () => {
   let sharedService: RescueRequestSharedService;
   let sessionStore: WhatsAppSessionStore;
   let paystack: { initializePayment: jest.Mock };
+  let paymentLedger: PaymentLedgerService;
+  let paymentEventsService: PaymentEventsService;
 
   const ok = (url = 'https://paystack.test/pay/xyz') => ({
     outcome: 'ok' as const,
@@ -91,7 +93,7 @@ describe('Per-operator deposit percentage (integration)', () => {
       twilio as never,
       sessionStore,
     );
-    const paymentLedger = new PaymentLedgerService(prisma);
+    paymentLedger = new PaymentLedgerService(prisma);
 
     dispatchService = new DispatchService(
       prisma,
@@ -103,7 +105,7 @@ describe('Per-operator deposit percentage (integration)', () => {
       {} as never, // OperatorMembershipService — not exercised by deliverQuoteShortlist
     );
 
-    const paymentEventsService = new PaymentEventsService(
+    paymentEventsService = new PaymentEventsService(
       prisma,
       paystack as never,
       twilio as never,
@@ -215,7 +217,11 @@ describe('Per-operator deposit percentage (integration)', () => {
     expect(updatedRequest.depositAmount).toBe(27_500);
   });
 
-  it('drives a 0%-deposit operator straight to OPERATOR_ASSIGNED with the offer ACCEPTED and zero DEPOSIT payments', async () => {
+  it('a 0%-deposit operator (stale or otherwise bypassed data) still produces a real, paid deposit — never a free job (hotfix, 2026-10-24)', async () => {
+    // depositPercentOverride: 0 is seeded directly via the factory — this is
+    // exactly the "data already in the database from before the floor
+    // existed" case the 2026-10-24 hotfix closed, end to end against a real
+    // database, not just the unit-level mocks that cover the same branch.
     const customer = await createCustomer(prisma);
     const operator = await createOperator(prisma, undefined, {
       depositPercentOverride: 0,
@@ -230,18 +236,6 @@ describe('Per-operator deposit percentage (integration)', () => {
 
     await seedCustomerSession(customer.id, request.id);
 
-    // activateAssignedJob (Task 4) resolves the operator's own WhatsApp
-    // user by phone number and updates their existing session — which, in
-    // the real flow, already exists because an operator must have messaged
-    // in (to submit the quote that put this offer in QUOTED status) before
-    // any of this runs. Seed that same precondition here, since this test
-    // seeds the QUOTED offer directly rather than through a full dispatch
-    // round.
-    const operatorUser = await sharedService.findOrCreateCustomer(
-      operator.phoneNumber!,
-    );
-    await sessionStore.getOrCreate(operatorUser.id);
-
     await dispatchService.deliverQuoteShortlist(request.id, customer.id);
 
     const quotedOffer = await prisma.dispatchOffer.findUniqueOrThrow({
@@ -249,25 +243,47 @@ describe('Per-operator deposit percentage (integration)', () => {
     });
     expect(Number(quotedOffer.depositPercentSnapshot)).toBe(0);
 
+    paystack.initializePayment.mockResolvedValue(ok());
     const session = await sessionStore.getOrCreate(customer.id);
     await selectFirstQuote(customer.phoneNumber!, customer.id, session);
 
     const updatedRequest = await prisma.rescueRequest.findUniqueOrThrow({
       where: { id: request.id },
     });
-    expect(updatedRequest.status).toBe('OPERATOR_ASSIGNED');
-    expect(updatedRequest.depositAmount).toBe(0);
-    // total = 100,000 + 10% service fee (10,000) = 110,000, all of it balance.
-    expect(updatedRequest.balanceAmount).toBe(110_000);
+    expect(updatedRequest.status).toBe('WAITING_FOR_DEPOSIT');
+    // total = 100,000 + 10% service fee (10,000) = 110,000. 0% of that
+    // rounds to 0, floored at Paystack's real minimum (5,000 kobo) — never
+    // a free, or unpayable, job.
+    expect(updatedRequest.depositAmount).toBe(5000);
+    expect(updatedRequest.balanceAmount).toBe(105_000);
 
     const winningOffer = await prisma.dispatchOffer.findUniqueOrThrow({
       where: { id: offer.id },
     });
-    expect(winningOffer.status).toBe('ACCEPTED');
+    expect(winningOffer.status).toBe('SELECTED_PENDING_PAYMENT');
 
-    const depositPaymentCount = await prisma.payment.count({
+    const freshDeposit = await prisma.payment.findFirstOrThrow({
       where: { rescueRequestId: request.id, type: 'DEPOSIT' },
     });
-    expect(depositPaymentCount).toBe(0);
+    expect(freshDeposit.amount).toBe(5000);
+
+    // Prove paying it actually unblocks the job, not just that a payable
+    // row was created — same real ledger claim sequence (claimForSubmission,
+    // then claimTerminal to SUCCEEDED) a webhook drives in production,
+    // mirroring non-whatsapp-manual-dispatch.int-spec.ts's own proof.
+    await paymentLedger.claimForSubmission(freshDeposit.id, new Date());
+    await paymentLedger.claimTerminal(freshDeposit.id, {
+      status: 'SUCCEEDED',
+    });
+    const settledDeposit = await prisma.payment.findUniqueOrThrow({
+      where: { id: freshDeposit.id },
+    });
+    expect(settledDeposit.status).toBe('SUCCEEDED');
+    await paymentEventsService.confirmDeposit(settledDeposit);
+
+    const finalRequest = await prisma.rescueRequest.findUniqueOrThrow({
+      where: { id: request.id },
+    });
+    expect(finalRequest.status).toBe('OPERATOR_ASSIGNED');
   });
 });

@@ -132,6 +132,33 @@ describe('PlatformConfigService', () => {
       ).rejects.toThrow(BadRequestException);
     });
 
+    it('rejects a depositPercent below 10 — 0% deposit must never be configurable', async () => {
+      await expect(service.updateConfig({ depositPercent: 9 })).rejects.toThrow(
+        BadRequestException,
+      );
+      await expect(service.updateConfig({ depositPercent: 0 })).rejects.toThrow(
+        BadRequestException,
+      );
+    });
+
+    it('accepts a depositPercent of exactly 10', async () => {
+      prisma.platformConfig.findFirst.mockResolvedValue({ id: 'default' });
+      prisma.platformConfig.update.mockResolvedValue({
+        id: 'default',
+        serviceFeePercent: { toNumber: () => 10 },
+        depositPercent: { toNumber: () => 10 },
+        dispatchWindowMinutes: 10,
+        dispatchBatchSize: 3,
+        quoteCollectionMinutes: 5,
+        disputeAlertPhoneNumbers: [],
+        testCustomerPhoneNumbers: [],
+      });
+
+      const result = await service.updateConfig({ depositPercent: 10 });
+
+      expect(result.depositPercent).toBe(10);
+    });
+
     it('accepts a depositPercent of exactly 50', async () => {
       prisma.platformConfig.findFirst.mockResolvedValue({ id: 'default' });
       prisma.platformConfig.update.mockResolvedValue({

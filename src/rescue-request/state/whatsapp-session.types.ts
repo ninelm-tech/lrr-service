@@ -4,6 +4,12 @@ export enum WhatsAppFlowState {
   WAITING_FOR_VEHICLE_TYPE = 'WAITING_FOR_VEHICLE_TYPE',
   WAITING_FOR_DESTINATION = 'WAITING_FOR_DESTINATION',
   WAITING_FOR_MEDIA = 'WAITING_FOR_MEDIA',
+  // Set when a BSUID-only (masked) customer's media capture is otherwise
+  // complete but User.phoneNumber is still null — dispatch is gated until
+  // they share their WhatsApp contact card. RescueRequestStatus stays
+  // WAITING_FOR_MEDIA for the whole time a session sits in this state;
+  // only the session-level state changes.
+  WAITING_FOR_CONTACT_INFO = 'WAITING_FOR_CONTACT_INFO',
   WAITING_FOR_QUOTE_SELECTION = 'WAITING_FOR_QUOTE_SELECTION',
   WAITING_FOR_RATING = 'WAITING_FOR_RATING',
   WAITING_FOR_ISSUE_TYPE = 'WAITING_FOR_ISSUE_TYPE',
