@@ -858,6 +858,438 @@ describe('WhatsAppCustomerFlowService', () => {
     });
   });
 
+  describe('WAITING_FOR_CONTACT_INFO — validate, claim, backfill or merge', () => {
+    let service: WhatsAppCustomerFlowService;
+    let prisma: {
+      operator: { findUnique: jest.Mock };
+      whatsAppSession: {
+        updateMany: jest.Mock;
+        deleteMany: jest.Mock;
+        update: jest.Mock;
+      };
+      user: {
+        findUnique: jest.Mock;
+        update: jest.Mock;
+        updateMany: jest.Mock;
+      };
+      rescueRequest: { findUnique: jest.Mock; update: jest.Mock };
+      $transaction: jest.Mock;
+    };
+    let sessionStore: { update: jest.Mock };
+    let twilioService: {
+      downloadMedia: jest.Mock;
+      sendWhatsAppMessage: jest.Mock;
+      sendWhatsAppTemplateMessage: jest.Mock;
+    };
+    let platformConfigService: { getConfig: jest.Mock };
+    let dispatchService: { startDispatch: jest.Mock };
+
+    const phoneNumber = 'whatsapp:CA.masked';
+    const userId = 'user-masked';
+    const existingUserId = 'user-existing';
+    const rescueRequestId = 'req-1';
+    const vcardPhone = '+15550100001';
+    const mediaUrl = 'https://api.twilio.com/media/vcard-123';
+    const session = {
+      state: WhatsAppFlowState.WAITING_FOR_CONTACT_INFO,
+      rescueRequestId,
+    } as WhatsAppSession;
+    const originalTemplateSid =
+      process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID;
+
+    const CONTACT_REQUEST_METADATA = JSON.stringify({
+      data: { context: { Origin: 'contact_request' } },
+    });
+
+    function vCardBuffer(telLine?: string): Buffer {
+      const lines = ['BEGIN:VCARD', 'VERSION:3.0', 'FN:Test Contact'];
+      if (telLine) lines.push(telLine);
+      lines.push('END:VCARD');
+      return Buffer.from(lines.join('\n'), 'utf-8');
+    }
+
+    function contactsBody(): Record<string, any> {
+      return {
+        MessageType: 'contacts',
+        MediaUrl0: mediaUrl,
+        MediaContentType0: 'text/vcard',
+        ChannelMetadata: CONTACT_REQUEST_METADATA,
+      };
+    }
+
+    beforeEach(async () => {
+      process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID = 'HXtest';
+      prisma = {
+        operator: { findUnique: jest.fn().mockResolvedValue(null) },
+        whatsAppSession: {
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+          deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+          update: jest.fn().mockResolvedValue({}),
+        },
+        user: {
+          findUnique: jest.fn().mockResolvedValue(null),
+          update: jest.fn().mockResolvedValue({}),
+          updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+        },
+        rescueRequest: {
+          findUnique: jest.fn().mockResolvedValue({
+            id: rescueRequestId,
+            vehicleType: 'SEDAN',
+            destination: 'Lekki Phase 1',
+            issueType: 'BREAKDOWN',
+          }),
+          update: jest.fn().mockResolvedValue({}),
+        },
+        $transaction: jest.fn((cb: (tx: unknown) => unknown) => cb(prisma)),
+      };
+      sessionStore = { update: jest.fn() };
+      twilioService = {
+        downloadMedia: jest
+          .fn()
+          .mockResolvedValue(vCardBuffer(`TEL;TYPE=CELL:${vcardPhone}`)),
+        sendWhatsAppMessage: jest.fn(),
+        sendWhatsAppTemplateMessage: jest.fn(),
+      };
+      platformConfigService = {
+        getConfig: jest
+          .fn()
+          .mockResolvedValue({ newRequestAlertPhoneNumbers: [] }),
+      };
+      dispatchService = { startDispatch: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          WhatsAppCustomerFlowService,
+          { provide: PrismaService, useValue: prisma },
+          {
+            provide: PaymentLedgerService,
+            useValue: createPaymentLedgerMock(),
+          },
+          {
+            provide: PaystackCustomerService,
+            useValue: createPaystackCustomerServiceMock(),
+          },
+          { provide: TwilioService, useValue: twilioService },
+          { provide: S3Service, useValue: {} },
+          { provide: GeocodingService, useValue: {} },
+          { provide: RatingService, useValue: {} },
+          { provide: PaystackService, useValue: {} },
+          { provide: PlatformConfigService, useValue: platformConfigService },
+          { provide: OperatorService, useValue: {} },
+          { provide: DispatchService, useValue: dispatchService },
+          { provide: DisputeService, useValue: {} },
+          { provide: PaymentEventsService, useValue: {} },
+          { provide: WhatsAppSessionStore, useValue: sessionStore },
+          { provide: RescueRequestSharedService, useValue: {} },
+        ],
+      }).compile();
+
+      service = module.get<WhatsAppCustomerFlowService>(
+        WhatsAppCustomerFlowService,
+      );
+    });
+
+    afterEach(() => {
+      if (originalTemplateSid === undefined)
+        delete process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID;
+      else
+        process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID =
+          originalTemplateSid;
+    });
+
+    async function sendContactReply(body: Record<string, any>) {
+      return service.handleCustomerMessage(
+        phoneNumber,
+        userId,
+        '',
+        '',
+        undefined,
+        undefined,
+        undefined,
+        session,
+        body,
+      );
+    }
+
+    it('re-prompts on an off-script reply', async () => {
+      const result = await sendContactReply({});
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        'HXtest',
+        {},
+      );
+      expect(twilioService.downloadMedia).not.toHaveBeenCalled();
+      expect(result).toContain('contact');
+      expect(sessionStore.update).not.toHaveBeenCalled();
+      expect(prisma.whatsAppSession.updateMany).not.toHaveBeenCalled();
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('re-prompts when the shared vCard has no phone number', async () => {
+      twilioService.downloadMedia.mockResolvedValue(vCardBuffer());
+
+      const result = await sendContactReply(contactsBody());
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        'HXtest',
+        {},
+      );
+      expect(result).toContain('contact');
+      expect(sessionStore.update).not.toHaveBeenCalled();
+      expect(prisma.whatsAppSession.updateMany).not.toHaveBeenCalled();
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('tolerates a transient vCard fetch failure', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+      twilioService.downloadMedia.mockRejectedValue(
+        new TwilioMediaDownloadError(mediaUrl, 404, 'Not Found'),
+      );
+
+      const result = await sendContactReply(contactsBody());
+
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        'HXtest',
+        {},
+      );
+      expect(result).toContain('contact');
+      expect(sessionStore.update).not.toHaveBeenCalled();
+      expect(prisma.whatsAppSession.updateMany).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+
+    it('rejects and re-prompts when the shared number belongs to a registered operator', async () => {
+      prisma.operator.findUnique.mockResolvedValue({
+        id: 'op-1',
+        phoneNumber: vcardPhone,
+      });
+
+      const result = await sendContactReply(contactsBody());
+
+      expect(prisma.operator.findUnique).toHaveBeenCalledWith({
+        where: { phoneNumber: vcardPhone },
+      });
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        'HXtest',
+        {},
+      );
+      expect(result).toContain('contact');
+      expect(prisma.whatsAppSession.updateMany).not.toHaveBeenCalled();
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('backfills the phone number and dispatches when there is no collision', async () => {
+      prisma.user.findUnique
+        .mockResolvedValueOnce(null) // existingUser lookup by phoneNumber — no collision
+        .mockResolvedValueOnce({
+          id: userId,
+          name: null,
+          phoneNumber: vcardPhone,
+        }); // handleMediaFinished's own lookup
+
+      const result = await sendContactReply(contactsBody());
+
+      expect(prisma.whatsAppSession.updateMany).toHaveBeenCalledWith({
+        where: { userId, state: WhatsAppFlowState.WAITING_FOR_CONTACT_INFO },
+        data: { state: WhatsAppFlowState.REQUEST_CONFIRMED },
+      });
+      expect(prisma.user.update).toHaveBeenCalledWith({
+        where: { id: userId },
+        data: { phoneNumber: vcardPhone },
+      });
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: rescueRequestId },
+        data: { status: 'DISPATCHING' },
+      });
+      // The reply goes to the session's own inbound address, never the
+      // vCard's number.
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        expect.stringContaining('Searching'),
+      );
+      expect(sessionStore.update).toHaveBeenCalledWith(userId, {
+        state: WhatsAppFlowState.REQUEST_CONFIRMED,
+      });
+      expect(dispatchService.startDispatch).toHaveBeenCalledWith(
+        rescueRequestId,
+        userId,
+      );
+      expect(result).toContain('<Response');
+    });
+
+    it('merges onto a pre-existing account with no prior BSUID when the shared number collides', async () => {
+      const existingUser = {
+        id: existingUserId,
+        phoneNumber: vcardPhone,
+        whatsappExternalUserId: null,
+      };
+      const maskedUser = {
+        id: userId,
+        phoneNumber: null,
+        whatsappExternalUserId: 'CA.masked',
+      };
+      prisma.user.findUnique
+        .mockResolvedValueOnce(existingUser) // existingUser lookup — collision!
+        .mockResolvedValueOnce(maskedUser) // mergeIntoExistingAccount: read masked's own BSUID
+        .mockResolvedValueOnce({
+          id: existingUserId,
+          name: null,
+          phoneNumber: vcardPhone,
+        }); // handleMediaFinished's own lookup, now keyed to the survivor
+
+      await sendContactReply(contactsBody());
+
+      expect(prisma.user.updateMany).toHaveBeenCalledWith({
+        where: {
+          whatsappExternalUserId: 'CA.masked',
+          id: { not: existingUserId },
+        },
+        data: { whatsappExternalUserId: null },
+      });
+      expect(prisma.user.update).toHaveBeenCalledWith({
+        where: { id: existingUserId },
+        data: { whatsappExternalUserId: 'CA.masked', phoneNumber: vcardPhone },
+      });
+      expect(prisma.whatsAppSession.deleteMany).toHaveBeenCalledWith({
+        where: { userId: existingUserId },
+      });
+      expect(prisma.whatsAppSession.update).toHaveBeenCalledWith({
+        where: { userId },
+        data: { userId: existingUserId },
+      });
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: rescueRequestId },
+        data: { customerId: existingUserId },
+      });
+      expect(prisma.user.update).toHaveBeenCalledWith({
+        where: { id: userId },
+        data: { deletedAt: expect.any(Date) },
+      });
+
+      // handleMediaFinished ran keyed to the survivor, not the orphan.
+      expect(prisma.rescueRequest.update).toHaveBeenCalledWith({
+        where: { id: rescueRequestId },
+        data: { status: 'DISPATCHING' },
+      });
+      expect(dispatchService.startDispatch).toHaveBeenCalledWith(
+        rescueRequestId,
+        existingUserId,
+      );
+      expect(sessionStore.update).toHaveBeenCalledWith(existingUserId, {
+        state: WhatsAppFlowState.REQUEST_CONFIRMED,
+      });
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        expect.stringContaining('Searching'),
+      );
+    });
+
+    it('merges the same way when the pre-existing account already has a different BSUID', async () => {
+      const existingUser = {
+        id: existingUserId,
+        phoneNumber: vcardPhone,
+        whatsappExternalUserId: 'CA.some-other-stale-id',
+      };
+      const maskedUser = {
+        id: userId,
+        phoneNumber: null,
+        whatsappExternalUserId: 'CA.masked',
+      };
+      prisma.user.findUnique
+        .mockResolvedValueOnce(existingUser)
+        .mockResolvedValueOnce(maskedUser)
+        .mockResolvedValueOnce({
+          id: existingUserId,
+          name: null,
+          phoneNumber: vcardPhone,
+        });
+
+      await expect(sendContactReply(contactsBody())).resolves.toBeDefined();
+
+      // Overwritten with the masked user's BSUID, not left at (or merged
+      // with) the stale prior value — same unconditional-overwrite
+      // behavior findOrCreateBySender already has for the fresh-message case.
+      expect(prisma.user.update).toHaveBeenCalledWith({
+        where: { id: existingUserId },
+        data: { whatsappExternalUserId: 'CA.masked', phoneNumber: vcardPhone },
+      });
+    });
+
+    it("discards the existing account's own stale session in favor of the live masked one", async () => {
+      const existingUser = {
+        id: existingUserId,
+        phoneNumber: vcardPhone,
+        whatsappExternalUserId: null,
+      };
+      const maskedUser = {
+        id: userId,
+        phoneNumber: null,
+        whatsappExternalUserId: 'CA.masked',
+      };
+      prisma.user.findUnique
+        .mockResolvedValueOnce(existingUser)
+        .mockResolvedValueOnce(maskedUser)
+        .mockResolvedValueOnce({
+          id: existingUserId,
+          name: null,
+          phoneNumber: vcardPhone,
+        });
+
+      await sendContactReply(contactsBody());
+
+      expect(prisma.whatsAppSession.deleteMany).toHaveBeenCalledWith({
+        where: { userId: existingUserId },
+      });
+      expect(prisma.whatsAppSession.update).toHaveBeenCalledWith({
+        where: { userId },
+        data: { userId: existingUserId },
+      });
+      // The existing account's own stale session row must be gone BEFORE
+      // the live one is re-pointed onto that same userId, or the re-point
+      // would collide with the unique constraint instead of leaving
+      // exactly one surviving row.
+      const deleteOrder =
+        prisma.whatsAppSession.deleteMany.mock.invocationCallOrder[0];
+      const updateOrder =
+        prisma.whatsAppSession.update.mock.invocationCallOrder[0];
+      expect(deleteOrder).toBeLessThan(updateOrder);
+    });
+
+    it('a second, concurrent delivery of the same contacts webhook finds the gate already claimed and does nothing', async () => {
+      // Both "deliveries" read the session before either had committed —
+      // same state, same vCard. The DB-level claim (whatsAppSession.updateMany)
+      // is what actually serializes them: only the first UPDATE's WHERE
+      // clause still matches state === WAITING_FOR_CONTACT_INFO, so it wins
+      // (count: 1); the second finds the row already moved on (count: 0).
+      prisma.whatsAppSession.updateMany
+        .mockResolvedValueOnce({ count: 1 })
+        .mockResolvedValueOnce({ count: 0 });
+      prisma.user.findUnique
+        .mockResolvedValueOnce(null) // first call's existingUser lookup
+        .mockResolvedValueOnce({
+          id: userId,
+          name: null,
+          phoneNumber: vcardPhone,
+        }); // first call's handleMediaFinished lookup
+
+      await sendContactReply(contactsBody());
+      const secondResult = await sendContactReply(contactsBody());
+
+      expect(prisma.whatsAppSession.updateMany).toHaveBeenCalledTimes(2);
+      // Neither the backfill nor handleMediaFinished's effects ran twice.
+      expect(prisma.user.update).toHaveBeenCalledTimes(1);
+      expect(dispatchService.startDispatch).toHaveBeenCalledTimes(1);
+      expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledTimes(1);
+      expect(secondResult).toBe(
+        '<?xml version="1.0" encoding="UTF-8"?>\n<Response></Response>',
+      );
+    });
+  });
+
   describe('WAITING_FOR_DESTINATION', () => {
     let destService: WhatsAppCustomerFlowService;
     let prisma: {

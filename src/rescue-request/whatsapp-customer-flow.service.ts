@@ -22,11 +22,15 @@ import {
   UserRole,
   RatingDirection,
   Payment,
+  User,
 } from '@prisma/client';
 import {
   mapVehicleTypeReply,
   formatVehicleType,
 } from './domain/vehicle-truck-mapping';
+import { parseVCard, isContactShareWebhook } from './domain/parse-vcard';
+import { ParsedContact } from './dto/parsed-contact.dto';
+import { TwilioInboundMessageBody } from '../webhooks/dto/twilio-inbound-message.dto';
 import { estimateEtaMinutes, rankQuotes } from './domain/quote-ranking';
 import { computeDepositAmount } from './domain/compute-deposit-amount';
 import {
@@ -694,6 +698,104 @@ export class WhatsAppCustomerFlowService {
       );
     }
 
+    // ── Step 3b-contact: Waiting for the customer's shared contact card ───
+    // Entered only via the WAITING_FOR_MEDIA block above (Task 2), for a
+    // BSUID-only customer whose User.phoneNumber is still null. Validates
+    // whatever came back, atomically claims the transition out of this
+    // state (so a duplicate Twilio delivery of the very same webhook can't
+    // double-process), then either backfills this User's own phoneNumber
+    // or merges onto a pre-existing account that already owns that number.
+    if (session.state === WhatsAppFlowState.WAITING_FOR_CONTACT_INFO) {
+      const inboundBody = body as TwilioInboundMessageBody;
+
+      // Every re-prompt below is identical: nudge via the template (same
+      // helper Task 2 used for the initial ask) and fall back to the same
+      // plain-text reply, staying in this state. `phoneNumber` is this
+      // function's own inbound parameter — never `parsed.phoneNumber` —
+      // the same distinction a prior plan review caught and fixed.
+      const reprompt = async () => {
+        await this.sendContactInfoRequest(phoneNumber);
+        return this.reply(
+          `📵 We don't have a phone number we can reach you on. Please share your contact card — tap 📎 (attachment) → Contact — so we can connect you with an operator.`,
+        );
+      };
+
+      if (!isContactShareWebhook(inboundBody)) {
+        return reprompt();
+      }
+
+      let buffer: Buffer;
+      try {
+        buffer = await this.twilioService.downloadMedia(inboundBody.MediaUrl0!);
+      } catch (error) {
+        console.error('Failed to download shared contact card:', error);
+        return reprompt();
+      }
+
+      const parsed = parseVCard(buffer.toString('utf-8'));
+      if (!parsed) {
+        return reprompt();
+      }
+
+      // Mirrors whatsapp-inbound.service.ts:90-93's exact inline pattern —
+      // a shared number that actually belongs to a registered operator's
+      // dispatch line must never become a customer's phoneNumber.
+      const operatorRecord = await this.prisma.operator.findUnique({
+        where: { phoneNumber: parsed.phoneNumber },
+      });
+      if (operatorRecord) {
+        return reprompt();
+      }
+
+      // The one atomic write that makes everything below single-flight: a
+      // duplicate delivery of this same contacts webhook races this exact
+      // conditional update, and only the delivery that still finds the row
+      // in WAITING_FOR_CONTACT_INFO wins — the other finds `count === 0`
+      // and does nothing further. handleMediaFinished (below) harmlessly
+      // re-sets the same REQUEST_CONFIRMED value this claim already set,
+      // so the winner's own continuation doesn't need to know this happened.
+      const claim = await this.prisma.whatsAppSession.updateMany({
+        where: {
+          userId,
+          state: WhatsAppFlowState.WAITING_FOR_CONTACT_INFO,
+        },
+        data: { state: WhatsAppFlowState.REQUEST_CONFIRMED },
+      });
+      if (claim.count === 0) {
+        return this.xmlOk();
+      }
+
+      const existingUser = await this.prisma.user.findUnique({
+        where: { phoneNumber: parsed.phoneNumber },
+      });
+
+      if (!existingUser || existingUser.id === userId) {
+        await this.prisma.user.update({
+          where: { id: userId },
+          data: { phoneNumber: parsed.phoneNumber },
+        });
+        return this.handleMediaFinished(
+          phoneNumber,
+          userId,
+          session,
+          session.rescueRequestId!,
+        );
+      }
+
+      const merged = await this.mergeIntoExistingAccount(
+        userId,
+        existingUser,
+        session.rescueRequestId!,
+        parsed,
+      );
+      return this.handleMediaFinished(
+        phoneNumber,
+        merged.userId,
+        session,
+        session.rescueRequestId!,
+      );
+    }
+
     // ── Step 3c: Waiting for quote selection ───────────────────────────────
     if (session.state === WhatsAppFlowState.WAITING_FOR_QUOTE_SELECTION) {
       const choice = Number(message);
@@ -866,6 +968,80 @@ export class WhatsAppCustomerFlowService {
       Sentry.captureException(error, { extra: { phoneNumber } });
       return false;
     }
+  }
+
+  /**
+   * Merges a BSUID-only (masked) customer's identity onto a pre-existing
+   * account that already owns the phone number they just shared via a
+   * WhatsApp contact card. Mirrors findOrCreateBySender's BSUID-move
+   * transaction (rescue-request-shared.service.ts:53-80) exactly:
+   * existingUser's whatsappExternalUserId is unconditionally overwritten
+   * with the masked user's own — whether it was null or some other, stale
+   * value beforehand — no special-casing either way.
+   *
+   * `maskedUserId` is the account the live session and rescue request are
+   * currently keyed to; `existingUser` survives this merge, `maskedUserId`
+   * ends up an identity-less, soft-deleted orphan.
+   */
+  private async mergeIntoExistingAccount(
+    maskedUserId: string,
+    existingUser: User,
+    rescueRequestId: string,
+    parsed: ParsedContact,
+  ): Promise<{ userId: string }> {
+    return this.prisma.$transaction(async (tx) => {
+      const maskedUser = await tx.user.findUnique({
+        where: { id: maskedUserId },
+      });
+      // Coerced to null (never undefined) so this can't accidentally be
+      // read by Prisma as "no filter on this field" below, which would
+      // turn the updateMany into an unscoped clear across every user.
+      const externalUserId = maskedUser?.whatsappExternalUserId ?? null;
+
+      // Clear that BSUID off every other row first — including
+      // maskedUserId's own row, which is exactly the point — so the
+      // unique constraint doesn't reject moving it onto existingUser next.
+      await tx.user.updateMany({
+        where: {
+          whatsappExternalUserId: externalUserId,
+          id: { not: existingUser.id },
+        },
+        data: { whatsappExternalUserId: null },
+      });
+      await tx.user.update({
+        where: { id: existingUser.id },
+        data: {
+          whatsappExternalUserId: externalUserId,
+          phoneNumber: parsed.phoneNumber,
+        },
+      });
+
+      // Discard any stale session existingUser already had, THEN re-point
+      // the live, already-claimed session onto the surviving account — in
+      // that order, so the userId unique constraint never sees both rows
+      // claiming it at once.
+      await tx.whatsAppSession.deleteMany({
+        where: { userId: existingUser.id },
+      });
+      await tx.whatsAppSession.update({
+        where: { userId: maskedUserId },
+        data: { userId: existingUser.id },
+      });
+
+      await tx.rescueRequest.update({
+        where: { id: rescueRequestId },
+        data: { customerId: existingUser.id },
+      });
+
+      // The orphan is now identity-less (no session, no request, no
+      // BSUID) — soft-delete rather than leave a dead row behind.
+      await tx.user.update({
+        where: { id: maskedUserId },
+        data: { deletedAt: new Date() },
+      });
+
+      return { userId: existingUser.id };
+    });
   }
 
   // ──────────────────────────────────────────────────────────────────────────
