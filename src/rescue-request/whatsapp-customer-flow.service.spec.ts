@@ -1288,6 +1288,62 @@ describe('WhatsAppCustomerFlowService', () => {
         '<?xml version="1.0" encoding="UTF-8"?>\n<Response></Response>',
       );
     });
+
+    it('rolls the claim back and re-prompts when the backfill write fails, leaving the customer in WAITING_FOR_CONTACT_INFO with no dispatch', async () => {
+      // Simulates a real transaction: the claim's state change is only kept
+      // if the whole callback resolves; a throw restores the prior state.
+      let sessionState: WhatsAppFlowState =
+        WhatsAppFlowState.WAITING_FOR_CONTACT_INFO;
+      prisma.whatsAppSession.updateMany.mockImplementation(async () => {
+        if (sessionState !== WhatsAppFlowState.WAITING_FOR_CONTACT_INFO) {
+          return { count: 0 };
+        }
+        sessionState = WhatsAppFlowState.REQUEST_CONFIRMED;
+        return { count: 1 };
+      });
+      prisma.$transaction.mockImplementation(
+        async (cb: (tx: unknown) => unknown) => {
+          const before = sessionState;
+          try {
+            return await cb(prisma);
+          } catch (error) {
+            sessionState = before;
+            throw error;
+          }
+        },
+      );
+      prisma.user.findUnique.mockResolvedValue(null);
+      prisma.user.update.mockRejectedValue(new Error('db blip'));
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+
+      const result = await sendContactReply(contactsBody());
+
+      expect(sessionState).toBe(WhatsAppFlowState.WAITING_FOR_CONTACT_INFO);
+      expect(twilioService.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
+        phoneNumber,
+        'HXtest',
+        {},
+      );
+      expect(result).toContain('Share contact');
+      expect(prisma.rescueRequest.update).not.toHaveBeenCalled();
+      expect(dispatchService.startDispatch).not.toHaveBeenCalled();
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+
+    it('tells the customer to use the Share contact button, not the attachment menu, when a manually attached contact arrives', async () => {
+      const result = await sendContactReply({
+        MessageType: 'contacts',
+        MediaUrl0: mediaUrl,
+        MediaContentType0: 'text/vcard',
+        ChannelMetadata: '{}',
+      });
+
+      expect(result).toContain('Share contact');
+      expect(result).toContain('not the attachment');
+      expect(twilioService.downloadMedia).not.toHaveBeenCalled();
+      expect(prisma.whatsAppSession.updateMany).not.toHaveBeenCalled();
+    });
   });
 
   describe('WAITING_FOR_DESTINATION', () => {

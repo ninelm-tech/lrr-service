@@ -253,7 +253,7 @@ export const TWILIO_CONTENT_TEMPLATES: Record<
   },
 
   // A native WhatsApp consent prompt, not a labeled button — sent to a
-  // BSUID-only customer at checkout when their phoneNumber is still null,
+  // BSUID-only customer, right after the photo step and before dispatch, when their phoneNumber is still null,
   // so WhatsApp can share their real number directly. See the WhatsApp
   // username/BSUID identity design doc.
   //
@@ -275,8 +275,8 @@ export const TWILIO_CONTENT_TEMPLATES: Record<
   // LRR Stage subaccount 2026-10-25/26. SID: HX842ee8d92168c7ccb366c9a5fd9dd7ff
   // (set TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID to this once wiring up
   // the env, Stage only — LRR Prod has nothing yet). Approval status
-  // "received" as of creation; not yet confirmed approved — check
-  // GET .../Content/{sid}/ApprovalRequests before relying on it sending.
+  // "received" as of creation; approval is not required to send inside an
+  // active session (see above).
   //
   // source is 'confirmed', not 'designed': the body below is exactly what
   // was sent to and echoed back by the Content API create call, not a

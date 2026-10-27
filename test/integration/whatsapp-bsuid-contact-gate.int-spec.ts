@@ -9,13 +9,13 @@ import { truncateAll, createCustomer, createOperator } from './factories';
 /**
  * End to end against a real database: a BSUID-only (masked) customer who
  * reaches the end of media capture with no phone number on file is gated
- * into WAITING_FOR_CONTACT_INFO (Task 2), and every real shape their reply
+ * into WAITING_FOR_CONTACT_INFO, and every real shape their reply
  * can take — a valid vCard, an off-script message, a vCard with no TEL
  * line, a transient Twilio media 404, an unnormalized bare number, a
  * number that belongs to a registered operator, a number that belongs to a
  * different existing customer, two concurrent deliveries of the same
  * webhook, and a CANCEL that ignores all of it — is driven through the
- * real handler (Task 3) via the same public entry point every real inbound
+ * real handler via the same public entry point every real inbound
  * WhatsApp webhook uses, WhatsAppInboundService.handleIncomingWhatsAppMessage.
  *
  * DispatchService is a plain jest-mock here, not the real class: whether
@@ -38,6 +38,9 @@ describe('WhatsApp BSUID contact-info gate (integration)', () => {
 
   const originalContactInfoTemplateSid =
     process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID;
+  const originalStaffAlertTemplateSid =
+    process.env.TWILIO_NEW_REQUEST_ALERT_TEMPLATE_SID;
+  const STAFF_ALERT_NUMBER = '+2348000000001';
 
   beforeAll(() => {
     prisma = new PrismaService();
@@ -48,6 +51,12 @@ describe('WhatsApp BSUID contact-info gate (integration)', () => {
   });
 
   afterEach(() => {
+    if (originalStaffAlertTemplateSid === undefined) {
+      delete process.env.TWILIO_NEW_REQUEST_ALERT_TEMPLATE_SID;
+    } else {
+      process.env.TWILIO_NEW_REQUEST_ALERT_TEMPLATE_SID =
+        originalStaffAlertTemplateSid;
+    }
     if (originalContactInfoTemplateSid === undefined) {
       delete process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID;
     } else {
@@ -61,6 +70,8 @@ describe('WhatsApp BSUID contact-info gate (integration)', () => {
     // sendContactInfoRequest warns and silently no-ops without this — every
     // scenario below needs the real Content-Template branch reachable.
     process.env.TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID = 'HXcontactinfo';
+    // Forces the freeform staff-alert fallback so its text is assertable.
+    delete process.env.TWILIO_NEW_REQUEST_ALERT_TEMPLATE_SID;
 
     twilio = {
       sendWhatsAppMessage: jest.fn().mockResolvedValue({ sid: 'SM1' }),
@@ -70,9 +81,9 @@ describe('WhatsApp BSUID contact-info gate (integration)', () => {
     const s3 = { uploadMedia: jest.fn().mockResolvedValue(undefined) };
     const geocoding = { reverseGeocode: jest.fn().mockResolvedValue(null) };
     const platformConfig = {
-      getConfig: jest
-        .fn()
-        .mockResolvedValue({ newRequestAlertPhoneNumbers: [] }),
+      getConfig: jest.fn().mockResolvedValue({
+        newRequestAlertPhoneNumbers: [STAFF_ALERT_NUMBER],
+      }),
     };
     // Out of scope for this plan — see the describe-block comment above.
     dispatchService = { startDispatch: jest.fn().mockResolvedValue(undefined) };
@@ -146,7 +157,7 @@ describe('WhatsApp BSUID contact-info gate (integration)', () => {
 
   /** Seeds a masked customer already parked at the real gate — media
    * capture complete, session in WAITING_FOR_CONTACT_INFO — the exact spot
-   * Task 2's handler leaves one in, without re-driving the whole SOS flow
+   * the media step leaves one in, without re-driving the whole SOS flow
    * for every scenario that's really only about the gate's own handler. */
   async function seedMaskedCustomerAtGate(externalUserId: string) {
     const maskedUser = await prisma.user.create({
@@ -246,7 +257,7 @@ describe('WhatsApp BSUID contact-info gate (integration)', () => {
       From: from,
       Body: '2',
     });
-    expect(askReply).toContain('share your contact card');
+    expect(askReply).toContain('Share contact');
 
     const sessionAfterAsk = await prisma.whatsAppSession.findUniqueOrThrow({
       where: { userId: maskedUser.id },
@@ -291,6 +302,15 @@ describe('WhatsApp BSUID contact-info gate (integration)', () => {
     expect(twilio.sendWhatsAppMessage).toHaveBeenCalledWith(
       'CA.happy1',
       expect.stringContaining('Searching for nearby tow operators'),
+    );
+    // Staff see the real number the gate collected, never the BSUID.
+    expect(twilio.sendWhatsAppMessage).toHaveBeenCalledWith(
+      `whatsapp:${STAFF_ALERT_NUMBER}`,
+      expect.stringContaining('Customer: +2348099990001'),
+    );
+    expect(twilio.sendWhatsAppMessage).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('CA.happy1'),
     );
   });
 
@@ -352,7 +372,7 @@ describe('WhatsApp BSUID contact-info gate (integration)', () => {
       From: 'whatsapp:CA.offscript',
       Body: 'what do you mean?',
     });
-    expect(reply).toContain('share your contact card');
+    expect(reply).toContain('Share contact');
 
     expect(twilio.sendWhatsAppTemplateMessage).toHaveBeenCalledWith(
       'CA.offscript',
@@ -378,7 +398,7 @@ describe('WhatsApp BSUID contact-info gate (integration)', () => {
     const reply = await inboundService.handleIncomingWhatsAppMessage(
       contactShareWebhook('whatsapp:CA.notel'),
     );
-    expect(reply).toContain('share your contact card');
+    expect(reply).toContain('Share contact');
 
     const session = await prisma.whatsAppSession.findUniqueOrThrow({
       where: { userId: maskedUser.id },
@@ -404,7 +424,7 @@ describe('WhatsApp BSUID contact-info gate (integration)', () => {
     const reply = await inboundService.handleIncomingWhatsAppMessage(
       contactShareWebhook('whatsapp:CA.transient404'),
     );
-    expect(reply).toContain('share your contact card');
+    expect(reply).toContain('Share contact');
 
     const session = await prisma.whatsAppSession.findUniqueOrThrow({
       where: { userId: maskedUser.id },
@@ -449,7 +469,7 @@ describe('WhatsApp BSUID contact-info gate (integration)', () => {
     const reply = await inboundService.handleIncomingWhatsAppMessage(
       contactShareWebhook('whatsapp:CA.opcollision'),
     );
-    expect(reply).toContain('share your contact card');
+    expect(reply).toContain('Share contact');
 
     const session = await prisma.whatsAppSession.findUniqueOrThrow({
       where: { userId: maskedUser.id },
@@ -524,6 +544,50 @@ describe('WhatsApp BSUID contact-info gate (integration)', () => {
       'CA.mergecust',
       expect.stringContaining('Searching for nearby tow operators'),
     );
+    expect(twilio.sendWhatsAppMessage).toHaveBeenCalledWith(
+      `whatsapp:${STAFF_ALERT_NUMBER}`,
+      expect.stringContaining(`Customer: ${existingPhone}`),
+    );
+
+    // A further message from the same masked sender now routes to the
+    // survivor: no new User is minted for that BSUID.
+    const usersBefore = await prisma.user.count();
+    const followUp = await inboundService.handleIncomingWhatsAppMessage({
+      From: 'whatsapp:CA.mergecust',
+      Body: 'hello?',
+    });
+    expect(followUp).toContain("We've received your request");
+    expect(await prisma.user.count()).toBe(usersBefore);
+    expect(
+      await prisma.user.findMany({
+        where: { whatsappExternalUserId: 'CA.mergecust' },
+        select: { id: true },
+      }),
+    ).toEqual([{ id: existingUser.id }]);
+    expect(
+      await prisma.whatsAppSession.findUnique({
+        where: { userId: existingUser.id },
+      }),
+    ).not.toBeNull();
+  });
+
+  it('a fresh SOS while waiting for contact info auto-cancels the old request and restarts the flow', async () => {
+    const { maskedUser, request } =
+      await seedMaskedCustomerAtGate('CA.sosagain');
+
+    await inboundService.handleIncomingWhatsAppMessage({
+      From: 'whatsapp:CA.sosagain',
+      Body: 'SOS',
+    });
+
+    const requestAfter = await prisma.rescueRequest.findUniqueOrThrow({
+      where: { id: request.id },
+    });
+    expect(requestAfter.status).toBe('CANCELLED');
+    const session = await prisma.whatsAppSession.findUniqueOrThrow({
+      where: { userId: maskedUser.id },
+    });
+    expect(session.state).toBe('WAITING_FOR_LOCATION');
   });
 
   it('a concurrent duplicate of the contacts webhook does not double-claim, double-backfill, or double-call handleMediaFinished', async () => {
