@@ -87,6 +87,7 @@ describe('DisputeService', () => {
         assignedOperator: {
           businessName: 'Swift Towing',
           phoneNumber: operatorPhone,
+          whatsappEnabled: true,
         },
         balanceAmount: 22500,
         depositAmount: 2500,
@@ -138,6 +139,7 @@ describe('DisputeService', () => {
         assignedOperator: {
           businessName: 'Swift Towing',
           phoneNumber: operatorPhone,
+          whatsappEnabled: true,
         },
         balanceAmount: 22500,
         depositAmount: 2500,
@@ -288,6 +290,7 @@ describe('DisputeService', () => {
         assignedOperator: {
           businessName: 'Swift Towing',
           phoneNumber: operatorPhone,
+          whatsappEnabled: true,
         },
         balanceAmount: 22500,
         depositAmount: 2500,
@@ -307,6 +310,34 @@ describe('DisputeService', () => {
         ([to]) => to.includes(customerPhone),
       );
       expect(customerCall?.[1]).not.toContain('vehicle');
+    });
+
+    it('does not notify a non-WhatsApp operator that a dispute was raised', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: rescueRequestId,
+        disputed: false,
+        disputeResolvedAt: null,
+        status: 'ARRIVED',
+        assignedOperator: {
+          businessName: 'Swift Towing',
+          phoneNumber: operatorPhone,
+          whatsappEnabled: false,
+        },
+        balanceAmount: 22500,
+        depositAmount: 2500,
+        customer: { id: 'cust-1', phoneNumber: customerPhone },
+      });
+      platformConfigService.getConfig.mockResolvedValue({
+        disputeAlertPhoneNumbers: [],
+      });
+
+      await service.raiseDispute(rescueRequestId, customerPhone, 'cust-1');
+
+      expect(sharedService.findOrCreateCustomer).not.toHaveBeenCalled();
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
+        expect.stringContaining(operatorPhone),
+        expect.anything(),
+      );
     });
 
     it('repeat while unresolved: no DB write, no re-alert, distinct reply', async () => {
@@ -502,7 +533,7 @@ describe('DisputeService', () => {
         disputeResolvedAt: null,
         balanceAmount: 45000,
         customer: { phoneNumber: customerPhone },
-        assignedOperator: { phoneNumber: operatorPhone },
+        assignedOperator: { phoneNumber: operatorPhone, whatsappEnabled: true },
       });
       prisma.payment.findFirst.mockResolvedValue({ id: 'pay-1' });
 
@@ -522,7 +553,7 @@ describe('DisputeService', () => {
         disputeResolvedAt: null,
         balanceAmount: 45000,
         customer: { phoneNumber: customerPhone },
-        assignedOperator: { phoneNumber: operatorPhone },
+        assignedOperator: { phoneNumber: operatorPhone, whatsappEnabled: true },
       });
       prisma.rescueRequest.update.mockResolvedValue({});
 
@@ -559,7 +590,7 @@ describe('DisputeService', () => {
         disputeResolvedAt: null,
         balanceAmount: 45000,
         customer: { phoneNumber: customerPhone },
-        assignedOperator: { phoneNumber: operatorPhone },
+        assignedOperator: { phoneNumber: operatorPhone, whatsappEnabled: true },
       });
       prisma.rescueRequest.update.mockResolvedValue({});
 
@@ -595,7 +626,7 @@ describe('DisputeService', () => {
         disputeResolvedAt: null,
         balanceAmount: 45000,
         customer: { phoneNumber: customerPhone },
-        assignedOperator: { phoneNumber: operatorPhone },
+        assignedOperator: { phoneNumber: operatorPhone, whatsappEnabled: true },
       });
       prisma.rescueRequest.update.mockResolvedValue({});
       twilioService.sendWhatsAppMessage.mockRejectedValueOnce(
@@ -613,6 +644,28 @@ describe('DisputeService', () => {
       expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledWith(
         expect.stringContaining(operatorPhone),
         expect.stringContaining('resolved'),
+      );
+    });
+
+    it('does not notify a non-WhatsApp operator that a dispute was resolved', async () => {
+      prisma.rescueRequest.findUnique.mockResolvedValue({
+        id: rescueRequestId,
+        disputed: true,
+        disputeResolvedAt: null,
+        balanceAmount: 45000,
+        customer: { phoneNumber: customerPhone },
+        assignedOperator: {
+          phoneNumber: operatorPhone,
+          whatsappEnabled: false,
+        },
+      });
+      prisma.rescueRequest.update.mockResolvedValue({});
+
+      await service.resolveDispute(rescueRequestId, 'note');
+
+      expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
+        expect.stringContaining(operatorPhone),
+        expect.anything(),
       );
     });
   });

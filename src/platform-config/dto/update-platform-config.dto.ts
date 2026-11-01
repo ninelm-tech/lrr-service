@@ -17,7 +17,7 @@ export class UpdatePlatformConfigDto {
   serviceFeePercent?: number;
 
   @IsNumber()
-  @Min(0)
+  @Min(10)
   @Max(50)
   @IsOptional()
   depositPercent?: number;

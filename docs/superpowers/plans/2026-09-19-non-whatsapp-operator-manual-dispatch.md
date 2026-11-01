@@ -10,6 +10,27 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-19-non-whatsapp-operator-manual-dispatch-design.md`
 
+**Before executing — multi-llm review, 2026-10-23:** this plan sat
+unexecuted for 5+ weeks after being written (2026-10-08), during which
+real, unrelated work landed in both repos (delivery-status tracking,
+staff alert phone number lists, per-operator deposit percentage). A
+three-reviewer pass (Claude, Codex, and a partial Gemini run — it hit a
+free-tier quota limit on a document this large and didn't complete)
+found and fixed 11 real issues, now folded into the tasks below as
+explicitly marked "Multi-llm review correction" / "Added by multi-llm
+review" notes — including two real architectural bugs (a parameter
+collision that would have broken the test/real operator partition; a
+plan snippet that would have silently broken the 0%-deposit assignment
+feature), a claim race, a missing completion-template regression, and a
+genuinely missing UI-wiring task. Every line-number citation that was
+independently verified during that review was corrected to its real
+current value as of 2026-10-23 and is marked as confirmed-on-that-date.
+**Any line-number citation NOT marked that way should be treated as
+unverified** — re-confirm with a grep before trusting it, the same way
+the review caught the ones that had drifted. This plan has now
+demonstrably gone stale once; there is no reason to assume the
+unmarked citations survived untouched.
+
 ## Global Constraints
 
 - `Operator.whatsappEnabled` and `RescueRequest.needsManualAssignment` are both `Boolean @default(...)`, additive, no backfill — every existing row keeps today's behavior.
@@ -78,17 +99,45 @@ git commit -m "Add whatsappEnabled and needsManualAssignment columns"
 
 ### Task 2: `OperatorService.findAndRankCandidates` gains a `whatsappOnly` filter
 
+**Multi-llm review correction (2026-10-23):** the original version of this
+task claimed the 7th parameter was free for `whatsappOnly`. It is not — as
+of the schema/code changes landed since this plan was written,
+`findAndRankCandidates`'s 7th parameter is **already** `isTest: boolean =
+false` (`operator.service.ts:507`), and `dispatch.service.ts:622` already
+calls it positionally with `isTestRequest` in that slot
+(`prepareNextRound`'s candidate-search loop). Reusing position 7 for
+`whatsappOnly` would silently turn every `isTestRequest` argument into
+`whatsappOnly`, breaking the test/real operator partition — or, if
+`isTest` were dropped instead, break it the other way. Fixed below:
+`whatsappOnly` becomes the **8th** parameter, after `isTest`, which both
+existing call sites already omit — they stay unaffected by default.
+
 **Files:**
-- Modify: `src/operator/operator.service.ts:335-354`
-- Test: `src/operator/operator.service.spec.ts`
+- Modify: `src/operator/operator.service.ts:500-521` (signature at 500,
+  `where` clause inside the `findMany` call starting at 509)
+- Test: `src/operator/operator.service.spec.ts` (existing
+  `findAndRankCandidates` coverage — grep the file for the describe block;
+  don't trust a historical line number here, this plan is already stale on
+  line numbers once and isn't worth re-trusting on a second file)
 
 **Interfaces:**
-- Consumes: `Operator.whatsappEnabled` (Task 1).
-- Produces: `OperatorService.findAndRankCandidates(latitude, longitude, excludeIds?, extraRadiusKm?, type?, truckClasses?, whatsappOnly: boolean = true): Promise<ScoredOperator[]>` — the 7th parameter is new; every existing call site (`operator.service.ts:456`, `dispatch.service.ts:549`) is unaffected by omitting it.
+- Consumes: `Operator.whatsappEnabled` (Task 1); `OperatorService.findAndRankCandidates`'s
+  existing `isTest` parameter (position 7, pre-existing — not touched).
+- Produces: `OperatorService.findAndRankCandidates(latitude, longitude, excludeIds?, extraRadiusKm?, type?, truckClasses?, isTest?: boolean, whatsappOnly: boolean = true): Promise<ScoredOperator[]>` —
+  the **8th** parameter is new. The two existing call sites
+  (`operator.service.ts`'s own `findNearestAvailableExcluding`, which omits
+  everything past `type`; `dispatch.service.ts:622`'s `prepareNextRound`
+  loop, which passes exactly 7 args ending in `isTestRequest`) are both
+  unaffected by the new 8th parameter's default. Any NEW caller that needs
+  `whatsappOnly: false` (Task 3, Task 14) must also pass the correct
+  `isTest` value in position 7 — see those tasks for how to derive it the
+  same way `prepareNextRound` does, not a reason to skip it.
 
 - [ ] **Step 1: Write the failing test**
 
-In `src/operator/operator.service.spec.ts`, find the `describe('findAndRankCandidates ...')` block (there's existing coverage around lines 337-363) and add:
+In `src/operator/operator.service.spec.ts`, find the existing
+`findAndRankCandidates` describe block (grep for it — don't trust a line
+number) and add:
 ```ts
 it('defaults to WhatsApp-only candidates when whatsappOnly is omitted', async () => {
   prisma.operator.findMany.mockResolvedValue([]);
@@ -105,11 +154,11 @@ it('defaults to WhatsApp-only candidates when whatsappOnly is omitted', async ()
 it('searches only non-WhatsApp operators when whatsappOnly is false', async () => {
   prisma.operator.findMany.mockResolvedValue([]);
 
-  await service.findAndRankCandidates(6.5, 3.4, [], 0, undefined, [], false);
+  await service.findAndRankCandidates(6.5, 3.4, [], 0, undefined, [], false, false);
 
   expect(prisma.operator.findMany).toHaveBeenCalledWith(
     expect.objectContaining({
-      where: expect.objectContaining({ whatsappEnabled: false }),
+      where: expect.objectContaining({ isTest: false, whatsappEnabled: false }),
     }),
   );
 });
@@ -123,7 +172,7 @@ Expected: FAIL — `whatsappEnabled` not present in the actual `where` clause ye
 
 - [ ] **Step 3: Implement**
 
-In `src/operator/operator.service.ts`, change the signature (line 335) and the `where` clause (inside the `findMany` call that starts at line 343):
+In `src/operator/operator.service.ts`, change the signature (line 500) and the `where` clause (inside the `findMany` call that starts at line 509) — `isTest` is unchanged, `whatsappOnly` is appended after it:
 ```ts
 async findAndRankCandidates(
   latitude: number,
@@ -132,12 +181,14 @@ async findAndRankCandidates(
   extraRadiusKm: number = 0,
   type?: OperatorType,
   truckClasses?: TruckClass[],
+  isTest: boolean = false,
   whatsappOnly: boolean = true,
 ): Promise<ScoredOperator[]> {
   const operators = await this.prisma.operator.findMany({
     where: {
       status: OperatorStatus.ACTIVE,
       isAvailable: true,
+      isTest,
       whatsappEnabled: whatsappOnly,
       ...(excludeIds.length > 0 && { id: { notIn: excludeIds } }),
       ...(type && { type }),
@@ -153,13 +204,13 @@ async findAndRankCandidates(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx jest src/operator/operator.service.spec.ts`
-Expected: PASS, including every pre-existing test in this file (the default-parameter change is backward compatible for the two existing call sites that don't pass a 7th argument).
+Expected: PASS, including every pre-existing test in this file (the default-parameter change is backward compatible — both existing call sites pass at most 7 arguments, so neither reaches the new 8th parameter).
 
 - [ ] **Step 5: Full suite, lint, commit**
 
 ```bash
 npx jest --silent
-npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 525
+npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 527
 git add src/operator/operator.service.ts src/operator/operator.service.spec.ts
 git commit -m "Add whatsappOnly filter to findAndRankCandidates"
 ```
@@ -168,14 +219,31 @@ git commit -m "Add whatsappOnly filter to findAndRankCandidates"
 
 ### Task 3: `DispatchService.resolveExhaustion` — the shared manual-fallback resolver
 
+**Multi-llm review correction (2026-10-23):** two fixes beyond stale line
+numbers (`startDispatch` has moved — see below). First, Task 2's fix means
+`findAndRankCandidates` now takes `isTest` (7th, pre-existing) AND
+`whatsappOnly` (8th, new) — every call this task adds must pass both, not
+just `false` in position 7 as the original draft did (that would have
+silently set `isTest: false, whatsappOnly: undefined→true`, defeating the
+whole point). `prepareNextRound` already computes `isTestRequest` internally
+(for its own `findAndRankCandidates` call) — rather than recomputing it or
+re-fetching `PlatformConfig` inside `resolveExhaustion`, this task threads
+that already-computed value through the exhausted-result type, so neither
+caller (this task's `startDispatch`, Task 4's `BatchResolveCheck`) needs a
+new fetch. Second, the one early-return inside `prepareNextRound` where the
+request isn't found (no customer data available at that point) gets
+`isTestRequest: false` as a defensive fallback — see Step 3.
+
 **Files:**
-- Modify: `src/rescue-request/dispatch.service.ts` (new method; `startDispatch` at lines 825-908 rewritten)
+- Modify: `src/rescue-request/dispatch.service.ts` (new method; `startDispatch`,
+  currently starting at line 1046 — grep for `async startDispatch` to confirm
+  before trusting this, the plan has already drifted once)
 - Test: `src/rescue-request/dispatch.service.spec.ts`
 
 **Interfaces:**
-- Consumes: `OperatorService.findAndRankCandidates(..., whatsappOnly)` (Task 2).
-- Produces: `DispatchService.resolveExhaustion(tx, rescueRequest, exhausted): Promise<ExhaustionResolution>` where `ExhaustionResolution = { outcome: 'manual-fallback'; candidateId: string } | { outcome: 'cancelled'; reason: 'no-coverage' | 'rounds-exhausted'; round: number }` — consumed by `startDispatch` in this task and by `BatchResolveCheck.resolve` in Task 4. **Not `private`** — Task 4's `BatchResolveCheck` calls it as `this.dispatchService.resolveExhaustion(...)` on its own injected `DispatchService` instance.
-- Extends `PrepareNextRoundResult`'s exhausted variant with `extraRadiusKm`. Both exhausted returns preserve the actual final expansion so fallback searches the same geographic envelope that automatic dispatch exhausted.
+- Consumes: `OperatorService.findAndRankCandidates(..., isTest, whatsappOnly)` (Task 2).
+- Produces: `DispatchService.resolveExhaustion(tx, rescueRequest, exhausted, isTestRequest): Promise<ExhaustionResolution>` where `ExhaustionResolution = { outcome: 'manual-fallback'; candidateId: string } | { outcome: 'cancelled'; reason: 'no-coverage' | 'rounds-exhausted'; round: number }` — consumed by `startDispatch` in this task and by `BatchResolveCheck.resolve` in Task 4. **Not `private`** — Task 4's `BatchResolveCheck` calls it as `this.dispatchService.resolveExhaustion(...)` on its own injected `DispatchService` instance.
+- Extends `PrepareNextRoundResult`'s exhausted variant with `extraRadiusKm` AND `isTestRequest`. Both exhausted returns preserve the actual final expansion so fallback searches the same geographic envelope that automatic dispatch exhausted, and the same test/real operator partition the automatic search was already using.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -205,6 +273,7 @@ describe('resolveExhaustion', () => {
       tx,
       baseRescueRequest,
       { reason: 'rounds-exhausted', round: 5, extraRadiusKm: 8 },
+      false, // isTestRequest — threaded through from prepareNextRound's own computation, not recomputed here
     );
 
     expect(operatorService.findAndRankCandidates).toHaveBeenCalledWith(
@@ -214,7 +283,8 @@ describe('resolveExhaustion', () => {
       8,
       undefined,
       undefined,
-      false,
+      false, // isTest
+      false, // whatsappOnly
     );
     expect(result).toEqual({ outcome: 'manual-fallback', candidateId: 'op-backup' });
     expect(tx.rescueRequest.update).toHaveBeenCalledWith({
@@ -237,6 +307,7 @@ describe('resolveExhaustion', () => {
       tx,
       baseRescueRequest,
       { reason: 'no-coverage', round: 2, extraRadiusKm: 2 },
+      false,
     );
 
     expect(result).toEqual({ outcome: 'cancelled', reason: 'no-coverage', round: 2 });
@@ -253,6 +324,35 @@ describe('resolveExhaustion', () => {
       data: { state: 'IDLE', rescueRequestId: null },
     });
   });
+
+  it('passes isTestRequest through to findAndRankCandidates unchanged — the test/real operator partition must hold for the fallback search too', async () => {
+    jest
+      .spyOn(operatorService, 'findAndRankCandidates')
+      .mockResolvedValue([{ id: 'op-backup' } as any]);
+    const tx = {
+      rescueRequest: { update: jest.fn() },
+      dispatchOffer: { updateMany: jest.fn() },
+      whatsAppSession: { updateMany: jest.fn() },
+    } as any;
+
+    await service.resolveExhaustion(
+      tx,
+      baseRescueRequest,
+      { reason: 'rounds-exhausted', round: 5, extraRadiusKm: 8 },
+      true, // isTestRequest
+    );
+
+    expect(operatorService.findAndRankCandidates).toHaveBeenCalledWith(
+      6.5,
+      3.4,
+      ['op-already-offered'],
+      8,
+      undefined,
+      undefined,
+      true, // isTest — must match the isTestRequest this call was given, not be dropped or hardcoded
+      false, // whatsappOnly
+    );
+  });
 });
 ```
 
@@ -268,21 +368,33 @@ Expected: FAIL — `resolveExhaustion` doesn't exist yet.
 
 - [ ] **Step 3: Implement**
 
-**First, make `prepareNextRound` itself actually return `extraRadiusKm`** —
-the type change alone doesn't do this; its three existing `exhausted: true`
-return statements need the field added. In `src/rescue-request/dispatch.service.ts`,
-inside `prepareNextRound` (the pre-existing method — do not rewrite anything
-else in it, only these three `return` statements):
+**First, make `prepareNextRound` itself actually return `extraRadiusKm` AND
+`isTestRequest`** — the type change alone doesn't do this; its three existing
+`exhausted: true` return statements need both fields added. Confirmed against
+the current file (`async prepareNextRound` — grep to find it, don't trust a
+cached line number): the method's own `isTestRequest` local variable already
+exists (`config.testCustomerPhoneNumbers.includes(rescueRequest.customer.phoneNumber ?? '')`,
+computed right after the method's own `tx.rescueRequest.findUnique(...)`,
+which already `include`s `customer: { select: { phoneNumber: true } }`) — this
+step reads that existing variable, it does not add a new fetch. In
+`src/rescue-request/dispatch.service.ts`, inside `prepareNextRound` (the
+pre-existing method — do not rewrite anything else in it, only these three
+`return` statements):
 ```ts
-// 1. Request-not-found early return, right after the initial findUnique —
-//    no radius context exists yet at this point, so 0 is the correct value:
+// 1. Request-not-found early return — this fires before isTestRequest is
+//    computed (no customer row to check), so false is a defensive fallback,
+//    not a real determination. In practice resolveExhaustion's own
+//    tx.rescueRequest.update on this same (apparently-vanished) row would
+//    also no-op or throw, so this path is a rare-race guard, not a real
+//    product decision about test-customer routing:
 if (!rescueRequest) {
-  return { offers: [], exhausted: true, reason: 'no-coverage', round, extraRadiusKm: 0 };
+  return { offers: [], exhausted: true, reason: 'no-coverage', round, extraRadiusKm: 0, isTestRequest: false };
 }
 ```
 ```ts
 // 2. The coverage-gap fast-fail (inside the `for (;;)` loop, after the
-//    nearbyOperatorCount === 0 check) — extraRadiusKm is already in scope:
+//    nearbyOperatorCount === 0 check) — extraRadiusKm and isTestRequest are
+//    both already in scope:
 if (nearbyOperatorCount === 0) {
   return {
     offers: [],
@@ -290,12 +402,13 @@ if (nearbyOperatorCount === 0) {
     reason: 'no-coverage',
     round: attemptRound,
     extraRadiusKm,
+    isTestRequest,
   };
 }
 ```
 ```ts
 // 3. The rounds-cap exit (immediately after incrementing attemptRound) —
-//    extraRadiusKm is already in scope here too:
+//    both already in scope here too:
 if (attemptRound >= MAX_ROUNDS_BEFORE_AUTO_CANCEL) {
   return {
     offers: [],
@@ -303,9 +416,59 @@ if (attemptRound >= MAX_ROUNDS_BEFORE_AUTO_CANCEL) {
     reason: 'rounds-exhausted',
     round: attemptRound,
     extraRadiusKm,
+    isTestRequest,
   };
 }
 ```
+
+**Added by multi-llm review (2026-10-23) — a fourth edit point, not one of
+the original three.** The spec's own stated intent (§1: *"`needsManualAssignment`
+is cleared the moment the request leaves the state that set it true —
+assigned (by staff), cancelled, or superseded by a later automatic
+match"*) was never actually implemented anywhere in the original plan.
+Confirmed via direct read: `expandRadiusNow` (`dispatch.service.ts:1255`)
+checks only `status !== DISPATCHING` — a flagged request still IS
+`DISPATCHING`, nothing about the flag stops it — bumps `dispatchRound`,
+and calls `startDispatch` again, completely blind to
+`needsManualAssignment`. If that automatic retry succeeds (a WhatsApp
+operator becomes available, or someone un-flags themselves), the request
+would get a real automatic round of offers while STILL flagged — staff
+could be mid-phone-call to a candidate for a job that's quietly being
+automatically re-dispatched underneath them. Fixed by clearing the flag
+exactly where the spec says to: the moment `prepareNextRound` itself
+succeeds in creating a new round (candidates found, `exhausted: false`)
+— that IS the "later automatic match." In `prepareNextRound`'s
+`candidates.length > 0` branch, immediately before the existing
+`writeRound(...)` call:
+```ts
+if (candidates.length > 0) {
+  // Multi-llm review: clears a stale manual-fallback flag the moment
+  // automatic dispatch succeeds again — see the spec's own §1 on when
+  // this flag is supposed to clear. Same transaction as the round
+  // itself, so a request can never be both freshly re-dispatched AND
+  // still flagged as needing a call.
+  await tx.rescueRequest.update({
+    where: { id: rescueRequestId },
+    data: { needsManualAssignment: false },
+  });
+  const offers = await this.writeRound(
+    tx,
+    rescueRequest,
+    candidates.slice(0, config.dispatchBatchSize),
+    attemptRound,
+    extraRadiusKm,
+    config.dispatchWindowMinutes * 60 * 1000,
+  );
+  return { offers, exhausted: false, round: attemptRound };
+}
+```
+Add a regression test to this task's own test file (`describe('prepareNextRound', ...)`
+if one already exists for this method, otherwise alongside the
+`resolveExhaustion` tests added above) proving: a request with
+`needsManualAssignment: true` that finds candidates on a subsequent call
+has the flag cleared in the same `rescueRequest.update` call that writes
+the new round — not a side effect to verify indirectly through
+`expandRadiusNow`, which this task does not otherwise touch.
 
 Then add the new `resolveExhaustion` method (anywhere in the class — near `prepareNextRound` makes sense) plus a new exported type near the top of the file:
 ```ts
@@ -317,6 +480,7 @@ type PrepareNextRoundResult =
       reason: 'no-coverage' | 'rounds-exhausted';
       round: number;
       extraRadiusKm: number;
+      isTestRequest: boolean;
     };
 
 export type ExhaustionResolution =
@@ -332,6 +496,13 @@ export type ExhaustionResolution =
  * reason prepareNextRound's own docstring gives for cancelling in that
  * transaction: nothing else will ever revisit a DISPATCHING request with no
  * live offers and no flag set.
+ *
+ * `isTestRequest` is threaded through from prepareNextRound's own
+ * computation (its exhausted-result's new field), not recomputed here — the
+ * fallback search must respect the SAME test/real operator partition the
+ * automatic search was already using, and doing that via a second
+ * PlatformConfig fetch here would risk the two disagreeing if the config
+ * changed mid-request.
  */
 async resolveExhaustion(
   tx: Prisma.TransactionClient,
@@ -348,6 +519,7 @@ async resolveExhaustion(
     round: number;
     extraRadiusKm: number;
   },
+  isTestRequest: boolean,
 ): Promise<ExhaustionResolution> {
   const eligibleTruckClasses = rescueRequest.vehicleType
     ? getEligibleTruckClasses(rescueRequest.vehicleType)
@@ -360,7 +532,8 @@ async resolveExhaustion(
     exhausted.extraRadiusKm,
     undefined,
     eligibleTruckClasses,
-    false,
+    isTestRequest,
+    false, // whatsappOnly — this is the manual-fallback search, by definition non-WhatsApp
   );
 
   if (backupCandidates.length > 0) {
@@ -391,7 +564,51 @@ async resolveExhaustion(
 }
 ```
 
-Now rewrite `startDispatch` (currently lines 825-908) to use it. Replace the `$transaction` block (lines 853-882) and the `if (outcome.exhausted)` branch (lines 884-892):
+**Added by multi-llm review (2026-10-23):** the spec originally justified
+skipping a staff alert here by claiming no push-alert mechanism existed —
+stale as of this plan's own later work (see the spec's corrected §4 note).
+`PlatformConfig.disputeAlertPhoneNumbers` is a real, already-shipped
+staff-alert list (used today by `StalledConfirmationCheck` for the same
+"a request needs a human to look at it" shape). Add a new public method,
+following that check's own per-number try/catch pattern exactly (one
+bad/unreachable staff number must never block alerting the rest):
+```ts
+/**
+ * Tells staff a request fell through to manual (non-WhatsApp) fallback —
+ * see resolveExhaustion. Best-effort and outside any transaction,
+ * deliberately: a Twilio failure here must never roll back the flag that
+ * was already committed, and sending real messages from inside a DB
+ * transaction is the wrong shape regardless (same reasoning as every
+ * other post-transaction notification in this file).
+ */
+async alertStaffManualFallback(
+  rescueRequestId: string,
+  round: number,
+): Promise<void> {
+  const config = await this.platformConfigService.getConfig();
+  const jobRef = formatJobRef(rescueRequestId);
+  for (const phoneNumber of config.disputeAlertPhoneNumbers) {
+    try {
+      await this.twilioService.sendWhatsAppMessage(
+        toWhatsAppAddress(phoneNumber),
+        `📞 ${jobRef} needs a manual call — no WhatsApp-capable operator left after round ${round}. Check the Requests tab for candidates.`,
+      );
+    } catch (error) {
+      console.error('Manual-fallback staff alert failed:', error);
+      Sentry.captureException(error, {
+        extra: { rescueRequestId, stage: 'manual-fallback-staff-alert' },
+      });
+    }
+  }
+}
+```
+Add a test proving it fans out to every configured number with per-number
+isolation (one rejected send doesn't block the others — copy
+`StalledConfirmationCheck`'s own spec for the established mock shape for
+this exact pattern) and a test proving an empty
+`disputeAlertPhoneNumbers` list sends nothing and throws nothing.
+
+Now rewrite `startDispatch` (confirmed at line 1046 as of 2026-10-23 — `grep -n "async startDispatch" src/rescue-request/dispatch.service.ts` to re-confirm before trusting this) to use it. Replace the `$transaction` block and the `if (outcome.exhausted)` branch (find them by content, not a cached line offset — they're the block containing `this.prepareNextRound(tx, ...)` and the `if (outcome.exhausted)` check immediately after):
 ```ts
 async startDispatch(rescueRequestId: string, customerId: string) {
   const rescueRequest = await this.prisma.rescueRequest.findUnique({
@@ -436,6 +653,7 @@ async startDispatch(rescueRequestId: string, customerId: string) {
         round: next.round,
         extraRadiusKm: next.extraRadiusKm,
       },
+      next.isTestRequest,
     );
     return { ...next, resolution };
   });
@@ -449,6 +667,7 @@ async startDispatch(rescueRequestId: string, customerId: string) {
         level: 'info',
         extra: { rescueRequestId, round: outcome.round },
       });
+      await this.alertStaffManualFallback(rescueRequestId, outcome.round);
       return;
     }
     await this.notifyNoOperatorAvailable(rescueRequestId, customerId, outcome.reason, outcome.round);
@@ -471,7 +690,7 @@ async startDispatch(rescueRequestId: string, customerId: string) {
   await this.deliverOffers(outcome.offers);
 }
 ```
-Add `import * as Sentry from '@sentry/node';` to this file's imports if not already present (check first — `dispatch.service.ts` likely already imports it given `alertAdminNoOperator`'s neighborhood; if it does, skip this).
+`dispatch.service.ts` already imports `* as Sentry from '@sentry/node'` — confirmed directly, no import change needed here.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -482,17 +701,28 @@ Expected: PASS, including every pre-existing `startDispatch` test in this file �
 
 ```bash
 npx jest --silent
-npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 525
+npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 527
 git add src/rescue-request/dispatch.service.ts src/rescue-request/dispatch.service.spec.ts
 git commit -m "Add DispatchService.resolveExhaustion, wire into startDispatch"
 ```
+
+**Note on the lint ceiling:** `527` reflects this repo's warning count as of
+2026-10-23. Re-check the real number (`npx eslint "{src,apps,libs,test}/**/*.ts"` with no `--max-warnings`, read the final count) before trusting this literally — it's a ratchet that only ever moves down, and several unrelated features have landed since this plan was written.
 
 ---
 
 ### Task 4: Wire `resolveExhaustion` into `BatchResolveCheck`
 
+**Multi-llm review correction (2026-10-23):** `resolveExhaustion` now takes
+a 4th parameter, `isTestRequest` (Task 3) — the real call this task adds
+must pass it, threaded from `next.isTestRequest` the same way Task 3's
+`startDispatch` does, not omitted.
+
 **Files:**
 - Modify: `src/rescue-request/reconciler/checks/batch-resolve.check.ts:159-181`
+  (Claude-subagent-reviewed and confirmed still accurate as of 2026-10-23 —
+  this is the one line-number citation in this plan that's actually still
+  correct, don't assume the others are just because this one is)
 - Test: `src/rescue-request/reconciler/checks/batch-resolve.check.spec.ts`
 
 **Interfaces:**
@@ -559,6 +789,7 @@ if (next.exhausted) {
       round: next.round,
       extraRadiusKm: next.extraRadiusKm,
     },
+    next.isTestRequest,
   );
   if (resolution.outcome === 'manual-fallback') {
     return {
@@ -575,7 +806,7 @@ if (next.exhausted) {
   };
 }
 ```
-Check the caller of `resolve()` (inside `run()`, and wherever `resolve()`'s return value's `outcome` is consumed after the transaction — likely right after the `$transaction` call in `resolve()`, sending `notifyNoOperatorAvailable` for `'exhausted'`) and add a branch there too: `'manual-fallback'` sends no customer notification (mirroring `startDispatch`'s Task 3 change) — log/Sentry only, same shape as Task 3's `startDispatch` addition.
+Check the caller of `resolve()` (inside `run()`, and wherever `resolve()`'s return value's `outcome` is consumed after the transaction — likely right after the `$transaction` call in `resolve()`, sending `notifyNoOperatorAvailable` for `'exhausted'`) and add a branch there too: `'manual-fallback'` sends no customer notification (mirroring `startDispatch`'s Task 3 change) — log/Sentry only, plus (multi-llm review addition, 2026-10-23) `await this.dispatchService.alertStaffManualFallback(batch.rescueRequestId, result.round)` — the same staff-alert call `startDispatch` now makes, so a request that falls through via the reconciler sweep (not a live `startDispatch` call) still alerts staff, not just the ones resolved synchronously.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -586,7 +817,7 @@ Expected: PASS, including every pre-existing test — the "cancels when exhauste
 
 ```bash
 npx jest --silent
-npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 525
+npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 527
 git add src/rescue-request/reconciler/checks/batch-resolve.check.ts src/rescue-request/reconciler/checks/batch-resolve.check.spec.ts
 git commit -m "Route BatchResolveCheck through the shared resolveExhaustion resolver"
 ```
@@ -595,8 +826,25 @@ git commit -m "Route BatchResolveCheck through the shared resolveExhaustion reso
 
 ### Task 5: `assignOperator` — backend enforcement, skip-send, clear the flag
 
+**Multi-llm review correction (2026-10-23):** the original version of this
+task's `claimed` update snippet replaced the whole `data` block with a
+version that hardcodes `status: WAITING_FOR_DEPOSIT` — but the real,
+current `assignOperator` has a 0%-deposit branch (`depositAmount === 0`)
+that sets `status: OPERATOR_ASSIGNED` instead and skips straight to
+`PaymentEventsService.activateAssignedJob`, which creates an operator
+WhatsApp session and sends a message/template **unconditionally** — not
+guarded by `whatsappEnabled` at all. Pasting the plan's original snippet
+verbatim would have broken the 0%-deposit feature outright. Fixed below:
+only ADD `needsManualAssignment: false` plus the conditional `where`
+clause to the EXISTING `data` block, leave the 0%-deposit conditional
+logic untouched here, and guard `activateAssignedJob` itself in Task 6
+(which both paths — this one and the paid-deposit confirmation flow —
+already funnel through, so guarding it there covers both).
+
 **Files:**
-- Modify: `src/rescue-request/rescue-request-admin.service.ts:116-318`
+- Modify: `src/rescue-request/rescue-request-admin.service.ts` (`assignOperator`,
+  confirmed at line 128 as of 2026-10-23 — grep `async assignOperator` to
+  re-confirm before trusting this)
 - Test: `src/rescue-request/rescue-request-admin.service.spec.ts`
 
 **Interfaces:**
@@ -702,9 +950,14 @@ Expected: FAIL on the new tests — the guard doesn't exist, the send isn't cond
 
 - [ ] **Step 3: Implement**
 
-In `src/rescue-request/rescue-request-admin.service.ts`, add the request lookup's `select`/fields needed (the existing `request` lookup at lines 133-136 already does `include: { customer: true }` with no explicit `select`, so `needsManualAssignment` is already included by default — no change needed there). Right after the existing operator-status check (after line 131, before the `request` lookup at line 133):
+In `src/rescue-request/rescue-request-admin.service.ts`, confirmed against
+the real current method: the `request` lookup (`this.prisma.rescueRequest.findUnique`
+with `include: { customer: true }`, no explicit `select`) already includes
+`needsManualAssignment` by default once Task 1's migration lands — no
+change needed there.
 
-Actually — insert the new guard right after BOTH lookups exist (it needs `request.needsManualAssignment`), so place it right after line 154 (`if (!request.customer.phoneNumber) {...}` block ends) and before line 156 (`const config = ...`):
+Insert the new guard right after both lookups exist and the existing
+`if (!request.customer.phoneNumber) {...}` block, before `const config = await this.platformConfigService.getConfig();`:
 ```ts
 if (!operator.whatsappEnabled && !request.needsManualAssignment) {
   throw new BadRequestException(
@@ -713,7 +966,12 @@ if (!operator.whatsappEnabled && !request.needsManualAssignment) {
 }
 ```
 
-Change the `claimed` update (lines 190-205) to also clear the flag:
+**Do not replace the `claimed` update's `data` block** — the real one has
+a pre-existing `depositAmount === 0` branch (status `OPERATOR_ASSIGNED`
+vs `WAITING_FOR_DEPOSIT`, conditional `depositWindowExpiresAt`/
+`depositRemindersSent`) that a wholesale replacement would silently
+break. Only add `needsManualAssignment: false` to the data object and the
+conditional clause to `where`:
 ```ts
 const claimed = await tx.rescueRequest.updateMany({
   where: {
@@ -724,13 +982,17 @@ const claimed = await tx.rescueRequest.updateMany({
   },
   data: {
     assignedOperatorId: dto.operatorId,
-    status: RescueRequestStatus.WAITING_FOR_DEPOSIT,
+    status:
+      depositAmount === 0
+        ? RescueRequestStatus.OPERATOR_ASSIGNED
+        : RescueRequestStatus.WAITING_FOR_DEPOSIT,
     needsManualAssignment: false,
     serviceFeeAmount,
     depositAmount,
     balanceAmount,
-    depositWindowExpiresAt,
-    depositRemindersSent: 0,
+    ...(depositAmount === 0
+      ? {}
+      : { depositWindowExpiresAt, depositRemindersSent: 0 }),
   },
 });
 ```
@@ -739,13 +1001,15 @@ conditional claim as authoritative. If it returns `count: 0`, re-read enough
 state to distinguish a stale request from a cleared manual flag and throw a
 `BadRequestException`; do not continue to payment creation or Paystack.
 
-Change the operator-directed send (currently line 312, unconditional) to be guarded — the surrounding code (lines 300-314):
+**The operator-directed send only needs the guard for the nonzero-deposit
+path** — the real method's operator message at the end (`void this.twilioService.sendWhatsAppMessage(operatorPhone, ...)`,
+right after the customer's "Operator assigned!" message with the checkout
+link) is the only standalone operator send `assignOperator` itself makes.
+The 0%-deposit path doesn't send an operator message here at all — it
+calls `this.paymentEventsService.activateAssignedJob(id)`, which makes
+its OWN operator-directed sends; that path is guarded in Task 6, not
+here. Wrap only the real send:
 ```ts
-const customerPhone = toWhatsAppAddress(request.customer.phoneNumber);
-const operatorPhone = toWhatsAppAddress(operator.phoneNumber!);
-const depositNaira = (depositAmount / 100).toLocaleString();
-const balanceNaira = (balanceAmount / 100).toLocaleString();
-
 void this.twilioService.sendWhatsAppMessage(
   customerPhone,
   `🚗 *Operator assigned!*\n\nBusiness: ${operator.businessName}\n💰 Deposit: *₦${depositNaira}* now · ₦${balanceNaira} balance on completion\n\n⚠️ *ACTION NEEDED* — tap the link below to pay and confirm. You have *30 minutes*:\n\n👉 ${checkoutUrl}\n\nReply CANCEL to cancel (no charge).`,
@@ -767,7 +1031,7 @@ Expected: PASS, including every pre-existing test in this file.
 
 ```bash
 npx jest --silent
-npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 525
+npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 527
 git add src/rescue-request/rescue-request-admin.service.ts src/rescue-request/rescue-request-admin.service.spec.ts
 git commit -m "Enforce non-WhatsApp assignment only on manually-flagged requests"
 ```
@@ -776,8 +1040,29 @@ git commit -m "Enforce non-WhatsApp assignment only on manually-flagged requests
 
 ### Task 6: Guard operator-directed WhatsApp sends — `payment-events.service.ts`
 
+**Multi-llm review correction (2026-10-23) — this task's target methods
+were wrong.** The original draft targeted `confirmDeposit`/`confirmBalance`
+directly, citing line numbers for operator-sends inside them. As of the
+current code, both are thin wrappers:
+`confirmDeposit` (line 62) calls `this.activateAssignedJob(rescueRequest.id)`
+(confirmed: `await this.activateAssignedJob(rescueRequest.id);` at line 187)
+instead of sending inline, and `confirmBalance` (line 317) is
+`return this.finalizeJobSettlement(payment.rescueRequestId);` — a one-line
+delegate. The real operator-directed sends live in `activateAssignedJob`
+(line 210) and `finalizeJobSettlement` (line 332), which are *shared* by
+more callers than just these two: `activateAssignedJob` is also called
+directly by `assignOperator`'s 0%-deposit branch (Task 5), and
+`finalizeJobSettlement` is also reachable from a 100%-deposit path (see
+its own docstring). Guarding the two shared methods covers every caller in
+one place — guarding `confirmDeposit`/`confirmBalance` themselves would
+have missed Task 5's 0%-deposit path entirely, which is exactly the gap
+multi-llm review caught.
+
 **Files:**
-- Modify: `src/rescue-request/payment-events.service.ts:142,238,242` (see exact context below)
+- Modify: `src/rescue-request/payment-events.service.ts` — `activateAssignedJob`
+  (confirmed at line 210 as of 2026-10-23) and `finalizeJobSettlement`
+  (confirmed at line 332) — grep `async activateAssignedJob` /
+  `async finalizeJobSettlement` to re-confirm before trusting these numbers
 - Test: `src/rescue-request/payment-events.service.spec.ts`
 
 **Interfaces:**
@@ -785,23 +1070,27 @@ git commit -m "Enforce non-WhatsApp assignment only on manually-flagged requests
 
 - [ ] **Step 1: Read the current surrounding code**
 
-Run: `sed -n '55,150p' src/rescue-request/payment-events.service.ts` (the `confirmDeposit` method, containing line 142's send) and `sed -n '178,250p' src/rescue-request/payment-events.service.ts` (the `confirmBalance` method, containing lines 238/242's sends) to confirm the exact current variable names holding the operator record in scope at each site (line numbers may have shifted slightly from the research pass — re-read before editing).
+Run: `sed -n '210,290p' src/rescue-request/payment-events.service.ts` (`activateAssignedJob` — the session-store calls at ~231-248 and the Twilio send at ~271-288) and `sed -n '332,420p' src/rescue-request/payment-events.service.ts` (`finalizeJobSettlement` — the operator-directed sends and rating-session setup starting around line 392, after the customer-directed block). Confirm the exact current variable names (`operator` in both) before editing — this plan has already drifted on method identity once, don't also trust these line numbers blindly.
 
 - [ ] **Step 2: Write the failing tests**
 
-In `src/rescue-request/payment-events.service.spec.ts`, find the existing `describe('confirmDeposit', ...)` and `describe('confirmBalance', ...)` blocks and add, in each:
+In `src/rescue-request/payment-events.service.spec.ts`, find the existing `describe('activateAssignedJob', ...)` and `describe('finalizeJobSettlement', ...)` blocks (or `confirmDeposit`/`confirmBalance` if the methods are tested indirectly through their wrappers — check which exists before assuming) and add, in each:
 ```ts
-it('skips the operator WhatsApp notification when the operator has no WhatsApp on file', async () => {
+it('skips the operator WhatsApp notification and session setup when the operator has no WhatsApp on file', async () => {
   // Reuse this test file's existing happy-path setup, but with the
-  // operator record's whatsappEnabled: false.
+  // assignedOperator record's whatsappEnabled: false.
   // ...
   expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalledWith(
     expect.stringContaining(operatorPhoneUsedInThisTest),
     expect.anything(),
   );
+  expect(twilioService.sendWhatsAppTemplateMessage).not.toHaveBeenCalled();
 });
 ```
-Write one such test per method (`confirmDeposit`, `confirmBalance` — the latter covers both the "payment received" and "rate the customer" sends in one pass since they're both operator-directed and adjacent).
+Write one such test per method. For `activateAssignedJob`, also keep a
+test proving the `dispatchOffer.updateMany` status-flip (SELECTED_PENDING_PAYMENT → ACCEPTED)
+still runs regardless of `whatsappEnabled` — that's a real state
+transition, not a WhatsApp side effect, and must not get pulled inside the guard.
 
 - [ ] **Step 3: Run tests to verify they fail**
 
@@ -810,7 +1099,18 @@ Expected: FAIL — sends aren't guarded yet.
 
 - [ ] **Step 4: Implement**
 
-Wrap each of the three operator-directed sends (the "job is live" notification in `confirmDeposit`, and the "payment received" + "rate the customer" sends in `confirmBalance`) in `if (operator.whatsappEnabled) { ... }`, using whatever the operator variable is actually named at each site (confirmed in Step 1). Do not touch any customer-directed send in this file.
+In `activateAssignedJob`, wrap everything from the WhatsApp session-store
+calls through the Twilio send (`this.sessionStore.getOrCreate`/`.update`
+for the operator, and the `arrivedTemplateSid`/freeform send) in
+`if (operator.whatsappEnabled) { ... }`. Leave the `dispatchOffer.updateMany`
+status-flip and the customer-side `this.sessionStore.update(rescueRequest.customerId, ...)`
+call outside the guard — those aren't WhatsApp sends.
+
+In `finalizeJobSettlement`, wrap the operator-directed block (the two
+`this.twilioService.sendWhatsAppMessage(toWhatsAppAddress(operator.phoneNumber), ...)`
+calls plus the `findOrCreateCustomer`/`sessionStore.update` rating-session
+setup that follows them) in `if (operator?.whatsappEnabled) { ... }`. Do
+not touch the customer-directed block earlier in the same method.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -821,9 +1121,87 @@ Expected: PASS, including every pre-existing test.
 
 ```bash
 npx jest --silent
-npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 525
+npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 527
 git add src/rescue-request/payment-events.service.ts src/rescue-request/payment-events.service.spec.ts
-git commit -m "Guard operator-directed WhatsApp sends in payment-events.service"
+git commit -m "Guard operator-directed WhatsApp sends in activateAssignedJob/finalizeJobSettlement"
+```
+
+---
+
+### Task 6A: Guard operator-directed WhatsApp sends — `payout.service.ts`
+
+**Added by multi-llm review (2026-10-23):** this task did not exist in the
+original plan. The operator-directed-sends inventory this plan was built
+from missed `payout.service.ts` entirely — confirmed via grep, the file
+is never mentioned anywhere in the spec or the original plan.
+`notifyOperatorPaid` and `notifyOperatorBankDetailsNeeded`
+(`src/payout/payout.service.ts:471` and `:505`) are both real,
+unconditional operator-directed sends, called from `createAndProcessPayout`
+(payout settlement, reachable for any assigned operator regardless of
+`whatsappEnabled`). Left unguarded, a non-WhatsApp operator's payout
+would stall completely silently from their own perspective — the
+"bank details needed" message is the *only* thing that tells an operator
+their payout is blocked on missing bank details; without it, nothing
+ever prompts them, and the only trace is Sentry noise from a failed
+Twilio send.
+
+**Files:**
+- Modify: `src/payout/payout.service.ts` (`notifyOperatorPaid` at line 471,
+  `notifyOperatorBankDetailsNeeded` at line 505 — grep to re-confirm)
+- Test: `src/payout/payout.service.spec.ts`
+
+**Interfaces:**
+- Consumes: `Operator.whatsappEnabled` (Task 1).
+
+- [ ] **Step 1: Write the failing tests**
+
+In `src/payout/payout.service.spec.ts`, find or create coverage for
+`notifyOperatorPaid`/`notifyOperatorBankDetailsNeeded` (they're `private`
+— test through whatever public method calls them, e.g.
+`createAndProcessPayout`, matching this file's existing test pattern for
+those methods) and add:
+```ts
+it('skips the operator WhatsApp notification (paid) when the operator has no WhatsApp on file', async () => {
+  // Reuse this file's existing happy-path setup for a successful payout,
+  // with the operator record's whatsappEnabled: false.
+  // ...
+  expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+  expect(twilioService.sendWhatsAppTemplateMessage).not.toHaveBeenCalled();
+});
+
+it('skips the operator WhatsApp notification (bank details needed) when the operator has no WhatsApp on file', async () => {
+  // Same, for the missing-bank-details path.
+});
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `npx jest src/payout/payout.service.spec.ts -t "skips the operator"`
+Expected: FAIL — sends aren't guarded yet.
+
+- [ ] **Step 3: Implement**
+
+Both methods currently take `operator: { phoneNumber: string }`. Widen
+the parameter type to `operator: { phoneNumber: string; whatsappEnabled: boolean }`
+and wrap each method's existing `try { ... }` body in
+`if (operator.whatsappEnabled) { ... }` — the catch block and its
+Sentry/console reporting stay outside the guard (nothing to catch when
+the send is deliberately skipped). Update each call site passing a plain
+`{ phoneNumber }` object to also pass `whatsappEnabled` from the real
+operator record already in scope there.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `npx jest src/payout/payout.service.spec.ts`
+Expected: PASS, including every pre-existing test.
+
+- [ ] **Step 5: Full suite, lint, commit**
+
+```bash
+npx jest --silent
+npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 527
+git add src/payout/payout.service.ts src/payout/payout.service.spec.ts
+git commit -m "Guard operator-directed WhatsApp sends in payout.service"
 ```
 
 ---
@@ -883,7 +1261,7 @@ Expected: PASS, including every pre-existing test in this file.
 
 ```bash
 npx jest --silent
-npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 525
+npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 527
 git add src/rescue-request/whatsapp-customer-flow.service.ts src/rescue-request/whatsapp-customer-flow.service.spec.ts
 git commit -m "Guard operator-directed WhatsApp sends in whatsapp-customer-flow.service"
 ```
@@ -960,7 +1338,7 @@ Expected: PASS, including every pre-existing test.
 
 ```bash
 npx jest --silent
-npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 525
+npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 527
 git add src/rescue-request/dispatch.service.ts src/rescue-request/dispatch.service.spec.ts
 git commit -m "Guard remaining operator-directed WhatsApp sends in dispatch.service"
 ```
@@ -998,12 +1376,27 @@ second identity/behavior for a registered operator number. Use the project's
 existing TwiML response helper or inject the smallest equivalent response in
 this router, matching current inbound tests.
 
+**Why this task covers every send inside `WhatsAppOperatorFlowService` without
+a separate guard on each one (multi-llm review question, resolved
+2026-10-23):** every method in that service — including `endChatRelay`
+(`whatsapp-operator-flow.service.ts:729`, an operator-directed send not
+otherwise guarded by this plan) — is reached *in response to* an inbound
+WhatsApp message from the operator. A non-WhatsApp operator has no inbound
+channel to trigger any of it: once this task's block is in place, none of
+`WhatsAppOperatorFlowService`'s own sends are reachable for one, by
+construction, not by an explicit per-send check. This is a different
+category from Task 5/6/6A/8's targets, which are all triggered by
+staff/system actions (an admin assigning an operator, a payout settling)
+that CAN reach a non-WhatsApp operator regardless of their own inbound
+capability — those genuinely need their own guards; this file's sends do
+not, once this task ships.
+
 - [ ] **Step 3: Verify and commit**
 
 ```bash
 npx jest src/rescue-request/whatsapp-inbound.service.spec.ts
 npx jest --silent
-npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 525
+npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 527
 git add src/rescue-request/whatsapp-inbound.service.ts src/rescue-request/whatsapp-inbound.service.spec.ts
 git commit -m "Block off-platform operators from the WhatsApp command flow"
 ```
@@ -1012,10 +1405,26 @@ git commit -m "Block off-platform operators from the WhatsApp command flow"
 
 ### Task 8B: Clear `needsManualAssignment` on every cancellation path
 
+**Multi-llm review correction (2026-10-23):** the original inventory
+missed one real writer. `PaymentEventsService` (`payment-events.service.ts:107`,
+inside its deposit-confirmation handling) also writes
+`status: RescueRequestStatus.CANCELLED` directly — for the case where a
+deposit lands on a request with no assigned operator, alerted via
+`Sentry.captureMessage('Deposit confirmed without an assigned operator', ...)`
+immediately above it. Missing this one is a real gap, not just
+theoretical: a request that reaches this branch while flagged
+`needsManualAssignment: true` would be left `CANCELLED` but still marked
+as needing a staff call — the badge stays on a dead request indefinitely,
+since nothing else ever revisits a CANCELLED row.
+
 **Files:**
 - Modify every RescueRequest writer that sets `status: CANCELLED`, currently:
   `dispatch.service.ts`, `whatsapp-customer-flow.service.ts`,
-  `rescue-request-admin.service.ts`, `reconciler/checks/batch-resolve.check.ts`,
+  `rescue-request-admin.service.ts`, `payment-events.service.ts` (the
+  no-assigned-operator branch, confirmed at line 107 as of 2026-10-23 —
+  grep `status: RescueRequestStatus.CANCELLED` in this file to re-confirm
+  no others exist before trusting this count),
+  `reconciler/checks/batch-resolve.check.ts`,
   `reconciler/checks/deposit-expiry.check.ts`, and
   `reconciler/checks/quote-selection-timeout.check.ts`
 - Test each owning service/check's existing spec
@@ -1106,6 +1515,7 @@ describe('startManualCompletionConfirmation', () => {
       where: {
         id: 'req-1',
         status: 'ARRIVED',
+        confirmationDueAt: null,
         assignedOperator: { whatsappEnabled: false },
       },
       data: { confirmationDueAt: expect.any(Date) },
@@ -1129,6 +1539,29 @@ describe('startManualCompletionConfirmation', () => {
     expect(result).toEqual({ claimed: false });
     expect(prisma.whatsAppSession.updateMany).not.toHaveBeenCalled();
     expect(twilioService.sendWhatsAppMessage).not.toHaveBeenCalled();
+  });
+
+  it('does not re-claim (or re-send CONFIRM) on a second call while a confirmation is already pending — multi-llm review regression test', async () => {
+    // confirmationDueAt: null is part of the claim's own WHERE clause now,
+    // so a row that already has one set (the first call's own write) can
+    // never match a second time — this test proves that by mocking the
+    // real atomic behavior: the second updateMany call reports count: 0.
+    prisma.$transaction.mockImplementation((cb: (tx: unknown) => unknown) => cb(prisma));
+    prisma.rescueRequest.updateMany
+      .mockResolvedValueOnce({ count: 1 }) // first call claims it
+      .mockResolvedValueOnce({ count: 0 }); // second call: confirmationDueAt no longer null
+    prisma.rescueRequest.findUnique.mockResolvedValue({
+      customerId: 'cust-1',
+      customer: { phoneNumber: '+2348000000000' },
+      assignedOperator: { businessName: 'Swift Towing' },
+    });
+
+    const first = await service.startManualCompletionConfirmation('req-1');
+    const second = await service.startManualCompletionConfirmation('req-1');
+
+    expect(first).toEqual({ claimed: true });
+    expect(second).toEqual({ claimed: false });
+    expect(twilioService.sendWhatsAppMessage).toHaveBeenCalledTimes(1);
   });
 });
 ```
@@ -1180,10 +1613,22 @@ async notifyCustomerOperatorArrived(rescueRequestId: string): Promise<void> {
  * Unlike `notifyCustomerOperatorArrived`, this one is NOT shared with any
  * WhatsApp-path method (the WhatsApp DONE flow has no manual-only
  * equivalent to share with), so it owns its own atomic conditional claim
- * end to end — the claim (`status: ARRIVED` → sets `confirmationDueAt`)
- * is the first statement inside its own transaction, closing the same
- * race Task 10's callout describes, self-contained, with no separate
- * claim helper needed elsewhere.
+ * end to end — the claim (`status: ARRIVED` AND `confirmationDueAt: null`
+ * → sets `confirmationDueAt`) is the first statement inside its own
+ * transaction, closing the same race Task 10's callout describes,
+ * self-contained, with no separate claim helper needed elsewhere.
+ *
+ * **Multi-llm review correction (2026-10-23):** the original claim
+ * condition checked only `status: ARRIVED`, which this method never
+ * itself advances — a second call (a staff double-click, a client retry)
+ * would match the same row again, re-set `confirmationDueAt` to a new
+ * future time, and re-send the CONFIRM prompt to the customer a second
+ * time, indefinitely. Added `confirmationDueAt: null` to the `where`
+ * clause so only a row with no pending confirmation can be claimed —
+ * this also means a LEGITIMATE re-claim after
+ * `StalledConfirmationCheck` fires (which sets `confirmationDueAt: null`
+ * as its own claim, see that reconciler's own comments) still works
+ * correctly once staff act on the alert.
  */
 async startManualCompletionConfirmation(
   rescueRequestId: string,
@@ -1193,6 +1638,7 @@ async startManualCompletionConfirmation(
       where: {
         id: rescueRequestId,
         status: RescueRequestStatus.ARRIVED,
+        confirmationDueAt: null,
         assignedOperator: { whatsappEnabled: false },
       },
       data: { confirmationDueAt: new Date(Date.now() + STALLED_CONFIRMATION_MS) },
@@ -1228,13 +1674,30 @@ async startManualCompletionConfirmation(
   return { claimed: true };
 }
 ```
-`handleOperatorArrived` (lines 554-603) is **not** modified in this task —
-it keeps its own unconditional `rescueRequest.update({data: {status: ARRIVED}})`
-exactly as today, immediately followed by a new call to
+**Multi-llm review correction (2026-10-23):** the original version of this
+task's replacement snippet dropped the method's existing `donePromptSid`
+template branch entirely, replacing it with an unconditional plain-text
+`this.reply(...)`. The real current method (confirmed at line 580) sends
+the operator a DONE-prompt Content Template (`TWILIO_DONE_PROMPT_TEMPLATE_SID`,
+`sendWhatsAppTemplateMessage` + `this.xmlOk()`) when that env var is set,
+falling back to the plain-text reply only when it's unset — exactly the
+same template/freeform pattern used throughout this codebase. As of
+2026-10-23 that template has a real, submitted SID (see
+`twilio-content-templates.ts`'s note on `done_prompt`), so pasting the
+original snippet verbatim would have regressed every real WhatsApp
+operator from the proper interactive template message to a plain-text
+reply. Fixed below: the template branch is preserved unchanged, only the
+customer-notification block is replaced with the shared method call.
+
+`handleOperatorArrived` (confirmed at line 580 as of 2026-10-23 — grep
+`private async handleOperatorArrived` to re-confirm) keeps its own
+unconditional `rescueRequest.update({data: {status: ARRIVED}})` exactly
+as today, immediately followed by a new call to
 `this.notifyCustomerOperatorArrived(rescueRequestId)` in place of the inline
 customer-notification block it previously had (the status write itself
 stays where it already is, right above where the inline notification used
-to be — only the notification send moves into the shared method call):
+to be — only the notification send moves into the shared method call; the
+DONE-prompt template branch that follows it is untouched):
 ```ts
 private async handleOperatorArrived(
   operatorPhone: string,
@@ -1278,12 +1741,25 @@ private async handleOperatorArrived(
 
   await this.notifyCustomerOperatorArrived(rescueRequestId);
 
+  // Unchanged from the current method — do not drop this branch. See the
+  // multi-llm review note above this snippet for what happens if you do.
+  // Full definition: TWILIO_CONTENT_TEMPLATES.done_prompt in
+  // src/integrations/twilio/twilio-content-templates.ts.
+  const donePromptSid = process.env.TWILIO_DONE_PROMPT_TEMPLATE_SID;
+  if (donePromptSid) {
+    await this.twilioService.sendWhatsAppTemplateMessage(
+      operatorPhone,
+      donePromptSid,
+      { '1': formatJobRef(rescueRequestId) },
+    );
+    return this.xmlOk();
+  }
   return this.reply(
     `✅ ${formatJobRef(rescueRequestId)} — Arrival confirmed! The customer has been notified.\n\nSend *DONE* when the job is complete.`,
   );
 }
 ```
-`handleOperatorJobDone` (lines 605-679) is **not** modified at all in this task.
+`handleOperatorJobDone` (confirmed at line 642 as of 2026-10-23) is **not** modified at all in this task.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1294,7 +1770,7 @@ Expected: PASS, including every pre-existing `handleOperatorArrived`/`handleOper
 
 ```bash
 npx jest --silent
-npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 525
+npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 527
 git add src/rescue-request/whatsapp-operator-flow.service.ts src/rescue-request/whatsapp-operator-flow.service.spec.ts
 git commit -m "Extract notifyCustomerOperatorArrived; add startManualCompletionConfirmation"
 ```
@@ -1646,13 +2122,82 @@ Add `BadRequestException`, `NotFoundException`, and `RescueRequestStatus` (from 
 Run: `npx jest src/rescue-request/rescue-request.controller.spec.ts`
 Expected: PASS.
 
+- [ ] **Step 6A: Close the generic status-override bypass for non-WhatsApp ARRIVED/COMPLETED transitions**
+
+**Added by multi-llm review (2026-10-23):** the pre-existing generic
+`PATCH :id/status` endpoint (`RescueRequestAdminService.updateStatus`,
+confirmed at line 725) accepts any `RescueRequestStatus` string with no
+guard at all — it can already set `ARRIVED` or `COMPLETED` directly,
+bypassing the WhatsApp-path's own session-state checks and (for
+`COMPLETED`) the completion-evidence requirement. This isn't new, but
+this plan makes the risk concrete: without a dedicated button for the new
+`manual-arrived`/`manual-done` endpoints (closed by Task 14's wiring,
+added below), staff have every incentive to reach for this existing
+generic endpoint for a non-WhatsApp job instead — which has none of
+Task 9/10's atomic claim, customer-notification, or
+`needsManualAssignment`-aware guards. Block it specifically for a
+non-WhatsApp-operator request transitioning into `ARRIVED` or
+`COMPLETED`, forcing those two transitions through the new guarded
+endpoints; every other status remains reachable through this endpoint
+exactly as before.
+
+Write a failing test in `rescue-request-admin.service.spec.ts`'s existing
+`describe('updateStatus', ...)` block:
+```ts
+it('rejects ARRIVED/COMPLETED via the generic status endpoint when the assigned operator has no WhatsApp', async () => {
+  prisma.rescueRequest.findUnique.mockResolvedValue({
+    id: 'req-1',
+    assignedOperator: { whatsappEnabled: false },
+  });
+
+  await expect(
+    service.updateStatus('req-1', { status: 'ARRIVED' }),
+  ).rejects.toThrow(
+    'Use manual-arrived/manual-done for a non-WhatsApp operator, not the generic status endpoint.',
+  );
+  await expect(
+    service.updateStatus('req-1', { status: 'COMPLETED' }),
+  ).rejects.toThrow(/manual-arrived.*manual-done/);
+});
+
+it('leaves every other status transition on this endpoint unaffected', async () => {
+  prisma.rescueRequest.findUnique.mockResolvedValue({
+    id: 'req-1',
+    assignedOperator: { whatsappEnabled: false },
+  });
+  // ...rest of this file's existing happy-path setup for updateStatus...
+
+  await expect(
+    service.updateStatus('req-1', { status: 'CANCELLED' }),
+  ).resolves.toBeDefined();
+});
+```
+Run it, confirm it fails (the guard doesn't exist yet), then implement —
+at the top of `updateStatus`, before the existing `this.prisma.rescueRequest.update` call:
+```ts
+if (status === RescueRequestStatus.ARRIVED || status === RescueRequestStatus.COMPLETED) {
+  const current = await this.prisma.rescueRequest.findUnique({
+    where: { id },
+    select: { assignedOperator: { select: { whatsappEnabled: true } } },
+  });
+  if (current?.assignedOperator?.whatsappEnabled === false) {
+    throw new BadRequestException(
+      'Use manual-arrived/manual-done for a non-WhatsApp operator, not the generic status endpoint.',
+    );
+  }
+}
+```
+Run the full file's suite, confirm green including every pre-existing
+`updateStatus` test (they all use a WhatsApp-enabled or unassigned
+operator today, so this guard doesn't touch them).
+
 - [ ] **Step 7: Full suite, lint, commit**
 
 ```bash
 npx jest --silent
-npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 525
-git add src/rescue-request/rescue-request.controller.ts src/rescue-request/rescue-request.controller.spec.ts src/rescue-request/rescue-request-admin.service.ts
-git commit -m "Add manual-arrived and manual-done endpoints for non-WhatsApp operators"
+npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 527
+git add src/rescue-request/rescue-request.controller.ts src/rescue-request/rescue-request.controller.spec.ts src/rescue-request/rescue-request-admin.service.ts src/rescue-request/rescue-request-admin.service.spec.ts
+git commit -m "Add manual-arrived and manual-done endpoints for non-WhatsApp operators; close the generic status-override bypass"
 ```
 
 ---
@@ -1880,7 +2425,7 @@ Expected: PASS, including every pre-existing test — `mapToDetailDto`'s existin
 
 ```bash
 npx jest --silent
-npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 525
+npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 527
 git add src/rescue-request/rescue-request.controller.ts src/rescue-request/rescue-request.controller.spec.ts src/rescue-request/rescue-request-admin.service.ts src/rescue-request/rescue-request-admin.service.spec.ts src/rescue-request/dto/rescue-request-response.dto.ts
 git commit -m "Audit-log manual operator assignments, expose whatsappEnabled on operator detail"
 ```
@@ -1972,7 +2517,7 @@ Expected: PASS, including every pre-existing test.
 
 ```bash
 npx jest --silent
-npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 525
+npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 527
 git add src/operator/dto/create-operator.dto.ts src/operator/operator.service.ts src/operator/operator.service.spec.ts
 git commit -m "Accept whatsappEnabled on operator registration"
 ```
@@ -2285,7 +2830,32 @@ badge markup as Step 2, given a second consumer.
 
 - [ ] **Step 5: Add candidate display and the "Assign this operator" action on the request detail view**
 
-In the request detail modal/view, when `needsManualAssignment` is true, fetch and show the suggested non-WhatsApp candidate(s) — check whether a backend endpoint already exists for this (Task 3/4 only persist a boolean, per the spec's design candidates are re-ranked live, not persisted) or whether this task needs a new small read endpoint, e.g. `GET /rescue-requests/:id/manual-candidates`, returning `operatorService.findAndRankCandidates(..., false)` scoped to that request's lat/lon/vehicleType. If no such endpoint exists yet, add it:
+**Multi-llm review correction (2026-10-23), two fixes:**
+
+First, this endpoint's `findAndRankCandidates` call has the exact same
+`isTest`/`whatsappOnly` parameter-collision bug as Task 3 (Finding 1) —
+the original snippet passed `false` as the 7th argument, which is
+`isTest`, not `whatsappOnly`. Fixed below by computing `isTestRequest`
+the same way `prepareNextRound` does (this is a fresh read, not a value
+threaded from a dispatch round, so it needs its own `PlatformConfig`
+fetch and the customer's phone number — `PlatformConfigService` is
+already injected in this class, confirmed at the constructor; the
+`select` below adds the customer phone this computation needs).
+
+Second, the radius formula `Math.max(0, request.dispatchRound - 1) * RADIUS_EXPANSION_KM`
+doesn't match what `resolveExhaustion` (Task 3) actually searched for
+this same request. Tracing the real arithmetic: `prepareNextRound`
+increments `attemptRound` (persisted as `dispatchRound`) *before*
+checking `rounds-exhausted`, but doesn't grow `extraRadiusKm` until
+*after* that check — so the radius actually used by the last real search
+is `(dispatchRound - 2) * RADIUS_EXPANSION_KM`, one step smaller than
+what the original formula computed. Left as `dispatchRound - 1`, staff
+could be shown candidates from a wider net than automatic dispatch (and
+`resolveExhaustion`'s own fallback search) ever actually searched —
+contradicting this plan's own stated goal that manual candidates reflect
+the same envelope the automatic search exhausted. Fixed below.
+
+Check whether a backend endpoint already exists for this (Task 3/4 only persist a boolean, per the spec's design candidates are re-ranked live, not persisted) or whether this task needs a new small read endpoint, e.g. `GET /rescue-requests/:id/manual-candidates`, returning `operatorService.findAndRankCandidates(..., isTest, false)` scoped to that request's lat/lon/vehicleType. If no such endpoint exists yet, add it:
 ```ts
 // rescue-request.controller.ts
 @Get(':id/manual-candidates')
@@ -2308,6 +2878,7 @@ async manualCandidatesFor(id: string) {
       vehicleType: true,
       offeredOperatorIds: true,
       dispatchRound: true,
+      customer: { select: { phoneNumber: true } },
     },
   });
   if (!request) throw new NotFoundException('Rescue request not found');
@@ -2320,19 +2891,33 @@ async manualCandidatesFor(id: string) {
   const eligibleTruckClasses = request.vehicleType
     ? getEligibleTruckClasses(request.vehicleType)
     : undefined;
+  // Same computation as DispatchService.prepareNextRound's own
+  // isTestRequest — see that method's comment for why it's re-checked
+  // live from PlatformConfig rather than snapshotted.
+  const config = await this.platformConfigService.getConfig();
+  const isTestRequest = config.testCustomerPhoneNumbers.includes(
+    request.customer.phoneNumber ?? '',
+  );
+  // Matches resolveExhaustion's own radius exactly — dispatchRound is
+  // persisted AFTER attemptRound's increment but BEFORE extraRadiusKm's
+  // own increment for that same round (see prepareNextRound), so the
+  // last radius actually searched is two steps back, not one.
+  const extraRadiusKm =
+    Math.max(0, request.dispatchRound - 2) * RADIUS_EXPANSION_KM;
   const candidates = await this.operatorService.findAndRankCandidates(
     Number(request.latitude),
     Number(request.longitude),
     request.offeredOperatorIds,
-    Math.max(0, request.dispatchRound - 1) * RADIUS_EXPANSION_KM,
+    extraRadiusKm,
     undefined,
     eligibleTruckClasses,
-    false,
+    isTestRequest,
+    false, // whatsappOnly
   );
   return { data: candidates };
 }
 ```
-(Check `getEligibleTruckClasses`'s import path from `dispatch.service.ts` and import it the same way here.)
+(Check `getEligibleTruckClasses`'s and `RADIUS_EXPANSION_KM`'s import path from `dispatch.service.ts` and import them the same way here — `RADIUS_EXPANSION_KM` is already a module-level constant there, not exported as of 2026-10-23; export it if it isn't, rather than redeclaring a duplicate `2` here, since this plan's own Step 5 text already warns against exactly that duplication below.)
 
 `RescueRequestAdminService` currently has no `OperatorService` dependency.
 Explicitly import and inject it, make sure `OperatorModule` exports it and the
@@ -2348,12 +2933,52 @@ staff confirms availability and agrees the price should **Confirm assignment**
 open/submit the existing price-entry flow. This ordering prevents a customer
 receiving a deposit link before the off-platform operator has accepted.
 
+- [ ] **Step 5A: Wire "Mark arrived" / "Mark done" buttons to the new manual-arrived/manual-done endpoints**
+
+**Added by multi-llm review (2026-10-23):** this step did not exist in the
+original plan — confirmed via grep, `manual-arrived`/`manual-done` are
+never referenced anywhere in the frontend tasks (13, 14), only in Task
+10's own backend and in Task 16's QA checklist prose, which assumes a UI
+control that no task actually built. Without this step, staff have no
+way to use the guarded endpoints at all once a non-WhatsApp job is
+assigned and in progress — they would reach for the pre-existing generic
+status dropdown/action instead, which Step 6A (Task 10) now explicitly
+blocks for exactly this reason. This step is what makes that block not a
+dead end.
+
+In the request detail view, when the assigned operator's
+`whatsappEnabled` is `false` (already available on `OperatorDetailDto`
+via Task 11) and the request's `status` is `OPERATOR_ASSIGNED`/
+`WAITING_FOR_DEPOSIT`→resolved (i.e. the job has an assigned non-WhatsApp
+operator and hasn't completed or cancelled), show two actions in place of
+whatever this view currently shows for a WhatsApp-path job's status
+(which relies on the operator's own WhatsApp replies to progress):
+
+- **"Mark arrived"** — visible when `status` is not yet `ARRIVED`,
+  `COMPLETED`, or `CANCELLED`. Calls `PATCH /rescue-requests/:id/manual-arrived`.
+  On success, update the local view's status to `ARRIVED` (or refetch) and
+  hide this button.
+- **"Mark done"** — visible when `status` is `ARRIVED`. Calls
+  `PATCH /rescue-requests/:id/manual-done`. On success, show a brief
+  "Waiting for customer confirmation" note (mirroring what the WhatsApp
+  path's own UI already communicates while `AWAITING_COMPLETION_CONFIRM`
+  is in effect — check how that's currently surfaced, if at all, and
+  match it rather than inventing new copy).
+
+Both calls are staff-triggered admin actions, same auth/role gate as the
+rest of this view (`ADMIN`/`SUPER_ADMIN` — matches Task 10's own
+`@Roles` on these endpoints). Add the corresponding hook functions
+(`markOperatorArrived`/`markOperatorDone` or similar, matching whatever
+naming convention `useRescueRequestApi.ts` already uses for other
+detail-view actions like `updateOperator`/`assignOperator`) and wire them
+to the two buttons.
+
 - [ ] **Step 6: Type-check and manual verification**
 
 Run: `npx tsc --noEmit`
 Expected: no new errors.
 
-Per this project's standing rule, start both dev servers and exercise this in a browser as SUPER_ADMIN: register a non-WhatsApp test operator, drive a test request through dispatch until it exhausts (or seed one directly flagged `needsManualAssignment: true` if driving a real exhaustion is impractical in dev), confirm the badge and candidate card appear on BOTH the Requests tab and the Dispatch Board, confirm "Assign this operator" completes the assignment and both badges disappear, confirm the "deposit paid, dispatch now" badge appears once a deposit clears (simulate via whatever this project's existing dev-mode payment-confirmation shortcut is, if one exists — check the QA test plan's §2 for the established way to confirm a deposit in dev).
+Per this project's standing rule, start both dev servers and exercise this in a browser as SUPER_ADMIN: register a non-WhatsApp test operator, drive a test request through dispatch until it exhausts (or seed one directly flagged `needsManualAssignment: true` if driving a real exhaustion is impractical in dev), confirm the badge and candidate card appear on BOTH the Requests tab and the Dispatch Board, confirm "Assign this operator" completes the assignment and both badges disappear, confirm the "deposit paid, dispatch now" badge appears once a deposit clears (simulate via whatever this project's existing dev-mode payment-confirmation shortcut is, if one exists — check the QA test plan's §2 for the established way to confirm a deposit in dev). Also confirm Step 5A's "Mark arrived"/"Mark done" buttons actually appear for the assigned non-WhatsApp operator, progress the job through both, and confirm no WhatsApp message is attempted for that operator at any point (check Twilio logs or local console output for a send attempt — there should be none).
 
 - [ ] **Step 7: Commit**
 
@@ -2364,7 +2989,7 @@ below are not optional extras, they're what those steps actually modify:
 # lrr-service
 git add src/rescue-request/rescue-request-admin.service.ts src/rescue-request/rescue-request-admin.service.spec.ts src/rescue-request/dto/rescue-request-response.dto.ts src/rescue-request/dispatch.service.ts src/rescue-request/dispatch.service.spec.ts src/rescue-request/rescue-request.controller.ts src/rescue-request/rescue-request.module.ts
 npx jest --silent
-npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 525
+npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 527
 git commit -m "Surface manual-assignment state and manual candidates on Requests tab, Dispatch Board, and detail view"
 
 # lrr-web
@@ -2475,7 +3100,7 @@ WhatsApp sends across the whole scenario.
 ```bash
 npx jest --silent
 npx jest --config test/integration/jest-integration.json
-npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 525
+npx eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 527
 git add test/integration/non-whatsapp-manual-dispatch.int-spec.ts test/integration/factories.ts
 git commit -m "Add end-to-end integration test for non-WhatsApp manual dispatch"
 ```
@@ -2507,7 +3132,7 @@ git commit -m "docs: add QA section for non-WhatsApp operator manual dispatch"
 - Section 2 (candidate ranking filter) → Task 2.
 - Section 3 (round-exhaustion resolver, preservation of the final expanded radius, both callers, the `alertAdminNoOperator` correction, the ordering note) → Tasks 3, 4.
 - Section 4 (`assignOperator` — skip-send, clear flag, backend enforcement) → Task 5.
-- Background's operator-channel inventory → Tasks 5 (site in `rescue-request-admin.service.ts`), 6 (`payment-events.service.ts`), 7 (`whatsapp-customer-flow.service.ts`, including full CHAT DRIVER/relay behavior), 8 (`dispatch.service.ts`), and 8A (`whatsapp-inbound.service.ts`; it has no outbound send, but its operator-routing behavior is explicitly blocked for off-platform operators).
+- Background's operator-channel inventory → Tasks 5 (site in `rescue-request-admin.service.ts`), 6 (`activateAssignedJob`/`finalizeJobSettlement` in `payment-events.service.ts` — corrected by multi-llm review from the original's stale `confirmDeposit`/`confirmBalance` targets, both of which are now thin delegates to these two shared methods), 6A (`payout.service.ts` — added by multi-llm review; missing from every earlier draft's inventory entirely), 7 (`whatsapp-customer-flow.service.ts`, including full CHAT DRIVER/relay behavior), 8 (`dispatch.service.ts`), and 8A (`whatsapp-inbound.service.ts`; it has no outbound send, but its operator-routing behavior is explicitly blocked for off-platform operators — Task 8A's own note, added by multi-llm review, explains why this single block also covers every send inside `WhatsAppOperatorFlowService`, e.g. `endChatRelay`, without a separate guard on each one).
 - The "attention now, not history" invariant for `needsManualAssignment` → Task 5 clears on assignment; Task 8B clears atomically at every cancellation writer.
 - Section 5 (badge on BOTH the Requests tab and the Dispatch Board, candidate cards + Assign action, the second deposit-paid handoff badge) → Task 14 (plus the small new `manual-candidates` read endpoint it required, not explicitly named in the spec but necessary to serve live-ranked candidates to the frontend — the spec's Section 5 said candidates are "re-ranked live," which requires *some* endpoint to do that ranking on demand; added as part of Task 14 rather than a separate task since it's small and the frontend task can't be completed without it). Found in review: an earlier draft only covered the Requests tab — the Dispatch Board is a genuinely separate projection (`DispatchService.getDispatchBoard()` → `DispatchBoardRowDto`, not `buildListResponse()` → `RescueRequestListItemDto`) with its own frontend (`DispatchBoardTab.tsx`/`useDispatchBoardApi.ts`), confirmed by direct read, and needed its own step (Task 14 Step 4) to carry the same badge.
 - Section 6 (atomic status guards, evidence-exemption decision, `notifyCustomerOperatorArrived`/`startManualCompletionConfirmation`, the two new endpoints) → Tasks 9, 10.
@@ -2517,4 +3142,4 @@ git commit -m "docs: add QA section for non-WhatsApp operator manual dispatch"
 
 **Placeholder scan:** No bare "TBD"/"TODO". Task 14 now explicitly requires the known list/detail mapping changes and the new `OperatorService` dependency/module/test wiring. Task 15's factory-extension note still directs the implementer to inspect the helper's current signature before making the mechanical extension; the required final scenario and assertions are fully specified.
 
-**Type consistency:** `PrepareNextRoundResult` carries `extraRadiusKm` on every exhausted result; both Task 3 and Task 4 pass it unchanged to `resolveExhaustion`. `ExhaustionResolution`'s two variants are consumed identically in both callers. `findAndRankCandidates`'s 7th parameter (`whatsappOnly: boolean = true`, Task 2) is called with `false` identically in Task 3's resolver and Task 14's guarded live-candidate endpoint. Task 10's manual transitions own their status/channel checks transactionally; controller reads are used only to explain a failed claim and build audit details, never as the guard itself. `notifyCustomerOperatorArrived(): Promise<void>` (notification-only, no status write) vs. `startManualCompletionConfirmation(): Promise<{claimed: boolean}>` (self-contained atomic) are two different shapes for a deliberate reason (Task 9) — the first is shared with an unconditional WhatsApp-path write and can't own a conditional claim itself without breaking that sharing; the second has no WhatsApp-path equivalent to share with, so it owns its claim internally. `OperatorDetailDto.whatsappEnabled` (Task 11, added ahead of when it's first read, fixing a real task-ordering bug an earlier draft had — Task 11's own controller code read this field, and its own tests mocked it, three tasks before anything added it) is consumed by Task 11 itself; Task 14 explicitly does not re-add it, only the separate `OperatorSummaryDto.whatsappEnabled` (list path, a different DTO with its own narrowed Prisma `select`) and the top-level `needsManualAssignment` field on both list and detail DTOs, which Task 11 never touched.
+**Type consistency:** `PrepareNextRoundResult` carries `extraRadiusKm` AND `isTestRequest` on every exhausted result (the latter added by multi-llm review, 2026-10-23); both Task 3 and Task 4 pass both unchanged to `resolveExhaustion`, which takes `isTestRequest` as an explicit 4th parameter. `ExhaustionResolution`'s two variants are consumed identically in both callers. `findAndRankCandidates`'s 8th parameter (`whatsappOnly: boolean = true`, Task 2 — corrected by multi-llm review from an original, broken reuse of the pre-existing 7th `isTest` parameter) is called with `(isTestRequest, false)` identically in Task 3's resolver and Task 14's guarded live-candidate endpoint — never just `false` alone, which would silently drop `isTest`. Task 10's manual transitions own their status/channel checks transactionally; controller reads are used only to explain a failed claim and build audit details, never as the guard itself. `notifyCustomerOperatorArrived(): Promise<void>` (notification-only, no status write) vs. `startManualCompletionConfirmation(): Promise<{claimed: boolean}>` (self-contained atomic) are two different shapes for a deliberate reason (Task 9) — the first is shared with an unconditional WhatsApp-path write and can't own a conditional claim itself without breaking that sharing; the second has no WhatsApp-path equivalent to share with, so it owns its claim internally. `OperatorDetailDto.whatsappEnabled` (Task 11, added ahead of when it's first read, fixing a real task-ordering bug an earlier draft had — Task 11's own controller code read this field, and its own tests mocked it, three tasks before anything added it) is consumed by Task 11 itself; Task 14 explicitly does not re-add it, only the separate `OperatorSummaryDto.whatsappEnabled` (list path, a different DTO with its own narrowed Prisma `select`) and the top-level `needsManualAssignment` field on both list and detail DTOs, which Task 11 never touched.

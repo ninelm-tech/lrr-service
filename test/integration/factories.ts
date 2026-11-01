@@ -24,11 +24,13 @@ export async function truncateAll(prisma: PrismaService): Promise<void> {
 export async function createCustomer(
   prisma: PrismaService,
   phoneNumber?: string,
+  overrides: Record<string, unknown> = {},
 ) {
   return prisma.user.create({
     data: {
       phoneNumber: phoneNumber ?? `+234800${unique().slice(-7)}`,
       role: 'CUSTOMER',
+      ...overrides,
     },
   });
 }

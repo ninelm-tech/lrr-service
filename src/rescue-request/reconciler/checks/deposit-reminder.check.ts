@@ -3,6 +3,7 @@ import * as Sentry from '@sentry/node';
 import { RescueRequestStatus } from '@prisma/client';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { TwilioService } from '../../../integrations/twilio/twilio.service';
+import { toWhatsAppDestination } from '../../../common/phone.util';
 import { ReconcilerCheck } from '../reconciler-check.interface';
 
 /** Minutes remaining at which a reminder is due. Descending: index 0 is the earliest nudge. */
@@ -48,7 +49,9 @@ export class DepositReminderCheck implements ReconcilerCheck {
         id: true,
         depositWindowExpiresAt: true,
         depositPaymentUrl: true,
-        customer: { select: { phoneNumber: true } },
+        customer: {
+          select: { phoneNumber: true, whatsappExternalUserId: true },
+        },
       },
       take: this.MAX_PER_PASS,
     });
@@ -59,7 +62,7 @@ export class DepositReminderCheck implements ReconcilerCheck {
       const sent = await this.send(
         request.id,
         dueCount,
-        request.customer?.phoneNumber ?? null,
+        request.customer ?? null,
         request.depositPaymentUrl,
         request.depositWindowExpiresAt!,
         now,
@@ -85,7 +88,10 @@ export class DepositReminderCheck implements ReconcilerCheck {
   private async send(
     rescueRequestId: string,
     dueCount: number,
-    phoneNumber: string | null,
+    customer: {
+      phoneNumber: string | null;
+      whatsappExternalUserId: string | null;
+    } | null,
     paymentUrl: string | null,
     expiresAt: Date,
     now: Date,
@@ -104,7 +110,7 @@ export class DepositReminderCheck implements ReconcilerCheck {
       data: { depositRemindersSent: dueCount },
     });
     if (count === 0) return false;
-    if (!phoneNumber) return true;
+    if (!customer) return true;
 
     const minutesLeft = Math.max(
       1,
@@ -116,7 +122,7 @@ export class DepositReminderCheck implements ReconcilerCheck {
     const link = paymentUrl ? `\n\n👉 ${paymentUrl}` : '';
     try {
       await this.twilioService.sendWhatsAppMessage(
-        phoneNumber,
+        toWhatsAppDestination(customer),
         `⏰ Reminder — your rescue request is still waiting for payment.${link}\n\nYou have about ${minutesLeft} minutes left before it is cancelled.`,
       );
     } catch (error) {
