@@ -272,15 +272,26 @@ export const TWILIO_CONTENT_TEMPLATES: Record<
   // (POST https://content.twilio.com/v1/Content, types['twilio/call-to-action'].actions
   // = [{ type: 'REQUEST_CONTACT_INFO' }]), then submitted for approval via
   // POST .../Content/{sid}/ApprovalRequests/whatsapp — both run against the
-  // LRR Stage subaccount 2026-10-25/26. SID: set via TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID
-  // (set TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID to this once wiring up
-  // the env, Stage only — LRR Prod has nothing yet). Approval status
-  // "received" as of creation; approval is not required to send inside an
-  // active session (see above).
+  // LRR Stage subaccount 2026-10-25/26, and the same way in the LRR Prod
+  // subaccount 2026-11-01. Each environment has its own template SID, set
+  // via TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID on that environment's ECS
+  // task definition. Approval is not required to send inside an active
+  // session (see above); both were submitted anyway.
+  //
+  // THE TWO ENVIRONMENTS USE DIFFERENT MESSAGE BODIES — deliberately. Stage
+  // still has the original body below. Prod was created with revised copy
+  // that frames sharing as the next intake step rather than an optional
+  // side request:
+  //   "To connect you with a tow operator, we need a phone number they can
+  //   reach you on. Your WhatsApp username hides your number from us, so
+  //   please tap Share contact below. We only use it for this rescue."
+  // The code never sends this body itself (it sends the template by SID),
+  // so the mismatch is harmless — but recreate Stage with the Prod copy if
+  // the two ever need to match.
   //
   // source is 'confirmed', not 'designed': the body below is exactly what
-  // was sent to and echoed back by the Content API create call, not a
-  // guess or a console screenshot transcription.
+  // the Stage Content API create call echoed back, not a guess or a
+  // console screenshot transcription.
   request_contact_info: {
     envVar: 'TWILIO_CONTACT_INFO_REQUEST_TEMPLATE_SID',
     category: 'UTILITY',
