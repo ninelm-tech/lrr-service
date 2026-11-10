@@ -215,7 +215,9 @@ export class RescueRequestController {
   async manualArrived(
     @Req() req: AuthenticatedRequest,
     @Param('id') id: string,
-    @Body() body: ManualOverrideDto,
+    // lrr-web sends no body for a non-WhatsApp operator; Express then
+    // leaves it undefined rather than {} (LRR-SERVICE-12).
+    @Body() body: ManualOverrideDto = {},
   ) {
     const request =
       await this.rescueRequestAdminService.findRawForManualAction(id);
@@ -278,7 +280,7 @@ export class RescueRequestController {
   async manualDone(
     @Req() req: AuthenticatedRequest,
     @Param('id') id: string,
-    @Body() body: ManualOverrideDto,
+    @Body() body: ManualOverrideDto = {}, // see manualArrived
   ) {
     const request =
       await this.rescueRequestAdminService.findRawForManualAction(id);
