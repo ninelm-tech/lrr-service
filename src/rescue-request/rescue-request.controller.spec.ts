@@ -1,5 +1,11 @@
+import { ExecutionContext, INestApplication } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { JwtService } from '@nestjs/jwt';
+import type { AddressInfo } from 'net';
+import { connect } from 'net';
+import type { Server } from 'http';
+import { AuthGuard } from '../auth/auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
 import { RescueRequestController } from './rescue-request.controller';
 import { DisputeService } from './dispute.service';
 import { RescueRequestAdminService } from './rescue-request-admin.service';
@@ -332,5 +338,148 @@ describe('RescueRequestController — manual dispatch actions', () => {
       ).toHaveBeenCalledWith('req-1');
       expect(result).toEqual(candidates);
     });
+  });
+});
+
+/**
+ * Sends a PATCH with no Content-Length and no Transfer-Encoding — how an
+ * empty PATCH from lrr-web reaches the service through the ALB. Express
+ * then skips body parsing entirely and `@Body()` is undefined. supertest
+ * can't send this: it always adds one of those headers, and Express then
+ * parses the empty body to `{}`. Returns the HTTP status code.
+ */
+async function patchWithNoBody(
+  app: INestApplication,
+  path: string,
+): Promise<number> {
+  await app.listen(0);
+  const { port } = (app.getHttpServer() as Server).address() as AddressInfo;
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, '127.0.0.1', () => {
+      socket.write(
+        `PATCH ${path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n`,
+      );
+    });
+    let raw = '';
+    socket.on('data', (chunk) => (raw += chunk.toString()));
+    socket.on('end', () => resolve(Number(raw.split(' ')[1])));
+    socket.on('error', reject);
+  });
+}
+
+// Over real HTTP, because the bug only exists there — a direct controller
+// call with `{}` can never reproduce an undefined body (LRR-SERVICE-12).
+describe('RescueRequestController — manual actions over HTTP with no body', () => {
+  let app: INestApplication;
+  let rescueRequestAdminService: {
+    findRawForManualAction: jest.Mock;
+    claimManualArrived: jest.Mock;
+  };
+  let operatorFlowService: {
+    notifyCustomerOperatorArrived: jest.Mock;
+    startManualCompletionConfirmation: jest.Mock;
+  };
+
+  beforeEach(async () => {
+    rescueRequestAdminService = {
+      findRawForManualAction: jest.fn(),
+      claimManualArrived: jest.fn().mockResolvedValue({ claimed: true }),
+    };
+    operatorFlowService = {
+      notifyCustomerOperatorArrived: jest.fn(),
+      startManualCompletionConfirmation: jest
+        .fn()
+        .mockResolvedValue({ claimed: true }),
+    };
+    const asAdmin = {
+      canActivate: (ctx: ExecutionContext) => {
+        ctx.switchToHttp().getRequest<{ user: unknown }>().user = {
+          userId: 'admin-1',
+        };
+        return true;
+      },
+    };
+
+    const moduleRef = await Test.createTestingModule({
+      controllers: [RescueRequestController],
+      providers: [
+        { provide: DisputeService, useValue: {} },
+        {
+          provide: RescueRequestAdminService,
+          useValue: rescueRequestAdminService,
+        },
+        { provide: DispatchService, useValue: {} },
+        { provide: AuditLogService, useValue: { record: jest.fn() } },
+        {
+          provide: WhatsAppOperatorFlowService,
+          useValue: operatorFlowService,
+        },
+      ],
+    })
+      .overrideGuard(AuthGuard)
+      .useValue(asAdmin)
+      .overrideGuard(RolesGuard)
+      .useValue(asAdmin)
+      .compile();
+
+    app = moduleRef.createNestApplication({ rawBody: true }); // as main.ts
+    await app.init();
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  it('PATCH manual-arrived with no body marks a non-WhatsApp operator arrived', async () => {
+    rescueRequestAdminService.findRawForManualAction.mockResolvedValue({
+      status: 'OPERATOR_ASSIGNED',
+      assignedOperatorId: 'op-1',
+      assignedOperator: { whatsappEnabled: false },
+    });
+
+    const status = await patchWithNoBody(
+      app,
+      '/rescue-requests/req-1/manual-arrived',
+    );
+
+    expect(status).toBe(200);
+    expect(rescueRequestAdminService.claimManualArrived).toHaveBeenCalledWith(
+      'req-1',
+      { reason: undefined },
+    );
+  });
+
+  it('PATCH manual-done with no body starts completion for a non-WhatsApp operator', async () => {
+    rescueRequestAdminService.findRawForManualAction.mockResolvedValue({
+      status: 'ARRIVED',
+      assignedOperatorId: 'op-1',
+      assignedOperator: { whatsappEnabled: false },
+    });
+
+    const status = await patchWithNoBody(
+      app,
+      '/rescue-requests/req-1/manual-done',
+    );
+
+    expect(status).toBe(200);
+    expect(
+      operatorFlowService.startManualCompletionConfirmation,
+    ).toHaveBeenCalledWith('req-1', { reason: undefined });
+  });
+
+  it('PATCH manual-arrived with no body still asks for a reason when the operator has WhatsApp', async () => {
+    rescueRequestAdminService.findRawForManualAction.mockResolvedValue({
+      status: 'OPERATOR_ASSIGNED',
+      assignedOperatorId: 'op-1',
+      assignedOperator: { whatsappEnabled: true },
+    });
+
+    const status = await patchWithNoBody(
+      app,
+      '/rescue-requests/req-1/manual-arrived',
+    );
+
+    expect(status).toBe(400);
+    expect(rescueRequestAdminService.claimManualArrived).not.toHaveBeenCalled();
   });
 });

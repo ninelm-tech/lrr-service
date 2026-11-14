@@ -19,7 +19,10 @@ env:
 jobs:
   deploy:
     name: Build & Deploy to Staging
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04 (Nov 2026), whose Docker reads
+    # the manifest back after push — a 403 for this deploy role, which has
+    # no ECR read permission. Unpin once the role has ecr:BatchGetImage.
+    runs-on: ubuntu-24.04
 
     # Required for OIDC token exchange with AWS
     permissions:

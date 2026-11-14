@@ -19,7 +19,7 @@ env:
 jobs:
   deploy:
     name: Build & Deploy to Production
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned — see deploy-staging.yml
     # Requires manual approval: configure a "production" environment under
     # repo Settings → Environments with required reviewers before this runs.
     environment: production
